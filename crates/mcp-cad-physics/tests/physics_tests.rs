@@ -17,6 +17,8 @@ fn create_test_box(id: &str, name: &str, w: f64, h: f64, d: f64) -> Part {
             width: w,
             height: h,
             depth: d,
+            position: None,
+            rotation_deg: None,
         },
         None,
     );
@@ -34,6 +36,8 @@ fn create_test_cylinder(id: &str, name: &str, radius: f64, height: f64) -> Part 
             radius,
             height,
             segments: 24,
+            position: None,
+            rotation_deg: None,
         },
         None,
     );
@@ -51,6 +55,8 @@ fn create_test_sphere(id: &str, name: &str, radius: f64) -> Part {
             radius,
             sectors: 16,
             stacks: 16,
+            position: None,
+            rotation_deg: None,
         },
         None,
     );

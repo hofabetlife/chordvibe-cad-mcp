@@ -13,7 +13,7 @@ use crate::error::ServerError;
 use crate::protocol::{ToolCallResult, ToolDefinition};
 use crate::state::EngineState;
 
-/// Returns the complete registry of all 16 MCP engineering tools with strict input schemas.
+/// Returns the complete registry of all 18 MCP engineering tools with strict input schemas.
 pub fn list_tools() -> Vec<ToolDefinition> {
     vec![
         // 1. create_part
@@ -62,7 +62,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         // 4. add_feature_primitive
         ToolDefinition {
             name: "add_feature_primitive".to_string(),
-            description: "Appends a 3D solid primitive (box, cylinder, or sphere) into the parametric history DAG of a part".to_string(),
+            description: "Appends a 3D solid primitive (box, cylinder, sphere, or cone) into the parametric history DAG of a part, with optional 3D position and rotation".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -72,12 +72,51 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     },
                     "primitive_type": {
                         "type": "string",
-                        "enum": ["box", "cylinder", "sphere"],
+                        "enum": ["box", "cylinder", "sphere", "cone"],
                         "description": "Type of 3D primitive"
                     },
                     "params": {
                         "type": "object",
-                        "description": "Geometric parameters (box: width, height, depth; cylinder: radius, height; sphere: radius)"
+                        "description": "Geometric parameters (box: width, height, depth; cylinder: radius, height; sphere: radius; cone: radius_bottom, radius_top, height; optional position [x,y,z], rotation_deg [rx,ry,rz])",
+                        "properties": {
+                            "width": { "type": "number", "description": "Box width in meters" },
+                            "height": { "type": "number", "description": "Height in meters (box, cylinder, cone)" },
+                            "depth": { "type": "number", "description": "Box depth in meters" },
+                            "radius": { "type": "number", "description": "Radius in meters (cylinder, sphere)" },
+                            "radius_bottom": { "type": "number", "description": "Bottom radius in meters (cone)" },
+                            "radius_top": { "type": "number", "description": "Top radius in meters (cone, 0 for sharp point)" },
+                            "segments": { "type": "integer", "description": "Radial segments (default 32)" },
+                            "sectors": { "type": "integer", "description": "Sphere sectors (default 32)" },
+                            "stacks": { "type": "integer", "description": "Sphere stacks (default 16)" },
+                            "position": {
+                                "type": "array",
+                                "items": { "type": "number" },
+                                "minItems": 3,
+                                "maxItems": 3,
+                                "description": "Optional center position [x, y, z] in meters"
+                            },
+                            "rotation_deg": {
+                                "type": "array",
+                                "items": { "type": "number" },
+                                "minItems": 3,
+                                "maxItems": 3,
+                                "description": "Optional rotation angles [rx, ry, rz] in degrees"
+                            }
+                        }
+                    },
+                    "position": {
+                        "type": "array",
+                        "items": { "type": "number" },
+                        "minItems": 3,
+                        "maxItems": 3,
+                        "description": "Optional position [x, y, z] in meters"
+                    },
+                    "rotation_deg": {
+                        "type": "array",
+                        "items": { "type": "number" },
+                        "minItems": 3,
+                        "maxItems": 3,
+                        "description": "Optional rotation angles [rx, ry, rz] in degrees"
                     }
                 },
                 "required": ["part_id", "primitive_type", "params"]
@@ -156,6 +195,68 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["part_id"]
+            }),
+        },
+        // 8. cut_helical_groove
+        ToolDefinition {
+            name: "cut_helical_groove".to_string(),
+            description: "Cuts one or more helical grooves (drill flutes, thread channels, or cooling spirals) into a CAD part".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "part_id": {
+                        "type": "string",
+                        "description": "Target part ID"
+                    },
+                    "helix_radius": {
+                        "type": "number",
+                        "description": "Radius of the helix center-line path in meters"
+                    },
+                    "groove_radius": {
+                        "type": "number",
+                        "description": "Radius of the cutter bead (groove cross-section radius) in meters"
+                    },
+                    "pitch": {
+                        "type": "number",
+                        "description": "Axial pitch (distance along Z per 360-degree revolution) in meters"
+                    },
+                    "height": {
+                        "type": "number",
+                        "description": "Total axial length/height of the groove sweep in meters"
+                    },
+                    "start_z": {
+                        "type": "number",
+                        "description": "Z coordinate where the helix starts in meters"
+                    },
+                    "starts": {
+                        "type": "integer",
+                        "description": "Number of interleaved helical flutes (e.g. 2 for standard twist drill, default 2)"
+                    },
+                    "is_right_hand": {
+                        "type": "boolean",
+                        "description": "True for right-hand helix (standard), false for left-hand (default true)"
+                    }
+                },
+                "required": ["part_id", "helix_radius", "groove_radius", "pitch", "height", "start_z"]
+            }),
+        },
+        // 9. boolean_difference
+        ToolDefinition {
+            name: "boolean_difference".to_string(),
+            description: "Subtracts the geometry of a tool part from a target part (CSG Boolean Difference)".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "target_part_id": {
+                        "type": "string",
+                        "description": "ID of the part to be cut/modified"
+                    },
+                    "tool_part_id": {
+                        "type": "string",
+                        "description": "ID of the part whose geometry acts as the cutting tool"
+                    }
+                },
+                "required": ["target_part_id", "tool_part_id"]
             }),
         },
         // 8. create_joint
@@ -442,6 +543,14 @@ pub fn dispatch_tool(
         }
         "get_feature_tree" => {
             let res = cad::get_feature_tree(args, state)?;
+            ToolCallResult::json(&res).map_err(ServerError::Json)
+        }
+        "cut_helical_groove" => {
+            let res = cad::cut_helical_groove(args, state)?;
+            ToolCallResult::json(&res).map_err(ServerError::Json)
+        }
+        "boolean_difference" => {
+            let res = cad::boolean_difference(args, state)?;
             ToolCallResult::json(&res).map_err(ServerError::Json)
         }
         "create_joint" => {

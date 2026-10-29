@@ -68,8 +68,8 @@ async fn test_mcp_tools_list() {
         .as_array()
         .expect("tools must be an array");
 
-    // Must declare exactly 16 tools
-    assert_eq!(tools.len(), 16, "Server must expose exactly 16 MCP tools");
+    // Must declare exactly 18 tools
+    assert_eq!(tools.len(), 18, "Server must expose exactly 18 MCP tools");
 
     let expected_tools = [
         "create_part",
@@ -79,6 +79,8 @@ async fn test_mcp_tools_list() {
         "cut_hole",
         "modify_feature",
         "get_feature_tree",
+        "cut_helical_groove",
+        "boolean_difference",
         "create_joint",
         "set_joint_motor",
         "run_physics_simulation",
@@ -617,4 +619,180 @@ async fn test_mcp_open_preview_window() {
     let text = resp["result"]["content"][0]["text"].as_str().unwrap();
     let val: Value = serde_json::from_str(text).unwrap();
     assert_eq!(val["status"], "headless");
+}
+
+#[tokio::test]
+async fn test_mcp_cone_and_helical_groove_and_boolean_difference() {
+    let state = EngineState::new()
+        .expect("EngineState initialization failed")
+        .into_shared();
+
+    // 1. Create a tool / drill part
+    let create_drill_req = json!({
+        "jsonrpc": "2.0",
+        "id": 201,
+        "method": "tools/call",
+        "params": {
+            "name": "create_part",
+            "arguments": {
+                "name": "Twist Drill",
+                "material": "steel_structural_aisi1020"
+            }
+        }
+    });
+    let resp = rpc_call(&state, create_drill_req).await;
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let data: Value = serde_json::from_str(text).unwrap();
+    let drill_id = data["part_id"].as_str().unwrap().to_string();
+
+    // 2. Add cylinder base (shank + body)
+    let add_cyl_req = json!({
+        "jsonrpc": "2.0",
+        "id": 202,
+        "method": "tools/call",
+        "params": {
+            "name": "add_feature_primitive",
+            "arguments": {
+                "part_id": drill_id,
+                "primitive_type": "cylinder",
+                "params": {
+                    "radius": 0.01,
+                    "height": 0.1,
+                    "segments": 32,
+                    "position": [0.0, 0.0, 0.05]
+                }
+            }
+        }
+    });
+    let resp = rpc_call(&state, add_cyl_req).await;
+    assert_eq!(resp["id"], 202);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let cyl_data: Value = serde_json::from_str(text).unwrap();
+    assert!(cyl_data["feature_id"].as_str().is_some());
+
+    // 3. Add cone tip with position
+    let add_cone_req = json!({
+        "jsonrpc": "2.0",
+        "id": 203,
+        "method": "tools/call",
+        "params": {
+            "name": "add_feature_primitive",
+            "arguments": {
+                "part_id": drill_id,
+                "primitive_type": "cone",
+                "params": {
+                    "radius_bottom": 0.01,
+                    "radius_top": 0.0,
+                    "height": 0.02,
+                    "segments": 32,
+                    "position": [0.0, 0.0, 0.11]
+                }
+            }
+        }
+    });
+    let resp = rpc_call(&state, add_cone_req).await;
+    assert_eq!(resp["id"], 203);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let cone_data: Value = serde_json::from_str(text).unwrap();
+    assert!(cone_data["feature_id"].as_str().is_some());
+
+    // 4. Cut helical groove (flutes)
+    let cut_helix_req = json!({
+        "jsonrpc": "2.0",
+        "id": 204,
+        "method": "tools/call",
+        "params": {
+            "name": "cut_helical_groove",
+            "arguments": {
+                "part_id": drill_id,
+                "helix_radius": 0.01,
+                "groove_radius": 0.004,
+                "pitch": 0.04,
+                "height": 0.08,
+                "start_z": 0.02,
+                "starts": 2,
+                "is_right_hand": true
+            }
+        }
+    });
+    let resp = rpc_call(&state, cut_helix_req).await;
+    assert_eq!(resp["id"], 204);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let helix_data: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(helix_data["status"], "helical_groove_cut");
+    assert!(helix_data["feature_id"].as_str().is_some());
+
+    // 5. Test boolean difference: create a block and subtract the drill
+    let create_block_req = json!({
+        "jsonrpc": "2.0",
+        "id": 205,
+        "method": "tools/call",
+        "params": {
+            "name": "create_part",
+            "arguments": {
+                "name": "Machining Block",
+                "material": "aluminum_6061_t6"
+            }
+        }
+    });
+    let resp = rpc_call(&state, create_block_req).await;
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let block_data: Value = serde_json::from_str(text).unwrap();
+    let block_id = block_data["part_id"].as_str().unwrap().to_string();
+
+    let add_box_req = json!({
+        "jsonrpc": "2.0",
+        "id": 206,
+        "method": "tools/call",
+        "params": {
+            "name": "add_feature_primitive",
+            "arguments": {
+                "part_id": block_id,
+                "primitive_type": "box",
+                "params": {
+                    "width": 0.1,
+                    "height": 0.1,
+                    "depth": 0.15,
+                    "position": [0.0, 0.0, 0.05]
+                }
+            }
+        }
+    });
+    let _ = rpc_call(&state, add_box_req).await;
+
+    let bool_diff_req = json!({
+        "jsonrpc": "2.0",
+        "id": 207,
+        "method": "tools/call",
+        "params": {
+            "name": "boolean_difference",
+            "arguments": {
+                "target_part_id": block_id,
+                "tool_part_id": drill_id
+            }
+        }
+    });
+    let resp = rpc_call(&state, bool_diff_req).await;
+    assert_eq!(resp["id"], 207);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let diff_data: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(diff_data["status"], "boolean_difference_applied");
+    assert!(diff_data["feature_id"].as_str().is_some());
+
+    // Check DAG feature tree of block has 2 features (box and boolean diff)
+    let tree_req = json!({
+        "jsonrpc": "2.0",
+        "id": 208,
+        "method": "tools/call",
+        "params": {
+            "name": "get_feature_tree",
+            "arguments": {
+                "part_id": block_id
+            }
+        }
+    });
+    let resp = rpc_call(&state, tree_req).await;
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let tree: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(tree["dag"].as_array().unwrap().len(), 2);
 }

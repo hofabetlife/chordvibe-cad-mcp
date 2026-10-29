@@ -9,6 +9,20 @@ use mcp_cad_core::part::Part;
 use crate::error::ServerError;
 use crate::state::EngineState;
 
+/// Helper function to parse 3D vector coordinates [x, y, z] from a JSON object.
+fn parse_vec3(val: &Value, key: &str) -> Option<[f64; 3]> {
+    let arr = val.get(key)?.as_array()?;
+    if arr.len() == 3 {
+        Some([
+            arr[0].as_f64()?,
+            arr[1].as_f64()?,
+            arr[2].as_f64()?,
+        ])
+    } else {
+        None
+    }
+}
+
 /// 1. `create_part`: Creates a new empty part with assigned material.
 pub fn create_part(args: &Value, state: &mut EngineState) -> Result<Value, ServerError> {
     let name = args
@@ -86,6 +100,12 @@ pub fn add_feature_primitive(args: &Value, state: &mut EngineState) -> Result<Va
 
     let params = args.get("params").unwrap_or(args);
 
+    let position = parse_vec3(params, "position").or_else(|| parse_vec3(args, "position"));
+    let rotation_deg = parse_vec3(params, "rotation_deg")
+        .or_else(|| parse_vec3(params, "rotation_rpy_deg"))
+        .or_else(|| parse_vec3(args, "rotation_deg"))
+        .or_else(|| parse_vec3(args, "rotation_rpy_deg"));
+
     let op = match prim_type.to_lowercase().as_str() {
         "box" => {
             let width = params
@@ -100,7 +120,13 @@ pub fn add_feature_primitive(args: &Value, state: &mut EngineState) -> Result<Va
                 .get("depth")
                 .and_then(|v| v.as_f64())
                 .ok_or_else(|| ServerError::InvalidArgument("Box requires 'depth'".to_string()))?;
-            FeatureOp::AddBox { width, height, depth }
+            FeatureOp::AddBox {
+                width,
+                height,
+                depth,
+                position,
+                rotation_deg,
+            }
         }
         "cylinder" => {
             let radius = params
@@ -115,7 +141,13 @@ pub fn add_feature_primitive(args: &Value, state: &mut EngineState) -> Result<Va
                 .get("segments")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(32) as usize;
-            FeatureOp::AddCylinder { radius, height, segments }
+            FeatureOp::AddCylinder {
+                radius,
+                height,
+                segments,
+                position,
+                rotation_deg,
+            }
         }
         "sphere" => {
             let radius = params
@@ -130,11 +162,44 @@ pub fn add_feature_primitive(args: &Value, state: &mut EngineState) -> Result<Va
                 .get("stacks")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(16) as usize;
-            FeatureOp::AddSphere { radius, sectors, stacks }
+            FeatureOp::AddSphere {
+                radius,
+                sectors,
+                stacks,
+                position,
+                rotation_deg,
+            }
+        }
+        "cone" => {
+            let radius_bottom = params
+                .get("radius_bottom")
+                .or_else(|| params.get("radius"))
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| ServerError::InvalidArgument("Cone requires 'radius_bottom'".to_string()))?;
+            let radius_top = params
+                .get("radius_top")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let height = params
+                .get("height")
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| ServerError::InvalidArgument("Cone requires 'height'".to_string()))?;
+            let segments = params
+                .get("segments")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(32) as usize;
+            FeatureOp::AddCone {
+                radius_bottom,
+                radius_top,
+                height,
+                segments,
+                position,
+                rotation_deg,
+            }
         }
         other => {
             return Err(ServerError::InvalidArgument(format!(
-                "Unknown primitive_type '{}'. Supported: box, cylinder, sphere",
+                "Unknown primitive_type '{}'. Supported: box, cylinder, sphere, cone",
                 other
             )));
         }
@@ -257,34 +322,93 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
         .ok_or_else(|| ServerError::FeatureNotFound(feat_str.to_string()))?;
 
     let updated_op = match &current_node.op {
-        FeatureOp::AddBox { width, height, depth } => {
+        FeatureOp::AddBox { width, height, depth, position, rotation_deg } => {
             let new_w = params.get("width").and_then(|v| v.as_f64()).unwrap_or(*width);
             let new_h = params.get("height").and_then(|v| v.as_f64()).unwrap_or(*height);
             let new_d = params.get("depth").and_then(|v| v.as_f64()).unwrap_or(*depth);
+            let pos = parse_vec3(params, "position").or(*position);
+            let rot = parse_vec3(params, "rotation_deg")
+                .or_else(|| parse_vec3(params, "rotation_rpy_deg"))
+                .or(*rotation_deg);
             FeatureOp::AddBox {
                 width: new_w,
                 height: new_h,
                 depth: new_d,
+                position: pos,
+                rotation_deg: rot,
             }
         }
-        FeatureOp::AddCylinder { radius, height, segments } => {
+        FeatureOp::AddCylinder { radius, height, segments, position, rotation_deg } => {
             let new_r = params.get("radius").and_then(|v| v.as_f64()).unwrap_or(*radius);
             let new_h = params.get("height").and_then(|v| v.as_f64()).unwrap_or(*height);
             let new_s = params.get("segments").and_then(|v| v.as_u64()).map(|s| s as usize).unwrap_or(*segments);
+            let pos = parse_vec3(params, "position").or(*position);
+            let rot = parse_vec3(params, "rotation_deg")
+                .or_else(|| parse_vec3(params, "rotation_rpy_deg"))
+                .or(*rotation_deg);
             FeatureOp::AddCylinder {
                 radius: new_r,
                 height: new_h,
                 segments: new_s,
+                position: pos,
+                rotation_deg: rot,
             }
         }
-        FeatureOp::AddSphere { radius, sectors, stacks } => {
+        FeatureOp::AddSphere { radius, sectors, stacks, position, rotation_deg } => {
             let new_r = params.get("radius").and_then(|v| v.as_f64()).unwrap_or(*radius);
             let new_sec = params.get("sectors").and_then(|v| v.as_u64()).map(|s| s as usize).unwrap_or(*sectors);
             let new_stk = params.get("stacks").and_then(|v| v.as_u64()).map(|s| s as usize).unwrap_or(*stacks);
+            let pos = parse_vec3(params, "position").or(*position);
+            let rot = parse_vec3(params, "rotation_deg")
+                .or_else(|| parse_vec3(params, "rotation_rpy_deg"))
+                .or(*rotation_deg);
             FeatureOp::AddSphere {
                 radius: new_r,
                 sectors: new_sec,
                 stacks: new_stk,
+                position: pos,
+                rotation_deg: rot,
+            }
+        }
+        FeatureOp::AddCone { radius_bottom, radius_top, height, segments, position, rotation_deg } => {
+            let new_rb = params.get("radius_bottom").or_else(|| params.get("radius")).and_then(|v| v.as_f64()).unwrap_or(*radius_bottom);
+            let new_rt = params.get("radius_top").and_then(|v| v.as_f64()).unwrap_or(*radius_top);
+            let new_h = params.get("height").and_then(|v| v.as_f64()).unwrap_or(*height);
+            let new_s = params.get("segments").and_then(|v| v.as_u64()).map(|s| s as usize).unwrap_or(*segments);
+            let pos = parse_vec3(params, "position").or(*position);
+            let rot = parse_vec3(params, "rotation_deg")
+                .or_else(|| parse_vec3(params, "rotation_rpy_deg"))
+                .or(*rotation_deg);
+            FeatureOp::AddCone {
+                radius_bottom: new_rb,
+                radius_top: new_rt,
+                height: new_h,
+                segments: new_s,
+                position: pos,
+                rotation_deg: rot,
+            }
+        }
+        FeatureOp::CutHelicalGroove { helix_radius, groove_radius, pitch, height, start_z, starts, is_right_hand } => {
+            let hr = params.get("helix_radius").and_then(|v| v.as_f64()).unwrap_or(*helix_radius);
+            let gr = params.get("groove_radius").and_then(|v| v.as_f64()).unwrap_or(*groove_radius);
+            let p = params.get("pitch").and_then(|v| v.as_f64()).unwrap_or(*pitch);
+            let h = params.get("height").and_then(|v| v.as_f64()).unwrap_or(*height);
+            let sz = params.get("start_z").and_then(|v| v.as_f64()).unwrap_or(*start_z);
+            let st = params.get("starts").and_then(|v| v.as_u64()).map(|s| s as usize).unwrap_or(*starts);
+            let rh = params.get("is_right_hand").and_then(|v| v.as_bool()).unwrap_or(*is_right_hand);
+            FeatureOp::CutHelicalGroove {
+                helix_radius: hr,
+                groove_radius: gr,
+                pitch: p,
+                height: h,
+                start_z: sz,
+                starts: st,
+                is_right_hand: rh,
+            }
+        }
+        FeatureOp::BooleanDifferenceMesh { tool_mesh } => {
+            FeatureOp::BooleanDifferenceMesh {
+                tool_mesh: tool_mesh.clone(),
             }
         }
         FeatureOp::CutHole { center, normal, radius, depth } => {
@@ -367,5 +491,124 @@ pub fn get_feature_tree(args: &Value, state: &EngineState) -> Result<Value, Serv
 
     Ok(json!({
         "dag": part.dag.nodes
+    }))
+}
+
+/// 8. `cut_helical_groove`: Cuts one or more helical grooves (flutes/threads) into the solid.
+pub fn cut_helical_groove(args: &Value, state: &mut EngineState) -> Result<Value, ServerError> {
+    let part_id = args
+        .get("part_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'part_id'".to_string()))?;
+
+    let params = args.get("params").unwrap_or(args);
+
+    let helix_radius = params
+        .get("helix_radius")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'helix_radius'".to_string()))?;
+
+    let groove_radius = params
+        .get("groove_radius")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'groove_radius'".to_string()))?;
+
+    let pitch = params
+        .get("pitch")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'pitch'".to_string()))?;
+
+    let height = params
+        .get("height")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'height'".to_string()))?;
+
+    let start_z = params
+        .get("start_z")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+
+    let starts = params
+        .get("starts")
+        .and_then(|v| v.as_u64())
+        .map(|s| s as usize)
+        .unwrap_or(2);
+
+    let is_right_hand = params
+        .get("is_right_hand")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let part = state
+        .parts
+        .get_mut(part_id)
+        .ok_or_else(|| ServerError::PartNotFound(part_id.to_string()))?;
+
+    let feature_id = part.dag.add_feature(
+        FeatureOp::CutHelicalGroove {
+            helix_radius,
+            groove_radius,
+            pitch,
+            height,
+            start_z,
+            starts,
+            is_right_hand,
+        },
+        None,
+    );
+    part.rebuild()?;
+
+    let mesh_clone = part.mesh.clone();
+    state.send_gui_mesh(&mesh_clone);
+
+    Ok(json!({
+        "feature_id": feature_id.to_string(),
+        "status": "helical_groove_cut"
+    }))
+}
+
+/// 9. `boolean_difference`: Subtracts tool_part from target_part.
+pub fn boolean_difference(args: &Value, state: &mut EngineState) -> Result<Value, ServerError> {
+    let target_part_id = args
+        .get("target_part_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'target_part_id'".to_string()))?;
+
+    let tool_part_id = args
+        .get("tool_part_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'tool_part_id'".to_string()))?;
+
+    if target_part_id == tool_part_id {
+        return Err(ServerError::InvalidArgument(
+            "target_part_id and tool_part_id must be different parts".to_string(),
+        ));
+    }
+
+    let tool_mesh = {
+        let tool_part = state
+            .parts
+            .get(tool_part_id)
+            .ok_or_else(|| ServerError::PartNotFound(tool_part_id.to_string()))?;
+        tool_part.mesh.clone()
+    };
+
+    let target_part = state
+        .parts
+        .get_mut(target_part_id)
+        .ok_or_else(|| ServerError::PartNotFound(target_part_id.to_string()))?;
+
+    let feature_id = target_part.dag.add_feature(
+        FeatureOp::BooleanDifferenceMesh { tool_mesh },
+        None,
+    );
+    target_part.rebuild()?;
+
+    let mesh_clone = target_part.mesh.clone();
+    state.send_gui_mesh(&mesh_clone);
+
+    Ok(json!({
+        "feature_id": feature_id.to_string(),
+        "status": "boolean_difference_applied"
     }))
 }
