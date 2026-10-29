@@ -3,4 +3,6 @@ resolver = "2"
 members = [
     "crates/mcp-cad-core",
     "crates/mcp-cad-physics",
+    "crates/mcp-cad-fea",
 ]
+

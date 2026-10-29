@@ -299,6 +299,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcp-cad-fea"
+version = "0.1.0"
+dependencies = [
+ "mcp-cad-core",
+ "nalgebra",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "mcp-cad-physics"
 version = "0.1.0"
 dependencies = [
