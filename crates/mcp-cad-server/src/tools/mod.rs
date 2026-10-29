@@ -13,7 +13,7 @@ use crate::error::ServerError;
 use crate::protocol::{ToolCallResult, ToolDefinition};
 use crate::state::EngineState;
 
-/// Returns the complete registry of all 19 MCP engineering tools with strict input schemas.
+/// Returns the complete registry of all 20 MCP engineering tools with strict input schemas.
 pub fn list_tools() -> Vec<ToolDefinition> {
     vec![
         // 1. create_part
@@ -30,6 +30,10 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     "material": {
                         "type": "string",
                         "description": "Identifier of material from registry (e.g. aluminum_6061_t6, steel_structural_aisi1020)"
+                    },
+                    "part_id": {
+                        "type": "string",
+                        "description": "Optional custom part ID (default: auto-generated UUID)"
                     }
                 },
                 "required": ["name", "material"]
@@ -307,7 +311,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "required": ["target_part_id", "tool_part_id"]
             }),
         },
-        // 8. create_joint
+        // 10. create_joint
         ToolDefinition {
             name: "create_joint".to_string(),
             description: "Establishes a kinematic or dynamic constraint between two parts in Rapier3D (revolute, prismatic, spherical, fixed)".to_string(),
@@ -359,7 +363,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "required": ["joint_type", "part_a", "part_b", "anchor_a", "anchor_b"]
             }),
         },
-        // 9. set_joint_motor
+        // 11. set_joint_motor
         ToolDefinition {
             name: "set_joint_motor".to_string(),
             description: "Activates motor velocity control with a maximum force/torque limit on an existing kinematic joint".to_string(),
@@ -382,7 +386,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "required": ["joint_id", "target_velocity", "max_force"]
             }),
         },
-        // 10. run_physics_simulation
+        // 12. run_physics_simulation
         ToolDefinition {
             name: "run_physics_simulation".to_string(),
             description: "Simulates mechanism dynamics forward in time, recording part trajectories, joint reactions, and collision events".to_string(),
@@ -401,7 +405,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "required": ["duration_seconds"]
             }),
         },
-        // 11. run_fea_analysis
+        // 13. run_fea_analysis
         ToolDefinition {
             name: "run_fea_analysis".to_string(),
             description: "Generates a 3D tetrahedral mesh (TET4), solves linear elasticity (K*u = F), and computes von Mises stresses and Factor of Safety (FoS)".to_string(),
@@ -454,7 +458,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "required": ["part_id"]
             }),
         },
-        // 12. get_fea_heatmap_image
+        // 14. get_fea_heatmap_image
         ToolDefinition {
             name: "get_fea_heatmap_image".to_string(),
             description: "Renders an offscreen 3D view of the part colored with the FEA equivalent von Mises stress heatmap into PNG/Base64".to_string(),
@@ -482,7 +486,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "required": ["part_id"]
             }),
         },
-        // 13. capture_viewport
+        // 15. capture_viewport
         ToolDefinition {
             name: "capture_viewport".to_string(),
             description: "Captures a photorealistic offscreen 3D render of the current CAD assembly from a specified camera angle into PNG/Base64".to_string(),
@@ -509,10 +513,10 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 }
             }),
         },
-        // 14. export_stl
+        // 16. export_stl
         ToolDefinition {
             name: "export_stl".to_string(),
-            description: "Exports a CAD part's surface mesh to an STL file (ASCII or compact Binary) for 3D printing and manufacturing".to_string(),
+            description: "Exports a CAD part's surface mesh to an STL file (ASCII or compact Binary) with adaptive tessellation for 3D printing and manufacturing".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -527,12 +531,21 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     "binary": {
                         "type": "boolean",
                         "description": "Export in compact Binary STL format if true; ASCII if false (default: true)"
+                    },
+                    "quality": {
+                        "type": "string",
+                        "enum": ["coarse", "medium", "fine"],
+                        "description": "Tessellation quality preset ('coarse', 'medium', 'fine', default: 'fine')"
+                    },
+                    "chord_tolerance": {
+                        "type": "number",
+                        "description": "Optional maximum chordal deviation (sagitta tolerance) in meters (e.g. 0.00005)"
                     }
                 },
                 "required": ["part_id", "filepath"]
             }),
         },
-        // 15. get_simulation_metrics_json
+        // 17. get_simulation_metrics_json
         ToolDefinition {
             name: "get_simulation_metrics_json".to_string(),
             description: "Returns the comprehensive engineering metrics summary including mass, bounding boxes, FEA stresses, and physics telemetry".to_string(),
@@ -541,7 +554,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "properties": {}
             }),
         },
-        // 16. open_preview_window
+        // 18. open_preview_window
         ToolDefinition {
             name: "open_preview_window".to_string(),
             description: "Opens or focuses the interactive native 3D CAD preview window on Windows, optionally displaying a specified part".to_string(),
@@ -555,7 +568,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 }
             }),
         },
-        // 17. import_stl
+        // 19. import_stl
         ToolDefinition {
             name: "import_stl".to_string(),
             description: "Imports an external 3D STL file (ASCII or binary) into the CAD scene as a new Part and displays it in the 3D viewport".to_string(),
@@ -576,6 +589,197 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["filepath"]
+            }),
+        },
+        // 20. tessellate_part
+        ToolDefinition {
+            name: "tessellate_part".to_string(),
+            description: "Evaluates lazy adaptive tessellation on a CAD part with specified quality preset or custom tolerances, updating cached polygon mesh".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "part_id": {
+                        "type": "string",
+                        "description": "Target part ID"
+                    },
+                    "quality": {
+                        "type": "string",
+                        "enum": ["coarse", "medium", "fine"],
+                        "description": "Optional tessellation quality preset ('coarse', 'medium', 'fine', default: 'medium')"
+                    },
+                    "chord_tolerance": {
+                        "type": "number",
+                        "description": "Optional maximum chordal deviation (sagitta error) in meters"
+                    },
+                    "angular_tolerance_deg": {
+                        "type": "number",
+                        "description": "Optional maximum angular deflection between adjacent segments in degrees"
+                    },
+                    "max_edge_length": {
+                        "type": "number",
+                        "description": "Optional maximum polygon edge length in meters"
+                    }
+                },
+                "required": ["part_id"]
+            }),
+        },
+        // 21. query_part_geometry
+        ToolDefinition {
+            name: "query_part_geometry".to_string(),
+            description: "Inspects detailed 3D geometry of a part: bounding box (min, max, dimensions), volume, surface area, center of mass, face/vertex counts, and detected planar faces".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "part_id": {
+                        "type": "string",
+                        "description": "Identifier of the CAD part to inspect"
+                    }
+                },
+                "required": ["part_id"]
+            }),
+        },
+        // 22. boolean_union
+        ToolDefinition {
+            name: "boolean_union".to_string(),
+            description: "Performs a CSG boolean union combining the geometry of tool_part into target_part, rebuilding DAG, GUI mesh, and physics collider".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "target_part_id": {
+                        "type": "string",
+                        "description": "ID of the target part that receives the union operation"
+                    },
+                    "tool_part_id": {
+                        "type": "string",
+                        "description": "ID of the tool part whose geometry will be united with the target part"
+                    }
+                },
+                "required": ["target_part_id", "tool_part_id"]
+            }),
+        },
+        // 23. boolean_intersection
+        ToolDefinition {
+            name: "boolean_intersection".to_string(),
+            description: "Performs a CSG boolean intersection keeping only overlapping volume between target_part and tool_part, rebuilding DAG, GUI mesh, and physics collider".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "target_part_id": {
+                        "type": "string",
+                        "description": "ID of the target part that receives the intersection operation"
+                    },
+                    "tool_part_id": {
+                        "type": "string",
+                        "description": "ID of the tool part whose geometry will be intersected with the target part"
+                    }
+                },
+                "required": ["target_part_id", "tool_part_id"]
+            }),
+        },
+        // 24. transform_part
+        ToolDefinition {
+            name: "transform_part".to_string(),
+            description: "Applies translation, rotation (RPY degrees), and scale to a part's parametric DAG, rebuilding geometry, GUI mesh, and physics collider".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "part_id": {
+                        "type": "string",
+                        "description": "Identifier of the part to transform"
+                    },
+                    "translation": {
+                        "type": "array",
+                        "items": { "type": "number" },
+                        "minItems": 3,
+                        "maxItems": 3,
+                        "description": "Translation vector [x, y, z] in meters (default: [0, 0, 0])"
+                    },
+                    "rotation_deg": {
+                        "type": "array",
+                        "items": { "type": "number" },
+                        "minItems": 3,
+                        "maxItems": 3,
+                        "description": "Euler rotation angles [roll_x, pitch_y, yaw_z] in degrees (default: [0, 0, 0])"
+                    },
+                    "scale": {
+                        "type": "array",
+                        "items": { "type": "number" },
+                        "minItems": 3,
+                        "maxItems": 3,
+                        "description": "Scaling factors [sx, sy, sz] along primary axes (default: [1, 1, 1])"
+                    }
+                },
+                "required": ["part_id"]
+            }),
+        },
+        // 25. define_material
+        ToolDefinition {
+            name: "define_material".to_string(),
+            description: "Registers a custom physical and mechanical engineering material into the material registry for FEA structural analysis and mass calculation".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Unique identifier for the engineering material (e.g. 'carbon_fiber_t700')"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Optional human-readable display name or description of the material"
+                    },
+                    "young_modulus_gpa": {
+                        "type": "number",
+                        "description": "Young's modulus of elasticity in Gigapascals (GPa, must be > 0)"
+                    },
+                    "poisson_ratio": {
+                        "type": "number",
+                        "description": "Poisson's ratio (dimensionless, must be between 0.0 and 0.5)"
+                    },
+                    "yield_strength_mpa": {
+                        "type": "number",
+                        "description": "Yield strength in Megapascals (MPa, must be > 0)"
+                    },
+                    "density_kg_m3": {
+                        "type": "number",
+                        "description": "Mass density in kilograms per cubic meter (kg/m³, must be > 0)"
+                    }
+                },
+                "required": [
+                    "id",
+                    "young_modulus_gpa",
+                    "poisson_ratio",
+                    "yield_strength_mpa",
+                    "density_kg_m3"
+                ]
+            }),
+        },
+        // 26. batch_cad_operations
+        ToolDefinition {
+            name: "batch_cad_operations".to_string(),
+            description: "Executes a batch sequence of MCP CAD operations sequentially. If any step fails, halts and returns error with failed index".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "operations": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "tool": {
+                                    "type": "string",
+                                    "description": "Name of the MCP tool to execute"
+                                },
+                                "params": {
+                                    "type": "object",
+                                    "description": "Parameters payload passed to the tool"
+                                }
+                            },
+                            "required": ["tool", "params"]
+                        },
+                        "description": "List of MCP CAD tool operations to execute sequentially"
+                    }
+                },
+                "required": ["operations"]
             }),
         },
     ]
@@ -651,7 +855,11 @@ pub fn dispatch_tool(
             ToolCallResult::image_and_json(&res, b64).map_err(ServerError::Json)
         }
         "export_stl" => {
-            let res = export::export_stl(args, state)?;
+            let res = cad::export_stl(args, state)?;
+            ToolCallResult::json(&res).map_err(ServerError::Json)
+        }
+        "tessellate_part" => {
+            let res = cad::tessellate_part(args, state)?;
             ToolCallResult::json(&res).map_err(ServerError::Json)
         }
         "import_stl" => {
@@ -664,6 +872,30 @@ pub fn dispatch_tool(
         }
         "open_preview_window" => {
             let res = render::open_preview_window(args, state)?;
+            ToolCallResult::json(&res).map_err(ServerError::Json)
+        }
+        "query_part_geometry" => {
+            let res = cad::query_part_geometry(args, state)?;
+            ToolCallResult::json(&res).map_err(ServerError::Json)
+        }
+        "boolean_union" => {
+            let res = cad::boolean_union(args, state)?;
+            ToolCallResult::json(&res).map_err(ServerError::Json)
+        }
+        "boolean_intersection" => {
+            let res = cad::boolean_intersection(args, state)?;
+            ToolCallResult::json(&res).map_err(ServerError::Json)
+        }
+        "transform_part" => {
+            let res = cad::transform_part(args, state)?;
+            ToolCallResult::json(&res).map_err(ServerError::Json)
+        }
+        "define_material" => {
+            let res = cad::define_material(args, state)?;
+            ToolCallResult::json(&res).map_err(ServerError::Json)
+        }
+        "batch_cad_operations" => {
+            let res = cad::batch_cad_operations(args, state)?;
             ToolCallResult::json(&res).map_err(ServerError::Json)
         }
         other => Err(ServerError::ToolNotFound(other.to_string())),

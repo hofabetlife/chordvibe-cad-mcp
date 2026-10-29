@@ -24,7 +24,11 @@ pub use element::{Tet4Element, compute_volume_and_b_matrix};
 pub use error::FeaError;
 pub use result::{compute_fea_results, FeaReport};
 pub use solver::{assemble_and_solve, solve_pcg, CsrMatrix, SolverOptions};
-pub use tetra_mesh::{MeshDensity, TetElement, TetNode, TetrahedralMesh};
+pub use tetra_mesh::{
+    mesh_max_edge_length, refine_mesh_max_edge_length, MeshDensity, TetElement, TetNode,
+    TetrahedralMesh,
+};
+pub use mcp_cad_core::tessellation::{TessellationQuality, TessellationSettings};
 
 use std::time::Instant;
 use mcp_cad_core::material::Material;
@@ -88,5 +92,43 @@ pub fn analyze_part(
     options: Option<SolverOptions>,
 ) -> Result<FeaReport, FeaError> {
     let mesh = TetrahedralMesh::from_part(part, density)?;
+    analyze_mesh(&part.id, &mesh, &part.material, boundary, options)
+}
+
+/// High-level entry point to mesh and execute FEA analysis directly on a CAD `Part`
+/// using automatic adaptive tessellation matching the target mesh density.
+pub fn analyze_part_adaptive(
+    part: &mut Part,
+    boundary: &BoundaryConditions,
+    density: MeshDensity,
+    options: Option<SolverOptions>,
+) -> Result<FeaReport, FeaError> {
+    let mesh = TetrahedralMesh::from_part_adaptive(part, density)?;
+    analyze_mesh(&part.id, &mesh, &part.material, boundary, options)
+}
+
+/// High-level entry point to mesh and execute FEA analysis directly on a CAD `Part`
+/// with explicit adaptive tessellation settings.
+pub fn analyze_part_with_settings(
+    part: &mut Part,
+    boundary: &BoundaryConditions,
+    settings: &TessellationSettings,
+    density: MeshDensity,
+    options: Option<SolverOptions>,
+) -> Result<FeaReport, FeaError> {
+    let mesh = TetrahedralMesh::from_part_with_settings(part, settings, density)?;
+    analyze_mesh(&part.id, &mesh, &part.material, boundary, options)
+}
+
+/// High-level entry point to mesh and execute FEA analysis directly on a CAD `Part`
+/// using a specified tessellation quality preset.
+pub fn analyze_part_quality(
+    part: &mut Part,
+    boundary: &BoundaryConditions,
+    quality: TessellationQuality,
+    density: MeshDensity,
+    options: Option<SolverOptions>,
+) -> Result<FeaReport, FeaError> {
+    let mesh = TetrahedralMesh::from_part_quality(part, quality, density)?;
     analyze_mesh(&part.id, &mesh, &part.material, boundary, options)
 }

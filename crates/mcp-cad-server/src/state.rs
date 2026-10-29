@@ -83,6 +83,13 @@ impl EngineState {
         }
     }
 
+    /// Sends multi-body physics simulation animation frames to the interactive GUI preview window for real-time playback.
+    pub fn send_gui_animation(&self, frames: Vec<TriangleMesh>, fps: f32) {
+        if let Some(proxy) = &self.gui_proxy {
+            let _ = proxy.send_event(GuiEvent::SetAnimation { frames, fps });
+        }
+    }
+
     /// Wraps this state into an `Arc<RwLock<EngineState>>`.
     pub fn into_shared(self) -> SharedState {
         Arc::new(RwLock::new(self))

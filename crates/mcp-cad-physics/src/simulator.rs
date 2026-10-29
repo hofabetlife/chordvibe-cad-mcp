@@ -30,6 +30,17 @@ pub struct CadJointRecord {
     pub handle: ImpulseJointHandle,
 }
 
+/// Kinematic gear constraint coupling two rotating bodies.
+#[derive(Debug, Clone)]
+pub struct GearConstraintRecord {
+    pub id: String,
+    pub part_a: String,
+    pub part_b: String,
+    pub ratio: f64,
+    pub axis_a: Vector3<f64>,
+    pub axis_b: Vector3<f64>,
+}
+
 /// The main physics simulation world wrapping Rapier3D.
 pub struct PhysicsWorld {
     pipeline: PhysicsPipeline,
@@ -56,6 +67,7 @@ pub struct PhysicsWorld {
     collider_to_part: HashMap<ColliderHandle, String>,
     part_to_colliders: HashMap<String, Vec<ColliderHandle>>,
     joints: HashMap<String, CadJointRecord>,
+    gear_constraints: HashMap<String, GearConstraintRecord>,
 
     // Current elapsed simulation time in seconds
     current_time_s: f64,
@@ -84,6 +96,15 @@ impl PhysicsWorld {
             ..Default::default()
         };
 
+        let mut bodies = RigidBodySet::new();
+        // Insert a static anchor rigid body for "ground" and "world" references
+        let ground_handle = bodies.insert(RigidBodyBuilder::fixed());
+        let mut part_to_body = HashMap::new();
+        let mut body_to_part = HashMap::new();
+        part_to_body.insert("ground".to_string(), ground_handle);
+        part_to_body.insert("world".to_string(), ground_handle);
+        body_to_part.insert(ground_handle, "ground".to_string());
+
         Self {
             pipeline: PhysicsPipeline::new(),
             gravity: vector![gravity[0] as Real, gravity[1] as Real, gravity[2] as Real],
@@ -91,7 +112,7 @@ impl PhysicsWorld {
             island_manager: IslandManager::new(),
             broad_phase: DefaultBroadPhase::new(),
             narrow_phase: NarrowPhase::new(),
-            bodies: RigidBodySet::new(),
+            bodies,
             colliders: ColliderSet::new(),
             impulse_joints: ImpulseJointSet::new(),
             multibody_joints: MultibodyJointSet::new(),
@@ -102,11 +123,12 @@ impl PhysicsWorld {
             contact_force_sender,
             contact_force_receiver,
 
-            part_to_body: HashMap::new(),
-            body_to_part: HashMap::new(),
+            part_to_body,
+            body_to_part,
             collider_to_part: HashMap::new(),
             part_to_colliders: HashMap::new(),
             joints: HashMap::new(),
+            gear_constraints: HashMap::new(),
 
             current_time_s: 0.0,
         }
@@ -208,7 +230,9 @@ impl PhysicsWorld {
 
         for j_id in attached_joint_ids {
             self.joints.remove(&j_id);
+            self.gear_constraints.remove(&j_id);
         }
+        self.gear_constraints.retain(|_, rec| rec.part_a != part_id && rec.part_b != part_id);
 
         self.bodies.remove(
             rb_handle,
@@ -254,13 +278,27 @@ impl PhysicsWorld {
         self.joints.insert(
             j_id.clone(),
             CadJointRecord {
-                id: j_id,
+                id: j_id.clone(),
                 part_a: part_a.to_string(),
                 part_b: part_b.to_string(),
-                joint_type,
+                joint_type: joint_type.clone(),
                 handle: joint_handle,
             },
         );
+
+        if let CadJointType::Gear { ratio, axis_a, axis_b } = &joint_type {
+            self.gear_constraints.insert(
+                j_id.clone(),
+                GearConstraintRecord {
+                    id: j_id,
+                    part_a: part_a.to_string(),
+                    part_b: part_b.to_string(),
+                    ratio: *ratio,
+                    axis_a: Vector3::new(axis_a[0], axis_a[1], axis_a[2]),
+                    axis_b: Vector3::new(axis_b[0], axis_b[1], axis_b[2]),
+                },
+            );
+        }
 
         Ok(joint_handle)
     }
@@ -307,6 +345,7 @@ impl PhysicsWorld {
             .ok_or_else(|| PhysicsError::JointNotFound(joint_id.to_string()))?;
 
         self.impulse_joints.remove(record.handle, true);
+        self.gear_constraints.remove(joint_id);
         Ok(())
     }
 
@@ -339,6 +378,63 @@ impl PhysicsWorld {
             &physics_hooks,
             &event_handler,
         );
+
+        // Enforce kinematic gear constraints: w_b = -ratio * w_a
+        for gear in self.gear_constraints.values() {
+            let Some(&handle_a) = self.part_to_body.get(&gear.part_a) else { continue };
+            let Some(&handle_b) = self.part_to_body.get(&gear.part_b) else { continue };
+
+            let (Some(rb_a), Some(rb_b)) = (self.bodies.get(handle_a), self.bodies.get(handle_b)) else { continue };
+
+            let w_a = rb_a.angvel();
+            let w_b = rb_b.angvel();
+
+            let axis_a_norm = if gear.axis_a.norm() > 1e-6 {
+                gear.axis_a.normalize()
+            } else {
+                Vector3::z()
+            };
+            let axis_b_norm = if gear.axis_b.norm() > 1e-6 {
+                gear.axis_b.normalize()
+            } else {
+                Vector3::z()
+            };
+
+            let wa_proj = w_a.x as f64 * axis_a_norm.x + w_a.y as f64 * axis_a_norm.y + w_a.z as f64 * axis_a_norm.z;
+            let wb_proj = w_b.x as f64 * axis_b_norm.x + w_b.y as f64 * axis_b_norm.y + w_b.z as f64 * axis_b_norm.z;
+
+            if wa_proj.abs() > 1e-5 || wb_proj.abs() <= 1e-5 {
+                let target_wb = -gear.ratio * wa_proj;
+                let delta_wb = target_wb - wb_proj;
+                let delta_angvel = vector![
+                    (delta_wb * axis_b_norm.x) as Real,
+                    (delta_wb * axis_b_norm.y) as Real,
+                    (delta_wb * axis_b_norm.z) as Real
+                ];
+
+                if let Some(rb_b_mut) = self.bodies.get_mut(handle_b) {
+                    if rb_b_mut.is_dynamic() {
+                        let new_w = rb_b_mut.angvel() + delta_angvel;
+                        rb_b_mut.set_angvel(new_w, true);
+                    }
+                }
+            } else {
+                let target_wa = -wb_proj / gear.ratio;
+                let delta_wa = target_wa - wa_proj;
+                let delta_angvel = vector![
+                    (delta_wa * axis_a_norm.x) as Real,
+                    (delta_wa * axis_a_norm.y) as Real,
+                    (delta_wa * axis_a_norm.z) as Real
+                ];
+
+                if let Some(rb_a_mut) = self.bodies.get_mut(handle_a) {
+                    if rb_a_mut.is_dynamic() {
+                        let new_w = rb_a_mut.angvel() + delta_angvel;
+                        rb_a_mut.set_angvel(new_w, true);
+                    }
+                }
+            }
+        }
 
         self.current_time_s += step_dt;
 
@@ -406,6 +502,9 @@ impl PhysicsWorld {
     ) {
         // Bodies
         for (part_id, &rb_handle) in &self.part_to_body {
+            if part_id == "ground" || part_id == "world" {
+                continue;
+            }
             if let Some(rb) = self.bodies.get(rb_handle) {
                 let pos = rb.translation();
                 let q = rb.rotation().quaternion();
@@ -489,6 +588,9 @@ impl PhysicsWorld {
 
         // Pre-allocate telemetry logs for all parts
         for part_id in self.part_to_body.keys() {
+            if part_id == "ground" || part_id == "world" {
+                continue;
+            }
             summary
                 .trajectories
                 .insert(part_id.clone(), BodyTelemetry::new(part_id));

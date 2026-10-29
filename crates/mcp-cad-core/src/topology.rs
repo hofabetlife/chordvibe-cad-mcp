@@ -3,6 +3,8 @@
 use nalgebra::Vector3;
 use serde::{Deserialize, Serialize};
 
+pub use crate::tessellation::{TessellationQuality, TessellationSettings};
+
 /// A 3D vertex with position and normal vector.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Vertex {
@@ -109,6 +111,38 @@ impl BoundingBox {
     pub fn is_empty(&self) -> bool {
         self.min[0] > self.max[0] || self.min[1] > self.max[1] || self.min[2] > self.max[2]
     }
+}
+
+/// Information about a detected planar face composed of coplanar triangles.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanarFaceInfo {
+    /// Unit normal vector of the planar face [nx, ny, nz].
+    pub normal: [f64; 3],
+    /// Area-weighted centroid of the planar face [x, y, z].
+    pub center: [f64; 3],
+    /// Total surface area of the planar face.
+    pub area: f64,
+    /// Number of triangles comprising this planar face.
+    pub triangles_count: usize,
+}
+
+/// Comprehensive geometry inspection result for CAD analysis and AI context.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GeometryInspection {
+    /// Axis-aligned bounding box (min, max, dimensions: [width, height, depth]).
+    pub bounding_box: BoundingBox,
+    /// Absolute volume of the solid.
+    pub volume: f64,
+    /// Total surface area.
+    pub surface_area: f64,
+    /// Center of mass (centroid) [x, y, z] of the homogeneous solid.
+    pub center_of_mass: [f64; 3],
+    /// Total number of triangular faces in the boundary mesh.
+    pub faces_count: usize,
+    /// Total number of vertices in the boundary mesh.
+    pub vertices_count: usize,
+    /// Top detected coplanar planar faces (up to 15, sorted by area descending).
+    pub detected_planar_faces: Vec<PlanarFaceInfo>,
 }
 
 /// A 3D triangular surface mesh represented by vertex buffers and index buffers.
@@ -324,6 +358,153 @@ impl TriangleMesh {
             v.normal = [n.x, n.y, n.z];
         }
     }
+
+    /// Inspects the mesh geometry and returns detailed geometric metrics including
+    /// bounding box, volume, surface area, center of mass, face/vertex counts,
+    /// and up to top-15 largest detected coplanar planar faces.
+    ///
+    /// Triangles with close normals (dot product n1 · n2 > 0.999) and lying in
+    /// the same plane (|n · p - d| < 1e-4) are clustered into planar faces,
+    /// limited to top-15 sorted by area in descending order.
+    pub fn inspect_geometry(&self) -> GeometryInspection {
+        let bounding_box = self.bounding_box();
+        let volume = self.volume();
+        let surface_area = self.surface_area();
+        let center_of_mass = self.center_of_mass();
+        let faces_count = self.triangle_count();
+        let vertices_count = self.vertex_count();
+
+        if self.indices.is_empty() {
+            return GeometryInspection {
+                bounding_box,
+                volume,
+                surface_area,
+                center_of_mass,
+                faces_count,
+                vertices_count,
+                detected_planar_faces: Vec::new(),
+            };
+        }
+
+        struct TriInfo {
+            normal: Vector3<f64>,
+            centroid: Vector3<f64>,
+            area: f64,
+            d: f64,
+        }
+
+        let mut triangles = Vec::with_capacity(self.indices.len());
+        for tri in &self.indices {
+            let v0 = self.vertices[tri[0] as usize].pos_vec();
+            let v1 = self.vertices[tri[1] as usize].pos_vec();
+            let v2 = self.vertices[tri[2] as usize].pos_vec();
+
+            let cross = (v1 - v0).cross(&(v2 - v0));
+            let cross_len = cross.norm();
+            let area = 0.5 * cross_len;
+            if area > 1e-12 {
+                let normal = cross / cross_len;
+                let centroid = (v0 + v1 + v2) / 3.0;
+                let d = normal.dot(&centroid);
+                triangles.push(TriInfo {
+                    normal,
+                    centroid,
+                    area,
+                    d,
+                });
+            }
+        }
+
+        // Sort triangles descending by area so largest triangles seed planar clusters
+        triangles.sort_by(|a, b| b.area.partial_cmp(&a.area).unwrap_or(std::cmp::Ordering::Equal));
+
+        struct Cluster {
+            seed_normal: Vector3<f64>,
+            seed_d: f64,
+            weighted_normal: Vector3<f64>,
+            weighted_center: Vector3<f64>,
+            area: f64,
+            triangles_count: usize,
+        }
+
+        let mut clusters: Vec<Cluster> = Vec::new();
+
+        for tri in triangles {
+            let mut best_match: Option<usize> = None;
+            let mut best_dot = 0.999;
+
+            for (idx, cluster) in clusters.iter().enumerate() {
+                let dot = cluster.seed_normal.dot(&tri.normal);
+                if dot > best_dot {
+                    // Check if triangle centroid is coplanar with cluster plane: |n · p - d| < 1e-4
+                    let dist = (cluster.seed_normal.dot(&tri.centroid) - cluster.seed_d).abs();
+                    if dist < 1e-4 {
+                        best_match = Some(idx);
+                        best_dot = dot;
+                    }
+                }
+            }
+
+            if let Some(idx) = best_match {
+                let cluster = &mut clusters[idx];
+                cluster.weighted_normal += tri.normal * tri.area;
+                cluster.weighted_center += tri.centroid * tri.area;
+                cluster.area += tri.area;
+                cluster.triangles_count += 1;
+            } else {
+                clusters.push(Cluster {
+                    seed_normal: tri.normal,
+                    seed_d: tri.d,
+                    weighted_normal: tri.normal * tri.area,
+                    weighted_center: tri.centroid * tri.area,
+                    area: tri.area,
+                    triangles_count: 1,
+                });
+            }
+        }
+
+        let mut detected_planar_faces: Vec<PlanarFaceInfo> = clusters
+            .into_iter()
+            .map(|c| {
+                let normal = if c.weighted_normal.norm() > 1e-12 {
+                    let n = c.weighted_normal.normalize();
+                    [n.x, n.y, n.z]
+                } else {
+                    [c.seed_normal.x, c.seed_normal.y, c.seed_normal.z]
+                };
+
+                let center = if c.area > 1e-12 {
+                    let ctr = c.weighted_center / c.area;
+                    [ctr.x, ctr.y, ctr.z]
+                } else {
+                    [0.0, 0.0, 0.0]
+                };
+
+                PlanarFaceInfo {
+                    normal,
+                    center,
+                    area: c.area,
+                    triangles_count: c.triangles_count,
+                }
+            })
+            .collect();
+
+        // Sort descending by area and limit to top 15
+        detected_planar_faces.sort_by(|a, b| {
+            b.area.partial_cmp(&a.area).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        detected_planar_faces.truncate(15);
+
+        GeometryInspection {
+            bounding_box,
+            volume,
+            surface_area,
+            center_of_mass,
+            faces_count,
+            vertices_count,
+            detected_planar_faces,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -376,5 +557,56 @@ mod tests {
         assert!(v0.normal[0].abs() < 1e-6);
         assert!((v0.normal[1] - 1.0).abs() < 1e-6);
         assert!(v0.normal[2].abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_inspect_geometry_empty() {
+        let mesh = TriangleMesh::empty();
+        let insp = mesh.inspect_geometry();
+        assert_eq!(insp.faces_count, 0);
+        assert_eq!(insp.vertices_count, 0);
+        assert_eq!(insp.volume, 0.0);
+        assert_eq!(insp.surface_area, 0.0);
+        assert!(insp.detected_planar_faces.is_empty());
+    }
+
+    #[test]
+    fn test_inspect_geometry_box() {
+        let box_mesh = crate::primitives::create_box(10.0, 20.0, 30.0);
+        let insp = box_mesh.inspect_geometry();
+
+        assert_eq!(insp.faces_count, 12);
+        assert_eq!(insp.vertices_count, 24);
+        assert!((insp.volume - 6000.0).abs() < 1e-4);
+        // Surface area: 2 * (10*20 + 20*30 + 10*30) = 2 * (200 + 600 + 300) = 2200
+        assert!((insp.surface_area - 2200.0).abs() < 1e-4);
+        assert_eq!(insp.bounding_box.dimensions(), [10.0, 20.0, 30.0]);
+        assert_eq!(insp.bounding_box.center(), [0.0, 0.0, 0.0]);
+        assert_eq!(insp.center_of_mass, [0.0, 0.0, 0.0]);
+
+        // Box has 6 rectangular planar faces, each composed of 2 triangles
+        assert_eq!(insp.detected_planar_faces.len(), 6);
+
+        // Sorted descending by area:
+        // Top 2 faces: 20 x 30 = 600 each
+        assert!((insp.detected_planar_faces[0].area - 600.0).abs() < 1e-4);
+        assert_eq!(insp.detected_planar_faces[0].triangles_count, 2);
+        assert!((insp.detected_planar_faces[1].area - 600.0).abs() < 1e-4);
+        assert_eq!(insp.detected_planar_faces[1].triangles_count, 2);
+
+        // Next 2 faces: 10 x 30 = 300 each
+        assert!((insp.detected_planar_faces[2].area - 300.0).abs() < 1e-4);
+        assert_eq!(insp.detected_planar_faces[2].triangles_count, 2);
+        assert!((insp.detected_planar_faces[3].area - 300.0).abs() < 1e-4);
+        assert_eq!(insp.detected_planar_faces[3].triangles_count, 2);
+
+        // Next 2 faces: 10 x 20 = 200 each
+        assert!((insp.detected_planar_faces[4].area - 200.0).abs() < 1e-4);
+        assert_eq!(insp.detected_planar_faces[4].triangles_count, 2);
+        assert!((insp.detected_planar_faces[5].area - 200.0).abs() < 1e-4);
+        assert_eq!(insp.detected_planar_faces[5].triangles_count, 2);
+
+        let total_detected_area: f64 = insp.detected_planar_faces.iter().map(|f| f.area).sum();
+        assert!((total_detected_area - 2200.0).abs() < 1e-4);
     }
 }

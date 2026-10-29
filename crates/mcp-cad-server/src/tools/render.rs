@@ -75,6 +75,22 @@ pub fn open_preview_window(args: &Value, state: &EngineState) -> Result<Value, S
                 "part_id": part_id,
                 "message": format!("Preview window opened showing part '{}'", part.name)
             }))
+        } else if let Some(sim) = &state.last_simulation {
+            let frames = crate::tools::physics::generate_animation_frames(&state.parts, &sim.trajectories, 120);
+            if !frames.is_empty() {
+                state.send_gui_animation(frames, 30.0);
+                Ok(json!({
+                    "status": "opened",
+                    "mode": "animation_playback",
+                    "message": "Preview window opened playing mechanism simulation animation"
+                }))
+            } else {
+                let _ = proxy.send_event(mcp_cad_viewer::window::GuiEvent::Show);
+                Ok(json!({
+                    "status": "opened",
+                    "message": "Preview window opened"
+                }))
+            }
         } else {
             let mut combined_verts = Vec::new();
             let mut combined_indices = Vec::new();

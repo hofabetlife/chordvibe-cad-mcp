@@ -1,10 +1,14 @@
 //! CAD part and parametric DAG modeling tools.
 
+use std::path::Path;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use mcp_cad_core::dag::FeatureOp;
+use mcp_cad_core::export_stl::{write_stl_ascii_file, write_stl_binary_file};
+use mcp_cad_core::material::Material;
 use mcp_cad_core::part::Part;
+use mcp_cad_core::tessellation::TessellationSettings;
 
 use crate::error::ServerError;
 use crate::state::EngineState;
@@ -48,13 +52,26 @@ pub fn create_part(args: &Value, state: &mut EngineState) -> Result<Value, Serve
             ))
         })?;
 
-    let part_id = format!("part-{}", Uuid::new_v4().simple());
-    let part = Part::new(&part_id, name, material);
+    let part_id = args
+        .get("part_id")
+        .or_else(|| args.get("id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("part-{}", Uuid::new_v4().simple()));
+
+    if state.parts.contains_key(&part_id) {
+        return Err(ServerError::InvalidArgument(format!("Part with id '{}' already exists", part_id)));
+    }
+
+    let is_fixed = args.get("is_fixed").and_then(|v| v.as_bool()).unwrap_or(false);
+    let mut part = Part::new(&part_id, name, material);
+    part.is_fixed = is_fixed;
 
     state.parts.insert(part_id.clone(), part);
 
     Ok(json!({
-        "part_id": part_id
+        "part_id": part_id,
+        "is_fixed": is_fixed
     }))
 }
 
@@ -776,6 +793,16 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
                 tool_mesh: tool_mesh.clone(),
             }
         }
+        FeatureOp::BooleanUnionMesh { tool_mesh } => {
+            FeatureOp::BooleanUnionMesh {
+                tool_mesh: tool_mesh.clone(),
+            }
+        }
+        FeatureOp::BooleanIntersectionMesh { tool_mesh } => {
+            FeatureOp::BooleanIntersectionMesh {
+                tool_mesh: tool_mesh.clone(),
+            }
+        }
         FeatureOp::CutHole { center, normal, radius, depth, keyway_width, keyway_depth } => {
             let new_center = if let Some(arr) = params.get("position").or_else(|| params.get("center")).and_then(|v| v.as_array()) {
                 if arr.len() == 3 {
@@ -1042,5 +1069,559 @@ pub fn import_stl(args: &Value, state: &mut EngineState) -> Result<Value, Server
         "triangles_count": mesh.indices.len(),
         "bounding_box": mesh.bounding_box(),
         "status": "stl_imported"
+    }))
+}
+
+/// Helper function to parse tessellation quality preset and tolerances.
+fn resolve_tessellation_settings(
+    quality_opt: Option<&str>,
+    chord_tolerance: Option<f64>,
+    angular_tolerance_deg: Option<f64>,
+    max_edge_length: Option<f64>,
+    default_quality: &str,
+) -> Result<(TessellationSettings, String), ServerError> {
+    if let Some(c) = chord_tolerance {
+        if c <= 0.0 {
+            return Err(ServerError::InvalidArgument(
+                "chord_tolerance must be greater than 0".to_string(),
+            ));
+        }
+    }
+    if let Some(a) = angular_tolerance_deg {
+        if a <= 0.0 {
+            return Err(ServerError::InvalidArgument(
+                "angular_tolerance_deg must be greater than 0".to_string(),
+            ));
+        }
+    }
+    if let Some(m) = max_edge_length {
+        if m <= 0.0 {
+            return Err(ServerError::InvalidArgument(
+                "max_edge_length must be greater than 0".to_string(),
+            ));
+        }
+    }
+
+    let q_str = quality_opt.unwrap_or(default_quality).to_lowercase();
+    let is_custom = chord_tolerance.is_some() || angular_tolerance_deg.is_some() || max_edge_length.is_some();
+
+    if is_custom {
+        let base_settings = match q_str.as_str() {
+            "coarse" => TessellationSettings::coarse(),
+            "medium" => TessellationSettings::medium(),
+            "fine" => TessellationSettings::fine(),
+            other if quality_opt.is_some() => {
+                return Err(ServerError::InvalidArgument(format!(
+                    "Unknown quality preset '{other}'. Supported: coarse, medium, fine"
+                )));
+            }
+            _ => TessellationSettings::fine(),
+        };
+
+        let chord_tol = chord_tolerance.unwrap_or(base_settings.chord_tolerance);
+        let ang_tol = angular_tolerance_deg.unwrap_or(base_settings.angular_tolerance_deg);
+        let max_edge = max_edge_length.or(base_settings.max_edge_length);
+
+        let settings = TessellationSettings::custom(chord_tol, ang_tol, max_edge);
+        Ok((settings, "custom".to_string()))
+    } else {
+        match q_str.as_str() {
+            "coarse" => Ok((TessellationSettings::coarse(), "coarse".to_string())),
+            "medium" => Ok((TessellationSettings::medium(), "medium".to_string())),
+            "fine" => Ok((TessellationSettings::fine(), "fine".to_string())),
+            other => Err(ServerError::InvalidArgument(format!(
+                "Unknown quality preset '{other}'. Supported: coarse, medium, fine"
+            ))),
+        }
+    }
+}
+
+/// `export_stl`: Exports a part's boundary surface mesh to an STL file (ASCII or Binary) with adaptive tessellation.
+pub fn export_stl(args: &Value, state: &mut EngineState) -> Result<Value, ServerError> {
+    let part_id = args
+        .get("part_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'part_id'".to_string()))?;
+
+    let filepath = args
+        .get("filepath")
+        .or_else(|| args.get("file_path"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'filepath'".to_string()))?;
+
+    let binary = args
+        .get("binary")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let quality = args
+        .get("quality")
+        .and_then(|v| v.as_str());
+
+    let chord_tolerance = args
+        .get("chord_tolerance")
+        .and_then(|v| v.as_f64());
+
+    let (settings, quality_applied) = resolve_tessellation_settings(
+        quality,
+        chord_tolerance,
+        None,
+        None,
+        "fine",
+    )?;
+
+    let part = state
+        .parts
+        .get_mut(part_id)
+        .ok_or_else(|| ServerError::PartNotFound(part_id.to_string()))?;
+
+    if !part.dag.nodes.is_empty() {
+        part.tessellate(&settings)?;
+    }
+
+    if part.mesh().vertices.is_empty() {
+        return Err(ServerError::InvalidArgument(
+            "Cannot export empty part mesh to STL. Add features first.".to_string(),
+        ));
+    }
+
+    let path = Path::new(filepath);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    let mesh = part.mesh();
+    if binary {
+        write_stl_binary_file(mesh, path)?;
+    } else {
+        write_stl_ascii_file(mesh, &part.name, path)?;
+    }
+
+    let triangles_count = mesh.triangle_count();
+
+    Ok(json!({
+        "filepath": filepath,
+        "file_path": filepath,
+        "triangles_count": triangles_count,
+        "triangle_count": triangles_count,
+        "quality": quality_applied,
+        "quality_applied": quality_applied
+    }))
+}
+
+/// `tessellate_part`: Evaluates lazy adaptive tessellation on a CAD part with specified quality preset or custom tolerances.
+pub fn tessellate_part(args: &Value, state: &mut EngineState) -> Result<Value, ServerError> {
+    let part_id = args
+        .get("part_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'part_id'".to_string()))?;
+
+    let quality = args
+        .get("quality")
+        .and_then(|v| v.as_str());
+
+    let chord_tolerance = args
+        .get("chord_tolerance")
+        .and_then(|v| v.as_f64());
+
+    let angular_tolerance_deg = args
+        .get("angular_tolerance_deg")
+        .and_then(|v| v.as_f64());
+
+    let max_edge_length = args
+        .get("max_edge_length")
+        .and_then(|v| v.as_f64());
+
+    let (settings, quality_applied) = resolve_tessellation_settings(
+        quality,
+        chord_tolerance,
+        angular_tolerance_deg,
+        max_edge_length,
+        "medium",
+    )?;
+
+    let (mesh_clone, volume) = {
+        let part = state
+            .parts
+            .get_mut(part_id)
+            .ok_or_else(|| ServerError::PartNotFound(part_id.to_string()))?;
+
+        if !part.dag.nodes.is_empty() {
+            part.tessellate(&settings)?;
+        }
+
+        (part.mesh().clone(), part.volume())
+    };
+
+    state.send_gui_mesh(&mesh_clone);
+
+    let vertex_count = mesh_clone.vertices.len();
+    let triangle_count = mesh_clone.triangle_count();
+
+    Ok(json!({
+        "part_id": part_id,
+        "quality_applied": quality_applied,
+        "vertex_count": vertex_count,
+        "vertices_count": vertex_count,
+        "triangle_count": triangle_count,
+        "triangles_count": triangle_count,
+        "volume": volume
+    }))
+}
+
+/// 21. `query_part_geometry`: Detailed geometry inspection of a part.
+pub fn query_part_geometry(args: &Value, state: &mut EngineState) -> Result<Value, ServerError> {
+    let part_id = args
+        .get("part_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'part_id'".to_string()))?;
+
+    let part = state
+        .parts
+        .get(part_id)
+        .ok_or_else(|| ServerError::PartNotFound(part_id.to_string()))?;
+
+    let inspection = part.inspect_geometry();
+
+    Ok(json!({
+        "part_id": part_id,
+        "bounding_box": {
+            "min": inspection.bounding_box.min,
+            "max": inspection.bounding_box.max,
+            "dimensions": inspection.bounding_box.dimensions(),
+        },
+        "volume": inspection.volume,
+        "surface_area": inspection.surface_area,
+        "center_of_mass": inspection.center_of_mass,
+        "faces_count": inspection.faces_count,
+        "vertices_count": inspection.vertices_count,
+        "detected_planar_faces": inspection.detected_planar_faces,
+    }))
+}
+
+/// 22. `boolean_union`: Combines tool_part into target_part using CSG union.
+pub fn boolean_union(args: &Value, state: &mut EngineState) -> Result<Value, ServerError> {
+    let target_part_id = args
+        .get("target_part_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'target_part_id'".to_string()))?;
+
+    let tool_part_id = args
+        .get("tool_part_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'tool_part_id'".to_string()))?;
+
+    if target_part_id == tool_part_id {
+        return Err(ServerError::InvalidArgument(
+            "target_part_id and tool_part_id must be different parts".to_string(),
+        ));
+    }
+
+    let tool_mesh = {
+        let tool_part = state
+            .parts
+            .get(tool_part_id)
+            .ok_or_else(|| ServerError::PartNotFound(tool_part_id.to_string()))?;
+        tool_part.mesh().clone()
+    };
+
+    let (feature_id, vertices_count, triangles_count, mesh_clone) = {
+        let target_part = state
+            .parts
+            .get_mut(target_part_id)
+            .ok_or_else(|| ServerError::PartNotFound(target_part_id.to_string()))?;
+
+        let feature_id = target_part.dag.add_feature(
+            FeatureOp::BooleanUnionMesh { tool_mesh },
+            None,
+        );
+        target_part.rebuild()?;
+
+        let mesh = target_part.mesh().clone();
+        (feature_id, mesh.vertices.len(), mesh.triangle_count(), mesh)
+    };
+
+    state.send_gui_mesh(&mesh_clone);
+
+    let _ = state.physics_world.remove_part(target_part_id);
+    if let Some(target_part) = state.parts.get(target_part_id) {
+        if !target_part.mesh().vertices.is_empty() {
+            let _ = state.physics_world.add_part(target_part, true);
+        }
+    }
+
+    Ok(json!({
+        "target_part_id": target_part_id,
+        "feature_id": feature_id.to_string(),
+        "status": "union_applied",
+        "vertices_count": vertices_count,
+        "triangles_count": triangles_count,
+    }))
+}
+
+/// 23. `boolean_intersection`: Intersects tool_part with target_part using CSG intersection.
+pub fn boolean_intersection(args: &Value, state: &mut EngineState) -> Result<Value, ServerError> {
+    let target_part_id = args
+        .get("target_part_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'target_part_id'".to_string()))?;
+
+    let tool_part_id = args
+        .get("tool_part_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'tool_part_id'".to_string()))?;
+
+    if target_part_id == tool_part_id {
+        return Err(ServerError::InvalidArgument(
+            "target_part_id and tool_part_id must be different parts".to_string(),
+        ));
+    }
+
+    let tool_mesh = {
+        let tool_part = state
+            .parts
+            .get(tool_part_id)
+            .ok_or_else(|| ServerError::PartNotFound(tool_part_id.to_string()))?;
+        tool_part.mesh().clone()
+    };
+
+    let (feature_id, vertices_count, triangles_count, mesh_clone) = {
+        let target_part = state
+            .parts
+            .get_mut(target_part_id)
+            .ok_or_else(|| ServerError::PartNotFound(target_part_id.to_string()))?;
+
+        let feature_id = target_part.dag.add_feature(
+            FeatureOp::BooleanIntersectionMesh { tool_mesh },
+            None,
+        );
+        target_part.rebuild()?;
+
+        let mesh = target_part.mesh().clone();
+        (feature_id, mesh.vertices.len(), mesh.triangle_count(), mesh)
+    };
+
+    state.send_gui_mesh(&mesh_clone);
+
+    let _ = state.physics_world.remove_part(target_part_id);
+    if let Some(target_part) = state.parts.get(target_part_id) {
+        if !target_part.mesh().vertices.is_empty() {
+            let _ = state.physics_world.add_part(target_part, true);
+        }
+    }
+
+    Ok(json!({
+        "target_part_id": target_part_id,
+        "feature_id": feature_id.to_string(),
+        "status": "intersection_applied",
+        "vertices_count": vertices_count,
+        "triangles_count": triangles_count,
+    }))
+}
+
+/// 24. `transform_part`: Applies translation, rotation (RPY deg), and scale to a part's DAG.
+pub fn transform_part(args: &Value, state: &mut EngineState) -> Result<Value, ServerError> {
+    let part_id = args
+        .get("part_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'part_id'".to_string()))?;
+
+    let translation = parse_vec3(args, "translation").unwrap_or([0.0, 0.0, 0.0]);
+    let rotation_deg = parse_vec3(args, "rotation_deg")
+        .or_else(|| parse_vec3(args, "rotation_rpy_deg"))
+        .unwrap_or([0.0, 0.0, 0.0]);
+    let scale = parse_vec3(args, "scale").unwrap_or([1.0, 1.0, 1.0]);
+
+    if scale[0] == 0.0 || scale[1] == 0.0 || scale[2] == 0.0 {
+        return Err(ServerError::InvalidArgument(
+            "Scale components cannot be zero".to_string(),
+        ));
+    }
+
+    let (feature_id, aabb, volume, mesh_clone) = {
+        let part = state
+            .parts
+            .get_mut(part_id)
+            .ok_or_else(|| ServerError::PartNotFound(part_id.to_string()))?;
+
+        let feature_id = part.dag.add_feature(
+            FeatureOp::Transform {
+                translation,
+                rotation_deg,
+                scale,
+            },
+            None,
+        );
+        part.rebuild()?;
+
+        let aabb = part.bounding_box();
+        let volume = part.volume();
+        let mesh = part.mesh().clone();
+        (feature_id, aabb, volume, mesh)
+    };
+
+    state.send_gui_mesh(&mesh_clone);
+
+    let _ = state.physics_world.remove_part(part_id);
+    if let Some(part) = state.parts.get(part_id) {
+        if !part.mesh().vertices.is_empty() {
+            let _ = state.physics_world.add_part(part, true);
+        }
+    }
+
+    Ok(json!({
+        "part_id": part_id,
+        "feature_id": feature_id.to_string(),
+        "status": "transformed",
+        "bounding_box": {
+            "min": aabb.min,
+            "max": aabb.max,
+            "dimensions": aabb.dimensions(),
+        },
+        "volume": volume,
+    }))
+}
+
+/// 25. `define_material`: Registers a new engineering material with physical and mechanical properties.
+pub fn define_material(args: &Value, state: &mut EngineState) -> Result<Value, ServerError> {
+    let id = args
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'id'".to_string()))?;
+
+    if id.trim().is_empty() {
+        return Err(ServerError::InvalidArgument("Material 'id' cannot be empty".to_string()));
+    }
+
+    let young_modulus_gpa = args
+        .get("young_modulus_gpa")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'young_modulus_gpa'".to_string()))?;
+
+    if young_modulus_gpa <= 0.0 || !young_modulus_gpa.is_finite() {
+        return Err(ServerError::InvalidArgument("Young's modulus must be greater than zero".to_string()));
+    }
+
+    let poisson_ratio = args
+        .get("poisson_ratio")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'poisson_ratio'".to_string()))?;
+
+    if poisson_ratio <= 0.0 || poisson_ratio >= 0.5 || !poisson_ratio.is_finite() {
+        return Err(ServerError::InvalidArgument("Poisson's ratio must be in range (0.0, 0.5)".to_string()));
+    }
+
+    let yield_strength_mpa = args
+        .get("yield_strength_mpa")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'yield_strength_mpa'".to_string()))?;
+
+    if yield_strength_mpa <= 0.0 || !yield_strength_mpa.is_finite() {
+        return Err(ServerError::InvalidArgument("Yield strength must be greater than zero".to_string()));
+    }
+
+    let density_kg_m3 = args
+        .get("density_kg_m3")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'density_kg_m3'".to_string()))?;
+
+    if density_kg_m3 <= 0.0 || !density_kg_m3.is_finite() {
+        return Err(ServerError::InvalidArgument("Density must be greater than zero".to_string()));
+    }
+
+    let name = args.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let desc = name.clone().unwrap_or_else(|| id.to_string());
+
+    let material = Material::new(
+        id,
+        young_modulus_gpa,
+        poisson_ratio,
+        yield_strength_mpa,
+        density_kg_m3,
+        &desc,
+    );
+
+    state.materials.register(material);
+
+    if let Some(ref custom_name) = name {
+        if custom_name != id {
+            let alias_mat = Material::new(
+                custom_name.clone(),
+                young_modulus_gpa,
+                poisson_ratio,
+                yield_strength_mpa,
+                density_kg_m3,
+                format!("Alias for {}", id),
+            );
+            state.materials.register(alias_mat);
+        }
+    }
+
+    Ok(json!({
+        "status": "material_registered",
+        "material_id": id,
+        "properties": {
+            "name": desc,
+            "young_modulus_gpa": young_modulus_gpa,
+            "young_modulus_pa": young_modulus_gpa * 1.0e9,
+            "poisson_ratio": poisson_ratio,
+            "yield_strength_mpa": yield_strength_mpa,
+            "yield_strength_pa": yield_strength_mpa * 1.0e6,
+            "density_kg_m3": density_kg_m3,
+        }
+    }))
+}
+
+/// 26. `batch_cad_operations`: Sequentially executes a batch of MCP CAD operations.
+pub fn batch_cad_operations(args: &Value, state: &mut EngineState) -> Result<Value, ServerError> {
+    let operations = args
+        .get("operations")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required array 'operations'".to_string()))?;
+
+    let mut results = Vec::with_capacity(operations.len());
+
+    for (idx, op) in operations.iter().enumerate() {
+        let tool_name = op
+            .get("tool")
+            .or_else(|| op.get("name"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ServerError::InvalidArgument(format!("Operation at index {idx} missing 'tool' field")))?;
+
+        if tool_name == "batch_cad_operations" {
+            return Err(ServerError::InvalidParameter(format!(
+                "Nested 'batch_cad_operations' is not permitted (at index {idx})"
+            )));
+        }
+
+        let empty_params = json!({});
+        let params = op
+            .get("params")
+            .or_else(|| op.get("args"))
+            .unwrap_or(&empty_params);
+
+        match super::dispatch_tool(tool_name, params, state) {
+            Ok(call_result) => {
+                let val = if let Some(crate::protocol::ToolContent::Text { text }) = call_result.content.first() {
+                    serde_json::from_str::<Value>(text).unwrap_or_else(|_| json!(text))
+                } else {
+                    serde_json::to_value(&call_result).unwrap_or(json!({}))
+                };
+                results.push(val);
+            }
+            Err(err) => {
+                return Err(ServerError::InvalidArgument(format!(
+                    "Batch operation at index {idx} ('{tool_name}') failed: {err}"
+                )));
+            }
+        }
+    }
+
+    Ok(json!({
+        "success": true,
+        "count": operations.len(),
+        "results": results,
     }))
 }

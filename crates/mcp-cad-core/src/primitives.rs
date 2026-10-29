@@ -3,6 +3,7 @@
 use std::f64::consts::PI;
 use nalgebra::{Matrix3, Rotation3, Vector3};
 use crate::csg::{csg_difference, csg_intersection, csg_union};
+use crate::tessellation::{TessellationQuality, TessellationSettings};
 use crate::topology::{TriangleMesh, Vertex};
 
 /// Generates a solid 3D box (cuboid) centered at the origin.
@@ -91,7 +92,11 @@ pub fn create_box(width: f64, height: f64, depth: f64) -> TriangleMesh {
 ///
 /// Coordinates span: `radius` in XY plane, `z in [-height/2, height/2]`.
 pub fn create_cylinder(radius: f64, height: f64, segments: usize) -> TriangleMesh {
-    let segs = segments.max(8);
+    let segs = if segments == 0 {
+        TessellationSettings::default().calculate_segments(radius)
+    } else {
+        segments.max(8)
+    };
     let h2 = height * 0.5;
 
     let mut vertices = Vec::new();
@@ -172,10 +177,21 @@ pub fn create_cylinder(radius: f64, height: f64, segments: usize) -> TriangleMes
     TriangleMesh::new(vertices, indices)
 }
 
+/// Generates a solid 3D cylinder with adaptive tessellation based on `TessellationSettings`.
+pub fn create_cylinder_with_settings(
+    radius: f64,
+    height: f64,
+    settings: &TessellationSettings,
+) -> TriangleMesh {
+    let segments = settings.calculate_segments(radius);
+    create_cylinder(radius, height, segments)
+}
+
 /// Generates a solid 3D UV sphere centered at the origin.
 pub fn create_sphere(radius: f64, sectors: usize, stacks: usize) -> TriangleMesh {
-    let sectors = sectors.max(6);
-    let stacks = stacks.max(4);
+    let (def_sec, def_stk) = TessellationSettings::default().calculate_sphere_resolution(radius);
+    let sectors = if sectors == 0 { def_sec } else { sectors.max(6) };
+    let stacks = if stacks == 0 { def_stk } else { stacks.max(4) };
 
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
@@ -210,6 +226,15 @@ pub fn create_sphere(radius: f64, sectors: usize, stacks: usize) -> TriangleMesh
     }
 
     TriangleMesh::new(vertices, indices)
+}
+
+/// Generates a solid 3D UV sphere with adaptive tessellation based on `TessellationSettings`.
+pub fn create_sphere_with_settings(
+    radius: f64,
+    settings: &TessellationSettings,
+) -> TriangleMesh {
+    let (sectors, stacks) = settings.calculate_sphere_resolution(radius);
+    create_sphere(radius, sectors, stacks)
 }
 
 /// Generates an oriented cylinder with specified center, axis direction vector, radius, and height.
@@ -252,6 +277,18 @@ pub fn create_cylinder_oriented(
     mesh
 }
 
+/// Generates an oriented cylinder with adaptive tessellation based on `TessellationSettings`.
+pub fn create_cylinder_oriented_with_settings(
+    center: [f64; 3],
+    axis: [f64; 3],
+    radius: f64,
+    height: f64,
+    settings: &TessellationSettings,
+) -> TriangleMesh {
+    let segments = settings.calculate_segments(radius);
+    create_cylinder_oriented(center, axis, radius, height, segments)
+}
+
 /// Cuts a cylindrical hole in `mesh` at the specified `center` location,
 /// oriented along `normal` with radius `radius` and depth `depth`.
 /// Optionally cuts a DIN 6885 keyway slot of specified `keyway_width` and `keyway_depth`.
@@ -265,6 +302,30 @@ pub fn cut_hole(
     depth: f64,
     keyway_width: Option<f64>,
     keyway_depth: Option<f64>,
+) -> TriangleMesh {
+    cut_hole_with_settings(
+        mesh,
+        center,
+        normal,
+        radius,
+        depth,
+        keyway_width,
+        keyway_depth,
+        &TessellationSettings::default(),
+    )
+}
+
+/// Cuts a cylindrical hole in `mesh` with adaptive tessellation based on `TessellationSettings`.
+#[allow(clippy::too_many_arguments)]
+pub fn cut_hole_with_settings(
+    mesh: &TriangleMesh,
+    center: [f64; 3],
+    normal: [f64; 3],
+    radius: f64,
+    depth: f64,
+    keyway_width: Option<f64>,
+    keyway_depth: Option<f64>,
+    settings: &TessellationSettings,
 ) -> TriangleMesh {
     let norm_v = Vector3::new(normal[0], normal[1], normal[2]);
     let norm_len = norm_v.norm();
@@ -286,12 +347,12 @@ pub fn cut_hole(
         + drill_dir * (depth * 0.5)
         + unit_norm * margin;
 
-    let cyl_tool = create_cylinder_oriented(
+    let cyl_tool = create_cylinder_oriented_with_settings(
         [tool_center.x, tool_center.y, tool_center.z],
         [drill_dir.x, drill_dir.y, drill_dir.z],
         radius,
         tool_height,
-        32,
+        settings,
     );
 
     let final_tool = if let (Some(kw), Some(kd)) = (keyway_width, keyway_depth) {
@@ -342,7 +403,12 @@ pub fn create_cone(radius_bottom: f64, radius_top: f64, height: f64, segments: u
         return TriangleMesh::empty();
     }
 
-    let segs = segments.max(8);
+    let max_r = radius_bottom.max(radius_top);
+    let segs = if segments == 0 {
+        TessellationSettings::default().calculate_segments(max_r)
+    } else {
+        segments.max(8)
+    };
     let h2 = height * 0.5;
 
     let mut vertices = Vec::new();
@@ -491,6 +557,18 @@ pub fn create_cone(radius_bottom: f64, radius_top: f64, height: f64, segments: u
     }
 
     TriangleMesh::new(vertices, indices)
+}
+
+/// Generates a solid 3D cone or frustum with adaptive tessellation based on `TessellationSettings`.
+pub fn create_cone_with_settings(
+    radius_bottom: f64,
+    radius_top: f64,
+    height: f64,
+    settings: &TessellationSettings,
+) -> TriangleMesh {
+    let max_r = radius_bottom.max(radius_top);
+    let segments = settings.calculate_segments(max_r);
+    create_cone(radius_bottom, radius_top, height, segments)
 }
 
 /// Helper to generate a convex turned solid for DIN 934 conical chamfering.
@@ -773,6 +851,34 @@ pub fn create_helical_cutter(
     turns: f64,
     profile_type: &str,
 ) -> TriangleMesh {
+    create_helical_cutter_with_settings(
+        helix_radius,
+        groove_radius,
+        pitch,
+        height,
+        start_z,
+        starts,
+        is_right_hand,
+        turns,
+        profile_type,
+        &TessellationSettings::default(),
+    )
+}
+
+/// Generates a helical cutter mesh with adaptive tessellation based on `TessellationSettings`.
+#[allow(clippy::too_many_arguments)]
+pub fn create_helical_cutter_with_settings(
+    helix_radius: f64,
+    groove_radius: f64,
+    pitch: f64,
+    height: f64,
+    start_z: f64,
+    starts: usize,
+    is_right_hand: bool,
+    turns: f64,
+    profile_type: &str,
+    settings: &TessellationSettings,
+) -> TriangleMesh {
     if pitch <= 1e-9 || groove_radius <= 1e-9 {
         return TriangleMesh::empty();
     }
@@ -790,8 +896,18 @@ pub fn create_helical_cutter(
     }
 
     let num_starts = starts.max(1);
-    let cross_segments: usize = 16;
-    let steps_per_turn: usize = 24;
+    let cross_segments: usize = match settings.quality {
+        TessellationQuality::Coarse => 12,
+        TessellationQuality::Medium => 16,
+        TessellationQuality::Fine => 24,
+        TessellationQuality::Custom { .. } => settings.calculate_segments(groove_radius).clamp(12, 32),
+    };
+    let steps_per_turn: usize = match settings.quality {
+        TessellationQuality::Coarse => 16,
+        TessellationQuality::Medium => 24,
+        TessellationQuality::Fine => 36,
+        TessellationQuality::Custom { .. } => settings.calculate_segments(helix_radius).clamp(16, 64),
+    };
     let k_steps = ((effective_turns * steps_per_turn as f64).round() as usize).max(8);
 
     let mut all_vertices = Vec::new();
@@ -962,6 +1078,34 @@ pub fn create_spur_gear(
     hub_diameter: Option<f64>,
     hub_length: Option<f64>,
 ) -> TriangleMesh {
+    create_spur_gear_with_settings(
+        module,
+        teeth,
+        pressure_angle_deg,
+        face_width,
+        bore_radius,
+        keyway_width,
+        keyway_depth,
+        hub_diameter,
+        hub_length,
+        &TessellationSettings::default(),
+    )
+}
+
+/// Generates a solid 3D parametric spur gear with adaptive tessellation based on `TessellationSettings`.
+#[allow(clippy::too_many_arguments)]
+pub fn create_spur_gear_with_settings(
+    module: f64,
+    teeth: usize,
+    pressure_angle_deg: f64,
+    face_width: f64,
+    bore_radius: Option<f64>,
+    keyway_width: Option<f64>,
+    keyway_depth: Option<f64>,
+    hub_diameter: Option<f64>,
+    hub_length: Option<f64>,
+    settings: &TessellationSettings,
+) -> TriangleMesh {
     if module <= 1e-9 || teeth < 3 || face_width <= 1e-9 {
         return TriangleMesh::empty();
     }
@@ -1002,7 +1146,12 @@ pub fn create_spur_gear(
 
     // 1. Construct 2D contour points in CCW order around origin
     let mut poly_2d: Vec<[f64; 2]> = Vec::new();
-    let n_flank_steps = 4;
+    let n_flank_steps = match settings.quality {
+        TessellationQuality::Coarse => 2,
+        TessellationQuality::Medium => 4,
+        TessellationQuality::Fine => 8,
+        TessellationQuality::Custom { .. } => (settings.calculate_segments(r_a) / teeth).clamp(2, 16),
+    };
     let r_inv_start = r_b.max(r_f);
 
     for k in 0..teeth {
@@ -1151,7 +1300,7 @@ pub fn create_spur_gear(
                 face_width + hub_l
             };
             let hub_z_center = -h2 + total_hub_len * 0.5;
-            let mut hub_mesh = create_cylinder(hub_r, total_hub_len, 64);
+            let mut hub_mesh = create_cylinder_with_settings(hub_r, total_hub_len, settings);
             hub_mesh.translate([0.0, 0.0, hub_z_center]);
             solid = csg_union(&solid, &hub_mesh);
         }
@@ -1168,7 +1317,7 @@ pub fn create_spur_gear(
             let cutter_height = total_span + margin * 2.0;
             let z_center = (z_min + z_max) * 0.5;
 
-            let mut bore_tool = create_cylinder(bore_r, cutter_height, 64);
+            let mut bore_tool = create_cylinder_with_settings(bore_r, cutter_height, settings);
             bore_tool.translate([0.0, 0.0, z_center]);
 
             let cutter = if let (Some(kw), Some(kd)) = (keyway_width, keyway_depth) {
@@ -1280,7 +1429,12 @@ pub fn create_revolve(profile: &[[f64; 2]], angle_deg: f64, segments: usize) -> 
         return TriangleMesh::empty();
     }
 
-    let segs = segments.max(3);
+    let max_r = profile.iter().map(|p| p[0].abs()).fold(0.0, f64::max);
+    let segs = if segments == 0 {
+        TessellationSettings::default().calculate_segments_arc(max_r, angle_deg * PI / 180.0)
+    } else {
+        segments.max(3)
+    };
     let sweep_angle_deg = angle_deg.clamp(1e-4, 360.0);
     let is_full_circle = (sweep_angle_deg - 360.0).abs() < 1e-5;
     let sweep_angle_rad = sweep_angle_deg * PI / 180.0;
@@ -1416,6 +1570,17 @@ pub fn create_revolve(profile: &[[f64; 2]], angle_deg: f64, segments: usize) -> 
     mesh
 }
 
+/// Generates a solid 3D body of revolution with adaptive tessellation based on `TessellationSettings`.
+pub fn create_revolve_with_settings(
+    profile: &[[f64; 2]],
+    angle_deg: f64,
+    settings: &TessellationSettings,
+) -> TriangleMesh {
+    let max_r = profile.iter().map(|p| p[0].abs()).fold(0.0, f64::max);
+    let segments = settings.calculate_segments_arc(max_r, angle_deg * PI / 180.0);
+    create_revolve(profile, angle_deg, segments)
+}
+
 /// Generates a solid 3D parametric automotive wheel rim according to tire & wheel engineering standards.
 ///
 /// Features:
@@ -1439,6 +1604,40 @@ pub fn create_wheel_rim(
     spoke_width: Option<f64>,
     spoke_thickness: Option<f64>,
     offset_et: Option<f64>,
+) -> TriangleMesh {
+    create_wheel_rim_with_settings(
+        rim_diameter,
+        rim_width,
+        flange_diameter,
+        hub_diameter,
+        hub_bore_diameter,
+        pcd_diameter,
+        bolt_holes_count,
+        bolt_hole_diameter,
+        spokes_count,
+        spoke_width,
+        spoke_thickness,
+        offset_et,
+        &TessellationSettings::default(),
+    )
+}
+
+/// Generates a solid 3D parametric automotive wheel rim with adaptive tessellation based on `TessellationSettings`.
+#[allow(clippy::too_many_arguments)]
+pub fn create_wheel_rim_with_settings(
+    rim_diameter: f64,
+    rim_width: f64,
+    flange_diameter: Option<f64>,
+    hub_diameter: Option<f64>,
+    hub_bore_diameter: Option<f64>,
+    pcd_diameter: Option<f64>,
+    bolt_holes_count: Option<usize>,
+    bolt_hole_diameter: Option<f64>,
+    spokes_count: Option<usize>,
+    spoke_width: Option<f64>,
+    spoke_thickness: Option<f64>,
+    offset_et: Option<f64>,
+    settings: &TessellationSettings,
 ) -> TriangleMesh {
     if rim_diameter <= 1e-4 || rim_width <= 1e-4 {
         return TriangleMesh::empty();
@@ -1504,13 +1703,13 @@ pub fn create_wheel_rim(
         [r_flange - t_w, -h_w],
     ];
 
-    let barrel = create_revolve(&barrel_profile, 360.0, 36);
+    let barrel = create_revolve_with_settings(&barrel_profile, 360.0, settings);
 
     // 2. Central hub cylinder with bore hole and PCD bolt pattern
     let t_hub = (w_rim * 0.15).clamp(0.015, 0.035);
     let z_hub_center = et - t_hub * 0.5;
 
-    let mut hub_solid = create_cylinder(r_hub, t_hub, 32);
+    let mut hub_solid = create_cylinder_with_settings(r_hub, t_hub, settings);
     hub_solid.translate([0.0, 0.0, z_hub_center]);
 
     let cutter_height = t_hub + 0.010;
@@ -1525,7 +1724,7 @@ pub fn create_wheel_rim(
         }
     };
 
-    let mut bore_cyl = create_cylinder(r_bore, cutter_height, 32);
+    let mut bore_cyl = create_cylinder_with_settings(r_bore, cutter_height, settings);
     bore_cyl.translate([0.0, 0.0, z_hub_center]);
     add_to_cutters(&bore_cyl);
 
@@ -1533,7 +1732,7 @@ pub fn create_wheel_rim(
         let beta = (b as f64) * 2.0 * PI / (n_bolts as f64) + PI / (n_bolts as f64);
         let bx = r_pcd * beta.cos();
         let by = r_pcd * beta.sin();
-        let mut bolt_cyl = create_cylinder(r_bolt, cutter_height, 16);
+        let mut bolt_cyl = create_cylinder_with_settings(r_bolt, cutter_height, settings);
         bolt_cyl.translate([bx, by, z_hub_center]);
         add_to_cutters(&bolt_cyl);
     }

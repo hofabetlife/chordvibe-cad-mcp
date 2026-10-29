@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "project": "Involute Spur Gear Transmission with Animated Preview",
+  "version": "1.0.0",
+  "description": "Two-stage involute gear drive (z1=20, z2=40, ratio=-0.5) mounted on fixed gearbox frame with real-time 3D viewport animation",
+  "units": {
+    "length": "meters",
+    "velocity_angular": "rad/s",
+    "force": "newtons",
+    "torque": "newton_meters",
+    "time": "seconds"
+  },
+  "parts": [
+    {
+      "name": "gearbox_frame",
+      "material": "steel_structural_aisi1020",
+      "is_fixed": true,
+      "primitive": {
+        "primitive_type": "box",
+        "params": {
+          "width": 0.20,
+          "height": 0.10,
+          "depth": 0.02
+        }
+      },
+      "comment": "Fixed structural ground base for mounting gear shafts (is_fixed: true prevents falling under gravity)"
+    },
+    {
+      "name": "pinion_driver",
+      "material": "steel_structural_aisi1020",
+      "primitive": {
+        "primitive_type": "spur_gear",
+        "params": {
+          "module": 0.002,
+          "teeth": 20,
+          "pressure_angle_deg": 20.0,
+          "face_width": 0.010,
+          "hub_diameter": 0.018,
+          "hub_length": 0.006,
+          "bore_diameter": 0.008
+        }
+      },
+      "comment": "Drive pinion: module 2 mm, 20 teeth, pitch diameter 40 mm, mounted at [0, 0, 0.02]"
+    },
+    {
+      "name": "gear_driven",
+      "material": "steel_structural_aisi1020",
+      "primitive": {
+        "primitive_type": "spur_gear",
+        "params": {
+          "module": 0.002,
+          "teeth": 40,
+          "pressure_angle_deg": 20.0,
+          "face_width": 0.010,
+          "hub_diameter": 0.024,
+          "hub_length": 0.006,
+          "bore_diameter": 0.012
+        }
+      },
+      "transform": {
+        "translation": [0.060, 0.0, 0.0],
+        "rotation_deg": [0.0, 0.0, 4.5]
+      },
+      "comment": "Driven gear: module 2 mm, 40 teeth, pitch diameter 80 mm, center distance a = 60 mm, rotated by 4.5 deg for tooth meshing"
+    }
+  ],
+  "kinematic_joints": [
+    {
+      "id": "joint_frame_pinion",
+      "joint_type": "revolute",
+      "part_a": "gearbox_frame",
+      "part_b": "pinion_driver",
+      "anchor_a": [0.0, 0.0, 0.02],
+      "anchor_b": [0.0, 0.0, 0.0],
+      "axis": [0.0, 0.0, 1.0],
+      "motor": {
+        "target_velocity": 6.0,
+        "max_force": 100.0,
+        "comment": "Rotational drive at 6.0 rad/s (approx 57 RPM) with 100 Nm peak torque limit"
+      }
+    },
+    {
+      "id": "joint_frame_gear",
+      "joint_type": "revolute",
+      "part_a": "gearbox_frame",
+      "part_b": "gear_driven",
+      "anchor_a": [0.060, 0.0, 0.02],
+      "anchor_b": [0.060, 0.0, 0.0],
+      "axis": [0.0, 0.0, 1.0],
+      "comment": "Passive shaft bearing supporting the driven gear at center distance 60 mm"
+    },
+    {
+      "id": "joint_gear_mesh",
+      "joint_type": "gear",
+      "part_a": "pinion_driver",
+      "part_b": "gear_driven",
+      "teeth_a": 20,
+      "teeth_b": 40,
+      "axis": [0.0, 0.0, 1.0],
+      "comment": "Analytical gear constraint with ratio -0.5000, transmitting torque and maintaining precise tooth phase"
+    }
+  ],
+  "simulation_execution": {
+    "tool": "run_physics_simulation",
+    "params": {
+      "duration_seconds": 2.0,
+      "step_size_ms": 10.0
+    },
+    "preview_playback": {
+      "tool": "open_preview_window",
+      "controls": "Press 'P' in preview window to Pause/Play animation, 'Space' for 4-viewport layout"
+    }
+  }
+}
