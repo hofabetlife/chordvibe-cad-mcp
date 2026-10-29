@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "project": "L-Bracket Structural Design and FEA Optimization",
+  "version": "1.0.0",
+  "units": {
+    "length": "meters",
+    "force": "newtons",
+    "stress": "pascals",
+    "mass": "kilograms"
+  },
+  "part": {
+    "name": "aerospace_bracket_l_shape",
+    "material": "aluminum_6061_t6",
+    "material_properties": {
+      "youngs_modulus_gpa": 68.9,
+      "poissons_ratio": 0.33,
+      "yield_strength_mpa": 276.0,
+      "density_kg_m3": 2700.0
+    }
+  },
+  "dag_construction_steps": [
+    {
+      "step": 1,
+      "tool": "create_part",
+      "params": {
+        "name": "aerospace_bracket_l_shape",
+        "material": "aluminum_6061_t6"
+      },
+      "comment": "Initialize empty CAD part entity with aerospace 6061-T6 alloy"
+    },
+    {
+      "step": 2,
+      "tool": "add_feature_primitive",
+      "params": {
+        "primitive_type": "box",
+        "params": {
+          "width": 0.12,
+          "height": 0.015,
+          "depth": 0.06
+        }
+      },
+      "comment": "Base horizontal mounting plate: 120 mm x 15 mm x 60 mm"
+    },
+    {
+      "step": 3,
+      "tool": "cut_hole",
+      "params": {
+        "position": [0.03, 0.0, 0.0],
+        "normal": [0.0, 1.0, 0.0],
+        "radius": 0.005,
+        "depth": 0.02
+      },
+      "comment": "Bolt hole 1 (10 mm diameter) through horizontal flange for M8 fastener"
+    },
+    {
+      "step": 4,
+      "tool": "cut_hole",
+      "params": {
+        "position": [-0.03, 0.0, 0.0],
+        "normal": [0.0, 1.0, 0.0],
+        "radius": 0.005,
+        "depth": 0.02
+      },
+      "comment": "Bolt hole 2 (10 mm diameter) through horizontal flange for M8 fastener"
+    }
+  ],
+  "fea_analysis_configuration": {
+    "mesh_density": "medium",
+    "boundary_conditions": {
+      "fixed_faces": ["min_x"],
+      "fixed_plane": {
+        "origin": [-0.06, 0.0, 0.0],
+        "normal": [-1.0, 0.0, 0.0],
+        "tolerance": 0.001
+      },
+      "applied_forces": [
+        {
+          "position": [0.05, 0.0075, 0.0],
+          "force_vector": [0.0, -800.0, 0.0],
+          "comment": "Vertical shear load of 800 N applied on outer edge of bracket"
+        }
+      ]
+    },
+    "acceptance_criteria": {
+      "target_safety_factor_min": 2.0,
+      "max_allowable_stress_mpa": 138.0,
+      "expected_verdict": "PASS"
+    }
+  },
+  "visual_and_export_pipeline": {
+    "viewport_snapshots": [
+      {
+        "tool": "capture_viewport",
+        "params": {
+          "camera_preset": "isometric",
+          "width": 1280,
+          "height": 720
+        }
+      },
+      {
+        "tool": "get_fea_heatmap_image",
+        "params": {
+          "camera_preset": "isometric",
+          "width": 1280,
+          "height": 720
+        }
+      }
+    ],
+    "export": {
+      "tool": "export_stl",
+      "params": {
+        "filepath": "./output/aerospace_bracket.stl",
+        "binary": true
+      }
+    }
+  }
+}

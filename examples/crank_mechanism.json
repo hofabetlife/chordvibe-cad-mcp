@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "project": "Crank-Slider Kinematic Mechanism with Motor Drive",
+  "version": "1.0.0",
+  "units": {
+    "length": "meters",
+    "velocity_angular": "rad/s",
+    "force": "newtons",
+    "torque": "newton_meters",
+    "time": "seconds"
+  },
+  "parts": [
+    {
+      "name": "mechanism_base",
+      "material": "steel_structural_aisi1020",
+      "primitive": {
+        "primitive_type": "box",
+        "params": {
+          "width": 0.40,
+          "height": 0.04,
+          "depth": 0.10
+        }
+      },
+      "comment": "Fixed structural ground base for mounting crank spindle and linear guide"
+    },
+    {
+      "name": "crank_arm",
+      "material": "aluminum_6061_t6",
+      "primitive": {
+        "primitive_type": "box",
+        "params": {
+          "width": 0.10,
+          "height": 0.02,
+          "depth": 0.02
+        }
+      },
+      "comment": "Rotating crank arm with length 100 mm"
+    },
+    {
+      "name": "connecting_rod",
+      "material": "steel_structural_aisi1020",
+      "primitive": {
+        "primitive_type": "box",
+        "params": {
+          "width": 0.25,
+          "height": 0.015,
+          "depth": 0.015
+        }
+      },
+      "comment": "Connecting rod transferring rotation to reciprocating motion, length 250 mm"
+    },
+    {
+      "name": "linear_slider",
+      "material": "brass_c360",
+      "primitive": {
+        "primitive_type": "box",
+        "params": {
+          "width": 0.06,
+          "height": 0.03,
+          "depth": 0.04
+        }
+      },
+      "comment": "Low-friction brass slider reciprocating along horizontal guide"
+    }
+  ],
+  "kinematic_joints": [
+    {
+      "id": "joint_base_crank",
+      "joint_type": "revolute",
+      "part_a": "mechanism_base",
+      "part_b": "crank_arm",
+      "anchor_a": [-0.12, 0.02, 0.0],
+      "anchor_b": [-0.05, 0.0, 0.0],
+      "axis": [0.0, 0.0, 1.0],
+      "motor": {
+        "target_velocity": 6.283185,
+        "max_force": 45.0,
+        "comment": "Rotational drive at 1.0 rev/sec (60 RPM) with 45 Nm peak torque limit"
+      }
+    },
+    {
+      "id": "joint_crank_rod",
+      "joint_type": "revolute",
+      "part_a": "crank_arm",
+      "part_b": "connecting_rod",
+      "anchor_a": [0.05, 0.0, 0.0],
+      "anchor_b": [-0.125, 0.0, 0.0],
+      "axis": [0.0, 0.0, 1.0],
+      "comment": "Passive pin joint connecting crank pin to connecting rod small end"
+    },
+    {
+      "id": "joint_rod_slider",
+      "joint_type": "revolute",
+      "part_a": "connecting_rod",
+      "part_b": "linear_slider",
+      "anchor_a": [0.125, 0.0, 0.0],
+      "anchor_b": [0.0, 0.0, 0.0],
+      "axis": [0.0, 0.0, 1.0],
+      "comment": "Gudgeon pin wrist joint connecting rod to reciprocating slider block"
+    },
+    {
+      "id": "joint_slider_base",
+      "joint_type": "prismatic",
+      "part_a": "mechanism_base",
+      "part_b": "linear_slider",
+      "anchor_a": [0.10, 0.02, 0.0],
+      "anchor_b": [0.0, 0.0, 0.0],
+      "axis": [1.0, 0.0, 0.0],
+      "limits": [-0.10, 0.10],
+      "comment": "Horizontal prismatic linear slider joint with travel limit +/- 100 mm"
+    }
+  ],
+  "simulation_execution": {
+    "tool": "run_physics_simulation",
+    "params": {
+      "duration_seconds": 2.0,
+      "step_size_ms": 16.6667
+    },
+    "expected_telemetry": {
+      "steps_simulated": 120,
+      "collision_count": 0,
+      "metrics_tool": "get_simulation_metrics_json"
+    }
+  }
+}
