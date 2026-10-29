@@ -25,6 +25,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     gui: bool,
 
+    /// Run in standalone GUI mode with local SSE server and interactive 3D viewport.
+    #[arg(long, default_value_t = false)]
+    standalone: bool,
+
     /// Transport mode: "stdio" or "sse".
     #[arg(short, long, default_value = "stdio")]
     mode: String,
@@ -45,7 +49,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     tracing::info!("Initializing MCP-CAD Engine...");
 
-    if args.gui {
+    let is_standalone = args.standalone;
+    let is_gui = args.gui || args.standalone;
+
+    if is_gui {
         tracing::info!("Starting MCP-CAD in GUI mode with native 3D viewport...");
         let event_loop = mcp_cad_viewer::create_gui_event_loop()?;
         let proxy = event_loop.create_proxy();
@@ -55,9 +62,12 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .into_shared();
 
         let proxy_clone = proxy.clone();
-        let port = args.port;
-        let mode = args.mode;
+        let sse_port = args.port.unwrap_or(8080);
+        let mode_lower = args.mode.to_lowercase();
+        let is_sse_mode = mode_lower == "sse" || args.port.is_some() || is_standalone;
+        let run_stdio_transport = !is_sse_mode;
 
+        let engine_for_bg = engine.clone();
         std::thread::spawn(move || {
             let rt = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -72,23 +82,35 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             };
 
             rt.block_on(async move {
-                let res = if let Some(p) = port {
-                    run_sse(engine, p).await
-                } else if mode.to_lowercase() == "sse" {
-                    run_sse(engine, 8080).await
-                } else {
-                    run_stdio(engine).await
-                };
+                // In standalone / GUI mode, always run the background SSE server
+                // so agents or tools can connect to http://127.0.0.1:{sse_port}
+                let engine_sse = engine_for_bg.clone();
+                let sse_task = tokio::spawn(async move {
+                    if let Err(e) = run_sse(engine_sse, sse_port).await {
+                        tracing::error!("MCP-CAD SSE server terminated with error: {e}");
+                    }
+                });
 
-                if let Err(e) = res {
-                    tracing::error!("MCP server terminated with error: {e}");
+                // If stdio transport is requested concurrently:
+                if run_stdio_transport {
+                    let engine_stdio = engine_for_bg.clone();
+                    if let Err(e) = run_stdio(engine_stdio).await {
+                        tracing::debug!("MCP stdio transport error: {e}");
+                    } else {
+                        tracing::debug!("MCP stdio stream reached EOF");
+                    }
+                    // In standalone, SSE, or manual GUI mode, DO NOT close on stdin EOF!
                 }
-                let _ = proxy_clone.send_event(mcp_cad_viewer::GuiEvent::Close);
+
+                // Keep SSE server running in background for the lifetime of GUI window
+                let _ = sse_task.await;
             });
         });
 
-        let app = mcp_cad_viewer::CadWindowApp::default();
-        mcp_cad_viewer::run_gui_app(event_loop, app)?;
+        let mut app = mcp_cad_viewer::CadWindowApp::default();
+        app.exit_on_close = true;
+        let _ = mcp_cad_viewer::run_gui_app(event_loop, app);
+        std::process::exit(0);
     } else {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()

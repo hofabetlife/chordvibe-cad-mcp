@@ -11,6 +11,17 @@ use mcp_cad_viewer::offscreen::OffscreenRenderer;
 const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 
 #[test]
+fn test_ortho_matrix() {
+    let o = nalgebra::Orthographic3::new(-2.0, 2.0, -1.5, 1.5, -500.0, 500.0);
+    let mat = mcp_cad_viewer::camera::OPENGL_TO_WGPU_MATRIX * o.to_homogeneous();
+    let p_neg = mat * nalgebra::Vector4::new(0.0, 0.0, 500.0, 1.0);
+    let p_pos = mat * nalgebra::Vector4::new(0.0, 0.0, -500.0, 1.0);
+    println!("p_neg: {:?}, p_pos: {:?}", p_neg, p_pos);
+    assert!((p_neg[2] - 0.0).abs() < 1e-4);
+    assert!((p_pos[2] - 1.0).abs() < 1e-4);
+}
+
+#[test]
 fn test_camera_preset_matrices() {
     let mut camera = OrbitCamera::new(
         [0.0, 0.0, 0.0],
@@ -176,4 +187,61 @@ fn test_offscreen_fea_heatmap_png() {
         .expect("Base64 string must decode successfully");
 
     assert_eq!(decoded, png_bytes);
+}
+
+#[test]
+fn test_wireframe_index_extraction() {
+    use mcp_cad_viewer::extract_wireframe_indices;
+
+    // Two adjacent triangles sharing edge (1, 2)
+    let indices = vec![[0, 1, 2], [1, 3, 2]];
+    let lines = extract_wireframe_indices(&indices);
+
+    // Edges should be: (0, 1), (1, 2), (0, 2), (1, 3), (2, 3) -> 5 unique edges, 10 indices
+    assert_eq!(lines.len(), 10);
+
+    // Box has 6 faces with duplicated vertices for flat normals (24 vertices, 12 triangles)
+    // Each face has 4 outer edges + 1 diagonal = 5 edges per face * 6 faces = 30 edges (60 indices)
+    let cube = create_box(1.0, 1.0, 1.0);
+    let cube_lines = extract_wireframe_indices(&cube.indices);
+    assert_eq!(cube_lines.len(), 60);
+}
+
+#[test]
+fn test_camera_zoom_and_clipping() {
+    use mcp_cad_viewer::camera::ProjectionMode;
+
+    let mut camera = OrbitCamera::default();
+    assert_eq!(camera.projection, ProjectionMode::Perspective);
+
+    // Initial distance = 5.0
+    let initial_dist = camera.distance;
+    camera.zoom_by(0.85); // Zoom in
+    assert!(camera.distance < initial_dist);
+    assert!(camera.z_near < camera.distance);
+    assert!(camera.z_far > 1000.0);
+
+    camera.zoom_by(1.5); // Zoom out
+    assert!(camera.distance > initial_dist);
+    assert!(camera.z_near < camera.distance);
+    assert!(camera.z_far >= 10000.0);
+
+    // Orthographic projection matrix computation
+    camera.projection = ProjectionMode::Orthographic;
+    let ortho_proj = camera.proj_matrix();
+    assert_eq!(ortho_proj.nrows(), 4);
+    assert_eq!(ortho_proj.ncols(), 4);
+}
+
+#[test]
+fn test_default_demo_mesh_creation() {
+    let demo = mcp_cad_viewer::create_default_demo_mesh();
+    assert!(!demo.vertices.is_empty(), "Demo mesh must contain vertices");
+    assert!(!demo.indices.is_empty(), "Demo mesh must contain triangles");
+    let aabb = demo.bounding_box();
+    assert!(aabb.max[0] > aabb.min[0]);
+    assert!(aabb.max[1] > aabb.min[1]);
+    assert!(aabb.max[2] > aabb.min[2]);
+    let vol = demo.volume();
+    assert!(vol > 0.0, "Demo mesh must have positive volume");
 }

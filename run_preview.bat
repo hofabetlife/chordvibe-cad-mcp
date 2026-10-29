@@ -1,0 +1,3 @@
+@echo off
+echo Starting MCP-CAD 3D Viewport...
+"%~dp0target\release\mcp-cad-server.exe" --gui --mode sse --port 8080
