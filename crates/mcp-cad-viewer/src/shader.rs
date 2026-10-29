@@ -220,3 +220,157 @@ impl Default for MaterialUniform {
         }
     }
 }
+
+/// WGSL shader source code for Wireframe CAD rendering with customizable line color.
+pub const WIREFRAME_SHADER_WGSL: &str = r#"
+struct CameraUniform {
+    view_proj: mat4x4<f32>,
+    camera_pos: vec4<f32>,
+};
+
+struct WireframeUniform {
+    color: vec4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> camera: CameraUniform;
+
+@group(0) @binding(1)
+var<uniform> wireframe: WireframeUniform;
+
+struct VertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+};
+
+@vertex
+fn vs_main(in: VertexInput) -> @builtin(position) vec4<f32> {
+    return camera.view_proj * vec4<f32>(in.position, 1.0);
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4<f32> {
+    return wireframe.color;
+}
+"#;
+
+/// WGSL shader source code for 2D Viewport UI overlay, buttons, badges, and dividers.
+pub const UI_SHADER_WGSL: &str = r#"
+struct UiVertexInput {
+    @location(0) position: vec2<f32>,
+    @location(1) color: vec4<f32>,
+};
+
+struct UiVertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) color: vec4<f32>,
+};
+
+@vertex
+fn vs_main(in: UiVertexInput) -> UiVertexOutput {
+    var out: UiVertexOutput;
+    out.clip_position = vec4<f32>(in.position, 0.0, 1.0);
+    out.color = in.color;
+    return out;
+}
+
+@fragment
+fn fs_main(in: UiVertexOutput) -> @location(0) vec4<f32> {
+    return in.color;
+}
+"#;
+
+/// Uniform structure for wireframe line color.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct WireframeUniform {
+    /// RGBA line color (default black [0.05, 0.05, 0.05, 1.0]).
+    pub color: [f32; 4],
+}
+
+impl Default for WireframeUniform {
+    fn default() -> Self {
+        Self {
+            color: [0.05, 0.05, 0.05, 1.0],
+        }
+    }
+}
+
+/// Vertex structure for 2D UI overlay elements.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct UiVertex {
+    /// 2D position in Normalized Device Coordinates (NDC) [-1.0, 1.0].
+    pub position: [f32; 2],
+    /// RGBA vertex color.
+    pub color: [f32; 4],
+}
+
+impl UiVertex {
+    /// Vertex buffer layout descriptor for 2D UI pipeline creation.
+    pub const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<UiVertex>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &[
+            wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 0,
+                format: wgpu::VertexFormat::Float32x2,
+            },
+            wgpu::VertexAttribute {
+                offset: 8,
+                shader_location: 1,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+        ],
+    };
+}
+
+/// Returns vector strokes for rendering CAD HUD alphanumeric characters.
+pub fn get_char_strokes(c: char) -> &'static [(f32, f32, f32, f32)] {
+    match c.to_ascii_uppercase() {
+        '-' => &[(0.2, 0.5, 0.8, 0.5)],
+        ':' => &[(0.5, 0.3, 0.5, 0.35), (0.5, 0.65, 0.5, 0.7)],
+        '[' => &[(0.7, 0.1, 0.3, 0.1), (0.3, 0.1, 0.3, 0.9), (0.3, 0.9, 0.7, 0.9)],
+        ']' => &[(0.3, 0.1, 0.7, 0.1), (0.7, 0.1, 0.7, 0.9), (0.7, 0.9, 0.3, 0.9)],
+        '|' => &[(0.5, 0.1, 0.5, 0.9)],
+        '/' => &[(0.2, 0.1, 0.8, 0.9)],
+        '0' => &[(0.2, 0.1, 0.8, 0.1), (0.8, 0.1, 0.8, 0.9), (0.8, 0.9, 0.2, 0.9), (0.2, 0.9, 0.2, 0.1), (0.8, 0.9, 0.2, 0.1)],
+        '1' => &[(0.3, 0.7, 0.5, 0.9), (0.5, 0.9, 0.5, 0.1), (0.2, 0.1, 0.8, 0.1)],
+        '2' => &[(0.2, 0.8, 0.8, 0.8), (0.8, 0.8, 0.8, 0.5), (0.8, 0.5, 0.2, 0.1), (0.2, 0.1, 0.8, 0.1)],
+        '3' => &[(0.2, 0.9, 0.8, 0.9), (0.8, 0.9, 0.5, 0.5), (0.5, 0.5, 0.8, 0.5), (0.8, 0.5, 0.8, 0.1), (0.8, 0.1, 0.2, 0.1)],
+        '4' => &[(0.8, 0.1, 0.8, 0.9), (0.8, 0.9, 0.2, 0.4), (0.2, 0.4, 0.9, 0.4)],
+        '5' => &[(0.8, 0.9, 0.2, 0.9), (0.2, 0.9, 0.2, 0.5), (0.2, 0.5, 0.8, 0.5), (0.8, 0.5, 0.8, 0.1), (0.8, 0.1, 0.2, 0.1)],
+        '6' => &[(0.8, 0.9, 0.2, 0.9), (0.2, 0.9, 0.2, 0.1), (0.2, 0.1, 0.8, 0.1), (0.8, 0.1, 0.8, 0.5), (0.8, 0.5, 0.2, 0.5)],
+        '7' => &[(0.2, 0.9, 0.8, 0.9), (0.8, 0.9, 0.3, 0.1)],
+        '8' => &[(0.2, 0.1, 0.8, 0.1), (0.8, 0.1, 0.8, 0.9), (0.8, 0.9, 0.2, 0.9), (0.2, 0.9, 0.2, 0.1), (0.2, 0.5, 0.8, 0.5)],
+        '9' => &[(0.8, 0.1, 0.8, 0.9), (0.8, 0.9, 0.2, 0.9), (0.2, 0.9, 0.2, 0.5), (0.2, 0.5, 0.8, 0.5)],
+        'A' => &[(0.2, 0.1, 0.5, 0.9), (0.5, 0.9, 0.8, 0.1), (0.3, 0.4, 0.7, 0.4)],
+        'B' => &[(0.2, 0.1, 0.2, 0.9), (0.2, 0.9, 0.7, 0.9), (0.7, 0.9, 0.7, 0.5), (0.7, 0.5, 0.2, 0.5), (0.2, 0.5, 0.8, 0.5), (0.8, 0.5, 0.8, 0.1), (0.8, 0.1, 0.2, 0.1)],
+        'C' => &[(0.8, 0.9, 0.2, 0.9), (0.2, 0.9, 0.2, 0.1), (0.2, 0.1, 0.8, 0.1)],
+        'D' => &[(0.2, 0.1, 0.2, 0.9), (0.2, 0.9, 0.6, 0.9), (0.6, 0.9, 0.8, 0.5), (0.8, 0.5, 0.6, 0.1), (0.6, 0.1, 0.2, 0.1)],
+        'E' => &[(0.8, 0.9, 0.2, 0.9), (0.2, 0.9, 0.2, 0.1), (0.2, 0.1, 0.8, 0.1), (0.2, 0.5, 0.6, 0.5)],
+        'F' => &[(0.8, 0.9, 0.2, 0.9), (0.2, 0.9, 0.2, 0.1), (0.2, 0.5, 0.6, 0.5)],
+        'G' => &[(0.8, 0.9, 0.2, 0.9), (0.2, 0.9, 0.2, 0.1), (0.2, 0.1, 0.8, 0.1), (0.8, 0.1, 0.8, 0.5), (0.8, 0.5, 0.5, 0.5)],
+        'H' => &[(0.2, 0.1, 0.2, 0.9), (0.8, 0.1, 0.8, 0.9), (0.2, 0.5, 0.8, 0.5)],
+        'I' => &[(0.3, 0.9, 0.7, 0.9), (0.5, 0.9, 0.5, 0.1), (0.3, 0.1, 0.7, 0.1)],
+        'J' => &[(0.7, 0.9, 0.7, 0.3), (0.7, 0.3, 0.5, 0.1), (0.5, 0.1, 0.3, 0.1), (0.3, 0.1, 0.3, 0.3)],
+        'K' => &[(0.2, 0.1, 0.2, 0.9), (0.8, 0.9, 0.2, 0.5), (0.2, 0.5, 0.8, 0.1)],
+        'L' => &[(0.2, 0.9, 0.2, 0.1), (0.2, 0.1, 0.8, 0.1)],
+        'M' => &[(0.2, 0.1, 0.2, 0.9), (0.2, 0.9, 0.5, 0.5), (0.5, 0.5, 0.8, 0.9), (0.8, 0.9, 0.8, 0.1)],
+        'N' => &[(0.2, 0.1, 0.2, 0.9), (0.2, 0.9, 0.8, 0.1), (0.8, 0.1, 0.8, 0.9)],
+        'O' => &[(0.2, 0.1, 0.8, 0.1), (0.8, 0.1, 0.8, 0.9), (0.8, 0.9, 0.2, 0.9), (0.2, 0.9, 0.2, 0.1)],
+        'P' => &[(0.2, 0.1, 0.2, 0.9), (0.2, 0.9, 0.8, 0.9), (0.8, 0.9, 0.8, 0.5), (0.8, 0.5, 0.2, 0.5)],
+        'Q' => &[(0.2, 0.1, 0.8, 0.1), (0.8, 0.1, 0.8, 0.9), (0.8, 0.9, 0.2, 0.9), (0.2, 0.9, 0.2, 0.1), (0.5, 0.3, 0.8, 0.05)],
+        'R' => &[(0.2, 0.1, 0.2, 0.9), (0.2, 0.9, 0.8, 0.9), (0.8, 0.9, 0.8, 0.5), (0.8, 0.5, 0.2, 0.5), (0.4, 0.5, 0.8, 0.1)],
+        'S' => &[(0.8, 0.9, 0.2, 0.9), (0.2, 0.9, 0.2, 0.5), (0.2, 0.5, 0.8, 0.5), (0.8, 0.5, 0.8, 0.1), (0.8, 0.1, 0.2, 0.1)],
+        'T' => &[(0.1, 0.9, 0.9, 0.9), (0.5, 0.9, 0.5, 0.1)],
+        'U' => &[(0.2, 0.9, 0.2, 0.2), (0.2, 0.2, 0.4, 0.1), (0.4, 0.1, 0.6, 0.1), (0.6, 0.1, 0.8, 0.2), (0.8, 0.2, 0.8, 0.9)],
+        'V' => &[(0.2, 0.9, 0.5, 0.1), (0.5, 0.1, 0.8, 0.9)],
+        'W' => &[(0.1, 0.9, 0.3, 0.1), (0.3, 0.1, 0.5, 0.6), (0.5, 0.6, 0.7, 0.1), (0.7, 0.1, 0.9, 0.9)],
+        'X' => &[(0.2, 0.1, 0.8, 0.9), (0.2, 0.9, 0.8, 0.1)],
+        'Y' => &[(0.2, 0.9, 0.5, 0.5), (0.8, 0.9, 0.5, 0.5), (0.5, 0.5, 0.5, 0.1)],
+        'Z' => &[(0.2, 0.9, 0.8, 0.9), (0.8, 0.9, 0.2, 0.1), (0.2, 0.1, 0.8, 0.1)],
+        _ => &[],
+    }
+}
