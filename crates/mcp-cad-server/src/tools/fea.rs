@@ -172,6 +172,19 @@ pub fn run_fea_analysis(args: &Value, state: &mut EngineState) -> Result<Value, 
     // 3. Execute analysis
     let report = mcp_cad_fea::analyze_mesh(part_id, &tet_mesh, &part.material, &boundary, None)?;
 
+    // Send FEA heatmap mesh and normalized stresses to interactive GUI
+    let surface_tris = tet_mesh.extract_surface_triangles();
+    let mut vertices = Vec::with_capacity(tet_mesh.nodes.len());
+    for node in &tet_mesh.nodes {
+        vertices.push(Vertex::new(node.position, [0.0, 1.0, 0.0]));
+    }
+    let indices: Vec<[u32; 3]> = surface_tris
+        .into_iter()
+        .map(|[a, b, c]| [a as u32, b as u32, c as u32])
+        .collect();
+    let tet_surface_mesh = TriangleMesh::new(vertices, indices);
+    state.send_gui_fea(&tet_surface_mesh, &report.normalized_stresses);
+
     state.last_fea_reports.insert(part_id.to_string(), report.clone());
     state.last_fea_meshes.insert(part_id.to_string(), tet_mesh);
 

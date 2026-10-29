@@ -13,7 +13,7 @@ use crate::error::ServerError;
 use crate::protocol::{ToolCallResult, ToolDefinition};
 use crate::state::EngineState;
 
-/// Returns the complete registry of all 15 MCP engineering tools with strict input schemas.
+/// Returns the complete registry of all 16 MCP engineering tools with strict input schemas.
 pub fn list_tools() -> Vec<ToolDefinition> {
     vec![
         // 1. create_part
@@ -392,6 +392,20 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "properties": {}
             }),
         },
+        // 16. open_preview_window
+        ToolDefinition {
+            name: "open_preview_window".to_string(),
+            description: "Opens or focuses the interactive native 3D CAD preview window on Windows, optionally displaying a specified part".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "part_id": {
+                        "type": "string",
+                        "description": "Optional ID of the part to focus and render in the preview window"
+                    }
+                }
+            }),
+        },
     ]
 }
 
@@ -462,6 +476,10 @@ pub fn dispatch_tool(
         }
         "get_simulation_metrics_json" => {
             let res = metrics::get_simulation_metrics_json(args, state)?;
+            ToolCallResult::json(&res).map_err(ServerError::Json)
+        }
+        "open_preview_window" => {
+            let res = render::open_preview_window(args, state)?;
             ToolCallResult::json(&res).map_err(ServerError::Json)
         }
         other => Err(ServerError::ToolNotFound(other.to_string())),

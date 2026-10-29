@@ -6,11 +6,13 @@ use parking_lot::RwLock;
 
 use mcp_cad_core::material::MaterialRegistry;
 use mcp_cad_core::part::Part;
+use mcp_cad_core::topology::TriangleMesh;
 use mcp_cad_fea::result::FeaReport;
 use mcp_cad_fea::tetra_mesh::TetrahedralMesh;
 use mcp_cad_physics::simulator::PhysicsWorld;
 use mcp_cad_physics::telemetry::SimulationSummary;
 use mcp_cad_viewer::offscreen::OffscreenRenderer;
+use mcp_cad_viewer::window::{GuiEvent, GuiProxy};
 
 use crate::error::ServerError;
 
@@ -30,6 +32,8 @@ pub struct EngineState {
     pub last_simulation: Option<SimulationSummary>,
     /// Headless WGPU offscreen renderer for capturing PNG snapshots and stress heatmaps.
     pub offscreen_renderer: Arc<OffscreenRenderer>,
+    /// Optional Winit event loop proxy for sending mesh and FEA updates to the interactive GUI window.
+    pub gui_proxy: Option<GuiProxy>,
 }
 
 /// Thread-safe shared handle to the engine state.
@@ -52,6 +56,30 @@ impl EngineState {
             last_fea_meshes: HashMap::new(),
             last_simulation: None,
             offscreen_renderer: renderer,
+            gui_proxy: None,
+        }
+    }
+
+    /// Attaches an interactive GUI event loop proxy to the state.
+    pub fn with_gui_proxy(mut self, proxy: GuiProxy) -> Self {
+        self.gui_proxy = Some(proxy);
+        self
+    }
+
+    /// Sends an updated CAD solid mesh to the interactive GUI preview window if active.
+    pub fn send_gui_mesh(&self, mesh: &TriangleMesh) {
+        if let Some(proxy) = &self.gui_proxy {
+            let _ = proxy.send_event(GuiEvent::UpdateMesh(mesh.clone()));
+        }
+    }
+
+    /// Sends FEA stress colormap data and surface mesh to the interactive GUI preview window if active.
+    pub fn send_gui_fea(&self, mesh: &TriangleMesh, stresses: &[f32]) {
+        if let Some(proxy) = &self.gui_proxy {
+            let _ = proxy.send_event(GuiEvent::UpdateFea {
+                mesh: mesh.clone(),
+                stresses: stresses.to_vec(),
+            });
         }
     }
 

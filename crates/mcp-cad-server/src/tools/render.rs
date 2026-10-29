@@ -59,3 +59,52 @@ pub fn capture_viewport(args: &Value, state: &EngineState) -> Result<Value, Serv
         "height": height
     }))
 }
+
+/// 16. `open_preview_window`: Opens or focuses the interactive native 3D CAD preview window on Windows.
+pub fn open_preview_window(args: &Value, state: &EngineState) -> Result<Value, ServerError> {
+    if let Some(proxy) = &state.gui_proxy {
+        let part_id_opt = args.get("part_id").and_then(|v| v.as_str());
+        if let Some(part_id) = part_id_opt {
+            let part = state
+                .parts
+                .get(part_id)
+                .ok_or_else(|| ServerError::PartNotFound(part_id.to_string()))?;
+            state.send_gui_mesh(&part.mesh);
+            Ok(json!({
+                "status": "opened",
+                "part_id": part_id,
+                "message": format!("Preview window opened showing part '{}'", part.name)
+            }))
+        } else {
+            let mut combined_verts = Vec::new();
+            let mut combined_indices = Vec::new();
+
+            for part in state.parts.values() {
+                if !part.mesh.vertices.is_empty() {
+                    let offset = combined_verts.len() as u32;
+                    combined_verts.extend_from_slice(&part.mesh.vertices);
+                    for tri in &part.mesh.indices {
+                        combined_indices.push([tri[0] + offset, tri[1] + offset, tri[2] + offset]);
+                    }
+                }
+            }
+
+            if !combined_verts.is_empty() {
+                let mesh = TriangleMesh::new(combined_verts, combined_indices);
+                state.send_gui_mesh(&mesh);
+            } else {
+                let _ = proxy.send_event(mcp_cad_viewer::window::GuiEvent::Show);
+            }
+
+            Ok(json!({
+                "status": "opened",
+                "message": "Preview window opened"
+            }))
+        }
+    } else {
+        Ok(json!({
+            "status": "headless",
+            "message": "Server is running in headless mode without --gui. Interactive window not available, use capture_viewport instead."
+        }))
+    }
+}

@@ -148,6 +148,9 @@ pub fn add_feature_primitive(args: &Value, state: &mut EngineState) -> Result<Va
     let feature_id = part.dag.add_feature(op, None);
     part.rebuild()?;
 
+    let mesh_clone = part.mesh.clone();
+    state.send_gui_mesh(&mesh_clone);
+
     Ok(json!({
         "feature_id": feature_id.to_string()
     }))
@@ -214,6 +217,9 @@ pub fn cut_hole(args: &Value, state: &mut EngineState) -> Result<Value, ServerEr
         None,
     );
     part.rebuild()?;
+
+    let mesh_clone = part.mesh.clone();
+    state.send_gui_mesh(&mesh_clone);
 
     Ok(json!({
         "feature_id": feature_id.to_string()
@@ -337,6 +343,9 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
     part.rebuild()?;
 
     let aabb = part.bounding_box();
+    let mesh_clone = part.mesh.clone();
+    state.send_gui_mesh(&mesh_clone);
+
     Ok(json!({
         "status": "updated",
         "updated_bounds": [aabb.min[0], aabb.min[1], aabb.min[2], aabb.max[0], aabb.max[1], aabb.max[2]],

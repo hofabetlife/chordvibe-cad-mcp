@@ -10,4 +10,6 @@ pub use camera::{CameraPreset, CameraUniform, OrbitCamera};
 pub use error::ViewerError;
 pub use offscreen::OffscreenRenderer;
 pub use shader::{CadVertex, FeaVertex, MaterialUniform};
-pub use window::CadWindowViewer;
+pub use window::{
+    create_gui_event_loop, run_gui_app, CadWindowApp, CadWindowViewer, GuiEvent, GuiProxy, RenderMode,
+};

@@ -68,8 +68,8 @@ async fn test_mcp_tools_list() {
         .as_array()
         .expect("tools must be an array");
 
-    // Must declare exactly 15 tools
-    assert_eq!(tools.len(), 15, "Server must expose exactly 15 MCP tools");
+    // Must declare exactly 16 tools
+    assert_eq!(tools.len(), 16, "Server must expose exactly 16 MCP tools");
 
     let expected_tools = [
         "create_part",
@@ -87,6 +87,7 @@ async fn test_mcp_tools_list() {
         "capture_viewport",
         "export_stl",
         "get_simulation_metrics_json",
+        "open_preview_window",
     ];
 
     let mut found_names = HashSet::new();
@@ -591,4 +592,29 @@ async fn test_mcp_sse_endpoints() {
     assert_eq!(sse_response.status(), StatusCode::OK);
     let content_type = sse_response.headers().get("content-type").unwrap();
     assert!(content_type.to_str().unwrap().contains("text/event-stream"));
+}
+
+#[tokio::test]
+async fn test_mcp_open_preview_window() {
+    let state = EngineState::new()
+        .expect("EngineState initialization failed")
+        .into_shared();
+
+    // Call open_preview_window in headless mode
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 100,
+        "method": "tools/call",
+        "params": {
+            "name": "open_preview_window",
+            "arguments": {}
+        }
+    });
+
+    let resp = rpc_call(&state, req).await;
+    assert_eq!(resp["id"], 100);
+    assert!(resp["result"]["content"].is_array());
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let val: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(val["status"], "headless");
 }
