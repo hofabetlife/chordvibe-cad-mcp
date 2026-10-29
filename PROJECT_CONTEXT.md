@@ -75,7 +75,17 @@ graph TD
   - `material`: Структура `Material` ($E$, $\nu$, $\sigma_y$, $\rho$), реестр встроенных материалов (`steel_structural_aisi1020`, `aluminum_6061_t6`, `titanium_grade5_ti6al4v`, `pla_filament_3dprint` и др.) и поддержка кастомных материалов.
   - `topology`: Представление полигональной сетки (`TriangleMesh`: вершины, нормали, индексы граней, UV).
   - `dag`: Параметрическое дерево операций (`FeatureTree`, `FeatureNode`). Поддерживает добавление узлов, модификацию параметров узла и линейный/направленный пересчет геометрии детали.
-  - `primitives`: Твердотельные примитивы (`Box`, `Cylinder`, `Sphere`), экструзия контуров (`ExtrudeSketch`), создание отверстий (`CutHole`).
+  - `primitives`: Твердотельные примитивы:
+    - `create_box(width, height, depth)`: Параллелепипед с центрированием в начале координат.
+    - `create_cylinder(radius, height, segments)`: Цилиндр вдоль оси Z.
+    - `create_sphere(radius, sectors, stacks)`: UV-сфера.
+    - `create_cone(radius_bottom, radius_top, height, segments)`: Конус и усеченный конус.
+    - `create_polygon_prism(sides, height, width_across_flats, radius, chamfer)`: Правильная $N$-гранная призма (шестигранник DIN 934) с плоскими нормалями и торцевыми коническими фасками.
+    - `create_spur_gear(module, teeth, pressure_angle, face_width, bore_radius, keyway_width, keyway_depth, hub_diameter, hub_length)`: Эвольвентная шестерня DIN 867 / ISO 53 со ступицей, отверстием и шпоночным пазом DIN 6885.
+    - `create_revolve(profile, angle_deg, segments)`: Тело вращения из 2D-профиля $[r, z]$ вокруг оси Z.
+    - `create_wheel_rim(...)`: Автомобильный легкосплавный колесный диск (ISO/ETRTO) со ступенчатым профилем обода, закраинами, ступицей, PCD разболтовкой и вентилируемыми спицами.
+    - `create_helical_cutter(...)`: Кинематическая фреза для винтовых канавок и метрической резьбы 60° (ISO 68-1).
+    - `cut_hole(mesh, center, normal, radius, depth, keyway_width, keyway_depth)`: Сверление цилиндрических отверстий с поддержкой шпоночного паза.
   - `csg`: Булевы операции над сетками (`Union`, `Difference`, `Intersection`).
   - `part`: `Part` (идентификатор `part_id`, имя, материал, трансформация, `FeatureTree`, сгенерированный меш, вычисленные масса и тензор инерции).
   - `export`: Генератор стандартного STL формата (бинарный и ASCII).
@@ -207,10 +217,11 @@ graph TD
 | `create_part` | `name: String`, `material: String` | `{ part_id: String }` | Создать деталь |
 | `list_parts` | *(нет)* | `{ parts: Vec<PartSummary> }` | Список всех деталей |
 | `delete_part` | `part_id: String` | `{ status: "deleted" }` | Удалить деталь |
-| `add_feature_primitive` | `part_id: String`, `primitive: Object` | `{ feature_id: String }` | Добавить примитив в DAG |
-| `apply_boolean` | `part_id`, `target_id`, `tool_id`, `op` | `{ feature_id: String }` | Булева операция |
-| `cut_hole` | `part_id`, `position`, `normal`, `radius`, `depth` | `{ feature_id: String }` | Вырезать отверстие |
-| `modify_feature` | `part_id: String`, `feature_id: String`, `params: Object` | `{ status: "updated", bounds: ... }` | Изменить шаг в истории |
+| `add_feature_primitive` | `part_id`, `primitive_type`, `params` | `{ feature_id: String }` | Добавить примитив в DAG (box, cylinder, sphere, cone, polygon_prism, spur_gear, revolve, wheel_rim) |
+| `cut_hole` | `part_id`, `position`, `normal`, `radius`, `depth`, `keyway_width?`, `keyway_depth?` | `{ feature_id: String }` | Вырезать цилиндрическое отверстие с опциональным шпоночным пазом |
+| `cut_helical_groove` | `part_id`, `helix_radius`, `groove_radius`, `pitch`, `height`, `starts`, `profile_type?` | `{ feature_id: String }` | Винтовая канавка или метрическая резьба 60° (ISO 68-1) |
+| `boolean_difference` | `target_part_id`, `tool_part_id` | `{ feature_id: String }` | Булево вычитание сетки инструмента из целевой детали |
+| `modify_feature` | `part_id: String`, `feature_id: String`, `params: Object` | `{ status: "updated", dimensions: ... }` | Изменить шаг в истории |
 | `get_feature_tree` | `part_id: String` | `{ dag: Vec<FeatureNodeView> }` | Получить дерево операций |
 | `create_joint` | `joint_type`, `part_a`, `part_b`, `anchor_a`, `anchor_b`, `axis`, `limits` | `{ joint_id: String }` | Создать сочленение |
 | `set_joint_motor` | `joint_id: String`, `target_velocity: f32`, `max_force: f32` | `{ status: "motor_active" }` | Включить привод |
@@ -218,6 +229,7 @@ graph TD
 | `run_fea_analysis` | `part_id`, `mesh_density`, `fixed_faces`, `applied_forces` | `{ max_von_mises_mpa: f32, yield_mpa: f32, safety_factor: f32, max_disp_mm: f32, status: "PASS"\|"FAIL" }` | МКЭ расчет |
 | `get_fea_heatmap_image` | `part_id: String`, `camera_preset: String` | `{ image_base64: String, legend: Object }` | Снимок тепловой карты |
 | `capture_viewport` | `camera_preset: String`, `width: u32`, `height: u32` | `{ image_base64: String }` | Скриншот 3D сцены |
+| `open_preview_window` | `part_id: Option<String>` | `{ status: "window_opened" }` | Открыть/сфокусировать нативное окно 3D превью |
 | `export_stl` | `part_id: String`, `filepath: String`, `binary: bool` | `{ file_path: String, triangles_count: u32 }` | Экспорт в STL |
 | `get_simulation_metrics_json` | *(нет)* | `{ current_metrics: Object }` | Полный инженерный отчет |
 
@@ -247,3 +259,25 @@ graph TD
    - Маршрутизация JSON-RPC по stdio и HTTP/SSE.
    - Полная связка инструментов со всеми модулями.
    - Верификационные сквозные тесты (End-to-End).
+
+---
+
+## 9. Комплекс инженерной верификации (5 тестовых деталей)
+
+Система верифицирована автономным тестированием с участием субагентов-моделлеров и субагентов-разработчиков:
+
+1. **Сверло (Drill Bit Ø10 мм)**:
+   - Цилиндрический хвостовик $L=30$ мм, рабочая часть $L=60$ мм, 2-заходные спиральные канавки (`cut_helical_groove`, шаг 50 мм, правый винт DIN 338), коническая вершина 118° (`cone`).
+   - Файл: `./output/drill_bit.stl` (19 991 полигон, 40.8 г).
+2. **Шестигранная гайка М10 (Hex Nut DIN 934)**:
+   - Призма под ключ $S=17$ мм, высота $m=8.4$ мм с нативными коническими фасками 30° (`polygon_prism`), центральное отверстие Ø8.5 мм (`cut_hole`) и метрическая резьба 60° по ISO 68-1 с шагом $P=1.5$ мм (`cut_helical_groove` с `profile_type: "metric_60"`).
+   - Файл: `./output/nut_m10.stl` (25 716 полигонов, 15.4 г).
+3. **Прямозубая шестерня (Spur Gear m=2, z=20 DIN 867)**:
+   - Эвольвентный венец $m=2.0$ мм, $z=20$, $\alpha=20^\circ$, $b=15$ мм, ступица Ø22 мм, отверстие под вал Ø12 мм со шпоночным пазом DIN 6885 ($4 \times 1.8$ мм) и 4 облегчающих отверстия Ø3.5 мм (`spur_gear` + `boolean_difference`). FEA-анализ: $FoS = 5.63$ при $F = 500$ Н.
+   - Файл: `./output/spur_gear.stl` (23 172 полигона, 135.4 г).
+4. **Автомобильный легкосплавный диск (Car Wheel Rim R16 5x112)**:
+   - Ступенчатый обод R16 (Ø406 мм, закраины Ø430 мм, ширина 180 мм), вылет ET+35, центральное отверстие Ø66.6 мм, разболтовка PCD 5x112 (5 отверстий Ø14 мм), 5 спиц с окнами охлаждения суппорта (`wheel_rim`).
+   - Файл: `./output/car_rim.stl` (31 629 полигонов, 7.89 кг).
+5. **Электрическая лампочка A60 с цоколем E27 (Lightbulb IEC 60061-1)**:
+   - Стеклянная грушевидная колба A60 (Ø60 мм, высота 80 мм) через 2D-профиль вращения (`revolve`), резьбовой цоколь E27 (Ø27 мм, длина 27 мм, резьба 5 витков с шагом 3.62 мм) и донный контактный пятачок Ø11 мм с изолятором.
+   - Файл: `./output/lightbulb_e27.stl` (72 028 полигонов, 391 г).
