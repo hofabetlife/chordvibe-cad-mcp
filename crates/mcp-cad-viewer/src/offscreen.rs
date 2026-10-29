@@ -1,0 +1,652 @@
+//! Headless offscreen renderer using WGPU for CAD mesh visualization and FEA colormaps.
+
+use std::sync::mpsc::channel;
+use base64::Engine;
+use wgpu::util::DeviceExt;
+use mcp_cad_core::topology::TriangleMesh;
+
+use crate::camera::{CameraPreset, OrbitCamera};
+use crate::error::ViewerError;
+use crate::shader::{
+    CadVertex, FeaVertex, MaterialUniform, CAD_SHADER_WGSL, FEA_HEATMAP_SHADER_WGSL,
+};
+
+/// Default width in pixels for offscreen rendering.
+pub const DEFAULT_RENDER_WIDTH: u32 = 800;
+/// Default height in pixels for offscreen rendering.
+pub const DEFAULT_RENDER_HEIGHT: u32 = 600;
+
+/// Headless WGPU offscreen renderer for capturing PNG snapshots and Base64 images.
+pub struct OffscreenRenderer {
+    /// WGPU Logical Device.
+    pub device: wgpu::Device,
+    /// WGPU Command Queue.
+    pub queue: wgpu::Queue,
+    /// Render pipeline for standard CAD solid shading.
+    cad_pipeline: wgpu::RenderPipeline,
+    /// Bind group layout for CAD uniforms.
+    cad_bind_group_layout: wgpu::BindGroupLayout,
+    /// Render pipeline for FEA stress heatmap rendering.
+    fea_pipeline: wgpu::RenderPipeline,
+    /// Bind group layout for FEA uniforms.
+    fea_bind_group_layout: wgpu::BindGroupLayout,
+}
+
+impl OffscreenRenderer {
+    /// Initializes a new headless OffscreenRenderer instance.
+    ///
+    /// Discovers an available GPU adapter (DirectX 12, Vulkan, or software WARP rasterizer)
+    /// without requiring an OS display window.
+    pub fn new() -> Result<Self, ViewerError> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..Default::default()
+        });
+
+        let adapter = pollster::block_on(async {
+            // First attempt: High performance discrete GPU
+            if let Some(adapter) = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    force_fallback_adapter: false,
+                    compatible_surface: None,
+                })
+                .await
+            {
+                return Some(adapter);
+            }
+
+            // Second attempt: Default adapter
+            if let Some(adapter) = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::None,
+                    force_fallback_adapter: false,
+                    compatible_surface: None,
+                })
+                .await
+            {
+                return Some(adapter);
+            }
+
+            // Third attempt: Fallback software rasterizer (e.g. WARP on Windows)
+            instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::None,
+                    force_fallback_adapter: true,
+                    compatible_surface: None,
+                })
+                .await
+        })
+        .ok_or(ViewerError::NoSuitableAdapter)?;
+
+        let (device, queue) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("MCP-CAD Headless Device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                memory_hints: wgpu::MemoryHints::Performance,
+            },
+            None,
+        ))?;
+
+        // 1. Build CAD Pipeline
+        let cad_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("CAD Shader Module"),
+            source: wgpu::ShaderSource::Wgsl(CAD_SHADER_WGSL.into()),
+        });
+
+        let cad_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("CAD Bind Group Layout"),
+                entries: &[
+                    // Camera uniform
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // Material uniform
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let cad_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("CAD Pipeline Layout"),
+            bind_group_layouts: &[&cad_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let cad_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("CAD Render Pipeline"),
+            layout: Some(&cad_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &cad_shader,
+                entry_point: "vs_main",
+                buffers: &[CadVertex::LAYOUT],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &cad_shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None, // Two-sided rendering for robust CAD viewing
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth24Plus,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // 2. Build FEA Heatmap Pipeline
+        let fea_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("FEA Heatmap Shader Module"),
+            source: wgpu::ShaderSource::Wgsl(FEA_HEATMAP_SHADER_WGSL.into()),
+        });
+
+        let fea_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("FEA Bind Group Layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+
+        let fea_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("FEA Pipeline Layout"),
+            bind_group_layouts: &[&fea_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let fea_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("FEA Render Pipeline"),
+            layout: Some(&fea_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &fea_shader,
+                entry_point: "vs_main",
+                buffers: &[FeaVertex::LAYOUT],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &fea_shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth24Plus,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        Ok(Self {
+            device,
+            queue,
+            cad_pipeline,
+            cad_bind_group_layout,
+            fea_pipeline,
+            fea_bind_group_layout,
+        })
+    }
+
+    /// Renders a triangular solid CAD mesh into PNG encoded bytes.
+    pub fn render_mesh_png(
+        &self,
+        mesh: &TriangleMesh,
+        camera_preset: CameraPreset,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, ViewerError> {
+        self.render_mesh_png_with_material(mesh, camera_preset, MaterialUniform::default(), width, height)
+    }
+
+    /// Renders a triangular solid CAD mesh with a custom material uniform into PNG encoded bytes.
+    pub fn render_mesh_png_with_material(
+        &self,
+        mesh: &TriangleMesh,
+        camera_preset: CameraPreset,
+        material: MaterialUniform,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, ViewerError> {
+        if width == 0 || height == 0 {
+            return Err(ViewerError::InvalidDimensions { width, height });
+        }
+        if mesh.vertices.is_empty() || mesh.indices.is_empty() {
+            return Err(ViewerError::EmptyMesh);
+        }
+
+        // Camera setup
+        let bbox = mesh.bounding_box();
+        let min_f32 = [bbox.min[0] as f32, bbox.min[1] as f32, bbox.min[2] as f32];
+        let max_f32 = [bbox.max[0] as f32, bbox.max[1] as f32, bbox.max[2] as f32];
+        let mut camera = OrbitCamera::from_preset(
+            camera_preset,
+            [0.0, 0.0, 0.0],
+            5.0,
+            width as f32 / height as f32,
+        );
+        camera.fit_bounding_box(min_f32, max_f32);
+        let camera_uniform = camera.build_uniform();
+
+        // GPU Buffers
+        let cad_vertices: Vec<CadVertex> = mesh
+            .vertices
+            .iter()
+            .map(|v| CadVertex {
+                position: [v.position[0] as f32, v.position[1] as f32, v.position[2] as f32],
+                normal: [v.normal[0] as f32, v.normal[1] as f32, v.normal[2] as f32],
+            })
+            .collect();
+
+        let flat_indices: Vec<u32> = mesh
+            .indices
+            .iter()
+            .flat_map(|tri| tri.iter().copied())
+            .collect();
+
+        let vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("CAD Vertex Buffer"),
+                contents: bytemuck::cast_slice(&cad_vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+
+        let index_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("CAD Index Buffer"),
+                contents: bytemuck::cast_slice(&flat_indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+
+        let camera_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("CAD Camera Uniform Buffer"),
+                contents: bytemuck::bytes_of(&camera_uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        let material_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("CAD Material Uniform Buffer"),
+                contents: bytemuck::bytes_of(&material),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("CAD Draw Bind Group"),
+            layout: &self.cad_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: material_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        self.execute_render_pass(
+            &self.cad_pipeline,
+            &bind_group,
+            &vertex_buffer,
+            &index_buffer,
+            flat_indices.len() as u32,
+            width,
+            height,
+        )
+    }
+
+    /// Renders a triangular mesh colored by normalized FEA stress scalars [0.0, 1.0] into PNG bytes.
+    pub fn render_fea_heatmap_png(
+        &self,
+        mesh: &TriangleMesh,
+        stress_scalars: &[f32],
+        camera_preset: CameraPreset,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, ViewerError> {
+        if width == 0 || height == 0 {
+            return Err(ViewerError::InvalidDimensions { width, height });
+        }
+        if mesh.vertices.is_empty() || mesh.indices.is_empty() {
+            return Err(ViewerError::EmptyMesh);
+        }
+        if stress_scalars.len() != mesh.vertices.len() {
+            return Err(ViewerError::StressScalarMismatch {
+                expected: mesh.vertices.len(),
+                actual: stress_scalars.len(),
+            });
+        }
+
+        // Camera setup
+        let bbox = mesh.bounding_box();
+        let min_f32 = [bbox.min[0] as f32, bbox.min[1] as f32, bbox.min[2] as f32];
+        let max_f32 = [bbox.max[0] as f32, bbox.max[1] as f32, bbox.max[2] as f32];
+        let mut camera = OrbitCamera::from_preset(
+            camera_preset,
+            [0.0, 0.0, 0.0],
+            5.0,
+            width as f32 / height as f32,
+        );
+        camera.fit_bounding_box(min_f32, max_f32);
+        let camera_uniform = camera.build_uniform();
+
+        // GPU Buffers
+        let fea_vertices: Vec<FeaVertex> = mesh
+            .vertices
+            .iter()
+            .zip(stress_scalars.iter())
+            .map(|(v, &s)| FeaVertex {
+                position: [v.position[0] as f32, v.position[1] as f32, v.position[2] as f32],
+                normal: [v.normal[0] as f32, v.normal[1] as f32, v.normal[2] as f32],
+                scalar: s.clamp(0.0, 1.0),
+            })
+            .collect();
+
+        let flat_indices: Vec<u32> = mesh
+            .indices
+            .iter()
+            .flat_map(|tri| tri.iter().copied())
+            .collect();
+
+        let vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("FEA Vertex Buffer"),
+                contents: bytemuck::cast_slice(&fea_vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+
+        let index_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("FEA Index Buffer"),
+                contents: bytemuck::cast_slice(&flat_indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+
+        let camera_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("FEA Camera Uniform Buffer"),
+                contents: bytemuck::bytes_of(&camera_uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("FEA Draw Bind Group"),
+            layout: &self.fea_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            }],
+        });
+
+        self.execute_render_pass(
+            &self.fea_pipeline,
+            &bind_group,
+            &vertex_buffer,
+            &index_buffer,
+            flat_indices.len() as u32,
+            width,
+            height,
+        )
+    }
+
+    /// Internal execution of the render pass and GPU-to-CPU texture readback.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_render_pass(
+        &self,
+        pipeline: &wgpu::RenderPipeline,
+        bind_group: &wgpu::BindGroup,
+        vertex_buffer: &wgpu::Buffer,
+        index_buffer: &wgpu::Buffer,
+        index_count: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, ViewerError> {
+        let texture_desc = wgpu::TextureDescriptor {
+            label: Some("Offscreen Color Texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        };
+        let color_texture = self.device.create_texture(&texture_desc);
+        let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let depth_desc = wgpu::TextureDescriptor {
+            label: Some("Offscreen Depth Texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth24Plus,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        };
+        let depth_texture = self.device.create_texture(&depth_desc);
+        let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let unpadded_bytes_per_row = width * 4;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT; // 256 bytes
+        let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
+        let buffer_size = (padded_bytes_per_row * height) as u64;
+
+        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Offscreen Readback Buffer"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Offscreen Render Encoder"),
+            });
+
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Offscreen Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // Sleek dark CAD studio background: [0.15, 0.17, 0.20]
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.15,
+                            g: 0.17,
+                            b: 0.20,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            render_pass.set_pipeline(pipeline);
+            render_pass.set_bind_group(0, bind_group, &[]);
+            render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+            render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            render_pass.draw_indexed(0..index_count, 0, 0..1);
+        }
+
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &color_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &output_buffer,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Map buffer to CPU memory
+        let buffer_slice = output_buffer.slice(..);
+        let (sender, receiver) = channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+
+        self.device.poll(wgpu::Maintain::Wait);
+
+        receiver
+            .recv()
+            .map_err(|_| ViewerError::Internal("Receiver channel disconnected".to_string()))?
+            .map_err(ViewerError::BufferAsyncError)?;
+
+        let padded_data = buffer_slice.get_mapped_range();
+        let mut unpadded = Vec::with_capacity((width * height * 4) as usize);
+
+        for row in 0..height {
+            let start = (row * padded_bytes_per_row) as usize;
+            let end = start + (width * 4) as usize;
+            unpadded.extend_from_slice(&padded_data[start..end]);
+        }
+
+        drop(padded_data);
+        output_buffer.unmap();
+
+        // Encode to PNG bytes
+        let img = image::RgbaImage::from_raw(width, height, unpadded).ok_or_else(|| {
+            ViewerError::Internal("Failed to construct RgbaImage from raw frame bytes".to_string())
+        })?;
+
+        let mut png_bytes = Vec::new();
+        let mut cursor = std::io::Cursor::new(&mut png_bytes);
+        img.write_to(&mut cursor, image::ImageFormat::Png)?;
+
+        Ok(png_bytes)
+    }
+
+    /// Converts raw PNG bytes to Base64 string for direct delivery over MCP protocol.
+    pub fn render_to_base64(&self, png_bytes: &[u8]) -> Result<String, ViewerError> {
+        Ok(base64::prelude::BASE64_STANDARD.encode(png_bytes))
+    }
+
+    /// Helper to render CAD mesh directly to Base64 string.
+    pub fn render_mesh_base64(
+        &self,
+        mesh: &TriangleMesh,
+        camera_preset: CameraPreset,
+        width: u32,
+        height: u32,
+    ) -> Result<String, ViewerError> {
+        let png = self.render_mesh_png(mesh, camera_preset, width, height)?;
+        self.render_to_base64(&png)
+    }
+
+    /// Helper to render FEA heatmap directly to Base64 string.
+    pub fn render_fea_heatmap_base64(
+        &self,
+        mesh: &TriangleMesh,
+        stress_scalars: &[f32],
+        camera_preset: CameraPreset,
+        width: u32,
+        height: u32,
+    ) -> Result<String, ViewerError> {
+        let png = self.render_fea_heatmap_png(mesh, stress_scalars, camera_preset, width, height)?;
+        self.render_to_base64(&png)
+    }
+}

@@ -1,0 +1,20 @@
+[package]
+name = "mcp-cad-viewer"
+version = "0.1.0"
+edition = "2021"
+description = "WGPU-based 3D viewport and offscreen headless renderer for MCP-CAD engine"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+mcp-cad-core = { path = "../mcp-cad-core" }
+mcp-cad-fea = { path = "../mcp-cad-fea" }
+wgpu = "22.0"
+winit = "0.30"
+bytemuck = { version = "1.16", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+nalgebra = "0.33"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+base64 = "0.22"
+pollster = "0.3"
