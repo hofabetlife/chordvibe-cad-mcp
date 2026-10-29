@@ -235,7 +235,7 @@
 | Параметр | Тип | Обязательный | Описание |
 |---|---|---|---|
 | `part_id` | `string` | Да | Идентификатор целевой детали |
-| `primitive_type` | `string` | Да | Тип примитива: `"box"`, `"cylinder"`, `"sphere"`, `"cone"`, `"polygon_prism"` |
+| `primitive_type` | `string` | Да | Тип примитива: `"box"`, `"cylinder"`, `"sphere"`, `"cone"`, `"polygon_prism"`, `"spur_gear"` |
 | `params` | `object` | Да | Геометрические размеры в метрах (см. таблицу ниже) |
 
 **Спецификация параметров примитивов**:
@@ -243,7 +243,8 @@
 - `"cylinder"`: `{"radius": number, "height": number, "segments"?: integer}`
 - `"sphere"`: `{"radius": number, "sectors"?: integer, "stacks"?: integer}`
 - `"cone"`: `{"radius_bottom": number, "radius_top"?: number, "height": number, "segments"?: integer}`
-- `"polygon_prism"`: `{"height": number, "sides"?: integer, "width_across_flats"?: number, "radius"?: number, "chamfer"?: number}` (правильная призма для гаек/болтов с коническими торцевыми фасками 30° по DIN 934)`
+- `"polygon_prism"`: `{"height": number, "sides"?: integer, "width_across_flats"?: number, "radius"?: number, "chamfer"?: number}` (правильная призма для гаек/болтов с коническими торцевыми фасками 30° по DIN 934)
+- `"spur_gear"`: `{"module": number, "teeth": integer, "face_width": number, "pressure_angle_deg"?: number, "bore_radius"?: number, "bore_diameter"?: number, "keyway_width"?: number, "keyway_depth"?: number, "hub_diameter"?: number, "hub_length"?: number}` (прямозубая цилиндрическая шестерня с точным эвольвентным профилем по DIN 867 / ISO 53, опциональной ступицей и шпоночным пазом DIN 6885)
 - *Общие опциональные параметры*: `"position"?: [x, y, z]`, `"rotation_deg"?: [rx, ry, rz]`
 
 #### Пример запроса
@@ -287,7 +288,7 @@
 
 ### 5. `cut_hole`
 
-Вырезает сквозное или глухое цилиндрическое отверстие вдоль заданного нормального вектора.
+Вырезает сквозное или глухое цилиндрическое отверстие вдоль заданного нормального вектора, с опциональным шпоночным пазом по стандарту DIN 6885.
 
 #### Входные параметры
 | Параметр | Тип | Обязательный | Описание |
@@ -297,6 +298,8 @@
 | `normal` | `[number, number, number]` | Да | Единичный вектор направления оси отверстия `[nx, ny, nz]` |
 | `radius` | `number` | Да | Радиус отверстия в метрах |
 | `depth` | `number` | Да | Глубина выреза в метрах |
+| `keyway_width` | `number` | Нет | Ширина шпоночного паза DIN 6885 в метрах |
+| `keyway_depth` | `number` | Нет | Глубина шпоночного паза DIN 6885 в стенку в метрах |
 
 #### Пример запроса
 ```json

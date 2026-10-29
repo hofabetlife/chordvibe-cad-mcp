@@ -232,9 +232,62 @@ pub fn add_feature_primitive(args: &Value, state: &mut EngineState) -> Result<Va
                 rotation_deg,
             }
         }
+        "spur_gear" => {
+            let module = params
+                .get("module")
+                .or_else(|| params.get("m"))
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| ServerError::InvalidArgument("Spur gear requires 'module'".to_string()))?;
+            let teeth = params
+                .get("teeth")
+                .or_else(|| params.get("z"))
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| ServerError::InvalidArgument("Spur gear requires 'teeth'".to_string()))? as usize;
+            let pressure_angle_deg = params
+                .get("pressure_angle_deg")
+                .or_else(|| params.get("pressure_angle"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(20.0);
+            let face_width = params
+                .get("face_width")
+                .or_else(|| params.get("width"))
+                .or_else(|| params.get("b"))
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| ServerError::InvalidArgument("Spur gear requires 'face_width'".to_string()))?;
+            let bore_radius = params
+                .get("bore_radius")
+                .and_then(|v| v.as_f64())
+                .or_else(|| params.get("bore_diameter").and_then(|v| v.as_f64()).map(|d| d * 0.5));
+            let keyway_width = params
+                .get("keyway_width")
+                .and_then(|v| v.as_f64());
+            let keyway_depth = params
+                .get("keyway_depth")
+                .and_then(|v| v.as_f64());
+            let hub_diameter = params
+                .get("hub_diameter")
+                .and_then(|v| v.as_f64());
+            let hub_length = params
+                .get("hub_length")
+                .and_then(|v| v.as_f64());
+
+            FeatureOp::AddSpurGear {
+                module,
+                teeth,
+                pressure_angle_deg,
+                face_width,
+                bore_radius,
+                keyway_width,
+                keyway_depth,
+                hub_diameter,
+                hub_length,
+                position,
+                rotation_deg,
+            }
+        }
         other => {
             return Err(ServerError::InvalidArgument(format!(
-                "Unknown primitive_type '{}'. Supported: box, cylinder, sphere, cone, polygon_prism",
+                "Unknown primitive_type '{}'. Supported: box, cylinder, sphere, cone, polygon_prism, spur_gear",
                 other
             )));
         }
@@ -302,6 +355,13 @@ pub fn cut_hole(args: &Value, state: &mut EngineState) -> Result<Value, ServerEr
         .and_then(|v| v.as_f64())
         .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'depth'".to_string()))?;
 
+    let keyway_width = args
+        .get("keyway_width")
+        .and_then(|v| v.as_f64());
+    let keyway_depth = args
+        .get("keyway_depth")
+        .and_then(|v| v.as_f64());
+
     let part = state
         .parts
         .get_mut(part_id)
@@ -313,6 +373,8 @@ pub fn cut_hole(args: &Value, state: &mut EngineState) -> Result<Value, ServerEr
             normal,
             radius,
             depth,
+            keyway_width,
+            keyway_depth,
         },
         None,
     );
@@ -451,6 +513,49 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
                 rotation_deg: rot,
             }
         }
+        FeatureOp::AddSpurGear {
+            module,
+            teeth,
+            pressure_angle_deg,
+            face_width,
+            bore_radius,
+            keyway_width,
+            keyway_depth,
+            hub_diameter,
+            hub_length,
+            position,
+            rotation_deg,
+        } => {
+            let new_m = params.get("module").or_else(|| params.get("m")).and_then(|v| v.as_f64()).unwrap_or(*module);
+            let new_z = params.get("teeth").or_else(|| params.get("z")).and_then(|v| v.as_u64()).map(|z| z as usize).unwrap_or(*teeth);
+            let new_pa = params.get("pressure_angle_deg").or_else(|| params.get("pressure_angle")).and_then(|v| v.as_f64()).unwrap_or(*pressure_angle_deg);
+            let new_fw = params.get("face_width").or_else(|| params.get("width")).or_else(|| params.get("b")).and_then(|v| v.as_f64()).unwrap_or(*face_width);
+            let new_bore = params.get("bore_radius").and_then(|v| v.as_f64())
+                .or_else(|| params.get("bore_diameter").and_then(|v| v.as_f64()).map(|d| d * 0.5))
+                .or(*bore_radius);
+            let new_kw = params.get("keyway_width").and_then(|v| v.as_f64()).or(*keyway_width);
+            let new_kd = params.get("keyway_depth").and_then(|v| v.as_f64()).or(*keyway_depth);
+            let new_hd = params.get("hub_diameter").and_then(|v| v.as_f64()).or(*hub_diameter);
+            let new_hl = params.get("hub_length").and_then(|v| v.as_f64()).or(*hub_length);
+            let pos = parse_vec3(params, "position").or(*position);
+            let rot = parse_vec3(params, "rotation_deg")
+                .or_else(|| parse_vec3(params, "rotation_rpy_deg"))
+                .or(*rotation_deg);
+
+            FeatureOp::AddSpurGear {
+                module: new_m,
+                teeth: new_z,
+                pressure_angle_deg: new_pa,
+                face_width: new_fw,
+                bore_radius: new_bore,
+                keyway_width: new_kw,
+                keyway_depth: new_kd,
+                hub_diameter: new_hd,
+                hub_length: new_hl,
+                position: pos,
+                rotation_deg: rot,
+            }
+        }
         FeatureOp::CutHelicalGroove { helix_radius, groove_radius, pitch, height, start_z, starts, is_right_hand, profile_type } => {
             let hr = params.get("helix_radius").and_then(|v| v.as_f64()).unwrap_or(*helix_radius);
             let gr = params.get("groove_radius").and_then(|v| v.as_f64()).unwrap_or(*groove_radius);
@@ -476,7 +581,7 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
                 tool_mesh: tool_mesh.clone(),
             }
         }
-        FeatureOp::CutHole { center, normal, radius, depth } => {
+        FeatureOp::CutHole { center, normal, radius, depth, keyway_width, keyway_depth } => {
             let new_center = if let Some(arr) = params.get("position").or_else(|| params.get("center")).and_then(|v| v.as_array()) {
                 if arr.len() == 3 {
                     [arr[0].as_f64().unwrap_or(center[0]), arr[1].as_f64().unwrap_or(center[1]), arr[2].as_f64().unwrap_or(center[2])]
@@ -497,11 +602,15 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
             };
             let new_r = params.get("radius").and_then(|v| v.as_f64()).unwrap_or(*radius);
             let new_d = params.get("depth").and_then(|v| v.as_f64()).unwrap_or(*depth);
+            let new_kw = params.get("keyway_width").and_then(|v| v.as_f64()).or(*keyway_width);
+            let new_kd = params.get("keyway_depth").and_then(|v| v.as_f64()).or(*keyway_depth);
             FeatureOp::CutHole {
                 center: new_center,
                 normal: new_normal,
                 radius: new_r,
                 depth: new_d,
+                keyway_width: new_kw,
+                keyway_depth: new_kd,
             }
         }
         FeatureOp::Transform { translation, rotation_deg, scale } => {

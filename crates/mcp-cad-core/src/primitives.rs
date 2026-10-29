@@ -1,8 +1,8 @@
 //! 3D solid primitive generators: Box, Cylinder, Sphere, and CutHole.
 
 use std::f64::consts::PI;
-use nalgebra::{Rotation3, Vector3};
-use crate::csg::{csg_difference, csg_intersection};
+use nalgebra::{Matrix3, Rotation3, Vector3};
+use crate::csg::{csg_difference, csg_intersection, csg_union};
 use crate::topology::{TriangleMesh, Vertex};
 
 /// Generates a solid 3D box (cuboid) centered at the origin.
@@ -254,6 +254,7 @@ pub fn create_cylinder_oriented(
 
 /// Cuts a cylindrical hole in `mesh` at the specified `center` location,
 /// oriented along `normal` with radius `radius` and depth `depth`.
+/// Optionally cuts a DIN 6885 keyway slot of specified `keyway_width` and `keyway_depth`.
 ///
 /// Uses Boolean difference (CSG subtraction).
 pub fn cut_hole(
@@ -262,6 +263,8 @@ pub fn cut_hole(
     normal: [f64; 3],
     radius: f64,
     depth: f64,
+    keyway_width: Option<f64>,
+    keyway_depth: Option<f64>,
 ) -> TriangleMesh {
     let norm_v = Vector3::new(normal[0], normal[1], normal[2]);
     let norm_len = norm_v.norm();
@@ -283,7 +286,7 @@ pub fn cut_hole(
         + drill_dir * (depth * 0.5)
         + unit_norm * margin;
 
-    let tool = create_cylinder_oriented(
+    let cyl_tool = create_cylinder_oriented(
         [tool_center.x, tool_center.y, tool_center.z],
         [drill_dir.x, drill_dir.y, drill_dir.z],
         radius,
@@ -291,7 +294,42 @@ pub fn cut_hole(
         32,
     );
 
-    csg_difference(mesh, &tool)
+    let final_tool = if let (Some(kw), Some(kd)) = (keyway_width, keyway_depth) {
+        if kw > 1e-6 && kd > 1e-6 {
+            // Find orthonormal basis (u, v, w) where w = drill_dir
+            let w = drill_dir;
+            let up = if w.y.abs() < 0.9 {
+                Vector3::new(0.0, 1.0, 0.0)
+            } else {
+                Vector3::new(0.0, 0.0, 1.0)
+            };
+            let u = w.cross(&up).normalize();
+            let v = w.cross(&u).normalize();
+
+            // DIN 6885 keyway slot:
+            // width kw along u, radial depth (radius + kd) along v, length tool_height along w.
+            let mut box_mesh = create_box(kw, radius + kd, tool_height);
+            let rot_mat = Matrix3::from_columns(&[u, v, w]);
+            let box_center = tool_center + v * ((radius + kd) * 0.5);
+
+            for vert in &mut box_mesh.vertices {
+                let p = Vector3::new(vert.position[0], vert.position[1], vert.position[2]);
+                let n = Vector3::new(vert.normal[0], vert.normal[1], vert.normal[2]);
+                let world_p = box_center + rot_mat * p;
+                let world_n = rot_mat * n;
+                vert.position = [world_p.x, world_p.y, world_p.z];
+                vert.normal = [world_n.x, world_n.y, world_n.z];
+            }
+
+            csg_union(&cyl_tool, &box_mesh)
+        } else {
+            cyl_tool
+        }
+    } else {
+        cyl_tool
+    };
+
+    csg_difference(mesh, &final_tool)
 }
 
 /// Generates a solid 3D cone or truncated cone (frustum) centered at the origin along the Z axis.
@@ -899,6 +937,259 @@ pub fn create_helical_cutter(
     TriangleMesh::new(all_vertices, all_indices)
 }
 
+/// Generates a solid 3D parametric spur gear centered at origin along the Z axis.
+///
+/// Features:
+/// - True involute flank profile according to DIN 867 / ISO 53 standards.
+/// - Module `module` ($m$), tooth count `teeth` ($z$).
+/// - Pitch diameter $d = m \cdot z$, pitch radius $r = m \cdot z / 2$.
+/// - Tip (addendum) radius $r_a = r + m$, root (dedendum) radius $r_f = r - 1.25 \cdot m$.
+/// - Base radius $r_b = r \cdot \cos(\alpha)$ with pressure angle $\alpha$ (default 20 deg).
+/// - Radial dedendum flank connecting smoothly below base circle if $r_f < r_b$.
+/// - Face width `face_width` ($b$) along Z axis.
+/// - Optional cylindrical mounting hub (`hub_diameter`, `hub_length`).
+/// - Optional central shaft bore hole (`bore_radius`).
+/// - Optional DIN 6885 parallel keyway slot (`keyway_width`, `keyway_depth`).
+#[allow(clippy::too_many_arguments)]
+pub fn create_spur_gear(
+    module: f64,
+    teeth: usize,
+    pressure_angle_deg: f64,
+    face_width: f64,
+    bore_radius: Option<f64>,
+    keyway_width: Option<f64>,
+    keyway_depth: Option<f64>,
+    hub_diameter: Option<f64>,
+    hub_length: Option<f64>,
+) -> TriangleMesh {
+    if module <= 1e-9 || teeth < 3 || face_width <= 1e-9 {
+        return TriangleMesh::empty();
+    }
+
+    let alpha_deg = if pressure_angle_deg > 0.0 && pressure_angle_deg < 89.0 {
+        pressure_angle_deg
+    } else {
+        20.0
+    };
+    let alpha = alpha_deg * PI / 180.0;
+
+    let z = teeth as f64;
+    let r = module * z * 0.5;
+    let r_a = r + module;
+    let r_f = r - 1.25 * module;
+    let r_b = r * alpha.cos();
+    let h2 = face_width * 0.5;
+
+    // Pitch circle tooth thickness half-angle: psi = pi / (2 * z)
+    let psi = PI / (2.0 * z);
+    // Involute function at pressure angle alpha: inv(alpha) = tan(alpha) - alpha
+    let inv_alpha = alpha.tan() - alpha;
+
+    // Angle theta from tooth centerline at radius R >= r_b
+    let theta_at_r = |radius: f64| -> f64 {
+        if radius < r_b {
+            psi + inv_alpha
+        } else {
+            let cos_ar = (r_b / radius).clamp(0.0, 1.0);
+            let alpha_r = cos_ar.acos();
+            let inv_alpha_r = alpha_r.tan() - alpha_r;
+            (psi + inv_alpha - inv_alpha_r).max(1e-6)
+        }
+    };
+
+    let theta_base = psi + inv_alpha;
+    let theta_root = if r_f < r_b { theta_base } else { theta_at_r(r_f) };
+
+    // 1. Construct 2D contour points in CCW order around origin
+    let mut poly_2d: Vec<[f64; 2]> = Vec::new();
+    let n_flank_steps = 4;
+    let r_inv_start = r_b.max(r_f);
+
+    for k in 0..teeth {
+        let phi_k = (k as f64) * 2.0 * PI / z;
+
+        // 1a. Leading flank root point
+        let phi_root_lead = phi_k - theta_root;
+        poly_2d.push([r_f * phi_root_lead.cos(), r_f * phi_root_lead.sin()]);
+
+        // 1b. If r_f < r_b, radial line from r_f to r_b on leading flank
+        if r_f < r_b - 1e-9 {
+            let phi_base_lead = phi_k - theta_base;
+            poly_2d.push([r_b * phi_base_lead.cos(), r_b * phi_base_lead.sin()]);
+        }
+
+        // 1c. Involute points on leading flank from r_inv_start up to r_a
+        for s_idx in 1..=n_flank_steps {
+            let s = (s_idx as f64) / (n_flank_steps as f64);
+            let r_curr = r_inv_start + s * (r_a - r_inv_start);
+            let th = theta_at_r(r_curr);
+            let phi = phi_k - th;
+            poly_2d.push([r_curr * phi.cos(), r_curr * phi.sin()]);
+        }
+
+        // 1d. Tip crest center point
+        poly_2d.push([r_a * phi_k.cos(), r_a * phi_k.sin()]);
+
+        // 1e. Involute points on trailing flank from r_a down to r_inv_start
+        for s_idx in 0..=n_flank_steps {
+            let s = 1.0 - (s_idx as f64) / (n_flank_steps as f64);
+            let r_curr = r_inv_start + s * (r_a - r_inv_start);
+            let th = theta_at_r(r_curr);
+            let phi = phi_k + th;
+            poly_2d.push([r_curr * phi.cos(), r_curr * phi.sin()]);
+        }
+
+        // 1f. If r_f < r_b, radial line from r_b down to r_f on trailing flank
+        if r_f < r_b - 1e-9 {
+            let phi_base_trail = phi_k + theta_base;
+            poly_2d.push([r_f * phi_base_trail.cos(), r_f * phi_base_trail.sin()]);
+        }
+
+        // 1g. Root trough point between tooth k and tooth k+1
+        let phi_trough = phi_k + PI / z;
+        poly_2d.push([r_f * phi_trough.cos(), r_f * phi_trough.sin()]);
+    }
+
+    // Filter duplicate consecutive points if any
+    let mut cleaned_poly: Vec<[f64; 2]> = Vec::with_capacity(poly_2d.len());
+    for p in poly_2d {
+        if let Some(last) = cleaned_poly.last() {
+            let d2 = (p[0] - last[0]).powi(2) + (p[1] - last[1]).powi(2);
+            if d2 > 1e-14 {
+                cleaned_poly.push(p);
+            }
+        } else {
+            cleaned_poly.push(p);
+        }
+    }
+    if cleaned_poly.len() > 2 {
+        let first = cleaned_poly[0];
+        let last = *cleaned_poly.last().unwrap();
+        let d2 = (first[0] - last[0]).powi(2) + (first[1] - last[1]).powi(2);
+        if d2 <= 1e-14 {
+            cleaned_poly.pop();
+        }
+    }
+
+    let m_pts = cleaned_poly.len();
+    if m_pts < 3 {
+        return TriangleMesh::empty();
+    }
+
+    // 2. Extrude the star-shaped 2D polygon into a watertight 3D solid mesh
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+
+    // 2a. Top cap at z = +h2 (normal = [0, 0, 1])
+    let top_center_idx = vertices.len() as u32;
+    vertices.push(Vertex::new([0.0, 0.0, h2], [0.0, 0.0, 1.0]));
+
+    let top_rim_start = vertices.len() as u32;
+    for p in &cleaned_poly {
+        vertices.push(Vertex::new([p[0], p[1], h2], [0.0, 0.0, 1.0]));
+    }
+    for i in 0..m_pts {
+        let next = (i + 1) % m_pts;
+        indices.push([
+            top_center_idx,
+            top_rim_start + (i as u32),
+            top_rim_start + (next as u32),
+        ]);
+    }
+
+    // 2b. Bottom cap at z = -h2 (normal = [0, 0, -1])
+    let bot_center_idx = vertices.len() as u32;
+    vertices.push(Vertex::new([0.0, 0.0, -h2], [0.0, 0.0, -1.0]));
+
+    let bot_rim_start = vertices.len() as u32;
+    for p in &cleaned_poly {
+        vertices.push(Vertex::new([p[0], p[1], -h2], [0.0, 0.0, -1.0]));
+    }
+    for i in 0..m_pts {
+        let next = (i + 1) % m_pts;
+        indices.push([
+            bot_center_idx,
+            bot_rim_start + (next as u32),
+            bot_rim_start + (i as u32),
+        ]);
+    }
+
+    // 2c. Side walls quads (2 triangles each) with outward facet normals
+    for i in 0..m_pts {
+        let next = (i + 1) % m_pts;
+        let p1 = cleaned_poly[i];
+        let p2 = cleaned_poly[next];
+
+        let dx = p2[0] - p1[0];
+        let dy = p2[1] - p1[1];
+        let edge_len = (dx * dx + dy * dy).sqrt();
+        let normal = if edge_len > 1e-12 {
+            [dy / edge_len, -dx / edge_len, 0.0]
+        } else {
+            [1.0, 0.0, 0.0]
+        };
+
+        let base = vertices.len() as u32;
+        vertices.push(Vertex::new([p1[0], p1[1], h2], normal));  // 0: top curr
+        vertices.push(Vertex::new([p1[0], p1[1], -h2], normal)); // 1: bot curr
+        vertices.push(Vertex::new([p2[0], p2[1], -h2], normal)); // 2: bot next
+        vertices.push(Vertex::new([p2[0], p2[1], h2], normal));  // 3: top next
+
+        indices.push([base, base + 1, base + 3]);
+        indices.push([base + 1, base + 2, base + 3]);
+    }
+
+    let mut solid = TriangleMesh::new(vertices, indices);
+
+    // 3. Optional Hub support
+    if let (Some(hub_d), Some(hub_l)) = (hub_diameter, hub_length) {
+        if hub_d > 1e-6 && hub_l > 1e-6 {
+            let hub_r = hub_d * 0.5;
+            let total_hub_len = if hub_l > face_width {
+                hub_l
+            } else {
+                face_width + hub_l
+            };
+            let hub_z_center = -h2 + total_hub_len * 0.5;
+            let mut hub_mesh = create_cylinder(hub_r, total_hub_len, 64);
+            hub_mesh.translate([0.0, 0.0, hub_z_center]);
+            solid = csg_union(&solid, &hub_mesh);
+        }
+    }
+
+    // 4. Optional Bore Hole & DIN 6885 Keyway support
+    if let Some(bore_r) = bore_radius {
+        if bore_r > 1e-6 {
+            let aabb = solid.bounding_box();
+            let z_min = aabb.min[2];
+            let z_max = aabb.max[2];
+            let total_span = z_max - z_min;
+            let margin = (total_span * 0.05).clamp(1e-4, 0.02);
+            let cutter_height = total_span + margin * 2.0;
+            let z_center = (z_min + z_max) * 0.5;
+
+            let mut bore_tool = create_cylinder(bore_r, cutter_height, 64);
+            bore_tool.translate([0.0, 0.0, z_center]);
+
+            let cutter = if let (Some(kw), Some(kd)) = (keyway_width, keyway_depth) {
+                if kw > 1e-6 && kd > 1e-6 {
+                    let mut keyway_box = create_box(kw, bore_r + kd, cutter_height);
+                    keyway_box.translate([0.0, (bore_r + kd) * 0.5, z_center]);
+                    csg_union(&bore_tool, &keyway_box)
+                } else {
+                    bore_tool
+                }
+            } else {
+                bore_tool
+            };
+
+            solid = csg_difference(&solid, &cutter);
+        }
+    }
+
+    solid
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1032,6 +1323,120 @@ mod tests {
             vol_chamfered > vol * 0.8,
             "Chamfered prism volume should retain most of original body: got {}",
             vol_chamfered
+        );
+    }
+
+    #[test]
+    fn test_spur_gear_solid_volume_and_dimensions() {
+        let m = 0.002;
+        let z = 20;
+        let b = 0.015;
+        let gear = create_spur_gear(m, z, 20.0, b, None, None, None, None, None);
+        assert!(gear.triangle_count() > 0);
+        let vol = gear.volume();
+        assert!(vol > 0.0, "Spur gear volume should be positive: got {}", vol);
+
+        // Approximate reference volume: pitch cylinder V = pi * r^2 * b
+        let r_pitch = m * (z as f64) * 0.5; // 0.020 m
+        let v_pitch_cyl = PI * r_pitch * r_pitch * b;
+        let diff_ratio = (vol - v_pitch_cyl).abs() / v_pitch_cyl;
+        assert!(
+            diff_ratio < 0.12,
+            "Gear volume ({}) should be close to pitch cylinder volume ({}), diff: {}",
+            vol,
+            v_pitch_cyl,
+            diff_ratio
+        );
+
+        // AABB dimensions: Z dimension should match face width, X and Y ~ tip diameter 2 * (r + m) = 0.044 m
+        let aabb = gear.bounding_box();
+        let dims = aabb.dimensions();
+        assert!((dims[2] - b).abs() < 1e-6, "Z dimension must match face width");
+        let d_tip = 2.0 * (r_pitch + m);
+        assert!(
+            (dims[0] - d_tip).abs() < 0.002,
+            "X diameter should be close to tip diameter {}, got {}",
+            d_tip,
+            dims[0]
+        );
+        assert!(
+            (dims[1] - d_tip).abs() < 0.002,
+            "Y diameter should be close to tip diameter {}, got {}",
+            d_tip,
+            dims[1]
+        );
+    }
+
+    #[test]
+    fn test_spur_gear_with_hub_bore_and_keyway() {
+        let m = 0.002;
+        let z = 20;
+        let b = 0.015;
+        let gear_plain = create_spur_gear(m, z, 20.0, b, None, None, None, None, None);
+        let _vol_plain = gear_plain.volume();
+
+        // Gear with hub (dia 25mm, length 10mm -> total length 25mm), bore 12mm (r=6mm), keyway 4x1.8mm
+        let gear_with_hub_and_keyway = create_spur_gear(
+            m,
+            z,
+            20.0,
+            b,
+            Some(0.006),
+            Some(0.004),
+            Some(0.0018),
+            Some(0.025),
+            Some(0.010),
+        );
+        assert!(gear_with_hub_and_keyway.triangle_count() > 0);
+        let vol_hub_gear = gear_with_hub_and_keyway.volume();
+        assert!(vol_hub_gear > 0.0, "Hub gear volume must be positive: got {}", vol_hub_gear);
+
+        // Check AABB spans total hub length 0.025m
+        let aabb = gear_with_hub_and_keyway.bounding_box();
+        assert!((aabb.dimensions()[2] - 0.025).abs() < 1e-4);
+
+        // Test without keyway vs with keyway: keyway should reduce volume
+        let gear_without_keyway = create_spur_gear(
+            m,
+            z,
+            20.0,
+            b,
+            Some(0.006),
+            None,
+            None,
+            Some(0.025),
+            Some(0.010),
+        );
+        let vol_no_key = gear_without_keyway.volume();
+        assert!(
+            vol_hub_gear < vol_no_key,
+            "Keyway must reduce volume: with_key={}, without_key={}",
+            vol_hub_gear,
+            vol_no_key
+        );
+    }
+
+    #[test]
+    fn test_cut_hole_with_keyway_reduces_volume() {
+        let block = create_box(10.0, 10.0, 10.0);
+        let hole_plain = cut_hole(&block, [0.0, 5.0, 0.0], [0.0, 1.0, 0.0], 2.0, 10.0, None, None);
+        let hole_keyway = cut_hole(
+            &block,
+            [0.0, 5.0, 0.0],
+            [0.0, 1.0, 0.0],
+            2.0,
+            10.0,
+            Some(1.0),
+            Some(1.0),
+        );
+
+        let v_plain = hole_plain.volume();
+        let v_keyway = hole_keyway.volume();
+        assert!(
+            v_keyway < v_plain,
+            "Hole with keyway volume ({}) must be less than plain hole ({})",
+            v_keyway,
+            v_plain
         );
     }
 }

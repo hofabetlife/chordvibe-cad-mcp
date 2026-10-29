@@ -62,7 +62,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         // 4. add_feature_primitive
         ToolDefinition {
             name: "add_feature_primitive".to_string(),
-            description: "Appends a 3D solid primitive (box, cylinder, sphere, cone, or polygon_prism) into the parametric history DAG of a part, with optional 3D position and rotation".to_string(),
+            description: "Appends a 3D solid primitive (box, cylinder, sphere, cone, polygon_prism, or spur_gear) into the parametric history DAG of a part, with optional 3D position and rotation".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -72,12 +72,12 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     },
                     "primitive_type": {
                         "type": "string",
-                        "enum": ["box", "cylinder", "sphere", "cone", "polygon_prism"],
+                        "enum": ["box", "cylinder", "sphere", "cone", "polygon_prism", "spur_gear"],
                         "description": "Type of 3D primitive"
                     },
                     "params": {
                         "type": "object",
-                        "description": "Geometric parameters (box: width, height, depth; cylinder: radius, height; sphere: radius; cone: radius_bottom, radius_top, height; polygon_prism: height, sides, width_across_flats, radius, chamfer; optional position [x,y,z], rotation_deg [rx,ry,rz])",
+                        "description": "Geometric parameters (box: width, height, depth; cylinder: radius, height; sphere: radius; cone: radius_bottom, radius_top, height; polygon_prism: height, sides, width_across_flats, radius, chamfer; spur_gear: module, teeth, face_width, pressure_angle_deg, bore_radius, bore_diameter, keyway_width, keyway_depth, hub_diameter, hub_length; optional position [x,y,z], rotation_deg [rx,ry,rz])",
                         "properties": {
                             "width": { "type": "number", "description": "Box width in meters" },
                             "height": { "type": "number", "description": "Height in meters (box, cylinder, cone, polygon_prism)" },
@@ -88,6 +88,16 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                             "sides": { "type": "integer", "description": "Number of polygon facets (minimum 3, default 6 for hexagon)" },
                             "width_across_flats": { "type": "number", "description": "Width across flats (S, e.g. wrench size for nuts/bolts) in meters" },
                             "chamfer": { "type": "number", "description": "Optional conical end chamfer size (30-degree DIN 934 chamfer) in meters" },
+                            "module": { "type": "number", "description": "Spur gear module (m) in meters (e.g. 0.002 for 2mm module)" },
+                            "teeth": { "type": "integer", "description": "Number of gear teeth (z, e.g. 20)" },
+                            "pressure_angle_deg": { "type": "number", "description": "Pressure angle in degrees (default 20.0)" },
+                            "face_width": { "type": "number", "description": "Gear face width (thickness along gear axis) in meters" },
+                            "bore_radius": { "type": "number", "description": "Optional shaft bore hole radius in meters" },
+                            "bore_diameter": { "type": "number", "description": "Optional shaft bore hole diameter in meters" },
+                            "keyway_width": { "type": "number", "description": "Optional DIN 6885 keyway slot width in meters" },
+                            "keyway_depth": { "type": "number", "description": "Optional DIN 6885 keyway slot depth into hub/bore in meters" },
+                            "hub_diameter": { "type": "number", "description": "Optional hub diameter in meters" },
+                            "hub_length": { "type": "number", "description": "Optional hub axial length in meters" },
                             "segments": { "type": "integer", "description": "Radial segments (default 32)" },
                             "sectors": { "type": "integer", "description": "Sphere sectors (default 32)" },
                             "stacks": { "type": "integer", "description": "Sphere stacks (default 16)" },
@@ -128,7 +138,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         // 5. cut_hole
         ToolDefinition {
             name: "cut_hole".to_string(),
-            description: "Cuts a cylindrical hole through a CAD part along a specified direction normal vector".to_string(),
+            description: "Cuts a cylindrical hole through a CAD part along a specified direction normal vector, with optional DIN 6885 keyway slot".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -157,6 +167,14 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     "depth": {
                         "type": "number",
                         "description": "Hole depth in meters"
+                    },
+                    "keyway_width": {
+                        "type": "number",
+                        "description": "Optional DIN 6885 keyway slot width in meters"
+                    },
+                    "keyway_depth": {
+                        "type": "number",
+                        "description": "Optional DIN 6885 keyway slot depth into wall in meters"
                     }
                 },
                 "required": ["part_id", "position", "normal", "radius", "depth"]

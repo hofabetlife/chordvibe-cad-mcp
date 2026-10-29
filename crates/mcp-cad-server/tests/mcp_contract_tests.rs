@@ -61,7 +61,7 @@ async fn test_mcp_tools_list() {
         "method": "tools/list"
     });
 
-    let resp = rpc_call(&state, list_req).await;
+    let resp = rpc_call(&state, list_req.clone()).await;
     assert_eq!(resp["id"], 2);
 
     let tools = resp["result"]["tools"]
@@ -350,7 +350,7 @@ async fn test_mcp_e2e_engineering_workflow() {
             "arguments": {}
         }
     });
-    let resp = rpc_call(&state, list_req).await;
+    let resp = rpc_call(&state, list_req.clone()).await;
     let text = resp["result"]["content"][0]["text"].as_str().unwrap();
     let parts_list: Value = serde_json::from_str(text).unwrap();
     assert_eq!(parts_list["parts"].as_array().unwrap().len(), 1);
@@ -912,4 +912,175 @@ async fn test_mcp_polygon_prism_and_metric_thread() {
     let text = resp["result"]["content"][0]["text"].as_str().unwrap();
     let mod_data: Value = serde_json::from_str(text).unwrap();
     assert_eq!(mod_data["status"], "updated");
+}
+
+#[tokio::test]
+async fn test_mcp_spur_gear_and_keyway() {
+    let state = EngineState::new()
+        .expect("EngineState initialization failed")
+        .into_shared();
+
+    // 1. Create part for transmission drive gear
+    let create_req = json!({
+        "jsonrpc": "2.0",
+        "id": 401,
+        "method": "tools/call",
+        "params": {
+            "name": "create_part",
+            "arguments": {
+                "name": "Transmission Drive Pinion",
+                "material": "steel_structural_aisi1020"
+            }
+        }
+    });
+    let resp = rpc_call(&state, create_req).await;
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let data: Value = serde_json::from_str(text).unwrap();
+    let gear_part_id = data["part_id"].as_str().unwrap().to_string();
+
+    // 2. Add spur_gear primitive with involute teeth, mounting hub, bore and DIN 6885 keyway
+    let add_gear_req = json!({
+        "jsonrpc": "2.0",
+        "id": 402,
+        "method": "tools/call",
+        "params": {
+            "name": "add_feature_primitive",
+            "arguments": {
+                "part_id": gear_part_id,
+                "primitive_type": "spur_gear",
+                "params": {
+                    "module": 0.002,
+                    "teeth": 20,
+                    "pressure_angle_deg": 20.0,
+                    "face_width": 0.015,
+                    "hub_diameter": 0.025,
+                    "hub_length": 0.010,
+                    "bore_diameter": 0.012,
+                    "keyway_width": 0.004,
+                    "keyway_depth": 0.0018
+                }
+            }
+        }
+    });
+    let resp = rpc_call(&state, add_gear_req).await;
+    assert_eq!(resp["id"], 402);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let gear_data: Value = serde_json::from_str(text).unwrap();
+    let gear_feat_id = gear_data["feature_id"].as_str().unwrap().to_string();
+
+    // 3. Inspect part summary via list_parts
+    let list_req = json!({
+        "jsonrpc": "2.0",
+        "id": 403,
+        "method": "tools/call",
+        "params": {
+            "name": "list_parts",
+            "arguments": {}
+        }
+    });
+    let resp = rpc_call(&state, list_req.clone()).await;
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let list_data: Value = serde_json::from_str(text).unwrap();
+    let parts_arr = list_data["parts"].as_array().unwrap();
+    let gear_summary = parts_arr.iter().find(|p| p["id"] == gear_part_id).unwrap();
+    let vol1 = gear_summary["volume"].as_f64().unwrap();
+    assert!(vol1 > 0.0, "Spur gear volume must be positive: got {}", vol1);
+    let dims = gear_summary["bounding_box_dimensions"].as_array().unwrap();
+    let z_span = dims[2].as_f64().unwrap();
+    // 0.015 face_width + 0.010 hub_length = 0.025 m total axial length
+    assert!((z_span - 0.025).abs() < 1e-4, "Z dimension should be 0.025, got {}", z_span);
+
+    // 4. Modify spur_gear: increase teeth from 20 to 24
+    let mod_req = json!({
+        "jsonrpc": "2.0",
+        "id": 404,
+        "method": "tools/call",
+        "params": {
+            "name": "modify_feature",
+            "arguments": {
+                "part_id": gear_part_id,
+                "feature_id": gear_feat_id,
+                "params": {
+                    "teeth": 24
+                }
+            }
+        }
+    });
+    let resp = rpc_call(&state, mod_req).await;
+    assert_eq!(resp["id"], 404);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let mod_data: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(mod_data["status"], "updated");
+
+    // Check that volume increased with more teeth
+    let resp = rpc_call(&state, list_req.clone()).await;
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let list_data2: Value = serde_json::from_str(text).unwrap();
+    let gear_summary2 = list_data2["parts"].as_array().unwrap().iter().find(|p| p["id"] == gear_part_id).unwrap();
+    let vol2 = gear_summary2["volume"].as_f64().unwrap();
+    assert!(
+        vol2 > vol1,
+        "Volume after increasing teeth to 24 ({}) must exceed 20 teeth ({})",
+        vol2,
+        vol1
+    );
+
+    // 5. Test cut_hole with DIN 6885 keyway on a separate cylindrical hub part
+    let create_hub_req = json!({
+        "jsonrpc": "2.0",
+        "id": 405,
+        "method": "tools/call",
+        "params": {
+            "name": "create_part",
+            "arguments": {
+                "name": "Coupling Sleeve",
+                "material": "aluminum_6061_t6"
+            }
+        }
+    });
+    let resp = rpc_call(&state, create_hub_req).await;
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let hub_part_id = serde_json::from_str::<Value>(text).unwrap()["part_id"].as_str().unwrap().to_string();
+
+    let add_cyl_req = json!({
+        "jsonrpc": "2.0",
+        "id": 406,
+        "method": "tools/call",
+        "params": {
+            "name": "add_feature_primitive",
+            "arguments": {
+                "part_id": hub_part_id,
+                "primitive_type": "cylinder",
+                "params": {
+                    "radius": 0.025,
+                    "height": 0.040
+                }
+            }
+        }
+    });
+    let resp = rpc_call(&state, add_cyl_req).await;
+    assert_eq!(resp["id"], 406);
+
+    let cut_keyed_hole_req = json!({
+        "jsonrpc": "2.0",
+        "id": 407,
+        "method": "tools/call",
+        "params": {
+            "name": "cut_hole",
+            "arguments": {
+                "part_id": hub_part_id,
+                "position": [0.0, 0.0, 0.020],
+                "normal": [0.0, 0.0, 1.0],
+                "radius": 0.010,
+                "depth": 0.045,
+                "keyway_width": 0.006,
+                "keyway_depth": 0.0028
+            }
+        }
+    });
+    let resp = rpc_call(&state, cut_keyed_hole_req).await;
+    assert_eq!(resp["id"], 407);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let cut_data: Value = serde_json::from_str(text).unwrap();
+    assert!(!cut_data["feature_id"].as_str().unwrap().is_empty());
 }

@@ -262,6 +262,8 @@ fn test_dag_cut_hole_evaluation() {
             normal: [0.0, 1.0, 0.0],
             radius: 2.0,
             depth: 10.0,
+            keyway_width: None,
+            keyway_depth: None,
         },
         Some("Thru Hole".to_string()),
     );
@@ -501,6 +503,8 @@ fn test_dag_polygon_prism_hex_nut_model() {
             normal: [0.0, 0.0, 1.0],
             radius: 4.25,
             depth: 10.0,
+            keyway_width: None,
+            keyway_depth: None,
         },
         Some("Tap Hole".to_string()),
     );
@@ -531,4 +535,62 @@ fn test_dag_polygon_prism_hex_nut_model() {
     assert!((dims[2] - height).abs() < 0.1, "Nut height must be ~8.0, got {}", dims[2]);
     assert!(dims[0] > waf * 0.95 && dims[0] < waf * 1.25);
     assert!(dims[1] > waf * 0.95 && dims[1] < waf * 1.25);
+}
+
+#[test]
+fn test_dag_spur_gear_model() {
+    let mut tree = FeatureTree::new();
+
+    // 1. Add Spur Gear: m = 0.002, z = 24, face_width = 0.015, hub = 28mm / 10mm, bore = 14mm dia (r=7mm), keyway 5x2.3mm
+    let m = 0.002;
+    let z = 24;
+    let face_width = 0.015;
+    let gear_id = tree.add_feature(
+        FeatureOp::AddSpurGear {
+            module: m,
+            teeth: z,
+            pressure_angle_deg: 20.0,
+            face_width,
+            bore_radius: Some(0.007),
+            keyway_width: Some(0.005),
+            keyway_depth: Some(0.0023),
+            hub_diameter: Some(0.028),
+            hub_length: Some(0.010),
+            position: None,
+            rotation_deg: None,
+        },
+        Some("Pinion Gear".to_string()),
+    );
+
+    let gear_mesh = tree.evaluate().expect("Spur gear evaluation failed");
+    assert!(gear_mesh.triangle_count() > 0);
+    let vol1 = gear_mesh.volume();
+    assert!(vol1 > 0.0, "Gear volume must be positive: got {}", vol1);
+
+    // 2. Modify feature: increase teeth to 30
+    tree.modify_feature(
+        gear_id,
+        FeatureOp::AddSpurGear {
+            module: m,
+            teeth: 30,
+            pressure_angle_deg: 20.0,
+            face_width,
+            bore_radius: Some(0.007),
+            keyway_width: Some(0.005),
+            keyway_depth: Some(0.0023),
+            hub_diameter: Some(0.028),
+            hub_length: Some(0.010),
+            position: None,
+            rotation_deg: None,
+        },
+    ).expect("Modify spur gear failed");
+
+    let gear_mesh2 = tree.evaluate().expect("Modified spur gear evaluation failed");
+    let vol2 = gear_mesh2.volume();
+    assert!(
+        vol2 > vol1,
+        "Gear with 30 teeth volume ({}) must be greater than with 24 teeth ({})",
+        vol2,
+        vol1
+    );
 }

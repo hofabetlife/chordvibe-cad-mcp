@@ -48,7 +48,7 @@ flowchart LR
 
 1. **Параметрическое Solid DAG-моделирование**:
    - Построение твердых тел на основе направленного графа операций (`FeatureTree`).
-   - Примитивы (`Box`, `Cylinder`, `Sphere`, `Cone`, `PolygonPrism` с фасками по DIN 934), вырезание отверстий (`cut_hole`), нарезка винтовых канавок и метрической резьбы 60° по ISO 68-1 (`cut_helical_groove`), булево вычитание произвольных сеток (`boolean_difference`) и трансформации.
+   - Примитивы (`Box`, `Cylinder`, `Sphere`, `Cone`, `PolygonPrism` с фасками по DIN 934, параметрический зубчатый венец `SpurGear` с эвольвентным профилем по DIN 867 / ISO 53, ступицей и шпоночным пазом DIN 6885), вырезание отверстий (`cut_hole` с опциональным шпоночным пазом), нарезка винтовых канавок и метрической резьбы 60° по ISO 68-1 (`cut_helical_groove`), булево вычитание произвольных сеток (`boolean_difference`) и трансформации.
    - Редактирование любого шага истории в реальном времени (`modify_feature`) с автоматическим пересчетом геометрии без потери топологии.
 
 2. **Динамика подвижных механизмов (Rapier3D)**:
@@ -165,8 +165,8 @@ cargo run --release -p mcp-cad-server -- --mode sse --port 8080
 | **1** | `create_part` | `name: str`, `material: str` | `{ part_id: str }` | Создать деталь с заданным материалом |
 | **2** | `list_parts` | *(нет)* | `{ parts: [...] }` | Получить список всех деталей, габариты и массу |
 | **3** | `delete_part` | `part_id: str` | `{ status: "deleted" }` | Удалить деталь из сцены, физики и кэша |
-| **4** | `add_feature_primitive` | `part_id: str`, `primitive_type: str`, `params: obj` | `{ feature_id: str }` | Добавить примитив (`box`, `cylinder`, `sphere`, `cone`, `polygon_prism`) в DAG |
-| **5** | `cut_hole` | `part_id: str`, `position: [3]`, `normal: [3]`, `radius: num`, `depth: num` | `{ feature_id: str }` | Вырезать цилиндрическое отверстие в твердом теле |
+| **4** | `add_feature_primitive` | `part_id: str`, `primitive_type: str`, `params: obj` | `{ feature_id: str }` | Добавить примитив (`box`, `cylinder`, `sphere`, `cone`, `polygon_prism`, `spur_gear`) в DAG |
+| **5** | `cut_hole` | `part_id: str`, `position: [3]`, `normal: [3]`, `radius: num`, `depth: num`, `keyway_width?: num`, `keyway_depth?: num` | `{ feature_id: str }` | Вырезать отверстие в твердом теле (опционально со шпоночным пазом DIN 6885) |
 | **6** | `modify_feature` | `part_id: str`, `feature_id: str`, `params: obj` | `{ status: "updated", dimensions: [3] }` | Изменить параметры любого шага в истории DAG |
 | **7** | `get_feature_tree` | `part_id: str` | `{ dag: [...] }` | Получить полную историю дерева операций детали |
 | **8** | `cut_helical_groove` | `part_id: str`, `helix_radius: num`, `groove_radius: num`, `pitch: num`, `height: num`, `start_z: num`, `profile_type?: "circular"\|"metric_60"` | `{ feature_id: str, status: "helical_groove_cut" }` | Нарезать винтовые канавки (канавки сверл или резьбу 60° по ISO 68-1) |

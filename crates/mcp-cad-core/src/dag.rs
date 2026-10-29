@@ -8,7 +8,7 @@ use crate::csg::{csg_difference, csg_union};
 use crate::error::CadError;
 use crate::primitives::{
     create_box, create_cone, create_cylinder, create_helical_cutter, create_polygon_prism,
-    create_sphere, cut_hole,
+    create_sphere, create_spur_gear, cut_hole,
 };
 use crate::topology::TriangleMesh;
 
@@ -76,12 +76,38 @@ pub enum FeatureOp {
         #[serde(default)]
         rotation_deg: Option<[f64; 3]>,
     },
-    /// Cut a cylindrical hole from the current solid.
+    /// Add a parametric involute spur gear centered along Z.
+    AddSpurGear {
+        module: f64,
+        teeth: usize,
+        #[serde(default = "default_pressure_angle_deg")]
+        pressure_angle_deg: f64,
+        face_width: f64,
+        #[serde(default)]
+        bore_radius: Option<f64>,
+        #[serde(default)]
+        keyway_width: Option<f64>,
+        #[serde(default)]
+        keyway_depth: Option<f64>,
+        #[serde(default)]
+        hub_diameter: Option<f64>,
+        #[serde(default)]
+        hub_length: Option<f64>,
+        #[serde(default)]
+        position: Option<[f64; 3]>,
+        #[serde(default)]
+        rotation_deg: Option<[f64; 3]>,
+    },
+    /// Cut a cylindrical hole from the current solid, with optional DIN 6885 keyway.
     CutHole {
         center: [f64; 3],
         normal: [f64; 3],
         radius: f64,
         depth: f64,
+        #[serde(default)]
+        keyway_width: Option<f64>,
+        #[serde(default)]
+        keyway_depth: Option<f64>,
     },
     /// Cut a helical groove (flute) into the solid.
     CutHelicalGroove {
@@ -114,6 +140,10 @@ pub enum FeatureOp {
 
 fn default_polygon_sides() -> usize {
     6
+}
+
+fn default_pressure_angle_deg() -> f64 {
+    20.0
 }
 
 fn default_profile_type() -> String {
@@ -211,6 +241,7 @@ impl FeatureTree {
             FeatureOp::AddPolygonPrism { .. } => "Polygon Prism".to_string(),
             FeatureOp::AddSphere { .. } => "Sphere".to_string(),
             FeatureOp::AddCone { .. } => "Cone".to_string(),
+            FeatureOp::AddSpurGear { .. } => "Spur Gear".to_string(),
             FeatureOp::CutHole { .. } => "Cut Hole".to_string(),
             FeatureOp::CutHelicalGroove { .. } => "Cut Helical Groove".to_string(),
             FeatureOp::BooleanDifferenceMesh { .. } => "Boolean Difference Mesh".to_string(),
@@ -391,7 +422,50 @@ impl FeatureTree {
                         None => Some(cone_mesh),
                     };
                 }
-                FeatureOp::CutHole { center, normal, radius, depth } => {
+                FeatureOp::AddSpurGear {
+                    module,
+                    teeth,
+                    pressure_angle_deg,
+                    face_width,
+                    bore_radius,
+                    keyway_width,
+                    keyway_depth,
+                    hub_diameter,
+                    hub_length,
+                    position,
+                    rotation_deg,
+                } => {
+                    if *module <= 0.0 || *teeth < 3 || *face_width <= 0.0 {
+                        return Err(CadError::InvalidParameter(format!(
+                            "Spur gear parameters invalid: module={}, teeth={}, face_width={}",
+                            module, teeth, face_width
+                        )));
+                    }
+                    let mut gear_mesh = create_spur_gear(
+                        *module,
+                        *teeth,
+                        *pressure_angle_deg,
+                        *face_width,
+                        *bore_radius,
+                        *keyway_width,
+                        *keyway_depth,
+                        *hub_diameter,
+                        *hub_length,
+                    );
+                    apply_pos_rot(&mut gear_mesh, position, rotation_deg);
+                    current_mesh = match current_mesh {
+                        Some(m) => Some(csg_union(&m, &gear_mesh)),
+                        None => Some(gear_mesh),
+                    };
+                }
+                FeatureOp::CutHole {
+                    center,
+                    normal,
+                    radius,
+                    depth,
+                    keyway_width,
+                    keyway_depth,
+                } => {
                     if *radius <= 0.0 || *depth <= 0.0 {
                         return Err(CadError::InvalidParameter(format!(
                             "Cut hole radius and depth must be positive, got: r={}, d={}",
@@ -401,7 +475,15 @@ impl FeatureTree {
                     let mesh = current_mesh.ok_or_else(|| {
                         CadError::EvaluationError("Cannot cut hole in empty solid".into())
                     })?;
-                    current_mesh = Some(cut_hole(&mesh, *center, *normal, *radius, *depth));
+                    current_mesh = Some(cut_hole(
+                        &mesh,
+                        *center,
+                        *normal,
+                        *radius,
+                        *depth,
+                        *keyway_width,
+                        *keyway_depth,
+                    ));
                 }
                 FeatureOp::CutHelicalGroove {
                     helix_radius,
