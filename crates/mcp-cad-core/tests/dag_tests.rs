@@ -394,7 +394,7 @@ fn test_dag_shifted_cylinder_stepped_shaft() {
 #[test]
 fn test_dag_helical_groove_drill_bit_model() {
     // 1. Direct helical cutter creation test
-    let cutter = create_helical_cutter(4.5, 2.0, 30.0, 40.0, 5.0, 2, true, 40.0 / 30.0);
+    let cutter = create_helical_cutter(4.5, 2.0, 30.0, 40.0, 5.0, 2, true, 40.0 / 30.0, "circular");
     assert!(cutter.triangle_count() > 0);
     assert!(cutter.volume() > 0.0);
 
@@ -424,6 +424,7 @@ fn test_dag_helical_groove_drill_bit_model() {
             start_z: 15.0,
             starts: 2,
             is_right_hand: true,
+            profile_type: "circular".to_string(),
         },
         Some("Spiral Flutes".to_string()),
     );
@@ -470,4 +471,64 @@ fn test_dag_helical_groove_drill_bit_model() {
         "BooleanDifferenceMesh volume should be 840, got {}",
         vol_diff
     );
+}
+
+#[test]
+fn test_dag_polygon_prism_hex_nut_model() {
+    let mut tree = FeatureTree::new();
+
+    // 1. Hexagonal prism with DIN 934 chamfer: M10 nut (S = 16.0, height = 8.0, chamfer = 0.8)
+    let waf = 16.0;
+    let height = 8.0;
+    let chamfer = 0.8;
+    tree.add_feature(
+        FeatureOp::AddPolygonPrism {
+            sides: 6,
+            height,
+            width_across_flats: Some(waf),
+            radius: None,
+            chamfer: Some(chamfer),
+            position: None,
+            rotation_deg: None,
+        },
+        Some("Hex Nut Blank".to_string()),
+    );
+
+    // 2. Cut central tap hole: radius 4.25 (M10 tap drill ~ 8.5mm diameter), depth 10.0
+    tree.add_feature(
+        FeatureOp::CutHole {
+            center: [0.0, 0.0, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            radius: 4.25,
+            depth: 10.0,
+        },
+        Some("Tap Hole".to_string()),
+    );
+
+    // 3. Cut internal metric 60-degree thread: M10x1.5 pitch, height 8.0, ISO 68-1
+    tree.add_feature(
+        FeatureOp::CutHelicalGroove {
+            helix_radius: 4.25,
+            groove_radius: 0.85,
+            pitch: 1.5,
+            height: 8.0,
+            start_z: -4.0,
+            starts: 1,
+            is_right_hand: true,
+            profile_type: "metric_60".to_string(),
+        },
+        Some("Metric Internal Thread".to_string()),
+    );
+
+    let nut_mesh = tree.evaluate().expect("Hex nut evaluation failed");
+    assert!(nut_mesh.triangle_count() > 0);
+    let vol_nut = nut_mesh.volume();
+    assert!(vol_nut > 0.0, "Hex nut volume must be positive: got {}", vol_nut);
+
+    // Verify AABB dimensions roughly match S (16.0) and height (8.0)
+    let aabb = nut_mesh.bounding_box();
+    let dims = aabb.dimensions();
+    assert!((dims[2] - height).abs() < 0.1, "Nut height must be ~8.0, got {}", dims[2]);
+    assert!(dims[0] > waf * 0.95 && dims[0] < waf * 1.25);
+    assert!(dims[1] > waf * 0.95 && dims[1] < waf * 1.25);
 }

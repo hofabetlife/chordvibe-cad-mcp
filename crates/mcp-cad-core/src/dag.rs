@@ -7,7 +7,8 @@ use uuid::Uuid;
 use crate::csg::{csg_difference, csg_union};
 use crate::error::CadError;
 use crate::primitives::{
-    create_box, create_cone, create_cylinder, create_helical_cutter, create_sphere, cut_hole,
+    create_box, create_cone, create_cylinder, create_helical_cutter, create_polygon_prism,
+    create_sphere, cut_hole,
 };
 use crate::topology::TriangleMesh;
 
@@ -30,6 +31,22 @@ pub enum FeatureOp {
         height: f64,
         #[serde(default = "default_segments")]
         segments: usize,
+        #[serde(default)]
+        position: Option<[f64; 3]>,
+        #[serde(default)]
+        rotation_deg: Option<[f64; 3]>,
+    },
+    /// Add a regular polygonal prism (e.g. Hexagonal nut/bolt head) centered along Z.
+    AddPolygonPrism {
+        #[serde(default = "default_polygon_sides")]
+        sides: usize,
+        height: f64,
+        #[serde(default)]
+        width_across_flats: Option<f64>,
+        #[serde(default)]
+        radius: Option<f64>,
+        #[serde(default)]
+        chamfer: Option<f64>,
         #[serde(default)]
         position: Option<[f64; 3]>,
         #[serde(default)]
@@ -77,6 +94,8 @@ pub enum FeatureOp {
         starts: usize,
         #[serde(default = "default_right_hand")]
         is_right_hand: bool,
+        #[serde(default = "default_profile_type")]
+        profile_type: String,
     },
     /// Subtract an arbitrary tool mesh from the solid.
     BooleanDifferenceMesh {
@@ -91,6 +110,14 @@ pub enum FeatureOp {
         #[serde(default = "default_scale")]
         scale: [f64; 3],
     },
+}
+
+fn default_polygon_sides() -> usize {
+    6
+}
+
+fn default_profile_type() -> String {
+    "circular".to_string()
 }
 
 fn default_segments() -> usize {
@@ -181,6 +208,7 @@ impl FeatureTree {
         let default_name = match &op {
             FeatureOp::AddBox { .. } => "Box".to_string(),
             FeatureOp::AddCylinder { .. } => "Cylinder".to_string(),
+            FeatureOp::AddPolygonPrism { .. } => "Polygon Prism".to_string(),
             FeatureOp::AddSphere { .. } => "Sphere".to_string(),
             FeatureOp::AddCone { .. } => "Cone".to_string(),
             FeatureOp::CutHole { .. } => "Cut Hole".to_string(),
@@ -283,6 +311,41 @@ impl FeatureTree {
                         None => Some(cyl_mesh),
                     };
                 }
+                FeatureOp::AddPolygonPrism {
+                    sides,
+                    height,
+                    width_across_flats,
+                    radius,
+                    chamfer,
+                    position,
+                    rotation_deg,
+                } => {
+                    if *height <= 0.0 {
+                        return Err(CadError::InvalidParameter(format!(
+                            "Polygon prism height must be positive, got: {}",
+                            height
+                        )));
+                    }
+                    let has_waf = width_across_flats.map(|w| w > 0.0).unwrap_or(false);
+                    let has_r = radius.map(|r| r > 0.0).unwrap_or(false);
+                    if !has_waf && !has_r {
+                        return Err(CadError::InvalidParameter(
+                            "Polygon prism requires either positive width_across_flats or radius".into(),
+                        ));
+                    }
+                    let mut prism_mesh = create_polygon_prism(
+                        *sides,
+                        *height,
+                        *width_across_flats,
+                        *radius,
+                        *chamfer,
+                    );
+                    apply_pos_rot(&mut prism_mesh, position, rotation_deg);
+                    current_mesh = match current_mesh {
+                        Some(m) => Some(csg_union(&m, &prism_mesh)),
+                        None => Some(prism_mesh),
+                    };
+                }
                 FeatureOp::AddSphere {
                     radius,
                     sectors,
@@ -348,6 +411,7 @@ impl FeatureTree {
                     start_z,
                     starts,
                     is_right_hand,
+                    profile_type,
                 } => {
                     if *groove_radius <= 0.0 || *pitch <= 0.0 || *height <= 0.0 {
                         return Err(CadError::InvalidParameter(format!(
@@ -368,6 +432,7 @@ impl FeatureTree {
                         *starts,
                         *is_right_hand,
                         turns,
+                        profile_type,
                     );
                     current_mesh = Some(csg_difference(&mesh, &tool));
                 }

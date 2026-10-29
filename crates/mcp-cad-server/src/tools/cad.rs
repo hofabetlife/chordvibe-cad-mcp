@@ -197,9 +197,44 @@ pub fn add_feature_primitive(args: &Value, state: &mut EngineState) -> Result<Va
                 rotation_deg,
             }
         }
+        "polygon_prism" => {
+            let height = params
+                .get("height")
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| ServerError::InvalidArgument("Polygon prism requires 'height'".to_string()))?;
+            let sides = params
+                .get("sides")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(6) as usize;
+            let width_across_flats = params
+                .get("width_across_flats")
+                .or_else(|| params.get("s"))
+                .and_then(|v| v.as_f64());
+            let radius = params
+                .get("radius")
+                .or_else(|| params.get("r"))
+                .and_then(|v| v.as_f64());
+            if width_across_flats.is_none() && radius.is_none() {
+                return Err(ServerError::InvalidArgument(
+                    "Polygon prism requires either 'width_across_flats' or 'radius'".to_string(),
+                ));
+            }
+            let chamfer = params
+                .get("chamfer")
+                .and_then(|v| v.as_f64());
+            FeatureOp::AddPolygonPrism {
+                sides,
+                height,
+                width_across_flats,
+                radius,
+                chamfer,
+                position,
+                rotation_deg,
+            }
+        }
         other => {
             return Err(ServerError::InvalidArgument(format!(
-                "Unknown primitive_type '{}'. Supported: box, cylinder, sphere, cone",
+                "Unknown primitive_type '{}'. Supported: box, cylinder, sphere, cone, polygon_prism",
                 other
             )));
         }
@@ -388,7 +423,35 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
                 rotation_deg: rot,
             }
         }
-        FeatureOp::CutHelicalGroove { helix_radius, groove_radius, pitch, height, start_z, starts, is_right_hand } => {
+        FeatureOp::AddPolygonPrism {
+            sides,
+            height,
+            width_across_flats,
+            radius,
+            chamfer,
+            position,
+            rotation_deg,
+        } => {
+            let new_sides = params.get("sides").and_then(|v| v.as_u64()).map(|s| s as usize).unwrap_or(*sides);
+            let new_h = params.get("height").and_then(|v| v.as_f64()).unwrap_or(*height);
+            let new_waf = params.get("width_across_flats").or_else(|| params.get("s")).and_then(|v| v.as_f64()).or(*width_across_flats);
+            let new_r = params.get("radius").or_else(|| params.get("r")).and_then(|v| v.as_f64()).or(*radius);
+            let new_chamfer = params.get("chamfer").and_then(|v| v.as_f64()).or(*chamfer);
+            let pos = parse_vec3(params, "position").or(*position);
+            let rot = parse_vec3(params, "rotation_deg")
+                .or_else(|| parse_vec3(params, "rotation_rpy_deg"))
+                .or(*rotation_deg);
+            FeatureOp::AddPolygonPrism {
+                sides: new_sides,
+                height: new_h,
+                width_across_flats: new_waf,
+                radius: new_r,
+                chamfer: new_chamfer,
+                position: pos,
+                rotation_deg: rot,
+            }
+        }
+        FeatureOp::CutHelicalGroove { helix_radius, groove_radius, pitch, height, start_z, starts, is_right_hand, profile_type } => {
             let hr = params.get("helix_radius").and_then(|v| v.as_f64()).unwrap_or(*helix_radius);
             let gr = params.get("groove_radius").and_then(|v| v.as_f64()).unwrap_or(*groove_radius);
             let p = params.get("pitch").and_then(|v| v.as_f64()).unwrap_or(*pitch);
@@ -396,6 +459,7 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
             let sz = params.get("start_z").and_then(|v| v.as_f64()).unwrap_or(*start_z);
             let st = params.get("starts").and_then(|v| v.as_u64()).map(|s| s as usize).unwrap_or(*starts);
             let rh = params.get("is_right_hand").and_then(|v| v.as_bool()).unwrap_or(*is_right_hand);
+            let pt = params.get("profile_type").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| profile_type.clone());
             FeatureOp::CutHelicalGroove {
                 helix_radius: hr,
                 groove_radius: gr,
@@ -404,6 +468,7 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
                 start_z: sz,
                 starts: st,
                 is_right_hand: rh,
+                profile_type: pt,
             }
         }
         FeatureOp::BooleanDifferenceMesh { tool_mesh } => {
@@ -539,6 +604,12 @@ pub fn cut_helical_groove(args: &Value, state: &mut EngineState) -> Result<Value
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
+    let profile_type = params
+        .get("profile_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("circular")
+        .to_string();
+
     let part = state
         .parts
         .get_mut(part_id)
@@ -553,6 +624,7 @@ pub fn cut_helical_groove(args: &Value, state: &mut EngineState) -> Result<Value
             start_z,
             starts,
             is_right_hand,
+            profile_type,
         },
         None,
     );

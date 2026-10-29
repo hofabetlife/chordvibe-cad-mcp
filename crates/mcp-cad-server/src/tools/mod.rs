@@ -62,7 +62,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         // 4. add_feature_primitive
         ToolDefinition {
             name: "add_feature_primitive".to_string(),
-            description: "Appends a 3D solid primitive (box, cylinder, sphere, or cone) into the parametric history DAG of a part, with optional 3D position and rotation".to_string(),
+            description: "Appends a 3D solid primitive (box, cylinder, sphere, cone, or polygon_prism) into the parametric history DAG of a part, with optional 3D position and rotation".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -72,19 +72,22 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     },
                     "primitive_type": {
                         "type": "string",
-                        "enum": ["box", "cylinder", "sphere", "cone"],
+                        "enum": ["box", "cylinder", "sphere", "cone", "polygon_prism"],
                         "description": "Type of 3D primitive"
                     },
                     "params": {
                         "type": "object",
-                        "description": "Geometric parameters (box: width, height, depth; cylinder: radius, height; sphere: radius; cone: radius_bottom, radius_top, height; optional position [x,y,z], rotation_deg [rx,ry,rz])",
+                        "description": "Geometric parameters (box: width, height, depth; cylinder: radius, height; sphere: radius; cone: radius_bottom, radius_top, height; polygon_prism: height, sides, width_across_flats, radius, chamfer; optional position [x,y,z], rotation_deg [rx,ry,rz])",
                         "properties": {
                             "width": { "type": "number", "description": "Box width in meters" },
-                            "height": { "type": "number", "description": "Height in meters (box, cylinder, cone)" },
+                            "height": { "type": "number", "description": "Height in meters (box, cylinder, cone, polygon_prism)" },
                             "depth": { "type": "number", "description": "Box depth in meters" },
-                            "radius": { "type": "number", "description": "Radius in meters (cylinder, sphere)" },
+                            "radius": { "type": "number", "description": "Radius in meters (cylinder, sphere, polygon_prism circumradius)" },
                             "radius_bottom": { "type": "number", "description": "Bottom radius in meters (cone)" },
                             "radius_top": { "type": "number", "description": "Top radius in meters (cone, 0 for sharp point)" },
+                            "sides": { "type": "integer", "description": "Number of polygon facets (minimum 3, default 6 for hexagon)" },
+                            "width_across_flats": { "type": "number", "description": "Width across flats (S, e.g. wrench size for nuts/bolts) in meters" },
+                            "chamfer": { "type": "number", "description": "Optional conical end chamfer size (30-degree DIN 934 chamfer) in meters" },
                             "segments": { "type": "integer", "description": "Radial segments (default 32)" },
                             "sectors": { "type": "integer", "description": "Sphere sectors (default 32)" },
                             "stacks": { "type": "integer", "description": "Sphere stacks (default 16)" },
@@ -235,6 +238,11 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     "is_right_hand": {
                         "type": "boolean",
                         "description": "True for right-hand helix (standard), false for left-hand (default true)"
+                    },
+                    "profile_type": {
+                        "type": "string",
+                        "enum": ["circular", "metric_60"],
+                        "description": "Cross-sectional cutter profile: 'circular' (default bead) or 'metric_60' (60-degree triangular metric thread profile per ISO 68-1)"
                     }
                 },
                 "required": ["part_id", "helix_radius", "groove_radius", "pitch", "height", "start_z"]

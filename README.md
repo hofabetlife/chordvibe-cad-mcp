@@ -48,7 +48,7 @@ flowchart LR
 
 1. **Параметрическое Solid DAG-моделирование**:
    - Построение твердых тел на основе направленного графа операций (`FeatureTree`).
-   - Примитивы (`Box`, `Cylinder`, `Sphere`), вырезание отверстий (`cut_hole`) и трансформации.
+   - Примитивы (`Box`, `Cylinder`, `Sphere`, `Cone`, `PolygonPrism` с фасками по DIN 934), вырезание отверстий (`cut_hole`), нарезка винтовых канавок и метрической резьбы 60° по ISO 68-1 (`cut_helical_groove`), булево вычитание произвольных сеток (`boolean_difference`) и трансформации.
    - Редактирование любого шага истории в реальном времени (`modify_feature`) с автоматическим пересчетом геометрии без потери топологии.
 
 2. **Динамика подвижных механизмов (Rapier3D)**:
@@ -158,25 +158,28 @@ cargo run --release -p mcp-cad-server -- --mode sse --port 8080
 
 ---
 
-## 🛠️ Сводная таблица инструментов MCP (15 Tools)
+## 🛠️ Сводная таблица инструментов MCP (18 Tools)
 
 | № | Имя инструмента | Входные параметры | Выходные данные | Назначение |
 |:---:|---|---|---|---|
 | **1** | `create_part` | `name: str`, `material: str` | `{ part_id: str }` | Создать деталь с заданным материалом |
 | **2** | `list_parts` | *(нет)* | `{ parts: [...] }` | Получить список всех деталей, габариты и массу |
 | **3** | `delete_part` | `part_id: str` | `{ status: "deleted" }` | Удалить деталь из сцены, физики и кэша |
-| **4** | `add_feature_primitive` | `part_id: str`, `primitive_type: str`, `params: obj` | `{ feature_id: str }` | Добавить примитив (`box`, `cylinder`, `sphere`) в DAG |
+| **4** | `add_feature_primitive` | `part_id: str`, `primitive_type: str`, `params: obj` | `{ feature_id: str }` | Добавить примитив (`box`, `cylinder`, `sphere`, `cone`, `polygon_prism`) в DAG |
 | **5** | `cut_hole` | `part_id: str`, `position: [3]`, `normal: [3]`, `radius: num`, `depth: num` | `{ feature_id: str }` | Вырезать цилиндрическое отверстие в твердом теле |
 | **6** | `modify_feature` | `part_id: str`, `feature_id: str`, `params: obj` | `{ status: "updated", dimensions: [3] }` | Изменить параметры любого шага в истории DAG |
 | **7** | `get_feature_tree` | `part_id: str` | `{ dag: [...] }` | Получить полную историю дерева операций детали |
-| **8** | `create_joint` | `joint_type: str`, `part_a: str`, `part_b: str`, `anchor_a: [3]`, `anchor_b: [3]`, `axis?: [3]`, `limits?: [2]` | `{ joint_id: str }` | Создать сочленение (`revolute`, `prismatic`, `spherical`, `fixed`) |
-| **9** | `set_joint_motor` | `joint_id: str`, `target_velocity: num`, `max_force: num` | `{ status: "motor_active" }` | Включить сервопривод скорости на сочленении |
-| **10** | `run_physics_simulation` | `duration_seconds: num`, `step_size_ms?: num` | `{ success: bool, steps_simulated: int, trajectory_summary: obj, peak_joint_forces: obj, collisions: [...] }` | Провести динамическую симуляцию механизма во времени |
-| **11** | `run_fea_analysis` | `part_id: str`, `mesh_density?: str`, `fixed_faces?: [str]`, `fixed_plane?: obj`, `applied_forces?: [...]` | `{ max_von_mises_mpa: num, yield_strength_mpa: num, safety_factor: num, max_displacement_mm: num, status: "PASS"\|"FAIL" }` | Выполнить 3D МКЭ-расчет прочности (TET4) |
-| **12** | `get_fea_heatmap_image` | `part_id: str`, `camera_preset?: str`, `width?: int`, `height?: int` | `{ colormap_legend: obj }` + `image/png` | Получить 3D-снимок тепловой карты напряжений по Мизесу |
-| **13** | `capture_viewport` | `camera_preset?: str`, `part_id?: str`, `width?: int`, `height?: int` | `{ camera_preset: str, format: "image/png" }` + `image/png` | Сделать оффскрин 3D-снимок сцены сборки в высоком разрешении |
-| **14** | `export_stl` | `part_id: str`, `filepath: str`, `binary?: bool` | `{ file_path: str, triangles_count: int }` | Экспортировать деталь в файл STL для 3D-печати |
-| **15** | `get_simulation_metrics_json` | *(нет)* | `{ current_metrics: obj }` | Получить агрегированный отчет по всей сцене и расчетам |
+| **8** | `cut_helical_groove` | `part_id: str`, `helix_radius: num`, `groove_radius: num`, `pitch: num`, `height: num`, `start_z: num`, `profile_type?: "circular"\|"metric_60"` | `{ feature_id: str, status: "helical_groove_cut" }` | Нарезать винтовые канавки (канавки сверл или резьбу 60° по ISO 68-1) |
+| **9** | `boolean_difference` | `target_part_id: str`, `tool_part_id: str` | `{ feature_id: str, status: "boolean_difference_applied" }` | Вычесть форму инструмента из детали (CSG Difference) |
+| **10** | `create_joint` | `joint_type: str`, `part_a: str`, `part_b: str`, `anchor_a: [3]`, `anchor_b: [3]`, `axis?: [3]`, `limits?: [2]` | `{ joint_id: str }` | Создать сочленение (`revolute`, `prismatic`, `spherical`, `fixed`) |
+| **11** | `set_joint_motor` | `joint_id: str`, `target_velocity: num`, `max_force: num` | `{ status: "motor_active" }` | Включить сервопривод скорости на сочленении |
+| **12** | `run_physics_simulation` | `duration_seconds: num`, `step_size_ms?: num` | `{ success: bool, steps_simulated: int, trajectory_summary: obj, peak_joint_forces: obj, collisions: [...] }` | Провести динамическую симуляцию механизма во времени |
+| **13** | `run_fea_analysis` | `part_id: str`, `mesh_density?: str`, `fixed_faces?: [str]`, `fixed_plane?: obj`, `applied_forces?: [...]` | `{ max_von_mises_mpa: num, yield_strength_mpa: num, safety_factor: num, max_displacement_mm: num, status: "PASS"\|"FAIL" }` | Выполнить 3D МКЭ-расчет прочности (TET4) |
+| **14** | `get_fea_heatmap_image` | `part_id: str`, `camera_preset?: str`, `width?: int`, `height?: int` | `{ colormap_legend: obj }` + `image/png` | Получить 3D-снимок тепловой карты напряжений по Мизесу |
+| **15** | `capture_viewport` | `camera_preset?: str`, `part_id?: str`, `width?: int`, `height?: int` | `{ camera_preset: str, format: "image/png" }` + `image/png` | Сделать оффскрин 3D-снимок сцены сборки в высоком разрешении |
+| **16** | `export_stl` | `part_id: str`, `filepath: str`, `binary?: bool` | `{ file_path: str, triangles_count: int }` | Экспортировать деталь в файл STL для 3D-печати |
+| **17** | `get_simulation_metrics_json` | *(нет)* | `{ current_metrics: obj }` | Получить агрегированный отчет по всей сцене и расчетам |
+| **18** | `open_preview_window` | `part_id?: str` | `{ status: "preview_window_opened" }` | Открыть или сфокусировать нативное окно 3D-просмотра |
 
 > [!TIP]
 > Полная документация с примерами JSON-RPC запросов и ответов для всех 15 инструментов представлена в документе [Справочник API инструментов MCP](docs/MCP_API_REFERENCE.md).

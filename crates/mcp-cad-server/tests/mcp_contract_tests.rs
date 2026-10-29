@@ -796,3 +796,120 @@ async fn test_mcp_cone_and_helical_groove_and_boolean_difference() {
     let tree: Value = serde_json::from_str(text).unwrap();
     assert_eq!(tree["dag"].as_array().unwrap().len(), 2);
 }
+
+#[tokio::test]
+async fn test_mcp_polygon_prism_and_metric_thread() {
+    let state = EngineState::new()
+        .expect("EngineState initialization failed")
+        .into_shared();
+
+    // 1. Create part for hex nut
+    let create_req = json!({
+        "jsonrpc": "2.0",
+        "id": 301,
+        "method": "tools/call",
+        "params": {
+            "name": "create_part",
+            "arguments": {
+                "name": "Hex Nut M10 DIN934",
+                "material": "steel_structural_aisi1020"
+            }
+        }
+    });
+    let resp = rpc_call(&state, create_req).await;
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let data: Value = serde_json::from_str(text).unwrap();
+    let nut_id = data["part_id"].as_str().unwrap().to_string();
+
+    // 2. Add polygon_prism primitive with DIN 934 chamfer
+    let add_prism_req = json!({
+        "jsonrpc": "2.0",
+        "id": 302,
+        "method": "tools/call",
+        "params": {
+            "name": "add_feature_primitive",
+            "arguments": {
+                "part_id": nut_id,
+                "primitive_type": "polygon_prism",
+                "params": {
+                    "sides": 6,
+                    "width_across_flats": 0.016,
+                    "height": 0.008,
+                    "chamfer": 0.0008
+                }
+            }
+        }
+    });
+    let resp = rpc_call(&state, add_prism_req).await;
+    assert_eq!(resp["id"], 302);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let prism_data: Value = serde_json::from_str(text).unwrap();
+    let prism_feat_id = prism_data["feature_id"].as_str().unwrap().to_string();
+
+    // 3. Cut tap hole through center
+    let cut_hole_req = json!({
+        "jsonrpc": "2.0",
+        "id": 303,
+        "method": "tools/call",
+        "params": {
+            "name": "cut_hole",
+            "arguments": {
+                "part_id": nut_id,
+                "position": [0.0, 0.0, 0.0],
+                "normal": [0.0, 0.0, 1.0],
+                "radius": 0.00425,
+                "depth": 0.010
+            }
+        }
+    });
+    let resp = rpc_call(&state, cut_hole_req).await;
+    assert_eq!(resp["id"], 303);
+
+    // 4. Cut internal metric 60-degree thread
+    let cut_thread_req = json!({
+        "jsonrpc": "2.0",
+        "id": 304,
+        "method": "tools/call",
+        "params": {
+            "name": "cut_helical_groove",
+            "arguments": {
+                "part_id": nut_id,
+                "helix_radius": 0.00425,
+                "groove_radius": 0.00085,
+                "pitch": 0.0015,
+                "height": 0.008,
+                "start_z": -0.004,
+                "starts": 1,
+                "is_right_hand": true,
+                "profile_type": "metric_60"
+            }
+        }
+    });
+    let resp = rpc_call(&state, cut_thread_req).await;
+    assert_eq!(resp["id"], 304);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let thread_data: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(thread_data["status"], "helical_groove_cut");
+
+    // 5. Test modify_feature on polygon_prism
+    let mod_req = json!({
+        "jsonrpc": "2.0",
+        "id": 305,
+        "method": "tools/call",
+        "params": {
+            "name": "modify_feature",
+            "arguments": {
+                "part_id": nut_id,
+                "feature_id": prism_feat_id,
+                "params": {
+                    "chamfer": 0.001
+                }
+            }
+        }
+    });
+    let resp = rpc_call(&state, mod_req).await;
+    assert_eq!(resp["id"], 305);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let mod_data: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(mod_data["status"], "updated");
+}
