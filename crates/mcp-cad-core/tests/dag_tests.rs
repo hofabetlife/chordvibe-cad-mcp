@@ -7,6 +7,7 @@ use mcp_cad_core::dag::{FeatureOp, FeatureTree};
 use mcp_cad_core::export_stl::{
     export_stl_ascii, export_stl_binary, write_stl_ascii_file, write_stl_binary_file,
 };
+use mcp_cad_core::import_stl::{import_stl, import_stl_file, weld_vertices};
 use mcp_cad_core::material::MaterialRegistry;
 use mcp_cad_core::part::Part;
 use mcp_cad_core::primitives::{
@@ -237,6 +238,104 @@ fn test_stl_export_structure_ascii_and_binary() {
     let mut content_bin = Vec::new();
     file_bin.read_to_end(&mut content_bin).unwrap();
     assert_eq!(content_bin.len(), expected_bin_size);
+}
+
+#[test]
+fn test_stl_import_export_roundtrip_ascii_and_binary() {
+    // 1. Test Box round-trip with Binary STL and ASCII STL
+    let (w, h, d) = (2.0, 3.0, 4.0);
+    let original_box = create_box(w, h, d);
+    let expected_box_vol = w * h * d;
+    assert_eq!(original_box.triangle_count(), 12);
+
+    // 1a. Binary Box Roundtrip via Disk
+    let tmp_bin_box = NamedTempFile::new().unwrap();
+    write_stl_binary_file(&original_box, tmp_bin_box.path()).expect("Write binary STL failed");
+    let imported_bin_box = import_stl_file(tmp_bin_box.path()).expect("Import binary STL failed");
+
+    assert_eq!(
+        imported_bin_box.triangle_count(),
+        original_box.triangle_count(),
+        "Triangle count mismatch for binary STL box"
+    );
+    let bin_box_vol = imported_bin_box.volume();
+    let bin_box_err = (bin_box_vol - expected_box_vol).abs() / expected_box_vol;
+    assert!(
+        bin_box_err < 0.001,
+        "Binary STL box volume error ratio ({}) exceeds 0.1%",
+        bin_box_err
+    );
+
+    // 1b. ASCII Box Roundtrip via Disk
+    let tmp_ascii_box = NamedTempFile::new().unwrap();
+    write_stl_ascii_file(&original_box, "box_solid", tmp_ascii_box.path()).expect("Write ASCII STL failed");
+    let imported_ascii_box = import_stl_file(tmp_ascii_box.path()).expect("Import ASCII STL failed");
+
+    assert_eq!(
+        imported_ascii_box.triangle_count(),
+        original_box.triangle_count(),
+        "Triangle count mismatch for ASCII STL box"
+    );
+    let ascii_box_vol = imported_ascii_box.volume();
+    let ascii_box_err = (ascii_box_vol - expected_box_vol).abs() / expected_box_vol;
+    assert!(
+        ascii_box_err < 0.001,
+        "ASCII STL box volume error ratio ({}) exceeds 0.1%",
+        ascii_box_err
+    );
+
+    // 2. Test Cylinder round-trip with Binary STL and ASCII STL
+    let (r, hc, segs) = (1.5, 5.0, 64);
+    let original_cyl = create_cylinder(r, hc, segs);
+    let orig_cyl_vol = original_cyl.volume();
+    let orig_cyl_tri_count = original_cyl.triangle_count();
+
+    // 2a. Binary Cylinder Roundtrip via Disk
+    let tmp_bin_cyl = NamedTempFile::new().unwrap();
+    write_stl_binary_file(&original_cyl, tmp_bin_cyl.path()).expect("Write binary STL failed");
+    let imported_bin_cyl = import_stl_file(tmp_bin_cyl.path()).expect("Import binary STL failed");
+
+    assert_eq!(
+        imported_bin_cyl.triangle_count(),
+        orig_cyl_tri_count,
+        "Triangle count mismatch for binary STL cylinder"
+    );
+    let bin_cyl_vol = imported_bin_cyl.volume();
+    let bin_cyl_err = (bin_cyl_vol - orig_cyl_vol).abs() / orig_cyl_vol;
+    assert!(
+        bin_cyl_err < 0.001,
+        "Binary STL cylinder volume error ratio ({}) exceeds 0.1%",
+        bin_cyl_err
+    );
+
+    // 2b. ASCII Cylinder Roundtrip via Disk
+    let tmp_ascii_cyl = NamedTempFile::new().unwrap();
+    write_stl_ascii_file(&original_cyl, "cyl_solid", tmp_ascii_cyl.path()).expect("Write ASCII STL failed");
+    let imported_ascii_cyl = import_stl_file(tmp_ascii_cyl.path()).expect("Import ASCII STL failed");
+
+    assert_eq!(
+        imported_ascii_cyl.triangle_count(),
+        orig_cyl_tri_count,
+        "Triangle count mismatch for ASCII STL cylinder"
+    );
+    let ascii_cyl_vol = imported_ascii_cyl.volume();
+    let ascii_cyl_err = (ascii_cyl_vol - orig_cyl_vol).abs() / orig_cyl_vol;
+    assert!(
+        ascii_cyl_err < 0.001,
+        "ASCII STL cylinder volume error ratio ({}) exceeds 0.1%",
+        ascii_cyl_err
+    );
+
+    // 3. Test In-memory Cursor auto-detection and welding
+    let mut file_reader = std::fs::File::open(tmp_bin_box.path()).unwrap();
+    let imported_cursor = import_stl(&mut file_reader).expect("import_stl on seekable file failed");
+    assert_eq!(imported_cursor.triangle_count(), 12);
+
+    let welded_box = weld_vertices(&imported_ascii_box, 1e-4);
+    assert_eq!(welded_box.vertex_count(), 8);
+    assert_eq!(welded_box.triangle_count(), 12);
+    let welded_vol_err = (welded_box.volume() - expected_box_vol).abs() / expected_box_vol;
+    assert!(welded_vol_err < 0.001);
 }
 
 #[test]
