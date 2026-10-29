@@ -988,3 +988,59 @@ pub fn boolean_difference(args: &Value, state: &mut EngineState) -> Result<Value
         "status": "boolean_difference_applied"
     }))
 }
+
+/// `import_stl`: Imports an external 3D STL file (ASCII or binary) as a new Part and displays it in the viewport.
+pub fn import_stl(args: &Value, state: &mut EngineState) -> Result<Value, ServerError> {
+    let filepath = args
+        .get("filepath")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'filepath'".to_string()))?;
+
+    let path = std::path::Path::new(filepath);
+    let default_name = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "imported_stl".to_string());
+
+    let part_name = args
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or(default_name);
+
+    let material_name = args
+        .get("material")
+        .and_then(|v| v.as_str())
+        .unwrap_or("steel_structural_aisi1020");
+
+    let material = state
+        .materials
+        .get(material_name)
+        .cloned()
+        .ok_or_else(|| {
+            let available: Vec<_> = state.materials.list().into_iter().map(|m| m.name.as_str()).collect();
+            ServerError::InvalidArgument(format!(
+                "Material '{}' not found in registry. Available presets: {}",
+                material_name,
+                available.join(", ")
+            ))
+        })?;
+
+    let mesh = mcp_cad_core::import_stl_file(path)?;
+
+    let part_id = format!("part-{}", Uuid::new_v4().simple());
+    let mut part = Part::new(&part_id, &part_name, material);
+    part.mesh = mesh.clone();
+
+    state.send_gui_mesh(&mesh);
+    state.parts.insert(part_id.clone(), part);
+
+    Ok(json!({
+        "part_id": part_id,
+        "name": part_name,
+        "vertices_count": mesh.vertices.len(),
+        "triangles_count": mesh.indices.len(),
+        "bounding_box": mesh.bounding_box(),
+        "status": "stl_imported"
+    }))
+}

@@ -68,8 +68,8 @@ async fn test_mcp_tools_list() {
         .as_array()
         .expect("tools must be an array");
 
-    // Must declare exactly 18 tools
-    assert_eq!(tools.len(), 18, "Server must expose exactly 18 MCP tools");
+    // Must declare exactly 19 tools
+    assert_eq!(tools.len(), 19, "Server must expose exactly 19 MCP tools");
 
     let expected_tools = [
         "create_part",
@@ -90,6 +90,7 @@ async fn test_mcp_tools_list() {
         "export_stl",
         "get_simulation_metrics_json",
         "open_preview_window",
+        "import_stl",
     ];
 
     let mut found_names = HashSet::new();
@@ -1284,4 +1285,121 @@ async fn test_mcp_revolve_and_wheel_rim() {
         vol_wheel2,
         vol_wheel
     );
+}
+
+#[tokio::test]
+async fn test_mcp_import_stl() {
+    let state = EngineState::new()
+        .expect("EngineState initialization failed")
+        .into_shared();
+
+    // 1. Create a part and export it to an STL file first
+    let part_req = json!({
+        "jsonrpc": "2.0",
+        "id": 601,
+        "method": "tools/call",
+        "params": {
+            "name": "create_part",
+            "arguments": {
+                "name": "stl_source_part",
+                "material": "aluminum_6061_t6"
+            }
+        }
+    });
+    let resp = rpc_call(&state, part_req).await;
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let src_part_id = serde_json::from_str::<Value>(text).unwrap()["part_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let add_prim_req = json!({
+        "jsonrpc": "2.0",
+        "id": 602,
+        "method": "tools/call",
+        "params": {
+            "name": "add_feature_primitive",
+            "arguments": {
+                "part_id": src_part_id,
+                "primitive_type": "box",
+                "params": {
+                    "width": 0.05,
+                    "height": 0.03,
+                    "depth": 0.02
+                }
+            }
+        }
+    });
+    let _ = rpc_call(&state, add_prim_req).await;
+
+    let tmp_dir = std::env::temp_dir();
+    let stl_path = tmp_dir.join(format!("test_import_{}.stl", uuid::Uuid::new_v4().simple()));
+    let stl_path_str = stl_path.to_str().unwrap().to_string();
+
+    let export_req = json!({
+        "jsonrpc": "2.0",
+        "id": 603,
+        "method": "tools/call",
+        "params": {
+            "name": "export_stl",
+            "arguments": {
+                "part_id": src_part_id,
+                "filepath": stl_path_str.clone(),
+                "binary": true
+            }
+        }
+    });
+    let _ = rpc_call(&state, export_req).await;
+    assert!(stl_path.exists(), "Source STL must exist on disk");
+
+    // 2. Import the STL via MCP import_stl tool
+    let import_req = json!({
+        "jsonrpc": "2.0",
+        "id": 604,
+        "method": "tools/call",
+        "params": {
+            "name": "import_stl",
+            "arguments": {
+                "filepath": stl_path_str,
+                "name": "custom_imported_box",
+                "material": "steel_structural_aisi1020"
+            }
+        }
+    });
+    let resp = rpc_call(&state, import_req).await;
+    assert_eq!(resp["id"], 604);
+    assert!(resp["error"].is_null());
+
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let import_data: Value = serde_json::from_str(text).unwrap();
+
+    let imported_part_id = import_data["part_id"].as_str().unwrap().to_string();
+    assert_eq!(import_data["name"], "custom_imported_box");
+    assert_eq!(import_data["status"], "stl_imported");
+    assert_eq!(import_data["triangles_count"], 12);
+    assert_eq!(import_data["vertices_count"], 36);
+    assert!(import_data["bounding_box"].is_object());
+
+    // 3. Verify the imported part appears in list_parts
+    let list_req = json!({
+        "jsonrpc": "2.0",
+        "id": 605,
+        "method": "tools/call",
+        "params": {
+            "name": "list_parts",
+            "arguments": {}
+        }
+    });
+    let resp = rpc_call(&state, list_req).await;
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let list_data: Value = serde_json::from_str(text).unwrap();
+    let found = list_data["parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["id"] == imported_part_id && p["name"] == "custom_imported_box");
+    assert!(found, "Imported part must appear in list_parts");
+
+    // Clean up
+    let _ = std::fs::remove_file(&stl_path);
 }
