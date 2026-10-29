@@ -1814,6 +1814,38 @@ impl ApplicationHandler<GuiEvent> for CadWindowApp {
                     self.reset_window_resources();
                 }
             }
+            WindowEvent::DroppedFile(path) => {
+                if path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map_or(false, |ext| ext.eq_ignore_ascii_case("stl"))
+                {
+                    match mcp_cad_core::import_stl_file(&path) {
+                        Ok(mesh) => {
+                            let v_len = mesh.vertices.len();
+                            let t_len = mesh.indices.len();
+                            self.upload_cad_mesh(&mesh);
+                            self.fit_all_cameras();
+                            if let Some(w) = &self.window {
+                                w.set_title(&format!(
+                                    "MCP-CAD Preview - {}",
+                                    path.file_name().unwrap_or_default().to_string_lossy()
+                                ));
+                                w.request_redraw();
+                            }
+                            eprintln!(
+                                "INFO: Successfully loaded STL: {} ({} vertices, {} triangles)",
+                                path.display(),
+                                v_len,
+                                t_len
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("ERROR: Failed to load dropped STL: {e}");
+                        }
+                    }
+                }
+            }
             WindowEvent::Resized(new_size) => {
                 if new_size.width > 0 && new_size.height > 0 {
                     if let (Some(surface), Some(device), Some(config)) = (

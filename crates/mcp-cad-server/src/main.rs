@@ -32,6 +32,14 @@ struct Args {
     /// Transport mode: "stdio" or "sse".
     #[arg(short, long, default_value = "stdio")]
     mode: String,
+
+    /// Path to an STL file to open and display upon launch.
+    #[arg(long)]
+    stl: Option<std::path::PathBuf>,
+
+    /// Positional path to an STL file to open and display upon launch.
+    #[arg(value_name = "STL_FILE")]
+    file: Option<std::path::PathBuf>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -50,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!("Initializing MCP-CAD Engine...");
 
     let is_standalone = args.standalone;
-    let is_gui = args.gui || args.standalone;
+    let is_gui = args.gui || args.standalone || args.stl.is_some() || args.file.is_some();
 
     if is_gui {
         tracing::info!("Starting MCP-CAD in GUI mode with native 3D viewport...");
@@ -109,6 +117,23 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         let mut app = mcp_cad_viewer::CadWindowApp::default();
         app.exit_on_close = true;
+
+        let stl_to_load = args.stl.as_ref().or(args.file.as_ref());
+        if let Some(stl_path) = stl_to_load {
+            match mcp_cad_core::import_stl_file(stl_path) {
+                Ok(mesh) => {
+                    if let Some(fname) = stl_path.file_name() {
+                        app.title = format!("MCP-CAD Preview - {}", fname.to_string_lossy());
+                    }
+                    app.mesh = Some(mesh);
+                    tracing::info!("Loaded startup STL file: {:?}", stl_path);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to load startup STL {:?}: {e}", stl_path);
+                }
+            }
+        }
+
         let _ = mcp_cad_viewer::run_gui_app(event_loop, app);
         std::process::exit(0);
     } else {

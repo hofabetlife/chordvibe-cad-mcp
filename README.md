@@ -180,6 +180,7 @@ cargo run --release -p mcp-cad-server -- --mode sse --port 8080
 | **16** | `export_stl` | `part_id: str`, `filepath: str`, `binary?: bool` | `{ file_path: str, triangles_count: int }` | Экспортировать деталь в файл STL для 3D-печати |
 | **17** | `get_simulation_metrics_json` | *(нет)* | `{ current_metrics: obj }` | Получить агрегированный отчет по всей сцене и расчетам |
 | **18** | `open_preview_window` | `part_id?: str` | `{ status: "preview_window_opened" }` | Открыть или сфокусировать нативное окно 3D-просмотра |
+| **19** | `import_stl` | `filepath: str`, `name?: str`, `material?: str` | `{ part_id: str, name: str, vertices_count: int, triangles_count: int, status: "stl_imported" }` | Импортировать готовую 3D-модель STL в сцену и 3D-вьюпорт |
 
 > [!TIP]
 > Полная документация с примерами JSON-RPC запросов и ответов для всех 15 инструментов представлена в документе [Справочник API инструментов MCP](docs/MCP_API_REFERENCE.md).

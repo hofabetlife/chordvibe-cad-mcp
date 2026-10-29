@@ -230,6 +230,7 @@ graph TD
 | `get_fea_heatmap_image` | `part_id: String`, `camera_preset: String` | `{ image_base64: String, legend: Object }` | Снимок тепловой карты |
 | `capture_viewport` | `camera_preset: String`, `width: u32`, `height: u32` | `{ image_base64: String }` | Скриншот 3D сцены |
 | `open_preview_window` | `part_id: Option<String>` | `{ status: "window_opened" }` | Открыть/сфокусировать нативное окно 3D превью |
+| `import_stl` | `filepath: String`, `name: Option<String>`, `material: Option<String>` | `{ part_id: String, name: String, vertices_count: usize, triangles_count: usize, status: "stl_imported" }` | Импорт STL файла в деталь и вывод во вьюпорт |
 | `export_stl` | `part_id: String`, `filepath: String`, `binary: bool` | `{ file_path: String, triangles_count: u32 }` | Экспорт в STL |
 | `get_simulation_metrics_json` | *(нет)* | `{ current_metrics: Object }` | Полный инженерный отчет |
 

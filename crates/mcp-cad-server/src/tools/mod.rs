@@ -13,7 +13,7 @@ use crate::error::ServerError;
 use crate::protocol::{ToolCallResult, ToolDefinition};
 use crate::state::EngineState;
 
-/// Returns the complete registry of all 18 MCP engineering tools with strict input schemas.
+/// Returns the complete registry of all 19 MCP engineering tools with strict input schemas.
 pub fn list_tools() -> Vec<ToolDefinition> {
     vec![
         // 1. create_part
@@ -555,6 +555,29 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 }
             }),
         },
+        // 17. import_stl
+        ToolDefinition {
+            name: "import_stl".to_string(),
+            description: "Imports an external 3D STL file (ASCII or binary) into the CAD scene as a new Part and displays it in the 3D viewport".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "filepath": {
+                        "type": "string",
+                        "description": "Path to the .stl file on disk"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Optional custom name for the part (defaults to file name without extension)"
+                    },
+                    "material": {
+                        "type": "string",
+                        "description": "Optional material identifier from registry (defaults to 'steel_structural_aisi1020')"
+                    }
+                },
+                "required": ["filepath"]
+            }),
+        },
     ]
 }
 
@@ -629,6 +652,10 @@ pub fn dispatch_tool(
         }
         "export_stl" => {
             let res = export::export_stl(args, state)?;
+            ToolCallResult::json(&res).map_err(ServerError::Json)
+        }
+        "import_stl" => {
+            let res = cad::import_stl(args, state)?;
             ToolCallResult::json(&res).map_err(ServerError::Json)
         }
         "get_simulation_metrics_json" => {
