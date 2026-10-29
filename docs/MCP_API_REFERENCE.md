@@ -235,7 +235,7 @@
 | Параметр | Тип | Обязательный | Описание |
 |---|---|---|---|
 | `part_id` | `string` | Да | Идентификатор целевой детали |
-| `primitive_type` | `string` | Да | Тип примитива: `"box"`, `"cylinder"`, `"sphere"`, `"cone"`, `"polygon_prism"`, `"spur_gear"` |
+| `primitive_type` | `string` | Да | Тип примитива: `"box"`, `"cylinder"`, `"sphere"`, `"cone"`, `"polygon_prism"`, `"spur_gear"`, `"revolve"`, `"wheel_rim"` |
 | `params` | `object` | Да | Геометрические размеры в метрах (см. таблицу ниже) |
 
 **Спецификация параметров примитивов**:
@@ -245,6 +245,8 @@
 - `"cone"`: `{"radius_bottom": number, "radius_top"?: number, "height": number, "segments"?: integer}`
 - `"polygon_prism"`: `{"height": number, "sides"?: integer, "width_across_flats"?: number, "radius"?: number, "chamfer"?: number}` (правильная призма для гаек/болтов с коническими торцевыми фасками 30° по DIN 934)
 - `"spur_gear"`: `{"module": number, "teeth": integer, "face_width": number, "pressure_angle_deg"?: number, "bore_radius"?: number, "bore_diameter"?: number, "keyway_width"?: number, "keyway_depth"?: number, "hub_diameter"?: number, "hub_length"?: number}` (прямозубая цилиндрическая шестерня с точным эвольвентным профилем по DIN 867 / ISO 53, опциональной ступицей и шпоночным пазом DIN 6885)
+- `"revolve"`: `{"profile": [[r, z], ...], "angle_deg"?: number, "segments"?: integer}` (тело вращения 2D-профиля вокруг оси Z; угол поворота `angle_deg` по умолчанию 360°, с плоскими крышками для углов < 360°)
+- `"wheel_rim"`: `{"rim_diameter": number, "rim_width": number, "flange_diameter"?: number, "hub_diameter"?: number, "hub_bore_diameter"?: number, "pcd_diameter"?: number, "bolt_holes_count"?: integer, "bolt_hole_diameter"?: number, "spokes_count"?: integer, "spoke_width"?: number, "spoke_thickness"?: number, "offset_et"?: number}` (параметрический легкосплавный колесный диск со ступенчатым ободом, закраинами, монтажным ручьем, ступицей, PCD разболтовкой и спицами с открытыми окнами вентиляции тормозов)
 - *Общие опциональные параметры*: `"position"?: [x, y, z]`, `"rotation_deg"?: [rx, ry, rz]`
 
 #### Пример запроса

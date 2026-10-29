@@ -1084,3 +1084,204 @@ async fn test_mcp_spur_gear_and_keyway() {
     let cut_data: Value = serde_json::from_str(text).unwrap();
     assert!(!cut_data["feature_id"].as_str().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn test_mcp_revolve_and_wheel_rim() {
+    let state = EngineState::new()
+        .expect("EngineState initialization failed")
+        .into_shared();
+
+    // 1. Verify schema in tools/list
+    let list_tools_req = json!({
+        "jsonrpc": "2.0",
+        "id": 501,
+        "method": "tools/list",
+        "params": {}
+    });
+    let resp = rpc_call(&state, list_tools_req).await;
+    let tools = resp["result"]["tools"].as_array().unwrap();
+    let add_prim = tools.iter().find(|t| t["name"] == "add_feature_primitive").unwrap();
+    let prim_enum = add_prim["inputSchema"]["properties"]["primitive_type"]["enum"].as_array().unwrap();
+    assert!(prim_enum.iter().any(|v| v.as_str() == Some("revolve")));
+    assert!(prim_enum.iter().any(|v| v.as_str() == Some("wheel_rim")));
+
+    // 2. Test revolve primitive
+    let create_part_req = json!({
+        "jsonrpc": "2.0",
+        "id": 502,
+        "method": "tools/call",
+        "params": {
+            "name": "create_part",
+            "arguments": {
+                "name": "Shaft Collar",
+                "material": "steel_structural_aisi1020"
+            }
+        }
+    });
+    let resp = rpc_call(&state, create_part_req).await;
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let collar_part_id = serde_json::from_str::<Value>(text).unwrap()["part_id"].as_str().unwrap().to_string();
+
+    let add_rev_req = json!({
+        "jsonrpc": "2.0",
+        "id": 503,
+        "method": "tools/call",
+        "params": {
+            "name": "add_feature_primitive",
+            "arguments": {
+                "part_id": collar_part_id,
+                "primitive_type": "revolve",
+                "params": {
+                    "profile": [
+                        [0.0, -0.05],
+                        [0.03, -0.05],
+                        [0.03, 0.05],
+                        [0.0, 0.05]
+                    ],
+                    "angle_deg": 360.0,
+                    "segments": 32
+                }
+            }
+        }
+    });
+    let resp = rpc_call(&state, add_rev_req).await;
+    assert_eq!(resp["id"], 503);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let rev_feat_id = serde_json::from_str::<Value>(text).unwrap()["feature_id"].as_str().unwrap().to_string();
+
+    let list_req = json!({
+        "jsonrpc": "2.0",
+        "id": 504,
+        "method": "tools/call",
+        "params": {
+            "name": "list_parts",
+            "arguments": {}
+        }
+    });
+    let resp = rpc_call(&state, list_req.clone()).await;
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let list_data: Value = serde_json::from_str(text).unwrap();
+    let collar_summary = list_data["parts"].as_array().unwrap().iter().find(|p| p["id"] == collar_part_id).unwrap();
+    let vol_full = collar_summary["volume"].as_f64().unwrap();
+    assert!(vol_full > 0.0, "Revolve volume should be positive: got {}", vol_full);
+
+    // Modify revolve to 180 degrees
+    let mod_rev_req = json!({
+        "jsonrpc": "2.0",
+        "id": 505,
+        "method": "tools/call",
+        "params": {
+            "name": "modify_feature",
+            "arguments": {
+                "part_id": collar_part_id,
+                "feature_id": rev_feat_id,
+                "params": {
+                    "angle_deg": 180.0
+                }
+            }
+        }
+    });
+    let resp = rpc_call(&state, mod_rev_req).await;
+    assert_eq!(resp["id"], 505);
+
+    let resp = rpc_call(&state, list_req.clone()).await;
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let list_data2: Value = serde_json::from_str(text).unwrap();
+    let collar_summary2 = list_data2["parts"].as_array().unwrap().iter().find(|p| p["id"] == collar_part_id).unwrap();
+    let vol_half = collar_summary2["volume"].as_f64().unwrap();
+    assert!(
+        (vol_half - vol_full * 0.5).abs() / (vol_full * 0.5) < 0.05,
+        "180-deg revolve volume ({}) should be ~half of 360-deg ({})",
+        vol_half,
+        vol_full
+    );
+
+    // 3. Test wheel_rim primitive
+    let create_wheel_req = json!({
+        "jsonrpc": "2.0",
+        "id": 506,
+        "method": "tools/call",
+        "params": {
+            "name": "create_part",
+            "arguments": {
+                "name": "Forged Alloy Wheel",
+                "material": "aluminum_6061_t6"
+            }
+        }
+    });
+    let resp = rpc_call(&state, create_wheel_req).await;
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let wheel_part_id = serde_json::from_str::<Value>(text).unwrap()["part_id"].as_str().unwrap().to_string();
+
+    let add_wheel_req = json!({
+        "jsonrpc": "2.0",
+        "id": 507,
+        "method": "tools/call",
+        "params": {
+            "name": "add_feature_primitive",
+            "arguments": {
+                "part_id": wheel_part_id,
+                "primitive_type": "wheel_rim",
+                "params": {
+                    "rim_diameter": 0.4572,
+                    "rim_width": 0.2032,
+                    "flange_diameter": 0.490,
+                    "hub_diameter": 0.160,
+                    "hub_bore_diameter": 0.066,
+                    "pcd_diameter": 0.1143,
+                    "bolt_holes_count": 5,
+                    "bolt_hole_diameter": 0.014,
+                    "spokes_count": 5,
+                    "spoke_width": 0.028,
+                    "spoke_thickness": 0.018,
+                    "offset_et": 0.035
+                }
+            }
+        }
+    });
+    let resp = rpc_call(&state, add_wheel_req).await;
+    assert_eq!(resp["id"], 507);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let wheel_feat_id = serde_json::from_str::<Value>(text).unwrap()["feature_id"].as_str().unwrap().to_string();
+
+    let resp = rpc_call(&state, list_req.clone()).await;
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let list_data3: Value = serde_json::from_str(text).unwrap();
+    let wheel_summary = list_data3["parts"].as_array().unwrap().iter().find(|p| p["id"] == wheel_part_id).unwrap();
+    let vol_wheel = wheel_summary["volume"].as_f64().unwrap();
+    assert!(vol_wheel > 0.001, "Wheel volume should be positive: got {}", vol_wheel);
+
+    let dims = wheel_summary["bounding_box_dimensions"].as_array().unwrap();
+    assert!((dims[2].as_f64().unwrap() - 0.2032).abs() < 0.02);
+
+    // Modify wheel rim: increase rim_width to 0.254
+    let mod_wheel_req = json!({
+        "jsonrpc": "2.0",
+        "id": 508,
+        "method": "tools/call",
+        "params": {
+            "name": "modify_feature",
+            "arguments": {
+                "part_id": wheel_part_id,
+                "feature_id": wheel_feat_id,
+                "params": {
+                    "rim_width": 0.254
+                }
+            }
+        }
+    });
+    let resp = rpc_call(&state, mod_wheel_req).await;
+    assert_eq!(resp["id"], 508);
+
+    let resp = rpc_call(&state, list_req).await;
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let list_data4: Value = serde_json::from_str(text).unwrap();
+    let wheel_summary2 = list_data4["parts"].as_array().unwrap().iter().find(|p| p["id"] == wheel_part_id).unwrap();
+    let vol_wheel2 = wheel_summary2["volume"].as_f64().unwrap();
+    assert!(
+        vol_wheel2 > vol_wheel,
+        "Wider wheel volume ({}) must exceed narrower wheel ({})",
+        vol_wheel2,
+        vol_wheel
+    );
+}

@@ -62,7 +62,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         // 4. add_feature_primitive
         ToolDefinition {
             name: "add_feature_primitive".to_string(),
-            description: "Appends a 3D solid primitive (box, cylinder, sphere, cone, polygon_prism, or spur_gear) into the parametric history DAG of a part, with optional 3D position and rotation".to_string(),
+            description: "Appends a 3D solid primitive (box, cylinder, sphere, cone, polygon_prism, spur_gear, revolve, or wheel_rim) into the parametric history DAG of a part, with optional 3D position and rotation".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -72,12 +72,12 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     },
                     "primitive_type": {
                         "type": "string",
-                        "enum": ["box", "cylinder", "sphere", "cone", "polygon_prism", "spur_gear"],
+                        "enum": ["box", "cylinder", "sphere", "cone", "polygon_prism", "spur_gear", "revolve", "wheel_rim"],
                         "description": "Type of 3D primitive"
                     },
                     "params": {
                         "type": "object",
-                        "description": "Geometric parameters (box: width, height, depth; cylinder: radius, height; sphere: radius; cone: radius_bottom, radius_top, height; polygon_prism: height, sides, width_across_flats, radius, chamfer; spur_gear: module, teeth, face_width, pressure_angle_deg, bore_radius, bore_diameter, keyway_width, keyway_depth, hub_diameter, hub_length; optional position [x,y,z], rotation_deg [rx,ry,rz])",
+                        "description": "Geometric parameters (box: width, height, depth; cylinder: radius, height; sphere: radius; cone: radius_bottom, radius_top, height; polygon_prism: height, sides, width_across_flats, radius, chamfer; spur_gear: module, teeth, face_width, pressure_angle_deg, bore_radius, bore_diameter, keyway_width, keyway_depth, hub_diameter, hub_length; revolve: profile [[r,z],...], angle_deg; wheel_rim: rim_diameter, rim_width, flange_diameter, hub_diameter, hub_bore_diameter, pcd_diameter, bolt_holes_count, bolt_hole_diameter, spokes_count, spoke_width, spoke_thickness, offset_et; optional position [x,y,z], rotation_deg [rx,ry,rz])",
                         "properties": {
                             "width": { "type": "number", "description": "Box width in meters" },
                             "height": { "type": "number", "description": "Height in meters (box, cylinder, cone, polygon_prism)" },
@@ -98,6 +98,28 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                             "keyway_depth": { "type": "number", "description": "Optional DIN 6885 keyway slot depth into hub/bore in meters" },
                             "hub_diameter": { "type": "number", "description": "Optional hub diameter in meters" },
                             "hub_length": { "type": "number", "description": "Optional hub axial length in meters" },
+                            "profile": {
+                                "type": "array",
+                                "items": {
+                                    "type": "array",
+                                    "items": { "type": "number" },
+                                    "minItems": 2,
+                                    "maxItems": 2
+                                },
+                                "description": "2D cross-section contour points [[r, z], ...] for revolve"
+                            },
+                            "angle_deg": { "type": "number", "description": "Revolution sweep angle in degrees (default 360.0)" },
+                            "rim_diameter": { "type": "number", "description": "Nominal wheel rim bead seat diameter in meters (e.g. 0.4572 for 18-inch rim)" },
+                            "rim_width": { "type": "number", "description": "Wheel rim width in meters (e.g. 0.2032 for 8-inch rim)" },
+                            "flange_diameter": { "type": "number", "description": "Optional outer rim flange diameter in meters" },
+                            "hub_bore_diameter": { "type": "number", "description": "Optional central hub bore hole diameter in meters" },
+                            "pcd_diameter": { "type": "number", "description": "Optional PCD (Pitch Circle Diameter) for bolt holes in meters (e.g. 0.1143)" },
+                            "bolt_holes_count": { "type": "integer", "description": "Number of bolt holes on PCD pattern (default 5)" },
+                            "bolt_hole_diameter": { "type": "number", "description": "Diameter of each bolt hole in meters (default 0.014 for M14)" },
+                            "spokes_count": { "type": "integer", "description": "Number of wheel spokes (default 5)" },
+                            "spoke_width": { "type": "number", "description": "Circumferential width of each spoke in meters" },
+                            "spoke_thickness": { "type": "number", "description": "Axial thickness of each spoke in meters" },
+                            "offset_et": { "type": "number", "description": "Wheel offset ET in meters (e.g. 0.035 for +35mm)" },
                             "segments": { "type": "integer", "description": "Radial segments (default 32)" },
                             "sectors": { "type": "integer", "description": "Sphere sectors (default 32)" },
                             "stacks": { "type": "integer", "description": "Sphere stacks (default 16)" },

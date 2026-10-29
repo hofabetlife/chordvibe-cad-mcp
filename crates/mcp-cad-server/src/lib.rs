@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! MCP-CAD Server library: JSON-RPC MCP dispatcher, stdio/SSE transports, and 15 CAD/CAE tools.
 
 pub mod error;

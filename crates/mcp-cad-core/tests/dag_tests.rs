@@ -594,3 +594,111 @@ fn test_dag_spur_gear_model() {
         vol1
     );
 }
+
+#[test]
+fn test_dag_revolve_model() {
+    let mut tree = FeatureTree::new();
+    let profile = vec![
+        [0.0, -0.05],
+        [0.04, -0.05],
+        [0.04, 0.05],
+        [0.0, 0.05],
+    ];
+    let rev_id = tree.add_feature(
+        FeatureOp::AddRevolve {
+            profile: profile.clone(),
+            angle_deg: 360.0,
+            segments: 32,
+            position: None,
+            rotation_deg: None,
+        },
+        Some("Revolved Cylinder".to_string()),
+    );
+
+    let mesh1 = tree.evaluate().expect("DAG revolve evaluation failed");
+    assert!(mesh1.triangle_count() > 0);
+    let vol1 = mesh1.volume();
+    assert!(vol1 > 0.0);
+
+    // Modify: change to 180 degrees
+    tree.modify_feature(
+        rev_id,
+        FeatureOp::AddRevolve {
+            profile,
+            angle_deg: 180.0,
+            segments: 32,
+            position: None,
+            rotation_deg: None,
+        },
+    ).expect("Modify revolve failed");
+
+    let mesh2 = tree.evaluate().expect("DAG modified revolve evaluation failed");
+    let vol2 = mesh2.volume();
+    assert!(
+        (vol2 - vol1 * 0.5).abs() / (vol1 * 0.5) < 0.05,
+        "180-deg revolve volume ({}) should be ~half of 360-deg ({})",
+        vol2,
+        vol1
+    );
+}
+
+#[test]
+fn test_dag_wheel_rim_model() {
+    let mut tree = FeatureTree::new();
+    let rim_d = 0.4572; // 18"
+    let rim_w = 0.2032; // 8"
+    let rim_id = tree.add_feature(
+        FeatureOp::AddWheelRim {
+            rim_diameter: rim_d,
+            rim_width: rim_w,
+            flange_diameter: Some(0.490),
+            hub_diameter: Some(0.160),
+            hub_bore_diameter: Some(0.066),
+            pcd_diameter: Some(0.1143),
+            bolt_holes_count: Some(5),
+            bolt_hole_diameter: Some(0.014),
+            spokes_count: Some(5),
+            spoke_width: Some(0.028),
+            spoke_thickness: Some(0.018),
+            offset_et: Some(0.035),
+            position: None,
+            rotation_deg: None,
+        },
+        Some("Alloy Wheel Rim".to_string()),
+    );
+
+    let wheel1 = tree.evaluate().expect("DAG wheel rim evaluation failed");
+    assert!(wheel1.triangle_count() > 0);
+    let vol1 = wheel1.volume();
+    assert!(vol1 > 0.001);
+
+    // Modify width to 10" (0.254 m)
+    tree.modify_feature(
+        rim_id,
+        FeatureOp::AddWheelRim {
+            rim_diameter: rim_d,
+            rim_width: 0.254,
+            flange_diameter: Some(0.490),
+            hub_diameter: Some(0.160),
+            hub_bore_diameter: Some(0.066),
+            pcd_diameter: Some(0.1143),
+            bolt_holes_count: Some(5),
+            bolt_hole_diameter: Some(0.014),
+            spokes_count: Some(5),
+            spoke_width: Some(0.028),
+            spoke_thickness: Some(0.018),
+            offset_et: Some(0.035),
+            position: None,
+            rotation_deg: None,
+        },
+    ).expect("Modify wheel rim failed");
+
+    let wheel2 = tree.evaluate().expect("DAG modified wheel rim evaluation failed");
+    let vol2 = wheel2.volume();
+    assert!(
+        vol2 > vol1,
+        "Wider wheel rim volume ({}) must be greater than narrower ({})",
+        vol2,
+        vol1
+    );
+}

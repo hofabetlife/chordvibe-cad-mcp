@@ -1190,6 +1190,388 @@ pub fn create_spur_gear(
     solid
 }
 
+/// Helper: 2D polygon ear-clipping triangulation for simple polygons.
+/// Returns a list of triangle index triples indexing into `pts`.
+fn triangulate_simple_polygon_2d(pts: &[[f64; 2]]) -> Vec<[u32; 3]> {
+    let n = pts.len();
+    if n < 3 {
+        return Vec::new();
+    }
+    if n == 3 {
+        return vec![[0, 1, 2]];
+    }
+
+    let mut indices: Vec<u32> = (0..n as u32).collect();
+    let mut triangles = Vec::with_capacity(n - 2);
+
+    let is_point_in_tri = |p: [f64; 2], a: [f64; 2], b: [f64; 2], c: [f64; 2]| -> bool {
+        let cross = |p1: [f64; 2], p2: [f64; 2], p3: [f64; 2]| {
+            (p2[0] - p1[0]) * (p3[1] - p1[1]) - (p2[1] - p1[1]) * (p3[0] - p1[0])
+        };
+        let c1 = cross(a, b, p);
+        let c2 = cross(b, c, p);
+        let c3 = cross(c, a, p);
+        let has_neg = (c1 < -1e-9) || (c2 < -1e-9) || (c3 < -1e-9);
+        let has_pos = (c1 > 1e-9) || (c2 > 1e-9) || (c3 > 1e-9);
+        !(has_neg && has_pos)
+    };
+
+    let is_ear = |prev: usize, curr: usize, next: usize, idxs: &[u32]| -> bool {
+        let a = pts[idxs[prev] as usize];
+        let b = pts[idxs[curr] as usize];
+        let c = pts[idxs[next] as usize];
+        // Convex check (CCW interior angle)
+        let cross = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]);
+        if cross <= 1e-12 {
+            return false;
+        }
+        for (i, &idx) in idxs.iter().enumerate() {
+            if i == prev || i == curr || i == next {
+                continue;
+            }
+            let p = pts[idx as usize];
+            if is_point_in_tri(p, a, b, c) {
+                return false;
+            }
+        }
+        true
+    };
+
+    let mut stuck_count = 0;
+    while indices.len() > 3 && stuck_count < indices.len() * 2 {
+        let len = indices.len();
+        let mut ear_found = false;
+        for i in 0..len {
+            let prev = (i + len - 1) % len;
+            let next = (i + 1) % len;
+            if is_ear(prev, i, next, &indices) {
+                triangles.push([indices[prev], indices[i], indices[next]]);
+                indices.remove(i);
+                ear_found = true;
+                break;
+            }
+        }
+        if !ear_found {
+            stuck_count += 1;
+            if stuck_count >= len {
+                triangles.push([indices[0], indices[1], indices[2]]);
+                indices.remove(1);
+            }
+        } else {
+            stuck_count = 0;
+        }
+    }
+    if indices.len() == 3 {
+        triangles.push([indices[0], indices[1], indices[2]]);
+    }
+    triangles
+}
+
+/// Generates a solid 3D body of revolution by rotating a 2D profile `[r, z]` around the Z axis.
+///
+/// Features:
+/// - 2D profile coordinates: `r` (distance from rotation axis Z, r >= 0) and `z` (axial position).
+/// - Complete 360-degree rotation or partial angle `angle_deg` (0 < angle_deg <= 360).
+/// - Radial resolution controlled by `segments` (minimum 3).
+/// - Manifold watertight topology with seam stitching at 360 degrees and planar end-caps for partial angles.
+/// - Surface normal computation with outward orientation.
+pub fn create_revolve(profile: &[[f64; 2]], angle_deg: f64, segments: usize) -> TriangleMesh {
+    if profile.len() < 3 || angle_deg <= 1e-6 {
+        return TriangleMesh::empty();
+    }
+
+    let segs = segments.max(3);
+    let sweep_angle_deg = angle_deg.clamp(1e-4, 360.0);
+    let is_full_circle = (sweep_angle_deg - 360.0).abs() < 1e-5;
+    let sweep_angle_rad = sweep_angle_deg * PI / 180.0;
+
+    // 1. Clean profile: ensure r >= 0 and remove duplicate consecutive points
+    let mut pts: Vec<[f64; 2]> = Vec::with_capacity(profile.len());
+    for p in profile {
+        let r = p[0].max(0.0);
+        let z = p[1];
+        if let Some(last) = pts.last() {
+            let d2 = (r - last[0]).powi(2) + (z - last[1]).powi(2);
+            if d2 > 1e-12 {
+                pts.push([r, z]);
+            }
+        } else {
+            pts.push([r, z]);
+        }
+    }
+    if pts.len() > 2 {
+        let first = pts[0];
+        let last = *pts.last().unwrap();
+        let d2 = (first[0] - last[0]).powi(2) + (first[1] - last[1]).powi(2);
+        if d2 <= 1e-12 {
+            pts.pop();
+        }
+    }
+    let m = pts.len();
+    if m < 3 {
+        return TriangleMesh::empty();
+    }
+
+    // 2. Ensure CCW orientation in the (r, z) half-plane (r as X, z as Y)
+    let mut area2d = 0.0;
+    for i in 0..m {
+        let next = (i + 1) % m;
+        area2d += pts[i][0] * pts[next][1] - pts[next][0] * pts[i][1];
+    }
+    if area2d < 0.0 {
+        pts.reverse();
+    }
+
+    // 3. Generate vertices in angular rings
+    let n_steps = if is_full_circle { segs } else { segs + 1 };
+    let mut vertices = Vec::with_capacity(n_steps * m);
+    let mut indices = Vec::new();
+
+    for j in 0..n_steps {
+        let theta = if is_full_circle {
+            (j as f64) * 2.0 * PI / (segs as f64)
+        } else {
+            (j as f64) * sweep_angle_rad / (segs as f64)
+        };
+        let cos_t = theta.cos();
+        let sin_t = theta.sin();
+
+        for p in &pts {
+            let r = p[0];
+            let z = p[1];
+            let x = r * cos_t;
+            let y = r * sin_t;
+            vertices.push(Vertex::new([x, y, z], [cos_t, sin_t, 0.0]));
+        }
+    }
+
+    // 4. Triangulate quad strips between ring j and ring next_j
+    for j in 0..segs {
+        let next_j = if is_full_circle {
+            (j + 1) % segs
+        } else {
+            j + 1
+        };
+
+        for i in 0..m {
+            let next_i = (i + 1) % m;
+
+            let r_a = pts[i][0];
+            let r_b = pts[next_i][0];
+
+            // Edge lying on rotation axis has zero surface area
+            if r_a < 1e-9 && r_b < 1e-9 {
+                continue;
+            }
+
+            let v_curr_i = (j * m + i) as u32;
+            let v_curr_next = (j * m + next_i) as u32;
+            let v_next_i = (next_j * m + i) as u32;
+            let v_next_next = (next_j * m + next_i) as u32;
+
+            if r_a < 1e-9 {
+                // Triangle fan around axis point at i
+                indices.push([v_curr_i, v_next_next, v_curr_next]);
+            } else if r_b < 1e-9 {
+                // Triangle fan around axis point at next_i
+                indices.push([v_curr_i, v_next_i, v_next_next]);
+            } else {
+                // Regular quad split into 2 triangles
+                indices.push([v_curr_i, v_next_i, v_next_next]);
+                indices.push([v_curr_i, v_next_next, v_curr_next]);
+            }
+        }
+    }
+
+    // 5. If partial angle, cap the planar start and end faces
+    if !is_full_circle {
+        let cap_triangles = triangulate_simple_polygon_2d(&pts);
+        // Start cap at ring 0 (theta = 0): outward normal points towards -Y
+        for tri in &cap_triangles {
+            let i0 = tri[0];
+            let i1 = tri[1];
+            let i2 = tri[2];
+            indices.push([i0, i2, i1]);
+        }
+        // End cap at ring segs (theta = sweep_angle): outward normal points towards +theta
+        let end_offset = (segs * m) as u32;
+        for tri in &cap_triangles {
+            let i0 = end_offset + tri[0];
+            let i1 = end_offset + tri[1];
+            let i2 = end_offset + tri[2];
+            indices.push([i0, i1, i2]);
+        }
+    }
+
+    let mut mesh = TriangleMesh::new(vertices, indices);
+
+    // 6. Enforce outward orientation and calculate accurate vertex normals
+    if mesh.signed_volume() < 0.0 {
+        for tri in &mut mesh.indices {
+            tri.swap(1, 2);
+        }
+    }
+    mesh.recompute_vertex_normals();
+
+    mesh
+}
+
+/// Generates a solid 3D parametric automotive wheel rim according to tire & wheel engineering standards.
+///
+/// Features:
+/// - Stepped rim barrel with inner/outer flanges, bead seat shelves, and drop center mounting well (монтажный ручей).
+/// - Central mounting hub with central bore hole (`hub_bore_diameter`).
+/// - Standard PCD (Pitch Circle Diameter) bolt pattern with `bolt_holes_count` holes (`bolt_hole_diameter`).
+/// - Structural spokes (`spokes_count`, `spoke_width`, `spoke_thickness`) connecting hub and rim barrel.
+/// - Open brake cooling windows between spokes for caliper and rotor ventilation.
+/// - Wheel offset ET (`offset_et`) setting hub mounting pad position relative to rim barrel centerline.
+#[allow(clippy::too_many_arguments)]
+pub fn create_wheel_rim(
+    rim_diameter: f64,
+    rim_width: f64,
+    flange_diameter: Option<f64>,
+    hub_diameter: Option<f64>,
+    hub_bore_diameter: Option<f64>,
+    pcd_diameter: Option<f64>,
+    bolt_holes_count: Option<usize>,
+    bolt_hole_diameter: Option<f64>,
+    spokes_count: Option<usize>,
+    spoke_width: Option<f64>,
+    spoke_thickness: Option<f64>,
+    offset_et: Option<f64>,
+) -> TriangleMesh {
+    if rim_diameter <= 1e-4 || rim_width <= 1e-4 {
+        return TriangleMesh::empty();
+    }
+
+    let d_rim = rim_diameter;
+    let w_rim = rim_width;
+    let r_bead = d_rim * 0.5;
+
+    let d_flange = flange_diameter.unwrap_or(d_rim * 1.08).max(d_rim * 1.02);
+    let r_flange = d_flange * 0.5;
+
+    let d_hub = hub_diameter.unwrap_or(d_rim * 0.35).clamp(d_rim * 0.15, d_rim * 0.65);
+    let r_hub = d_hub * 0.5;
+
+    let d_bore = hub_bore_diameter.unwrap_or(d_hub * 0.45).clamp(d_hub * 0.15, d_hub * 0.70);
+    let r_bore = d_bore * 0.5;
+
+    let d_pcd = pcd_diameter.unwrap_or((d_hub + d_bore) * 0.5).clamp(d_bore + 0.015, d_hub - 0.012);
+    let r_pcd = d_pcd * 0.5;
+
+    let n_bolts = bolt_holes_count.unwrap_or(5).clamp(3, 12);
+    let d_bolt = bolt_hole_diameter.unwrap_or(0.014).clamp(0.005, (r_hub - r_pcd).min(r_pcd - r_bore).max(0.008) * 1.6);
+    let r_bolt = d_bolt * 0.5;
+
+    let n_spokes = spokes_count.unwrap_or(5).max(3);
+
+    let max_spoke_w = (2.0 * PI * r_hub / (n_spokes as f64)) * 0.75;
+    let w_spoke = spoke_width.unwrap_or(d_rim * 0.055).clamp(0.010, max_spoke_w);
+
+    let t_spoke = spoke_thickness.unwrap_or(w_spoke * 0.65).clamp(0.008, w_rim * 0.4);
+
+    let et = offset_et.unwrap_or(0.035).clamp(-w_rim * 0.4, w_rim * 0.4);
+
+    // 1. Construct stepped rim barrel profile (in mm/m): outer flanges, bead seats, drop center well
+    let t_w = (r_bead * 0.045).clamp(0.006, 0.012);
+    let drop_depth = (r_bead * 0.08).clamp(0.015, 0.035);
+    let r_well = r_bead - drop_depth;
+    let r_hump = r_bead + (r_bead * 0.012).clamp(0.002, 0.005);
+
+    let h_w = w_rim * 0.5;
+    let barrel_profile: Vec<[f64; 2]> = vec![
+        // Outer surface: from inner flange (-h_w) to outer flange (+h_w)
+        [r_flange, -h_w],
+        [r_flange, -h_w + 0.05 * w_rim],
+        [r_bead + 0.004, -h_w + 0.08 * w_rim],
+        [r_bead, -h_w + 0.12 * w_rim],
+        [r_bead, -h_w + 0.28 * w_rim],
+        [r_well, -h_w + 0.38 * w_rim],
+        [r_well, h_w - 0.35 * w_rim],
+        [r_hump, h_w - 0.24 * w_rim],
+        [r_bead, h_w - 0.20 * w_rim],
+        [r_bead, h_w - 0.08 * w_rim],
+        [r_flange, h_w - 0.04 * w_rim],
+        [r_flange, h_w],
+        // Outer lip thickness
+        [r_flange - t_w, h_w],
+        // Inner surface: from outer lip back to inner lip
+        [r_bead - t_w, h_w - 0.08 * w_rim],
+        [r_well - t_w, h_w - 0.35 * w_rim],
+        [r_well - t_w, -h_w + 0.38 * w_rim],
+        [r_bead - t_w, -h_w + 0.28 * w_rim],
+        [r_flange - t_w, -h_w],
+    ];
+
+    let barrel = create_revolve(&barrel_profile, 360.0, 36);
+
+    // 2. Central hub cylinder with bore hole and PCD bolt pattern
+    let t_hub = (w_rim * 0.15).clamp(0.015, 0.035);
+    let z_hub_center = et - t_hub * 0.5;
+
+    let mut hub_solid = create_cylinder(r_hub, t_hub, 32);
+    hub_solid.translate([0.0, 0.0, z_hub_center]);
+
+    let cutter_height = t_hub + 0.010;
+    let mut cutter_vertices = Vec::new();
+    let mut cutter_indices = Vec::new();
+
+    let mut add_to_cutters = |cyl: &TriangleMesh| {
+        let base_idx = cutter_vertices.len() as u32;
+        cutter_vertices.extend_from_slice(&cyl.vertices);
+        for tri in &cyl.indices {
+            cutter_indices.push([tri[0] + base_idx, tri[1] + base_idx, tri[2] + base_idx]);
+        }
+    };
+
+    let mut bore_cyl = create_cylinder(r_bore, cutter_height, 32);
+    bore_cyl.translate([0.0, 0.0, z_hub_center]);
+    add_to_cutters(&bore_cyl);
+
+    for b in 0..n_bolts {
+        let beta = (b as f64) * 2.0 * PI / (n_bolts as f64) + PI / (n_bolts as f64);
+        let bx = r_pcd * beta.cos();
+        let by = r_pcd * beta.sin();
+        let mut bolt_cyl = create_cylinder(r_bolt, cutter_height, 16);
+        bolt_cyl.translate([bx, by, z_hub_center]);
+        add_to_cutters(&bolt_cyl);
+    }
+    let all_cutters = TriangleMesh::new(cutter_vertices, cutter_indices);
+
+    let hub_finished = csg_difference(&hub_solid, &all_cutters);
+
+    // 3. Structural spokes with open cooling windows between them
+    let r_spoke_inner = r_hub - 0.003;
+    let r_spoke_outer = (r_bead - t_w) + 0.004;
+    let l_spoke = r_spoke_outer - r_spoke_inner;
+    let r_spoke_mid = (r_spoke_inner + r_spoke_outer) * 0.5;
+
+    let mut spoke_vertices = Vec::new();
+    let mut spoke_indices = Vec::new();
+
+    for s in 0..n_spokes {
+        let theta_s = (s as f64) * 2.0 * PI / (n_spokes as f64);
+        let mut spoke = create_box(l_spoke, w_spoke, t_spoke);
+        spoke.translate([r_spoke_mid, 0.0, z_hub_center]);
+        spoke.rotate_rpy_deg(0.0, 0.0, theta_s * 180.0 / PI);
+
+        let base_idx = spoke_vertices.len() as u32;
+        spoke_vertices.extend_from_slice(&spoke.vertices);
+        for tri in &spoke.indices {
+            spoke_indices.push([tri[0] + base_idx, tri[1] + base_idx, tri[2] + base_idx]);
+        }
+    }
+    let all_spokes = TriangleMesh::new(spoke_vertices, spoke_indices);
+
+    // 4. Union hub, spokes, and barrel
+    let hub_and_spokes = csg_union(&hub_finished, &all_spokes);
+    let mut wheel = csg_union(&hub_and_spokes, &barrel);
+    wheel.recompute_vertex_normals();
+
+    wheel
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1437,6 +1819,122 @@ mod tests {
             "Hole with keyway volume ({}) must be less than plain hole ({})",
             v_keyway,
             v_plain
+        );
+    }
+
+    #[test]
+    fn test_revolve_cylinder_volume_and_aabb() {
+        let r = 2.0;
+        let h = 2.0;
+        let profile = vec![
+            [0.0, -1.0],
+            [r, -1.0],
+            [r, 1.0],
+            [0.0, 1.0],
+        ];
+        let cyl_revolve = create_revolve(&profile, 360.0, 32);
+        assert!(cyl_revolve.triangle_count() > 0);
+        let vol = cyl_revolve.volume();
+        let expected_vol = PI * r * r * h;
+        let diff_ratio = (vol - expected_vol).abs() / expected_vol;
+        assert!(
+            diff_ratio < 0.03,
+            "Revolved cylinder volume {} should be close to analytical {}, diff: {}",
+            vol,
+            expected_vol,
+            diff_ratio
+        );
+
+        let aabb = cyl_revolve.bounding_box();
+        let dims = aabb.dimensions();
+        assert!((dims[0] - 2.0 * r).abs() < 0.1);
+        assert!((dims[1] - 2.0 * r).abs() < 0.1);
+        assert!((dims[2] - h).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_revolve_partial_angle_and_hollow_ring() {
+        // 180-degree half cylinder
+        let profile = vec![
+            [0.0, -1.0],
+            [2.0, -1.0],
+            [2.0, 1.0],
+            [0.0, 1.0],
+        ];
+        let half_cyl = create_revolve(&profile, 180.0, 32);
+        let vol_half = half_cyl.volume();
+        let expected_half = 0.5 * PI * 4.0 * 2.0;
+        let diff_ratio = (vol_half - expected_half).abs() / expected_half;
+        assert!(
+            diff_ratio < 0.03,
+            "Half revolved cylinder volume {} should be close to {}, diff: {}",
+            vol_half,
+            expected_half,
+            diff_ratio
+        );
+
+        // Hollow ring/pipe: r in [1, 2], h = 2
+        let ring_profile = vec![
+            [1.0, -1.0],
+            [2.0, -1.0],
+            [2.0, 1.0],
+            [1.0, 1.0],
+        ];
+        let ring = create_revolve(&ring_profile, 360.0, 32);
+        let vol_ring = ring.volume();
+        let expected_ring = PI * (4.0 - 1.0) * 2.0;
+        let ring_diff_ratio = (vol_ring - expected_ring).abs() / expected_ring;
+        assert!(
+            ring_diff_ratio < 0.03,
+            "Hollow ring volume {} should be close to {}, diff: {}",
+            vol_ring,
+            expected_ring,
+            ring_diff_ratio
+        );
+    }
+
+    #[test]
+    fn test_wheel_rim_parametric_solid_and_dimensions() {
+        let rim_d = 0.4572; // 18 inches
+        let rim_w = 0.2032; // 8 inches
+        let wheel = create_wheel_rim(
+            rim_d,
+            rim_w,
+            Some(0.490),
+            Some(0.160),
+            Some(0.066),
+            Some(0.1143),
+            Some(5),
+            Some(0.014),
+            Some(5),
+            Some(0.028),
+            Some(0.018),
+            Some(0.035),
+        );
+
+        assert!(wheel.triangle_count() > 0, "Wheel rim should have triangles");
+        let vol = wheel.volume();
+        assert!(vol > 0.001, "Wheel rim volume should be positive: got {}", vol);
+
+        let aabb = wheel.bounding_box();
+        let dims = aabb.dimensions();
+        // Z dimension should match rim width
+        assert!(
+            (dims[2] - rim_w).abs() < 0.01,
+            "Wheel Z span {} should be close to rim width {}",
+            dims[2],
+            rim_w
+        );
+        // X and Y dimensions should be close to flange diameter (0.490m)
+        assert!(
+            (dims[0] - 0.490).abs() < 0.02,
+            "Wheel X diameter {} should be close to flange diameter 0.490",
+            dims[0]
+        );
+        assert!(
+            (dims[1] - 0.490).abs() < 0.02,
+            "Wheel Y diameter {} should be close to flange diameter 0.490",
+            dims[1]
         );
     }
 }

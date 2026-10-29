@@ -285,9 +285,125 @@ pub fn add_feature_primitive(args: &Value, state: &mut EngineState) -> Result<Va
                 rotation_deg,
             }
         }
+        "revolve" => {
+            let profile_val = params
+                .get("profile")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| ServerError::InvalidArgument("Revolve requires 'profile' array of [r, z] points".to_string()))?;
+
+            let mut profile = Vec::with_capacity(profile_val.len());
+            for item in profile_val {
+                let arr = item.as_array().ok_or_else(|| {
+                    ServerError::InvalidArgument("Each profile element must be [r, z]".to_string())
+                })?;
+                if arr.len() != 2 {
+                    return Err(ServerError::InvalidArgument("Profile points must have 2 coordinates: [r, z]".to_string()));
+                }
+                let r = arr[0].as_f64().ok_or_else(|| ServerError::InvalidArgument("Invalid r coordinate in profile".to_string()))?;
+                let z = arr[1].as_f64().ok_or_else(|| ServerError::InvalidArgument("Invalid z coordinate in profile".to_string()))?;
+                profile.push([r, z]);
+            }
+
+            let angle_deg = params
+                .get("angle_deg")
+                .or_else(|| params.get("angle"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(360.0);
+
+            let segments = params
+                .get("segments")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(32) as usize;
+
+            FeatureOp::AddRevolve {
+                profile,
+                angle_deg,
+                segments,
+                position,
+                rotation_deg,
+            }
+        }
+        "wheel_rim" => {
+            let rim_diameter = params
+                .get("rim_diameter")
+                .or_else(|| params.get("diameter"))
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| ServerError::InvalidArgument("Wheel rim requires 'rim_diameter'".to_string()))?;
+
+            let rim_width = params
+                .get("rim_width")
+                .or_else(|| params.get("width"))
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| ServerError::InvalidArgument("Wheel rim requires 'rim_width'".to_string()))?;
+
+            let flange_diameter = params
+                .get("flange_diameter")
+                .and_then(|v| v.as_f64());
+
+            let hub_diameter = params
+                .get("hub_diameter")
+                .and_then(|v| v.as_f64());
+
+            let hub_bore_diameter = params
+                .get("hub_bore_diameter")
+                .or_else(|| params.get("bore_diameter"))
+                .and_then(|v| v.as_f64());
+
+            let pcd_diameter = params
+                .get("pcd_diameter")
+                .or_else(|| params.get("pcd"))
+                .and_then(|v| v.as_f64());
+
+            let bolt_holes_count = params
+                .get("bolt_holes_count")
+                .or_else(|| params.get("bolts_count"))
+                .or_else(|| params.get("bolts"))
+                .and_then(|v| v.as_u64())
+                .map(|b| b as usize);
+
+            let bolt_hole_diameter = params
+                .get("bolt_hole_diameter")
+                .and_then(|v| v.as_f64());
+
+            let spokes_count = params
+                .get("spokes_count")
+                .or_else(|| params.get("spokes"))
+                .and_then(|v| v.as_u64())
+                .map(|s| s as usize);
+
+            let spoke_width = params
+                .get("spoke_width")
+                .and_then(|v| v.as_f64());
+
+            let spoke_thickness = params
+                .get("spoke_thickness")
+                .and_then(|v| v.as_f64());
+
+            let offset_et = params
+                .get("offset_et")
+                .or_else(|| params.get("et"))
+                .and_then(|v| v.as_f64());
+
+            FeatureOp::AddWheelRim {
+                rim_diameter,
+                rim_width,
+                flange_diameter,
+                hub_diameter,
+                hub_bore_diameter,
+                pcd_diameter,
+                bolt_holes_count,
+                bolt_hole_diameter,
+                spokes_count,
+                spoke_width,
+                spoke_thickness,
+                offset_et,
+                position,
+                rotation_deg,
+            }
+        }
         other => {
             return Err(ServerError::InvalidArgument(format!(
-                "Unknown primitive_type '{}'. Supported: box, cylinder, sphere, cone, polygon_prism, spur_gear",
+                "Unknown primitive_type '{}'. Supported: box, cylinder, sphere, cone, polygon_prism, spur_gear, revolve, wheel_rim",
                 other
             )));
         }
@@ -552,6 +668,85 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
                 keyway_depth: new_kd,
                 hub_diameter: new_hd,
                 hub_length: new_hl,
+                position: pos,
+                rotation_deg: rot,
+            }
+        }
+        FeatureOp::AddRevolve { profile, angle_deg, segments, position, rotation_deg } => {
+            let new_profile = if let Some(arr) = params.get("profile").and_then(|v| v.as_array()) {
+                let mut p = Vec::with_capacity(arr.len());
+                for item in arr {
+                    if let Some(coords) = item.as_array() {
+                        if coords.len() == 2 {
+                            if let (Some(r), Some(z)) = (coords[0].as_f64(), coords[1].as_f64()) {
+                                p.push([r, z]);
+                            }
+                        }
+                    }
+                }
+                if !p.is_empty() { p } else { profile.clone() }
+            } else {
+                profile.clone()
+            };
+            let new_angle = params.get("angle_deg").or_else(|| params.get("angle")).and_then(|v| v.as_f64()).unwrap_or(*angle_deg);
+            let new_segs = params.get("segments").and_then(|v| v.as_u64()).map(|s| s as usize).unwrap_or(*segments);
+            let pos = parse_vec3(params, "position").or(*position);
+            let rot = parse_vec3(params, "rotation_deg")
+                .or_else(|| parse_vec3(params, "rotation_rpy_deg"))
+                .or(*rotation_deg);
+            FeatureOp::AddRevolve {
+                profile: new_profile,
+                angle_deg: new_angle,
+                segments: new_segs,
+                position: pos,
+                rotation_deg: rot,
+            }
+        }
+        FeatureOp::AddWheelRim {
+            rim_diameter,
+            rim_width,
+            flange_diameter,
+            hub_diameter,
+            hub_bore_diameter,
+            pcd_diameter,
+            bolt_holes_count,
+            bolt_hole_diameter,
+            spokes_count,
+            spoke_width,
+            spoke_thickness,
+            offset_et,
+            position,
+            rotation_deg,
+        } => {
+            let new_dia = params.get("rim_diameter").or_else(|| params.get("diameter")).and_then(|v| v.as_f64()).unwrap_or(*rim_diameter);
+            let new_w = params.get("rim_width").or_else(|| params.get("width")).and_then(|v| v.as_f64()).unwrap_or(*rim_width);
+            let new_flange = params.get("flange_diameter").and_then(|v| v.as_f64()).or(*flange_diameter);
+            let new_hub = params.get("hub_diameter").and_then(|v| v.as_f64()).or(*hub_diameter);
+            let new_bore = params.get("hub_bore_diameter").or_else(|| params.get("bore_diameter")).and_then(|v| v.as_f64()).or(*hub_bore_diameter);
+            let new_pcd = params.get("pcd_diameter").or_else(|| params.get("pcd")).and_then(|v| v.as_f64()).or(*pcd_diameter);
+            let new_bolts = params.get("bolt_holes_count").or_else(|| params.get("bolts_count")).or_else(|| params.get("bolts")).and_then(|v| v.as_u64()).map(|b| b as usize).or(*bolt_holes_count);
+            let new_bolt_d = params.get("bolt_hole_diameter").and_then(|v| v.as_f64()).or(*bolt_hole_diameter);
+            let new_spokes = params.get("spokes_count").or_else(|| params.get("spokes")).and_then(|v| v.as_u64()).map(|s| s as usize).or(*spokes_count);
+            let new_spoke_w = params.get("spoke_width").and_then(|v| v.as_f64()).or(*spoke_width);
+            let new_spoke_t = params.get("spoke_thickness").and_then(|v| v.as_f64()).or(*spoke_thickness);
+            let new_et = params.get("offset_et").or_else(|| params.get("et")).and_then(|v| v.as_f64()).or(*offset_et);
+            let pos = parse_vec3(params, "position").or(*position);
+            let rot = parse_vec3(params, "rotation_deg")
+                .or_else(|| parse_vec3(params, "rotation_rpy_deg"))
+                .or(*rotation_deg);
+            FeatureOp::AddWheelRim {
+                rim_diameter: new_dia,
+                rim_width: new_w,
+                flange_diameter: new_flange,
+                hub_diameter: new_hub,
+                hub_bore_diameter: new_bore,
+                pcd_diameter: new_pcd,
+                bolt_holes_count: new_bolts,
+                bolt_hole_diameter: new_bolt_d,
+                spokes_count: new_spokes,
+                spoke_width: new_spoke_w,
+                spoke_thickness: new_spoke_t,
+                offset_et: new_et,
                 position: pos,
                 rotation_deg: rot,
             }
