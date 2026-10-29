@@ -307,6 +307,23 @@ impl TriangleMesh {
             v.normal = [n.x, n.y, n.z];
         }
     }
+
+    /// Transforms the mesh by rotating by RPY angles in degrees, then translating by translation vector.
+    pub fn transform(&mut self, translation: [f64; 3], rotation_deg: [f64; 3]) {
+        let r = rotation_deg[0].to_radians();
+        let p = rotation_deg[1].to_radians();
+        let y = rotation_deg[2].to_radians();
+
+        let rot = nalgebra::Rotation3::from_euler_angles(r, p, y);
+        let t = Vector3::new(translation[0], translation[1], translation[2]);
+
+        for v in &mut self.vertices {
+            let pos = rot * v.pos_vec() + t;
+            let n = rot * v.normal_vec();
+            v.position = [pos.x, pos.y, pos.z];
+            v.normal = [n.x, n.y, n.z];
+        }
+    }
 }
 
 #[cfg(test)]
@@ -333,5 +350,31 @@ mod tests {
         assert_eq!(aabb.max, [4.0, 2.0, 6.0]);
         assert_eq!(aabb.dimensions(), [5.0, 7.0, 9.0]);
         assert_eq!(aabb.center(), [1.5, -1.5, 1.5]);
+    }
+
+    #[test]
+    fn test_mesh_transform() {
+        let mut mesh = TriangleMesh::new(
+            vec![
+                Vertex::new([1.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
+                Vertex::new([0.0, 1.0, 0.0], [0.0, 1.0, 0.0]),
+                Vertex::new([0.0, 0.0, 1.0], [0.0, 0.0, 1.0]),
+            ],
+            vec![[0, 1, 2]],
+        );
+
+        // Rotate 90 deg around Z, translate by [5.0, -2.0, 3.0]
+        // [1, 0, 0] rotated 90 deg around Z -> [0, 1, 0] -> translated -> [5.0, -1.0, 3.0]
+        mesh.transform([5.0, -2.0, 3.0], [0.0, 0.0, 90.0]);
+
+        let v0 = mesh.vertices[0];
+        assert!((v0.position[0] - 5.0).abs() < 1e-6);
+        assert!((v0.position[1] - (-1.0)).abs() < 1e-6);
+        assert!((v0.position[2] - 3.0).abs() < 1e-6);
+
+        // Normal should only be rotated, not translated
+        assert!(v0.normal[0].abs() < 1e-6);
+        assert!((v0.normal[1] - 1.0).abs() < 1e-6);
+        assert!(v0.normal[2].abs() < 1e-6);
     }
 }

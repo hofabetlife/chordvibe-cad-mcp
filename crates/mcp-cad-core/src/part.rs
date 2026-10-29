@@ -123,6 +123,8 @@ mod tests {
                 width: 0.1,
                 height: 0.2,
                 depth: 0.05,
+                position: None,
+                rotation_deg: None,
             },
             None,
         );

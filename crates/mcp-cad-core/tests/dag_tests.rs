@@ -4,10 +4,14 @@ use std::f64::consts::PI;
 use std::fs::File;
 use std::io::Read;
 use mcp_cad_core::dag::{FeatureOp, FeatureTree};
-use mcp_cad_core::export_stl::{export_stl_ascii, export_stl_binary, write_stl_ascii_file, write_stl_binary_file};
+use mcp_cad_core::export_stl::{
+    export_stl_ascii, export_stl_binary, write_stl_ascii_file, write_stl_binary_file,
+};
 use mcp_cad_core::material::MaterialRegistry;
 use mcp_cad_core::part::Part;
-use mcp_cad_core::primitives::{create_box, create_cylinder, create_sphere};
+use mcp_cad_core::primitives::{
+    create_box, create_cone, create_cylinder, create_helical_cutter, create_sphere,
+};
 use tempfile::NamedTempFile;
 
 #[test]
@@ -52,6 +56,20 @@ fn test_primitive_volumes_analytical_verification() {
         v_sph_analytical,
         sph_error_ratio
     );
+
+    // 4. Cone volume: V = 1/3 * pi * h * (r1^2 + r1*r2 + r2^2)
+    let (r_bot, r_top, h_cone) = (3.5, 1.5, 7.0);
+    let cone_mesh = create_cone(r_bot, r_top, h_cone, 128);
+    let v_cone_analytical = (1.0 / 3.0) * PI * h_cone * (r_bot * r_bot + r_bot * r_top + r_top * r_top);
+    let v_cone_mesh = cone_mesh.volume();
+    let cone_error_ratio = (v_cone_mesh - v_cone_analytical).abs() / v_cone_analytical;
+    assert!(
+        cone_error_ratio < 0.005,
+        "Cone volume error ratio too high: computed={}, expected={}, ratio={}",
+        v_cone_mesh,
+        v_cone_analytical,
+        cone_error_ratio
+    );
 }
 
 #[test]
@@ -64,6 +82,8 @@ fn test_dag_modify_feature_volume_update() {
             width: 2.0,
             height: 3.0,
             depth: 5.0,
+            position: None,
+            rotation_deg: None,
         },
         Some("Initial Base Block".to_string()),
     );
@@ -83,6 +103,8 @@ fn test_dag_modify_feature_volume_update() {
             width: 2.0,
             height: 9.0,
             depth: 5.0,
+            position: None,
+            rotation_deg: None,
         },
     ).expect("Modify feature failed");
 
@@ -116,7 +138,16 @@ fn test_part_mass_calculation_across_materials() {
     let expected_vol = w * h * d; // 0.01 m³
 
     let mut steel_part = Part::new("p_steel", "Steel Bar", steel);
-    steel_part.dag.add_feature(FeatureOp::AddBox { width: w, height: h, depth: d }, None);
+    steel_part.dag.add_feature(
+        FeatureOp::AddBox {
+            width: w,
+            height: h,
+            depth: d,
+            position: None,
+            rotation_deg: None,
+        },
+        None,
+    );
     steel_part.rebuild().unwrap();
 
     assert!((steel_part.volume() - expected_vol).abs() < 1e-6);
@@ -124,14 +155,32 @@ fn test_part_mass_calculation_across_materials() {
     assert!((steel_part.mass() - expected_steel_mass).abs() < 1e-4);
 
     let mut alu_part = Part::new("p_alu", "Aluminum Bar", aluminum);
-    alu_part.dag.add_feature(FeatureOp::AddBox { width: w, height: h, depth: d }, None);
+    alu_part.dag.add_feature(
+        FeatureOp::AddBox {
+            width: w,
+            height: h,
+            depth: d,
+            position: None,
+            rotation_deg: None,
+        },
+        None,
+    );
     alu_part.rebuild().unwrap();
 
     let expected_alu_mass = expected_vol * 2700.0; // 27.0 kg
     assert!((alu_part.mass() - expected_alu_mass).abs() < 1e-4);
 
     let mut ti_part = Part::new("p_ti", "Titanium Bar", titanium);
-    ti_part.dag.add_feature(FeatureOp::AddBox { width: w, height: h, depth: d }, None);
+    ti_part.dag.add_feature(
+        FeatureOp::AddBox {
+            width: w,
+            height: h,
+            depth: d,
+            position: None,
+            rotation_deg: None,
+        },
+        None,
+    );
     ti_part.rebuild().unwrap();
 
     let expected_ti_mass = expected_vol * 4430.0; // 44.3 kg
@@ -200,6 +249,8 @@ fn test_dag_cut_hole_evaluation() {
             width: 10.0,
             height: 10.0,
             depth: 10.0,
+            position: None,
+            rotation_deg: None,
         },
         Some("Cube".to_string()),
     );
@@ -229,5 +280,194 @@ fn test_dag_cut_hole_evaluation() {
         vol > 800.0,
         "Volume after cut hole should be around 874, got {}",
         vol
+    );
+}
+
+#[test]
+fn test_dag_cone_and_frustum_volume() {
+    // 1. Sharp cone: r1 = 3.0, r2 = 0.0, h = 6.0
+    // Analytical formula: V = 1/3 * pi * h * (r1^2 + r1*r2 + r2^2) = 1/3 * pi * 6.0 * 9.0 = 18 * pi
+    let mut tree_sharp = FeatureTree::new();
+    tree_sharp.add_feature(
+        FeatureOp::AddCone {
+            radius_bottom: 3.0,
+            radius_top: 0.0,
+            height: 6.0,
+            segments: 64,
+            position: None,
+            rotation_deg: None,
+        },
+        Some("Sharp Cone".to_string()),
+    );
+    let sharp_mesh = tree_sharp.evaluate().expect("Sharp cone evaluation failed");
+    let v_sharp_mesh = sharp_mesh.volume();
+    let v_sharp_expected = (1.0 / 3.0) * PI * 6.0 * (3.0 * 3.0);
+    let sharp_err = (v_sharp_mesh - v_sharp_expected).abs() / v_sharp_expected;
+    assert!(
+        sharp_err < 0.01,
+        "Sharp cone volume error ratio too high: computed={}, expected={}, ratio={}",
+        v_sharp_mesh,
+        v_sharp_expected,
+        sharp_err
+    );
+
+    // 2. Truncated cone (frustum): r1 = 4.0, r2 = 2.0, h = 5.0
+    // Analytical formula: V = 1/3 * pi * 5.0 * (16.0 + 8.0 + 4.0) = 140/3 * pi
+    let mut tree_frustum = FeatureTree::new();
+    tree_frustum.add_feature(
+        FeatureOp::AddCone {
+            radius_bottom: 4.0,
+            radius_top: 2.0,
+            height: 5.0,
+            segments: 64,
+            position: Some([0.0, 0.0, 10.0]),
+            rotation_deg: None,
+        },
+        Some("Frustum".to_string()),
+    );
+    let frustum_mesh = tree_frustum.evaluate().expect("Frustum evaluation failed");
+    let v_frustum_mesh = frustum_mesh.volume();
+    let v_frustum_expected = (1.0 / 3.0) * PI * 5.0 * (4.0 * 4.0 + 4.0 * 2.0 + 2.0 * 2.0);
+    let frustum_err = (v_frustum_mesh - v_frustum_expected).abs() / v_frustum_expected;
+    assert!(
+        frustum_err < 0.01,
+        "Frustum volume error ratio too high: computed={}, expected={}, ratio={}",
+        v_frustum_mesh,
+        v_frustum_expected,
+        frustum_err
+    );
+    // Center along Z should be shifted to ~ 10.0
+    let aabb = frustum_mesh.bounding_box();
+    assert!((aabb.center()[2] - 10.0).abs() < 1e-4);
+}
+
+#[test]
+fn test_dag_shifted_cylinder_stepped_shaft() {
+    let mut tree = FeatureTree::new();
+
+    // Shank (хвостовик): radius 2.0, height 10.0, positioned at z = 5.0 (spans z in [0, 10])
+    let r_shank = 2.0;
+    let h_shank = 10.0;
+    tree.add_feature(
+        FeatureOp::AddCylinder {
+            radius: r_shank,
+            height: h_shank,
+            segments: 64,
+            position: Some([0.0, 0.0, 5.0]),
+            rotation_deg: None,
+        },
+        Some("Shank".to_string()),
+    );
+
+    // Body (тело вала): radius 4.0, height 20.0, positioned at z = 20.0 (spans z in [10, 30])
+    let r_body = 4.0;
+    let h_body = 20.0;
+    tree.add_feature(
+        FeatureOp::AddCylinder {
+            radius: r_body,
+            height: h_body,
+            segments: 64,
+            position: Some([0.0, 0.0, 20.0]),
+            rotation_deg: None,
+        },
+        Some("Shaft Body".to_string()),
+    );
+
+    let shaft_mesh = tree.evaluate().expect("Stepped shaft evaluation failed");
+    let vol_actual = shaft_mesh.volume();
+    let vol_expected = PI * r_shank * r_shank * h_shank + PI * r_body * r_body * h_body;
+    let err_ratio = (vol_actual - vol_expected).abs() / vol_expected;
+    assert!(
+        err_ratio < 0.01,
+        "Stepped shaft volume mismatch: actual={}, expected={}, ratio={}",
+        vol_actual,
+        vol_expected,
+        err_ratio
+    );
+
+    let aabb = shaft_mesh.bounding_box();
+    assert!((aabb.min[2] - 0.0).abs() < 0.05);
+    assert!((aabb.max[2] - 30.0).abs() < 0.05);
+    assert!((aabb.dimensions()[2] - 30.0).abs() < 0.05);
+}
+
+#[test]
+fn test_dag_helical_groove_drill_bit_model() {
+    // 1. Direct helical cutter creation test
+    let cutter = create_helical_cutter(4.5, 2.0, 30.0, 40.0, 5.0, 2, true, 40.0 / 30.0);
+    assert!(cutter.triangle_count() > 0);
+    assert!(cutter.volume() > 0.0);
+
+    // 2. Full drill bit parametric DAG modeling:
+    // Blank cylinder: radius 5.0, height 50.0, positioned at z = 25.0 (spans z in [0, 50])
+    let mut tree = FeatureTree::new();
+    let r_drill = 5.0;
+    let h_drill = 50.0;
+    tree.add_feature(
+        FeatureOp::AddCylinder {
+            radius: r_drill,
+            height: h_drill,
+            segments: 32,
+            position: Some([0.0, 0.0, 25.0]),
+            rotation_deg: None,
+        },
+        Some("Drill Blank".to_string()),
+    );
+
+    // Cut helical flutes into cylinder (2 starts, pitch 30.0, height 35.0, start_z 15.0)
+    tree.add_feature(
+        FeatureOp::CutHelicalGroove {
+            helix_radius: 4.5,
+            groove_radius: 2.0,
+            pitch: 30.0,
+            height: 35.0,
+            start_z: 15.0,
+            starts: 2,
+            is_right_hand: true,
+        },
+        Some("Spiral Flutes".to_string()),
+    );
+
+    let drill_mesh = tree.evaluate().expect("Drill DAG evaluation failed");
+    let vol_drill = drill_mesh.volume();
+    let vol_blank = PI * r_drill * r_drill * h_drill;
+
+    assert!(
+        vol_drill < vol_blank,
+        "Drill volume ({}) must be less than blank volume ({}) after groove cut",
+        vol_drill,
+        vol_blank
+    );
+    assert!(
+        vol_drill > vol_blank * 0.5,
+        "Drill core must remain solid: got {}",
+        vol_drill
+    );
+    assert!(drill_mesh.triangle_count() > 0);
+
+    // 3. Test BooleanDifferenceMesh with custom cutting tool
+    let mut diff_tree = FeatureTree::new();
+    diff_tree.add_feature(
+        FeatureOp::AddBox {
+            width: 10.0,
+            height: 10.0,
+            depth: 10.0,
+            position: None,
+            rotation_deg: None,
+        },
+        Some("Base Block".to_string()),
+    );
+    let tool_mesh = create_box(4.0, 4.0, 12.0);
+    diff_tree.add_feature(
+        FeatureOp::BooleanDifferenceMesh { tool_mesh },
+        Some("Box Notch".to_string()),
+    );
+    let diff_mesh = diff_tree.evaluate().expect("BooleanDifferenceMesh evaluation failed");
+    let vol_diff = diff_mesh.volume();
+    // 1000 - 4*4*10 = 840
+    assert!(
+        (vol_diff - 840.0).abs() < 1e-4,
+        "BooleanDifferenceMesh volume should be 840, got {}",
+        vol_diff
     );
 }

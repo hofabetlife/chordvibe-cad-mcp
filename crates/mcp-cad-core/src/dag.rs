@@ -4,9 +4,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::csg::csg_union;
+use crate::csg::{csg_difference, csg_union};
 use crate::error::CadError;
-use crate::primitives::{create_box, create_cylinder, create_sphere, cut_hole};
+use crate::primitives::{
+    create_box, create_cone, create_cylinder, create_helical_cutter, create_sphere, cut_hole,
+};
 use crate::topology::TriangleMesh;
 
 /// Individual modeling feature operation.
@@ -17,6 +19,10 @@ pub enum FeatureOp {
         width: f64,
         height: f64,
         depth: f64,
+        #[serde(default)]
+        position: Option<[f64; 3]>,
+        #[serde(default)]
+        rotation_deg: Option<[f64; 3]>,
     },
     /// Add a cylinder centered along Z.
     AddCylinder {
@@ -24,6 +30,10 @@ pub enum FeatureOp {
         height: f64,
         #[serde(default = "default_segments")]
         segments: usize,
+        #[serde(default)]
+        position: Option<[f64; 3]>,
+        #[serde(default)]
+        rotation_deg: Option<[f64; 3]>,
     },
     /// Add a UV sphere centered at the origin.
     AddSphere {
@@ -32,6 +42,22 @@ pub enum FeatureOp {
         sectors: usize,
         #[serde(default = "default_stacks")]
         stacks: usize,
+        #[serde(default)]
+        position: Option<[f64; 3]>,
+        #[serde(default)]
+        rotation_deg: Option<[f64; 3]>,
+    },
+    /// Add a cone or frustum centered along Z.
+    AddCone {
+        radius_bottom: f64,
+        radius_top: f64,
+        height: f64,
+        #[serde(default = "default_segments")]
+        segments: usize,
+        #[serde(default)]
+        position: Option<[f64; 3]>,
+        #[serde(default)]
+        rotation_deg: Option<[f64; 3]>,
     },
     /// Cut a cylindrical hole from the current solid.
     CutHole {
@@ -39,6 +65,22 @@ pub enum FeatureOp {
         normal: [f64; 3],
         radius: f64,
         depth: f64,
+    },
+    /// Cut a helical groove (flute) into the solid.
+    CutHelicalGroove {
+        helix_radius: f64,
+        groove_radius: f64,
+        pitch: f64,
+        height: f64,
+        start_z: f64,
+        #[serde(default = "default_starts")]
+        starts: usize,
+        #[serde(default = "default_right_hand")]
+        is_right_hand: bool,
+    },
+    /// Subtract an arbitrary tool mesh from the solid.
+    BooleanDifferenceMesh {
+        tool_mesh: TriangleMesh,
     },
     /// Apply spatial translation, rotation (RPY degrees), and scale factors.
     Transform {
@@ -63,8 +105,29 @@ fn default_stacks() -> usize {
     16
 }
 
+fn default_starts() -> usize {
+    2
+}
+
+fn default_right_hand() -> bool {
+    true
+}
+
 fn default_scale() -> [f64; 3] {
     [1.0, 1.0, 1.0]
+}
+
+#[inline]
+fn apply_pos_rot(
+    mesh: &mut TriangleMesh,
+    position: &Option<[f64; 3]>,
+    rotation_deg: &Option<[f64; 3]>,
+) {
+    let pos = position.unwrap_or([0.0, 0.0, 0.0]);
+    let rot = rotation_deg.unwrap_or([0.0, 0.0, 0.0]);
+    if pos != [0.0, 0.0, 0.0] || rot != [0.0, 0.0, 0.0] {
+        mesh.transform(pos, rot);
+    }
 }
 
 /// A node in the parametric history tree.
@@ -119,7 +182,10 @@ impl FeatureTree {
             FeatureOp::AddBox { .. } => "Box".to_string(),
             FeatureOp::AddCylinder { .. } => "Cylinder".to_string(),
             FeatureOp::AddSphere { .. } => "Sphere".to_string(),
+            FeatureOp::AddCone { .. } => "Cone".to_string(),
             FeatureOp::CutHole { .. } => "Cut Hole".to_string(),
+            FeatureOp::CutHelicalGroove { .. } => "Cut Helical Groove".to_string(),
+            FeatureOp::BooleanDifferenceMesh { .. } => "Boolean Difference Mesh".to_string(),
             FeatureOp::Transform { .. } => "Transform".to_string(),
         };
         let node_name = name.unwrap_or(default_name);
@@ -177,43 +243,89 @@ impl FeatureTree {
             }
 
             match &node.op {
-                FeatureOp::AddBox { width, height, depth } => {
+                FeatureOp::AddBox {
+                    width,
+                    height,
+                    depth,
+                    position,
+                    rotation_deg,
+                } => {
                     if *width <= 0.0 || *height <= 0.0 || *depth <= 0.0 {
                         return Err(CadError::InvalidParameter(format!(
                             "Box dimensions must be positive, got: {}x{}x{}",
                             width, height, depth
                         )));
                     }
-                    let box_mesh = create_box(*width, *height, *depth);
+                    let mut box_mesh = create_box(*width, *height, *depth);
+                    apply_pos_rot(&mut box_mesh, position, rotation_deg);
                     current_mesh = match current_mesh {
                         Some(m) => Some(csg_union(&m, &box_mesh)),
                         None => Some(box_mesh),
                     };
                 }
-                FeatureOp::AddCylinder { radius, height, segments } => {
+                FeatureOp::AddCylinder {
+                    radius,
+                    height,
+                    segments,
+                    position,
+                    rotation_deg,
+                } => {
                     if *radius <= 0.0 || *height <= 0.0 {
                         return Err(CadError::InvalidParameter(format!(
                             "Cylinder radius and height must be positive, got: r={}, h={}",
                             radius, height
                         )));
                     }
-                    let cyl_mesh = create_cylinder(*radius, *height, *segments);
+                    let mut cyl_mesh = create_cylinder(*radius, *height, *segments);
+                    apply_pos_rot(&mut cyl_mesh, position, rotation_deg);
                     current_mesh = match current_mesh {
                         Some(m) => Some(csg_union(&m, &cyl_mesh)),
                         None => Some(cyl_mesh),
                     };
                 }
-                FeatureOp::AddSphere { radius, sectors, stacks } => {
+                FeatureOp::AddSphere {
+                    radius,
+                    sectors,
+                    stacks,
+                    position,
+                    rotation_deg,
+                } => {
                     if *radius <= 0.0 {
                         return Err(CadError::InvalidParameter(format!(
                             "Sphere radius must be positive, got: r={}",
                             radius
                         )));
                     }
-                    let sph_mesh = create_sphere(*radius, *sectors, *stacks);
+                    let mut sph_mesh = create_sphere(*radius, *sectors, *stacks);
+                    apply_pos_rot(&mut sph_mesh, position, rotation_deg);
                     current_mesh = match current_mesh {
                         Some(m) => Some(csg_union(&m, &sph_mesh)),
                         None => Some(sph_mesh),
+                    };
+                }
+                FeatureOp::AddCone {
+                    radius_bottom,
+                    radius_top,
+                    height,
+                    segments,
+                    position,
+                    rotation_deg,
+                } => {
+                    if *height <= 0.0
+                        || (*radius_bottom <= 0.0 && *radius_top <= 0.0)
+                        || *radius_bottom < 0.0
+                        || *radius_top < 0.0
+                    {
+                        return Err(CadError::InvalidParameter(format!(
+                            "Cone dimensions invalid: r_bot={}, r_top={}, h={}",
+                            radius_bottom, radius_top, height
+                        )));
+                    }
+                    let mut cone_mesh = create_cone(*radius_bottom, *radius_top, *height, *segments);
+                    apply_pos_rot(&mut cone_mesh, position, rotation_deg);
+                    current_mesh = match current_mesh {
+                        Some(m) => Some(csg_union(&m, &cone_mesh)),
+                        None => Some(cone_mesh),
                     };
                 }
                 FeatureOp::CutHole { center, normal, radius, depth } => {
@@ -227,6 +339,43 @@ impl FeatureTree {
                         CadError::EvaluationError("Cannot cut hole in empty solid".into())
                     })?;
                     current_mesh = Some(cut_hole(&mesh, *center, *normal, *radius, *depth));
+                }
+                FeatureOp::CutHelicalGroove {
+                    helix_radius,
+                    groove_radius,
+                    pitch,
+                    height,
+                    start_z,
+                    starts,
+                    is_right_hand,
+                } => {
+                    if *groove_radius <= 0.0 || *pitch <= 0.0 || *height <= 0.0 {
+                        return Err(CadError::InvalidParameter(format!(
+                            "Helical groove parameters must be positive: r_groove={}, pitch={}, height={}",
+                            groove_radius, pitch, height
+                        )));
+                    }
+                    let mesh = current_mesh.ok_or_else(|| {
+                        CadError::EvaluationError("Cannot cut helical groove in empty solid".into())
+                    })?;
+                    let turns = *height / *pitch;
+                    let tool = create_helical_cutter(
+                        *helix_radius,
+                        *groove_radius,
+                        *pitch,
+                        *height,
+                        *start_z,
+                        *starts,
+                        *is_right_hand,
+                        turns,
+                    );
+                    current_mesh = Some(csg_difference(&mesh, &tool));
+                }
+                FeatureOp::BooleanDifferenceMesh { tool_mesh } => {
+                    let mesh = current_mesh.ok_or_else(|| {
+                        CadError::EvaluationError("Cannot perform boolean difference on empty solid".into())
+                    })?;
+                    current_mesh = Some(csg_difference(&mesh, tool_mesh));
                 }
                 FeatureOp::Transform { translation, rotation_deg, scale } => {
                     let mut mesh = current_mesh.ok_or_else(|| {
@@ -259,6 +408,8 @@ mod tests {
                 width: 10.0,
                 height: 10.0,
                 depth: 10.0,
+                position: None,
+                rotation_deg: None,
             },
             Some("Base Cube".into()),
         );
@@ -273,6 +424,8 @@ mod tests {
                 width: 10.0,
                 height: 20.0,
                 depth: 10.0,
+                position: None,
+                rotation_deg: None,
             },
         ).unwrap();
 
