@@ -4,6 +4,8 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use crate::error::CadError;
+use crate::part::Part;
+use crate::tessellation::TessellationQuality;
 use crate::topology::TriangleMesh;
 
 /// Exports a TriangleMesh to an ASCII STL formatted stream.
@@ -142,6 +144,34 @@ pub fn write_stl_binary_file(
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
     export_stl_binary(mesh, &mut writer)
+}
+
+/// Exports a Part to an STL stream with the requested tessellation quality.
+pub fn export_part_stl_with_quality<W: Write>(
+    part: &mut Part,
+    quality: TessellationQuality,
+    writer: &mut W,
+    binary: bool,
+) -> Result<(), CadError> {
+    let solid_name = part.name.clone();
+    let mesh = part.tessellate_quality(quality)?;
+    if binary {
+        export_stl_binary(mesh, writer)
+    } else {
+        export_stl_ascii(mesh, &solid_name, writer)
+    }
+}
+
+/// Convenience function to write a Part to an STL file directly to disk with the requested tessellation quality.
+pub fn write_part_stl_with_quality(
+    part: &mut Part,
+    quality: TessellationQuality,
+    path: impl AsRef<Path>,
+    binary: bool,
+) -> Result<(), CadError> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+    export_part_stl_with_quality(part, quality, &mut writer, binary)
 }
 
 #[cfg(test)]

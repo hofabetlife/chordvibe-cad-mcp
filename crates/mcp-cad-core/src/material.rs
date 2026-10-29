@@ -217,5 +217,13 @@ mod tests {
         let retrieved = registry.get("carbon_fiber").unwrap();
         assert_eq!(retrieved.name, "carbon_fiber");
         assert!((retrieved.density_g_cm3() - 1.6).abs() < 1e-4);
+
+        // Unknown material lookup returns None
+        assert!(registry.get("unknown_material_xyz").is_none());
+
+        // Dynamic registration updates existing material
+        let updated = Material::new("carbon_fiber", 180.0, 0.30, 600.0, 1650.0, "Updated carbon composite");
+        registry.register(updated);
+        assert_eq!(registry.get("carbon_fiber").unwrap().youngs_modulus_gpa, 180.0);
     }
 }

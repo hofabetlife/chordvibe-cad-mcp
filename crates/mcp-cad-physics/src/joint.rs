@@ -32,6 +32,12 @@ pub enum CadJointType {
         anchor_a: [f64; 3],
         anchor_b: [f64; 3],
     },
+    /// Gear kinematic constraint transmitting rotation between two axes: w_b = -ratio * w_a.
+    Gear {
+        ratio: f64,
+        axis_a: [f64; 3],
+        axis_b: [f64; 3],
+    },
 }
 
 /// Motor configuration for actuated kinematic joints.
@@ -191,6 +197,11 @@ impl CadJointType {
                 generic.set_contacts_enabled(false);
                 Ok(generic)
             }
+            CadJointType::Gear { .. } => {
+                let mut generic: GenericJoint = GenericJointBuilder::new(JointAxesMask::empty()).build();
+                generic.set_contacts_enabled(false);
+                Ok(generic)
+            }
         }
     }
 
@@ -222,6 +233,11 @@ impl CadJointType {
                     "Cannot set motor on Spherical or Fixed joint".into(),
                 ))
             }
+            CadJointType::Gear { .. } => {
+                Err(PhysicsError::InvalidJointConfiguration(
+                    "Cannot set motor directly on Gear constraint; apply motor to one of the connected Revolute joints".into(),
+                ))
+            }
         }
     }
 
@@ -238,7 +254,7 @@ impl CadJointType {
                 joint.set_motor_max_force(JointAxis::LinX, 0.0);
                 Ok(())
             }
-            CadJointType::Spherical { .. } | CadJointType::Fixed { .. } => Ok(()),
+            CadJointType::Spherical { .. } | CadJointType::Fixed { .. } | CadJointType::Gear { .. } => Ok(()),
         }
     }
 }

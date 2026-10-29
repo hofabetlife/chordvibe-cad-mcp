@@ -136,10 +136,13 @@ graph TD
     - `Prismatic` (направляющий слайдер вдоль оси с лимитами хода).
     - `Spherical` (шаровой шарнир).
     - `Fixed` (жесткое закрепление двух деталей).
+    - `Gear` (кинематическое зубчатое зацепление с синхронизацией угловых скоростей $\omega_B = -\text{ratio} \cdot \omega_A$, отключением паразитных полигональных коллизий между шестернями и передачей вращения).
+  - Поддержка статической фиксации (`is_fixed: bool`) и сопряжений с неподвижным пространством (`"ground"` / `"world"`).
   - Сбор данных симуляции:
     - Запись положения и скоростей тел по шагам времени ($\Delta t = 1/60$ с).
     - Расчет пиковых нагрузок и реакций в сочленениях.
     - Детекция соударений и заклиниваний.
+    - Генерация ключевых кадров полигональной сетки для визуализатора.
 
 ### 4.3. Подсистема прочностных расчетов (МКЭ / FEA)
 - **Стек**: Чистый Rust (`nalgebra` / `faer` для разреженных матриц, кастомный 3D тетраэдральный МКЭ-солвер).
@@ -181,6 +184,7 @@ graph TD
   - Рендеринг затененных твердых тел (PBR/Blinn-Phong) с контурными линиями граней (CAD-стиль).
   - Рендеринг сочленений: оси шарниров, векторы приводов, маркеры степеней свободы.
   - Рендеринг результатов МКЭ: деформированная геометрия с масштабируемым коэффициентом деформации (scale factor), цветовая карта напряжений по Мизесу с легендой значений в МПа.
+  - Воспроизведение анимации симуляции механизмов (Loop playback) в окне WGPU с обновлением вершинных буферов на GPU на лету и горячей клавишей паузы/продолжения (`P`).
   - Оффскрин-рендеринг в память без показа окна (для тестов или фонового режима) и по требованию ИИ (`capture_viewport`).
 
 ### 4.6. Транспорт MCP
@@ -195,31 +199,31 @@ graph TD
 Ниже представлен базовый контракт инструментов, предоставляемых ИИ-агенту:
 
 ### 5.1. Управление сценой и деталями
-- `create_part(name: string, material: string) -> { part_id: string }`
-  Создает новую пустую деталь с привязкой к материалу.
+- `create_part(name: string, material: string, is_fixed?: bool) -> { part_id: string, is_fixed: bool }`
+  Создает новую деталь с привязкой к материалу и опциональной фиксацией в мировом пространстве (статическое тело).
 - `list_parts() -> { parts: [...] }`
   Возвращает список деталей, их габариты, объемы, массы и статус.
 - `delete_part(part_id: string) -> { status: "deleted" }`
 
 ### 5.2. Параметрическое моделирование (DAG-операции)
-- `add_feature_primitive(part_id: string, primitive_type: "box"|"cylinder"|"sphere", params: object) -> { feature_id: string }`
+- `add_feature_primitive(part_id: string, primitive_type: "box"|"cylinder"|"sphere"|"cone"|"polygon_prism"|"spur_gear"|"revolve"|"wheel_rim", params: object) -> { feature_id: string }`
   Добавляет базовый твердотельный объем.
 - `apply_boolean(part_id: string, target_feature_id: string, tool_feature_id: string, op: "union"|"difference"|"intersection") -> { feature_id: string }`
   Выполняет булеву операцию между телами.
-- `cut_hole(part_id: string, position: [f32; 3], normal: [f32; 3], radius: f32, depth: f32) -> { feature_id: string }`
-  Отверстие под вал, крепеж или ось.
+- `cut_hole(part_id: string, position: [f32; 3], normal: [f32; 3], radius: f32, depth: f32, keyway_width?: f32, keyway_depth?: f32) -> { feature_id: string }`
+  Отверстие под вал, крепеж или ось со шпоночным пазом.
 - `modify_feature(part_id: string, feature_id: string, new_params: object) -> { status: "updated", updated_bounds: [...] }`
   Редактирование любого параметра в истории построения.
 - `get_feature_tree(part_id: string) -> { dag: [...] }`
   Получение полной структуры дерева операций детали.
 
 ### 5.3. Механизмы и кинематика
-- `create_joint(joint_type: "revolute"|"prismatic"|"spherical"|"fixed", part_a: string, part_b: string, anchor_a: [f32; 3], anchor_b: [f32; 3], axis: [f32; 3], limits: object) -> { joint_id: string }`
-  Создание кинематического сопряжения между деталями.
+- `create_joint(joint_type: "revolute"|"prismatic"|"spherical"|"fixed"|"gear", part_a: string, part_b: string, anchor_a?: [f32; 3], anchor_b?: [f32; 3], axis?: [f32; 3], ratio?: f32, teeth_a?: u32, teeth_b?: u32, limits?: object) -> { joint_id: string }`
+  Создание кинематического сопряжения между деталями (поддерживает привязку к неподвижному пространству `"ground"`/`"world"` и зубчатые зацепления `"gear"`).
 - `set_joint_motor(joint_id: string, target_velocity: f32, max_force: f32) -> { status: "motor_active" }`
   Включение привода (вращение или линейный сдвиг).
 - `run_physics_simulation(duration_seconds: f32, step_size_ms: f32) -> { success: bool, trajectory_summary: object, peak_joint_forces: object, collisions: [...] }`
-  Запуск физической симуляции в Rapier3D с записью телеметрии.
+  Запуск физической симуляции в Rapier3D с записью телеметрии и автоматической отправкой кадров анимации в окно предварительного просмотра.
 
 ### 5.4. Расчет прочности (FEA)
 - `run_fea_analysis(part_id: string, mesh_density: "coarse"|"medium"|"fine", fixed_faces: [...], applied_forces: [{ position: [f32; 3], force_vector: [f32; 3] }]) -> { max_von_mises_mpa: f32, yield_strength_mpa: f32, safety_factor: f32, max_displacement_mm: f32, status: "PASS"|"FAIL" }`
@@ -230,6 +234,8 @@ graph TD
 ### 5.5. Визуализация и экспорт
 - `capture_viewport(camera_preset: string, width: u32, height: u32) -> { image_base64: string }`
   Снимок текущего состояния 3D-сцены.
+- `open_preview_window(part_id?: string) -> { status: "opened", mode: string }`
+  Открытие интерактивного нативного окна 3D превью на Windows с орбитальной камерой, переключением качества тесселяции (`Q`) и циклическим воспроизведением симуляции (`P`).
 - `export_stl(part_id: string, filepath: string, binary: bool) -> { file_path: string, triangles_count: u32 }`
   Экспорт в стандартный STL файл для производства/3D-печати.
 - `get_simulation_metrics_json() -> { current_metrics: object }`

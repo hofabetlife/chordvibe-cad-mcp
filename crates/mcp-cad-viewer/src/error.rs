@@ -59,6 +59,10 @@ pub enum ViewerError {
         actual: usize,
     },
 
+    /// CAD core modeling or evaluation error.
+    #[error("CAD core error: {0}")]
+    Cad(#[from] mcp_cad_core::CadError),
+
     /// An internal or unexpected error occurred.
     #[error("Internal viewer error: {0}")]
     Internal(String),

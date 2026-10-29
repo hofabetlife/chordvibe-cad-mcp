@@ -62,7 +62,17 @@ pub enum FeaError {
     #[error("Mesh generation failed: {0}")]
     MeshGenerationFailed(String),
 
+    /// Raised when a CAD core operation or evaluation fails.
+    #[error("CAD core error: {0}")]
+    Cad(String),
+
     /// General FEA error with descriptive message.
     #[error("FEA error: {0}")]
     General(String),
+}
+
+impl From<mcp_cad_core::CadError> for FeaError {
+    fn from(err: mcp_cad_core::CadError) -> Self {
+        Self::Cad(err.to_string())
+    }
 }

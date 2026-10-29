@@ -4,12 +4,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::csg::{csg_difference, csg_union};
+use crate::csg::{csg_difference, csg_intersection, csg_union};
 use crate::error::CadError;
 use crate::primitives::{
-    create_box, create_cone, create_cylinder, create_helical_cutter, create_polygon_prism,
-    create_revolve, create_sphere, create_spur_gear, create_wheel_rim, cut_hole,
+    create_box, create_cone, create_cylinder, create_helical_cutter_with_settings,
+    create_polygon_prism, create_revolve_with_settings, create_sphere,
+    create_spur_gear_with_settings, create_wheel_rim_with_settings, cut_hole_with_settings,
 };
+use crate::tessellation::TessellationSettings;
 use crate::topology::TriangleMesh;
 
 /// Individual modeling feature operation.
@@ -168,6 +170,14 @@ pub enum FeatureOp {
     BooleanDifferenceMesh {
         tool_mesh: TriangleMesh,
     },
+    /// Union an arbitrary tool mesh with the solid.
+    BooleanUnionMesh {
+        tool_mesh: TriangleMesh,
+    },
+    /// Intersect an arbitrary tool mesh with the solid.
+    BooleanIntersectionMesh {
+        tool_mesh: TriangleMesh,
+    },
     /// Apply spatial translation, rotation (RPY degrees), and scale factors.
     Transform {
         #[serde(default)]
@@ -304,6 +314,8 @@ impl FeatureTree {
             FeatureOp::CutHole { .. } => "Cut Hole".to_string(),
             FeatureOp::CutHelicalGroove { .. } => "Cut Helical Groove".to_string(),
             FeatureOp::BooleanDifferenceMesh { .. } => "Boolean Difference Mesh".to_string(),
+            FeatureOp::BooleanUnionMesh { .. } => "Boolean Union Mesh".to_string(),
+            FeatureOp::BooleanIntersectionMesh { .. } => "Boolean Intersection Mesh".to_string(),
             FeatureOp::Transform { .. } => "Transform".to_string(),
         };
         let node_name = name.unwrap_or(default_name);
@@ -351,8 +363,8 @@ impl FeatureTree {
         Ok(())
     }
 
-    /// Evaluates the complete feature history tree and returns the resulting 3D boundary mesh.
-    pub fn evaluate(&self) -> Result<TriangleMesh, CadError> {
+    /// Evaluates the complete feature history tree with adaptive tessellation settings.
+    pub fn evaluate_with_settings(&self, settings: &TessellationSettings) -> Result<TriangleMesh, CadError> {
         let mut current_mesh: Option<TriangleMesh> = None;
 
         for node in &self.nodes {
@@ -384,7 +396,7 @@ impl FeatureTree {
                 FeatureOp::AddCylinder {
                     radius,
                     height,
-                    segments,
+                    segments: _,
                     position,
                     rotation_deg,
                 } => {
@@ -394,7 +406,8 @@ impl FeatureTree {
                             radius, height
                         )));
                     }
-                    let mut cyl_mesh = create_cylinder(*radius, *height, *segments);
+                    let segs = settings.calculate_segments(*radius);
+                    let mut cyl_mesh = create_cylinder(*radius, *height, segs);
                     apply_pos_rot(&mut cyl_mesh, position, rotation_deg);
                     current_mesh = match current_mesh {
                         Some(m) => Some(csg_union(&m, &cyl_mesh)),
@@ -438,8 +451,8 @@ impl FeatureTree {
                 }
                 FeatureOp::AddSphere {
                     radius,
-                    sectors,
-                    stacks,
+                    sectors: _,
+                    stacks: _,
                     position,
                     rotation_deg,
                 } => {
@@ -449,7 +462,8 @@ impl FeatureTree {
                             radius
                         )));
                     }
-                    let mut sph_mesh = create_sphere(*radius, *sectors, *stacks);
+                    let (sec, stk) = settings.calculate_sphere_resolution(*radius);
+                    let mut sph_mesh = create_sphere(*radius, sec, stk);
                     apply_pos_rot(&mut sph_mesh, position, rotation_deg);
                     current_mesh = match current_mesh {
                         Some(m) => Some(csg_union(&m, &sph_mesh)),
@@ -460,7 +474,7 @@ impl FeatureTree {
                     radius_bottom,
                     radius_top,
                     height,
-                    segments,
+                    segments: _,
                     position,
                     rotation_deg,
                 } => {
@@ -474,7 +488,9 @@ impl FeatureTree {
                             radius_bottom, radius_top, height
                         )));
                     }
-                    let mut cone_mesh = create_cone(*radius_bottom, *radius_top, *height, *segments);
+                    let max_r = radius_bottom.max(*radius_top);
+                    let segs = settings.calculate_segments(max_r);
+                    let mut cone_mesh = create_cone(*radius_bottom, *radius_top, *height, segs);
                     apply_pos_rot(&mut cone_mesh, position, rotation_deg);
                     current_mesh = match current_mesh {
                         Some(m) => Some(csg_union(&m, &cone_mesh)),
@@ -500,7 +516,7 @@ impl FeatureTree {
                             module, teeth, face_width
                         )));
                     }
-                    let mut gear_mesh = create_spur_gear(
+                    let mut gear_mesh = create_spur_gear_with_settings(
                         *module,
                         *teeth,
                         *pressure_angle_deg,
@@ -510,6 +526,7 @@ impl FeatureTree {
                         *keyway_depth,
                         *hub_diameter,
                         *hub_length,
+                        settings,
                     );
                     apply_pos_rot(&mut gear_mesh, position, rotation_deg);
                     current_mesh = match current_mesh {
@@ -520,7 +537,7 @@ impl FeatureTree {
                 FeatureOp::AddRevolve {
                     profile,
                     angle_deg,
-                    segments,
+                    segments: _,
                     position,
                     rotation_deg,
                 } => {
@@ -535,7 +552,7 @@ impl FeatureTree {
                             angle_deg
                         )));
                     }
-                    let mut mesh = create_revolve(profile, *angle_deg, *segments);
+                    let mut mesh = create_revolve_with_settings(profile, *angle_deg, settings);
                     apply_pos_rot(&mut mesh, position, rotation_deg);
                     current_mesh = match current_mesh {
                         Some(m) => Some(csg_union(&m, &mesh)),
@@ -564,7 +581,7 @@ impl FeatureTree {
                             rim_diameter, rim_width
                         )));
                     }
-                    let mut mesh = create_wheel_rim(
+                    let mut mesh = create_wheel_rim_with_settings(
                         *rim_diameter,
                         *rim_width,
                         *flange_diameter,
@@ -577,6 +594,7 @@ impl FeatureTree {
                         *spoke_width,
                         *spoke_thickness,
                         *offset_et,
+                        settings,
                     );
                     apply_pos_rot(&mut mesh, position, rotation_deg);
                     current_mesh = match current_mesh {
@@ -601,7 +619,7 @@ impl FeatureTree {
                     let mesh = current_mesh.ok_or_else(|| {
                         CadError::EvaluationError("Cannot cut hole in empty solid".into())
                     })?;
-                    current_mesh = Some(cut_hole(
+                    current_mesh = Some(cut_hole_with_settings(
                         &mesh,
                         *center,
                         *normal,
@@ -609,6 +627,7 @@ impl FeatureTree {
                         *depth,
                         *keyway_width,
                         *keyway_depth,
+                        settings,
                     ));
                 }
                 FeatureOp::CutHelicalGroove {
@@ -631,7 +650,7 @@ impl FeatureTree {
                         CadError::EvaluationError("Cannot cut helical groove in empty solid".into())
                     })?;
                     let turns = *height / *pitch;
-                    let tool = create_helical_cutter(
+                    let tool = create_helical_cutter_with_settings(
                         *helix_radius,
                         *groove_radius,
                         *pitch,
@@ -641,6 +660,7 @@ impl FeatureTree {
                         *is_right_hand,
                         turns,
                         profile_type,
+                        settings,
                     );
                     current_mesh = Some(csg_difference(&mesh, &tool));
                 }
@@ -649,6 +669,18 @@ impl FeatureTree {
                         CadError::EvaluationError("Cannot perform boolean difference on empty solid".into())
                     })?;
                     current_mesh = Some(csg_difference(&mesh, tool_mesh));
+                }
+                FeatureOp::BooleanUnionMesh { tool_mesh } => {
+                    let mesh = current_mesh.ok_or_else(|| {
+                        CadError::EvaluationError("Cannot perform boolean union on empty solid".into())
+                    })?;
+                    current_mesh = Some(csg_union(&mesh, tool_mesh));
+                }
+                FeatureOp::BooleanIntersectionMesh { tool_mesh } => {
+                    let mesh = current_mesh.ok_or_else(|| {
+                        CadError::EvaluationError("Cannot perform boolean intersection on empty solid".into())
+                    })?;
+                    current_mesh = Some(csg_intersection(&mesh, tool_mesh));
                 }
                 FeatureOp::Transform { translation, rotation_deg, scale } => {
                     let mut mesh = current_mesh.ok_or_else(|| {
@@ -666,6 +698,13 @@ impl FeatureTree {
         }
 
         Ok(current_mesh.unwrap_or_else(TriangleMesh::empty))
+    }
+
+    /// Evaluates the complete feature history tree and returns the resulting 3D boundary mesh.
+    ///
+    /// Uses default `TessellationSettings::default()` for backward compatibility.
+    pub fn evaluate(&self) -> Result<TriangleMesh, CadError> {
+        self.evaluate_with_settings(&TessellationSettings::default())
     }
 }
 
@@ -704,5 +743,85 @@ mod tests {
 
         let mesh2 = tree.evaluate().unwrap();
         assert!((mesh2.volume() - 2000.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_tree_boolean_union_and_intersection_mesh() {
+        // Base box: 10 x 10 x 10, volume = 1000
+        let mut tree = FeatureTree::new();
+        tree.add_feature(
+            FeatureOp::AddBox {
+                width: 10.0,
+                height: 10.0,
+                depth: 10.0,
+                position: None,
+                rotation_deg: None,
+            },
+            Some("Base".into()),
+        );
+
+        // Tool box: 10 x 10 x 10 shifted by x = 5 (overlaps from x = 0 to 5)
+        // Overlap: 5 x 10 x 10 = 500
+        let mut tool = create_box(10.0, 10.0, 10.0);
+        tool.translate([5.0, 0.0, 0.0]);
+
+        // Intersection: base ([-5, 5]) ∩ tool ([0, 10]) => [0, 5] x [-5, 5] x [-5, 5], volume = 500
+        let mut intersect_tree = tree.clone();
+        intersect_tree.add_feature(
+            FeatureOp::BooleanIntersectionMesh { tool_mesh: tool.clone() },
+            Some("Intersect Tool".into()),
+        );
+        let intersect_mesh = intersect_tree.evaluate().unwrap();
+        assert!((intersect_mesh.volume() - 500.0).abs() < 1e-2);
+
+        // Union: base ∪ tool => [-5, 10] x [-5, 5] x [-5, 5], volume = 1500
+        let mut union_tree = tree;
+        union_tree.add_feature(
+            FeatureOp::BooleanUnionMesh { tool_mesh: tool },
+            Some("Union Tool".into()),
+        );
+        let union_mesh = union_tree.evaluate().unwrap();
+        assert!((union_mesh.volume() - 1500.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn test_tree_transform_feature() {
+        let mut tree = FeatureTree::new();
+        tree.add_feature(
+            FeatureOp::AddBox {
+                width: 2.0,
+                height: 4.0,
+                depth: 6.0,
+                position: None,
+                rotation_deg: None,
+            },
+            Some("Box".into()),
+        );
+
+        // Scale 2x along X, rotate 90 deg around Z, translate by [10, 20, 30]
+        tree.add_feature(
+            FeatureOp::Transform {
+                scale: [2.0, 1.0, 1.0],
+                rotation_deg: [0.0, 0.0, 90.0],
+                translation: [10.0, 20.0, 30.0],
+            },
+            Some("Transform".into()),
+        );
+
+        let mesh = tree.evaluate().unwrap();
+        // Original volume = 2 * 4 * 6 = 48. After scale 2x = 96.
+        assert!((mesh.volume() - 96.0).abs() < 1e-4);
+
+        let aabb = mesh.bounding_box();
+        // Original X: [-1, 1] scaled 2x -> [-2, 2]
+        // Original Y: [-2, 2]
+        // Rotated 90 deg around Z:
+        // x' = -y in [-2, 2], y' = x in [-2, 2]
+        // Translated by [10, 20, 30]:
+        // X in [8, 12], Y in [18, 22], Z in [27, 33]
+        let center = aabb.center();
+        assert!((center[0] - 10.0).abs() < 1e-4);
+        assert!((center[1] - 20.0).abs() < 1e-4);
+        assert!((center[2] - 30.0).abs() < 1e-4);
     }
 }

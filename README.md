@@ -6,14 +6,15 @@
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64-blue.svg?logo=windows&logoColor=white)](https://www.microsoft.com/windows)
 [![Dependencies](https://img.shields.io/badge/dependencies-Zero%20C%2B%2B%20%2F%20Pure%20Rust-brightgreen.svg)](Cargo.toml)
 [![Protocol](https://img.shields.io/badge/MCP-2024--11--05-blueviolet.svg)](https://modelcontextprotocol.io)
-[![Tests](https://img.shields.io/badge/tests-100%25%20Passing%20(34%2F34)-success.svg)](crates/)
+[![Tests](https://img.shields.io/badge/tests-100%25%20Passing%20(99%2F99)-success.svg)](crates/)
 [![License](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-blue.svg)](LICENSE)
 
 **Первая в мире автономная инженерная среда 3D CAD/CAE на чистом Rust под Windows, спроектированная под прямое управление ИИ-агентами по протоколу Model Context Protocol (MCP).**
 
 [Быстрый старт](#-быстрый-старт-quick-start) •
 [Подключение к ИИ](#-подключение-к-популярным-ии-клиентам) •
-[Инструменты MCP](#-сводная-таблица-инструментов-mcp-15-tools) •
+[Инструменты MCP](#-сводная-таблица-инструментов-mcp-26-tools) •
+[AI-Native Возможности](#-ai-native-cad-experience) •
 [Архитектура](#-архитектура-системы) •
 [Примеры промптов](#-готовые-промпты-для-ии-агентов)
 
@@ -29,10 +30,10 @@
 
 ```mermaid
 flowchart LR
-    A["📐 Проектирование<br/>(Solid DAG)"] --> B["⚙️ Кинематика<br/>(Rapier3D)"]
+    A["📐 Проектирование<br/>(Solid DAG & Адаптивная тесселяция)"] --> B["⚙️ Кинематика<br/>(Rapier3D)"]
     B --> C["🧪 Анализ прочности<br/>(FEA / МКЭ TET4)"]
     C --> D["👁️ Визуальный аудит<br/>(WGPU PNG/Base64)"]
-    D --> E["🖨️ Экспорт в производство<br/>(STL)"]
+    D --> E["🖨️ Экспорт в производство<br/>(STL с контролем хорды)"]
     D -.->|"Оптимизация<br/>геометрии"| A
 
     style A fill:#e1f5fe,stroke:#0288d1,stroke-width:2px
@@ -46,33 +47,40 @@ flowchart LR
 
 ## ✨ Ключевые возможности
 
-1. **Параметрическое Solid DAG-моделирование**:
-   - Построение твердых тел на основе направленного графа операций (`FeatureTree`).
-   - Примитивы (`Box`, `Cylinder`, `Sphere`, `Cone`, `PolygonPrism` с фасками по DIN 934, параметрический зубчатый венец `SpurGear` с эвольвентным профилем по DIN 867 / ISO 53, ступицей и шпоночным пазом DIN 6885, тела вращения `Revolve` по 2D-профилю `[r, z]`, параметрический легкосплавный колесный диск `WheelRim` со ступенчатым профилем обода, закраинами, монтажным ручьем, ступицей, PCD разболтовкой и спицами с окнами охлаждения тормозов), вырезание отверстий (`cut_hole` с опциональным шпоночным пазом), нарезка винтовых канавок и метрической резьбы 60° по ISO 68-1 (`cut_helical_groove`), булево вычитание произвольных сеток (`boolean_difference`) и трансформации.
-   - Редактирование любого шага истории в реальном времени (`modify_feature`) с автоматическим пересчетом геометрии без потери топологии.
+1. **Параметрическое Solid DAG-моделирование и адаптивная тесселяция**:
+   - Аналитическая геометрия и построение твердых тел на основе направленного графа операций (`FeatureTree`).
+   - Примитивы (`Box`, `Cylinder`, `Sphere`, `Cone`, `PolygonPrism` с фасками по DIN 934, параметрический зубчатый венец `SpurGear` с эвольвентным профилем по DIN 867 / ISO 53, ступицей и шпоночным пазом DIN 6885, тела вращения `Revolve` по 2D-профилю `[r, z]`, параметрический легкосплавный колесный диск `WheelRim` со ступенчатым профилем обода, закраинами, монтажным ручьем, ступицей, PCD разболтовкой и спицами с окнами охлаждения тормозов), вырезание отверстий (`cut_hole` с опциональным шпоночным пазом), нарезка винтовых канавок и метрической резьбы 60° по ISO 68-1 (`cut_helical_groove`).
+   - **Полная CSG-триада и пространственные трансформации**: вычитание (`boolean_difference`), объединение (`boolean_union`), пересечение произвольных сеток (`boolean_intersection`) и аффинные трансформации (`transform_part`: перемещение, вращение RPY, масштабирование).
+   - **Ленивая адаптивная тесселяция (`tessellate_part`)**: автоматическая адаптивная дискретизация криволинейных поверхностей по стреле прогиба (хорде $\delta$) и угловому отклонению $\theta$ с пресетами качества (`Coarse`, `Medium`, `Fine`, `Custom`) и кэшированием меша.
+   - Редактирование любого шага истории в реальном времени (`modify_feature`) с автоматической инвалидацией кэша и пересчетом геометрии без потери топологии.
 
-2. **Динамика подвижных механизмов (Rapier3D)**:
+2. **AI-Native интроспекция и пакетная оптимизация**:
+   - **Инспекция геометрии (`query_part_geometry`)**: устранение "слепоты координат" у LLM благодаря автодетекции компланарных граней (`detected_planar_faces`), вычислению нормалей, средневзвешенных центров, объема, площади и точного AABB.
+   - **Пакетное атомарное выполнение (`batch_cad_operations`)**: выполнение цепочек из десятков CAD-операций за один сетевой запрос с валидацией шагов.
+
+3. **Динамика подвижных механизмов (Rapier3D)**:
    - Полный спектр кинематических сочленений: шарниры (`Revolute`), направляющие ползуны (`Prismatic`), шаровые опоры (`Spherical`) и жесткие фиксации (`Fixed`).
    - Управляемые сервомоторы с ограничением по пиковому моменту и скорости.
    - Симуляция динамики во времени с фиксацией траекторий, реакций в сочленениях и соударений.
 
-3. **Линейный МКЭ-анализ прочности (Pure-Rust FEA)**:
-   - Автоматическая 3D тетраэдризация геометрии (TET4: 4 узла, 12 DoF).
+4. **Линейный МКЭ-анализ прочности (Pure-Rust FEA)**:
+   - Автоматическая 3D тетраэдризация геометрии (TET4: 4 узла, 12 DoF) с адаптивной увязкой поверхностного меша и разбиением длинных ребер (`refine_mesh_max_edge_length`).
    - Закон Гука в трехмерном виде через изотропную матрицу упругости $D(E, \nu)$.
    - Разреженный итерационный решатель (Conjugate Gradient) для уравнения равновесия $K \cdot u = F$.
    - Вычисление тензора напряжений Коши, эквивалентных напряжений по Мизесу $\sigma_{vM}$ и коэффициента запаса прочности ($FoS = \sigma_{yield} / \max(\sigma_{vM})$).
 
-4. **WGPU 3D Визуализация и оффскрин-рендеринг**:
-   - Нативное 3D-окно Windows (DirectX 12 / Vulkan) с шейдингом Blinn-Phong и контурной обводкой ребер.
-   - Headless оффскрин-рендеринг в кадровый буфер RGBA8 с кодированием в PNG/Base64 прямо в теле ответа MCP.
+5. **WGPU 3D Визуализация и оффскрин-рендеринг**:
+   - Нативное 3D-окно Windows (DirectX 12 / Vulkan) с шейдингом Blinn-Phong, контурной обводкой ребер и горячей клавишей `'Q'` для переключения качества тесселяции (Coarse $\to$ Medium $\to$ Fine) на лету.
+   - Headless оффскрин-рендеринг в кадровый буфер RGBA8 с кодированием в PNG/Base64 прямо в теле ответа MCP с поддержкой пресетов качества.
    - Процедурные тепловые карты напряжений Мизеса (градиент Синий $\to$ Циан $\to$ Зеленый $\to$ Желтый $\to$ Красный) для мультимодального анализа агентом.
 
-5. **Встроенная инженерная библиотека материалов**:
+6. **Инженерная библиотека и кастомные материалы**:
    - Стали: `steel_structural_aisi1020`, `steel_high_strength_4140`.
    - Легкие сплавы: авиационный алюминий `aluminum_6061_t6`, титан `titanium_grade5_ti6al4v`, латунь `brass_c360`.
    - Полимеры для 3D-печати: `pla_filament_3dprint`, `petg_filament_3dprint`, инженерный нейлон `nylon_pa12`.
+   - **Динамическое создание материалов (`define_material`)**: регистрация пользовательских сплавов, полимеров и композитов с индивидуальными $E$, $\nu$, $\sigma_y$ и $\rho$.
 
-6. **Производственный экспорт и телеметрия**:
+7. **Производственный экспорт и телеметрия**:
    - Экспорт поверхностных сеток в стандартный формат STL (компактный бинарный или текстовый ASCII).
    - Полная телеметрия и структурированные инженерные отчеты в формате JSON.
 
@@ -147,7 +155,7 @@ cargo run --release -p mcp-cad-server -- --mode sse --port 8080
    - **Name**: `cad-engine`
    - **Type**: `command`
    - **Command**: `c:\Users\voley\Documents\3D_MCP\target\release\mcp-cad-server.exe --mode stdio`
-4. Нажмите **Save**. Зеленый индикатор подтвердит доступность всех 15 инструментов.
+4. Нажмите **Save**. Зеленый индикатор подтвердит доступность всех 26 инструментов.
 
 ---
 
@@ -158,7 +166,30 @@ cargo run --release -p mcp-cad-server -- --mode sse --port 8080
 
 ---
 
-## 🛠️ Сводная таблица инструментов MCP (18 Tools)
+## 🧠 AI-Native CAD Experience: Новые горизонты для ИИ-агентов
+
+MCP-CAD Engine спроектирован специально для преодоления фундаментальных проблем LLM в пространственном мышлении и сетевом взаимодействии:
+
+1. **Интроспекция геометрии без «слепоты координат» (`query_part_geometry`)**:
+   - Языковые модели не могут визуально «видеть» сетку и часто ошибаются в координатах привязки отверстий, вырезов или сил.
+   - Инструмент `query_part_geometry` возвращает точный AABB (min, max, dimensions), абсолютный объем, площадь, центр масс, а главное — массив распознанных компланарных плоскостей (`detected_planar_faces`).
+   - Для каждой плоскости автоматически вычисляются точная нормаль $[n_x, n_y, n_z]$ и средневзвешенный центр грани $[x, y, z]$. Агенту достаточно вызвать инспекцию, чтобы безошибочно указать точку и вектор нормали для `cut_hole` или `run_fea_analysis` (`fixed_faces`/`fixed_plane`).
+
+2. **Пакетное атомарное выполнение без задержек (`batch_cad_operations`)**:
+   - Сложные детали требуют десятков шагов построения. Выполнение их по одному через отдельные JSON-RPC вызовы создавало десятки лишних roundtrip сетевых задержек.
+   - `batch_cad_operations` позволяет агенту скомпоновать полный технологический процесс изготовления детали в один пакетный запрос. Все операции выполняются последовательно и атомарно в одном контексте движка, а в случае ошибки возвращается индекс сбойного шага с точной причиной.
+
+3. **Динамические кастомные материалы (`define_material`)**:
+   - Инженерные задачи часто требуют нестандартных материалов: карбон, титановые сплавы, спецстали, композиты или филаменты для 3D-печати.
+   - Агент может зарегистрировать любой материал с физическими константами (модуль Юнга $E$, коэффициент Пуассона $\nu$, предел текучести $\sigma_y$, плотность $\rho$) и мгновенно использовать его в расчетах прочности МКЭ и кинематике.
+
+4. **Полный булев базис CSG и пространственные трансформации**:
+   - В дополнение к `boolean_difference`, добавлены `boolean_union` (объединение твердых тел) и `boolean_intersection` (пересечение с сохранением общего объема).
+   - Инструмент `transform_part` позволяет масштабировать, сдвигать и ориентировать детали по углам Эйлера (Roll-Pitch-Yaw) прямо в истории построения DAG.
+
+---
+
+## 🛠️ Сводная таблица инструментов MCP (26 Tools)
 
 | № | Имя инструмента | Входные параметры | Выходные данные | Назначение |
 |:---:|---|---|---|---|
@@ -171,19 +202,26 @@ cargo run --release -p mcp-cad-server -- --mode sse --port 8080
 | **7** | `get_feature_tree` | `part_id: str` | `{ dag: [...] }` | Получить полную историю дерева операций детали |
 | **8** | `cut_helical_groove` | `part_id: str`, `helix_radius: num`, `groove_radius: num`, `pitch: num`, `height: num`, `start_z: num`, `profile_type?: "circular"\|"metric_60"` | `{ feature_id: str, status: "helical_groove_cut" }` | Нарезать винтовые канавки (канавки сверл или резьбу 60° по ISO 68-1) |
 | **9** | `boolean_difference` | `target_part_id: str`, `tool_part_id: str` | `{ feature_id: str, status: "boolean_difference_applied" }` | Вычесть форму инструмента из детали (CSG Difference) |
-| **10** | `create_joint` | `joint_type: str`, `part_a: str`, `part_b: str`, `anchor_a: [3]`, `anchor_b: [3]`, `axis?: [3]`, `limits?: [2]` | `{ joint_id: str }` | Создать сочленение (`revolute`, `prismatic`, `spherical`, `fixed`) |
-| **11** | `set_joint_motor` | `joint_id: str`, `target_velocity: num`, `max_force: num` | `{ status: "motor_active" }` | Включить сервопривод скорости на сочленении |
-| **12** | `run_physics_simulation` | `duration_seconds: num`, `step_size_ms?: num` | `{ success: bool, steps_simulated: int, trajectory_summary: obj, peak_joint_forces: obj, collisions: [...] }` | Провести динамическую симуляцию механизма во времени |
-| **13** | `run_fea_analysis` | `part_id: str`, `mesh_density?: str`, `fixed_faces?: [str]`, `fixed_plane?: obj`, `applied_forces?: [...]` | `{ max_von_mises_mpa: num, yield_strength_mpa: num, safety_factor: num, max_displacement_mm: num, status: "PASS"\|"FAIL" }` | Выполнить 3D МКЭ-расчет прочности (TET4) |
-| **14** | `get_fea_heatmap_image` | `part_id: str`, `camera_preset?: str`, `width?: int`, `height?: int` | `{ colormap_legend: obj }` + `image/png` | Получить 3D-снимок тепловой карты напряжений по Мизесу |
-| **15** | `capture_viewport` | `camera_preset?: str`, `part_id?: str`, `width?: int`, `height?: int` | `{ camera_preset: str, format: "image/png" }` + `image/png` | Сделать оффскрин 3D-снимок сцены сборки в высоком разрешении |
-| **16** | `export_stl` | `part_id: str`, `filepath: str`, `binary?: bool` | `{ file_path: str, triangles_count: int }` | Экспортировать деталь в файл STL для 3D-печати |
-| **17** | `get_simulation_metrics_json` | *(нет)* | `{ current_metrics: obj }` | Получить агрегированный отчет по всей сцене и расчетам |
-| **18** | `open_preview_window` | `part_id?: str` | `{ status: "preview_window_opened" }` | Открыть или сфокусировать нативное окно 3D-просмотра |
-| **19** | `import_stl` | `filepath: str`, `name?: str`, `material?: str` | `{ part_id: str, name: str, vertices_count: int, triangles_count: int, status: "stl_imported" }` | Импортировать готовую 3D-модель STL в сцену и 3D-вьюпорт |
+| **10** | `boolean_union` | `target_part_id: str`, `tool_part_id: str` | `{ target_part_id: str, feature_id: str, status: "union_applied", vertices_count: int, triangles_count: int }` | Булево объединение геометрии инструмента с деталью (CSG Union) |
+| **11** | `boolean_intersection` | `target_part_id: str`, `tool_part_id: str` | `{ target_part_id: str, feature_id: str, status: "intersection_applied", vertices_count: int, triangles_count: int }` | Булево пересечение геометрии инструмента с деталью (CSG Intersection) |
+| **12** | `transform_part` | `part_id: str`, `translation?: [3]`, `rotation_deg?: [3]`, `scale?: [3]` | `{ part_id: str, feature_id: str, status: "transformed", bounding_box: obj, volume: num }` | Применить смещение, поворот RPY и масштабирование к детали в DAG |
+| **13** | `tessellate_part` | `part_id: str`, `quality?: "coarse"\|"medium"\|"fine"`, `chord_tolerance?: num`, `angular_tolerance_deg?: num`, `max_edge_length?: num` | `{ part_id: str, quality: str, vertices_count: int, triangles_count: int }` | Выполнить ленивую адаптивную тесселяцию детали с заданным качеством/допусками хорды |
+| **14** | `query_part_geometry` | `part_id: str` | `{ part_id: str, bounding_box: obj, volume: num, surface_area: num, center_of_mass: [3], faces_count: int, vertices_count: int, detected_planar_faces: [...] }` | Детальная топологическая инспекция: AABB, объем, площадь, центр масс и плоские грани |
+| **15** | `define_material` | `id: str`, `young_modulus_gpa: num`, `poisson_ratio: num`, `yield_strength_mpa: num`, `density_kg_m3: num`, `name?: str` | `{ status: "material_registered", material_id: str, properties: obj }` | Зарегистрировать кастомный материал для МКЭ прочности и расчета масс |
+| **16** | `batch_cad_operations` | `operations: [...]` | `{ success: bool, count: int, results: [...] }` | Пакетное атомарное выполнение цепочки операций без сетевых задержек roundtrip |
+| **17** | `create_joint` | `joint_type: str`, `part_a: str`, `part_b: str`, `anchor_a: [3]`, `anchor_b: [3]`, `axis?: [3]`, `limits?: [2]` | `{ joint_id: str }` | Создать сочленение (`revolute`, `prismatic`, `spherical`, `fixed`) |
+| **18** | `set_joint_motor` | `joint_id: str`, `target_velocity: num`, `max_force: num` | `{ status: "motor_active" }` | Включить сервопривод скорости на сочленении |
+| **19** | `run_physics_simulation` | `duration_seconds: num`, `step_size_ms?: num` | `{ success: bool, steps_simulated: int, trajectory_summary: obj, peak_joint_forces: obj, collisions: [...] }` | Провести динамическую симуляцию механизма во времени |
+| **20** | `run_fea_analysis` | `part_id: str`, `mesh_density?: str`, `fixed_faces?: [str]`, `fixed_plane?: obj`, `applied_forces?: [...]` | `{ max_von_mises_mpa: num, yield_strength_mpa: num, safety_factor: num, max_displacement_mm: num, status: "PASS"\|"FAIL" }` | Выполнить 3D МКЭ-расчет прочности (TET4) |
+| **21** | `get_fea_heatmap_image` | `part_id: str`, `camera_preset?: str`, `width?: int`, `height?: int` | `{ colormap_legend: obj }` + `image/png` | Получить 3D-снимок тепловой карты напряжений по Мизесу |
+| **22** | `capture_viewport` | `camera_preset?: str`, `part_id?: str`, `width?: int`, `height?: int` | `{ camera_preset: str, format: "image/png" }` + `image/png` | Сделать оффскрин 3D-снимок сцены сборки в высоком разрешении |
+| **23** | `export_stl` | `part_id: str`, `filepath: str`, `binary?: bool`, `quality?: "coarse"\|"medium"\|"fine"`, `chord_tolerance?: num` | `{ file_path: str, triangles_count: int }` | Экспортировать деталь в файл STL с адаптивным контролем качества |
+| **24** | `get_simulation_metrics_json` | *(нет)* | `{ current_metrics: obj }` | Получить агрегированный отчет по всей сцене и расчетам |
+| **25** | `open_preview_window` | `part_id?: str` | `{ status: "preview_window_opened" }` | Открыть или сфокусировать нативное окно 3D-просмотра |
+| **26** | `import_stl` | `filepath: str`, `name?: str`, `material?: str` | `{ part_id: str, name: str, vertices_count: int, triangles_count: int, status: "stl_imported" }` | Импортировать готовую 3D-модель STL в сцену и 3D-вьюпорт |
 
 > [!TIP]
-> Полная документация с примерами JSON-RPC запросов и ответов для всех 15 инструментов представлена в документе [Справочник API инструментов MCP](docs/MCP_API_REFERENCE.md).
+> Полная документация с примерами JSON-RPC запросов и ответов для всех 26 инструментов представлена в документе [Справочник API инструментов MCP](docs/MCP_API_REFERENCE.md).
 
 ---
 
@@ -244,7 +282,7 @@ graph TD
 В репозитории реализован полный набор юнит-, интеграционных и верификационных тестов:
 - **Аналитическая верификация МКЭ**: Сравнение численного прогиба консольной балки под изгибом с теоретической формулой сопротивления материалов ($\delta = \frac{F L^3}{3 E I}$, совпадение с точностью до 5%).
 - **Верификация кинематики**: Тестирование степеней свободы сочленений Rapier3D, работы моторов и детекции коллизий.
-- **Сквозное E2E тестирование MCP**: Проверка обработки всех 15 инструментов и соответствия схеме MCP 2024-11-05.
+- **Сквозное E2E тестирование MCP**: Проверка обработки всех 26 инструментов и соответствия схеме MCP 2024-11-05 (17 тестов контракта, 100% Passing).
 
 Запуск всего набора тестов:
 ```powershell
@@ -267,7 +305,7 @@ cargo clippy --workspace -- -D warnings
 ├── README.md                     # Главная страница (данный файл)
 ├── docs/
 │   ├── ARCHITECTURE.md           # Глубокий архитектурный обзор
-│   ├── MCP_API_REFERENCE.md      # Исчерпывающий справочник всех 15 инструментов
+│   ├── MCP_API_REFERENCE.md      # Исчерпывающий справочник всех 26 инструментов
 │   └── CLAUDE_DESKTOP_SETUP.md   # Руководство по подключению к Claude Desktop
 ├── examples/
 │   ├── bracket_design.json       # Пример проекта силового L-кронштейна

@@ -245,3 +245,113 @@ fn test_default_demo_mesh_creation() {
     let vol = demo.volume();
     assert!(vol > 0.0, "Demo mesh must have positive volume");
 }
+
+#[test]
+fn test_offscreen_render_part_adaptive() {
+    use mcp_cad_core::dag::FeatureOp;
+    use mcp_cad_core::material::Material;
+    use mcp_cad_core::part::Part;
+    use mcp_cad_viewer::{TessellationQuality, TessellationSettings};
+
+    let renderer = match OffscreenRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Skipping test due to unavailable GPU: {e}");
+            return;
+        }
+    };
+
+    let material = Material::new(
+        "steel",
+        205.0,
+        0.29,
+        250.0,
+        7850.0,
+        "Steel",
+    );
+
+    let mut part = Part::new("cyl_part", "Cylinder Part", material);
+    part.dag.add_feature(
+        FeatureOp::AddCylinder {
+            radius: 0.2,
+            height: 0.5,
+            segments: 0,
+            position: None,
+            rotation_deg: None,
+        },
+        Some("cylinder".to_string()),
+    );
+
+    // 1. Render Coarse preview
+    let coarse_png = renderer
+        .render_part_preview_coarse(&mut part, CameraPreset::Isometric, 400, 300)
+        .expect("Coarse part render should succeed");
+    assert_eq!(&coarse_png[0..8], &PNG_MAGIC);
+    let coarse_tri_count = part.mesh().triangle_count();
+
+    // 2. Render Fine snapshot
+    let fine_png = renderer
+        .render_part_snapshot_fine(&mut part, CameraPreset::Isometric, 400, 300)
+        .expect("Fine part render should succeed");
+    assert_eq!(&fine_png[0..8], &PNG_MAGIC);
+    let fine_tri_count = part.mesh().triangle_count();
+
+    // Fine tessellation must generate significantly more triangles than Coarse
+    assert!(
+        fine_tri_count > coarse_tri_count,
+        "Fine tessellation ({} tris) must be higher resolution than Coarse ({} tris)",
+        fine_tri_count,
+        coarse_tri_count
+    );
+
+    // 3. Render with custom settings
+    let custom_settings = TessellationSettings::coarse().with_max_edge_length(Some(0.05));
+    let custom_png = renderer
+        .render_part_png_with_settings(&mut part, &custom_settings, CameraPreset::Isometric, 400, 300)
+        .expect("Custom settings part render should succeed");
+    assert_eq!(&custom_png[0..8], &PNG_MAGIC);
+
+    // 4. Render immutable part
+    let immut_png = renderer
+        .render_part_immutable_png(&part, TessellationQuality::Medium, CameraPreset::Isometric, 400, 300)
+        .expect("Immutable part render should succeed");
+    assert_eq!(&immut_png[0..8], &PNG_MAGIC);
+}
+
+#[test]
+fn test_cad_window_viewer_with_part() {
+    use mcp_cad_core::dag::FeatureOp;
+    use mcp_cad_core::material::Material;
+    use mcp_cad_core::part::Part;
+    use mcp_cad_viewer::{CadWindowViewer, TessellationQuality};
+
+    let material = Material::new(
+        "aluminum",
+        68.9,
+        0.33,
+        276.0,
+        2700.0,
+        "Aluminum",
+    );
+
+    let mut part = Part::new("box_part", "Box Part", material);
+    part.dag.add_feature(
+        FeatureOp::AddBox {
+            width: 1.0,
+            height: 2.0,
+            depth: 3.0,
+            position: None,
+            rotation_deg: None,
+        },
+        Some("box".to_string()),
+    );
+
+    let viewer = CadWindowViewer::new("Test Part Window")
+        .with_part(part, TessellationQuality::Fine)
+        .expect("with_part should succeed");
+
+    assert!(viewer.mesh().is_some());
+    assert!(viewer.part().is_some());
+    assert_eq!(viewer.tessellation_quality(), TessellationQuality::Fine);
+    assert_eq!(viewer.mesh().unwrap().triangle_count(), 12);
+}

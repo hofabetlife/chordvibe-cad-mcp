@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use crate::dag::FeatureTree;
 use crate::error::CadError;
 use crate::material::Material;
-use crate::topology::{BoundingBox, TriangleMesh};
+use crate::tessellation::{TessellationQuality, TessellationSettings};
+use crate::topology::{BoundingBox, GeometryInspection, TriangleMesh};
 
 /// A complete CAD part comprising identity, material, parametric DAG, and generated boundary mesh.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -19,6 +20,15 @@ pub struct Part {
     pub dag: FeatureTree,
     /// The currently evaluated triangular boundary surface mesh.
     pub mesh: TriangleMesh,
+    /// Cached evaluation mesh for lazy tessellation.
+    #[serde(default)]
+    pub cached_mesh: Option<TriangleMesh>,
+    /// Settings corresponding to cached_mesh.
+    #[serde(default)]
+    pub cached_settings: Option<TessellationSettings>,
+    /// Indicates whether the part should be treated as fixed/static in physics simulations.
+    #[serde(default)]
+    pub is_fixed: bool,
 }
 
 impl Part {
@@ -30,20 +40,72 @@ impl Part {
             material,
             dag: FeatureTree::new(),
             mesh: TriangleMesh::empty(),
+            cached_mesh: None,
+            cached_settings: None,
+            is_fixed: false,
         }
     }
 
+    /// Evaluates the parametric feature tree with the specified tessellation settings lazily.
+    /// Returns a cached mesh if the requested settings match the cached settings.
+    pub fn tessellate(&mut self, settings: &TessellationSettings) -> Result<&TriangleMesh, CadError> {
+        if let (Some(ref _cached), Some(ref s)) = (&self.cached_mesh, &self.cached_settings) {
+            if s == settings {
+                return Ok(self.cached_mesh.as_ref().unwrap());
+            }
+        }
+
+        let evaluated = self.dag.evaluate_with_settings(settings)?;
+        self.mesh = evaluated.clone();
+        self.cached_mesh = Some(evaluated);
+        self.cached_settings = Some(settings.clone());
+        Ok(self.cached_mesh.as_ref().unwrap())
+    }
+
+    /// Evaluates the part geometry with a quality preset.
+    pub fn tessellate_quality(&mut self, quality: TessellationQuality) -> Result<&TriangleMesh, CadError> {
+        let settings = TessellationSettings::from(quality);
+        self.tessellate(&settings)
+    }
+
     /// Re-evaluates the parametric feature tree and updates the stored triangle mesh.
+    /// Uses cached settings if available, otherwise defaults to `TessellationSettings::default()`.
     pub fn rebuild(&mut self) -> Result<(), CadError> {
-        self.mesh = self.dag.evaluate()?;
+        let settings = self.cached_settings.clone().unwrap_or_default();
+        let evaluated = self.dag.evaluate_with_settings(&settings)?;
+        self.mesh = evaluated.clone();
+        self.cached_mesh = Some(evaluated);
+        self.cached_settings = Some(settings);
         Ok(())
+    }
+
+    /// Invalidates cached tessellation mesh (e.g. after modifying the DAG).
+    pub fn invalidate_cache(&mut self) {
+        self.cached_mesh = None;
+        self.cached_settings = None;
+    }
+
+    /// Reference to the current evaluated triangle mesh.
+    #[inline]
+    pub fn mesh(&self) -> &TriangleMesh {
+        if let Some(ref m) = self.cached_mesh {
+            m
+        } else {
+            &self.mesh
+        }
+    }
+
+    /// Mutable reference to the boundary mesh for legacy direct manipulations.
+    #[inline]
+    pub fn mesh_mut(&mut self) -> &mut TriangleMesh {
+        &mut self.mesh
     }
 
     /// Volume of the evaluated mesh.
     /// In SI units (when coordinates are in meters), volume is in m³.
     #[inline]
     pub fn volume(&self) -> f64 {
-        self.mesh.volume()
+        self.mesh().volume()
     }
 
     /// Total mass of the part in kilograms (assuming coordinates are in meters):
@@ -63,32 +125,40 @@ impl Part {
     /// Exact 3D center of mass [x, y, z] of the part.
     #[inline]
     pub fn center_of_mass(&self) -> [f64; 3] {
-        self.mesh.center_of_mass()
+        self.mesh().center_of_mass()
     }
 
     /// Total surface area of the boundary mesh.
     #[inline]
     pub fn surface_area(&self) -> f64 {
-        self.mesh.surface_area()
+        self.mesh().surface_area()
     }
 
     /// 3D Axis-Aligned Bounding Box (AABB) of the part.
     #[inline]
     pub fn bounding_box(&self) -> BoundingBox {
-        self.mesh.bounding_box()
+        self.mesh().bounding_box()
+    }
+
+    /// Detailed geometry inspection for CAD analysis and AI context.
+    #[inline]
+    pub fn inspect_geometry(&self) -> GeometryInspection {
+        self.mesh().inspect_geometry()
     }
 
     /// Summary metadata for MCP / UI listings.
     pub fn summary(&self) -> PartSummary {
         let aabb = self.bounding_box();
+        let mesh = self.mesh();
         PartSummary {
             id: self.id.clone(),
             name: self.name.clone(),
             material_name: self.material.name.clone(),
             volume: self.volume(),
             mass: self.mass(),
-            triangle_count: self.mesh.triangle_count(),
+            triangle_count: mesh.triangle_count(),
             bounding_box_dimensions: aabb.dimensions(),
+            is_fixed: self.is_fixed,
         }
     }
 }
@@ -103,6 +173,8 @@ pub struct PartSummary {
     pub mass: f64,
     pub triangle_count: usize,
     pub bounding_box_dimensions: [f64; 3],
+    #[serde(default)]
+    pub is_fixed: bool,
 }
 
 #[cfg(test)]

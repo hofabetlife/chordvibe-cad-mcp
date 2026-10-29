@@ -12,22 +12,34 @@
    - [1. `create_part`](#1-create_part)
    - [2. `list_parts`](#2-list_parts)
    - [3. `delete_part`](#3-delete_part)
-3. [Группа 2: Параметрическое DAG-моделирование](#группа-2-параметрическое-dag-моделирование)
+3. [Группа 2: Параметрическое DAG-моделирование и тесселяция](#группа-2-параметрическое-dag-моделирование-и-тесселяция)
    - [4. `add_feature_primitive`](#4-add_feature_primitive)
    - [5. `cut_hole`](#5-cut_hole)
    - [6. `modify_feature`](#6-modify_feature)
    - [7. `get_feature_tree`](#7-get_feature_tree)
+   - [8. `cut_helical_groove`](#8-cut_helical_groove)
+   - [9. `boolean_difference`](#9-boolean_difference)
+   - [10. `tessellate_part`](#10-tessellate_part)
 4. [Группа 3: Кинематика и физика механизмов](#группа-3-кинематика-и-физика-механизмов)
-   - [8. `create_joint`](#8-create_joint)
-   - [9. `set_joint_motor`](#9-set_joint_motor)
-   - [10. `run_physics_simulation`](#10-run_physics_simulation)
+   - [11. `create_joint`](#11-create_joint)
+   - [12. `set_joint_motor`](#12-set_joint_motor)
+   - [13. `run_physics_simulation`](#13-run_physics_simulation)
 5. [Группа 4: Конечно-элементный анализ прочности (FEA)](#группа-4-конечно-элементный-анализ-прочности-fea)
-   - [11. `run_fea_analysis`](#11-run_fea_analysis)
-   - [12. `get_fea_heatmap_image`](#12-get_fea_heatmap_image)
-6. [Группа 5: Визуализация, экспорт и метрики](#группа-5-визуализация-экспорт-и-метрики)
-   - [13. `capture_viewport`](#13-capture_viewport)
-   - [14. `export_stl`](#14-export_stl)
-   - [15. `get_simulation_metrics_json`](#15-get_simulation_metrics_json)
+   - [14. `run_fea_analysis`](#14-run_fea_analysis)
+   - [15. `get_fea_heatmap_image`](#15-get_fea_heatmap_image)
+6. [Группа 5: Визуализация, экспорт и импорт](#группа-5-визуализация-экспорт-и-импорт)
+   - [16. `capture_viewport`](#16-capture_viewport)
+   - [17. `open_preview_window`](#17-open_preview_window)
+   - [18. `import_stl`](#18-import_stl)
+   - [19. `export_stl`](#19-export_stl)
+   - [20. `get_simulation_metrics_json`](#20-get_simulation_metrics_json)
+7. [Группа 6: Топология, CSG операции, кастомные материалы и пакетная оптимизация](#группа-6-топология-csg-операции-кастомные-материалы-и-пакетная-оптимизация)
+   - [21. `query_part_geometry`](#21-query_part_geometry)
+   - [22. `boolean_union`](#22-boolean_union)
+   - [23. `boolean_intersection`](#23-boolean_intersection)
+   - [24. `transform_part`](#24-transform_part)
+   - [25. `define_material`](#25-define_material)
+   - [26. `batch_cad_operations`](#26-batch_cad_operations)
 
 ---
 
@@ -100,6 +112,7 @@
 |---|---|---|---|
 | `name` | `string` | Да | Человекочитаемое имя детали (например, `"mounting_bracket"`) |
 | `material` | `string` | Да | Идентификатор материала из базы пресетов |
+| `is_fixed` | `boolean` | Нет | Закрепить деталь неподвижно в мировом пространстве (статическое тело с бесконечной массой для физических расчетов и кинематики, например станина или корпус редуктора). По умолчанию `false` |
 
 **Доступные пресеты материалов**:
 - `aluminum_6061_t6`: Авиационный алюминиевый сплав ($E=68.9$ GPa, $\sigma_y=276$ MPa, $\rho=2700$ kg/m³).
@@ -463,38 +476,30 @@
 
 ---
 
-## Группа 3: Кинематика и физика механизмов
+### 10. `tessellate_part`
 
-### 8. `create_joint`
-
-Устанавливает кинематическое или силовое сопряжение между двумя деталями в физическом мире Rapier3D.
+Выполняет ленивую адаптивную тесселяцию криволинейных поверхностей детали по хорде и углу отклонения с обновлением кэша полигональной сетки.
 
 #### Входные параметры
 | Параметр | Тип | Обязательный | Описание |
 |---|---|---|---|
-| `joint_type` | `string` | Да | `"revolute"`, `"prismatic"`, `"spherical"`, `"fixed"` |
-| `part_a` | `string` | Да | Идентификатор первой сопрягаемой детали |
-| `part_b` | `string` | Да | Идентификатор второй сопрягаемой детали |
-| `anchor_a` | `[number, number, number]` | Да | Точка крепления `[x, y, z]` в локальной СК детали A (м) |
-| `anchor_b` | `[number, number, number]` | Да | Точка крепления `[x, y, z]` в локальной СК детали B (м) |
-| `axis` | `[number, number, number]` | Нет | Направляющая ось `[x, y, z]` (обязательна для revolute/prismatic) |
-| `limits` | `[number, number]` | Нет | Пределы движения `[min, max]` (в радианах или метрах) |
+| `part_id` | `string` | Да | Идентификатор детали |
+| `quality` | `string` | Нет | Пресет качества: `"coarse"` (~0.5 мм), `"medium"` (~0.1 мм, default), `"fine"` (~0.02 мм) |
+| `chord_tolerance` | `number` | Нет | Пользовательская максимальная стрела прогиба (хорда $\delta$) в метрах |
+| `angular_tolerance_deg` | `number` | Нет | Максимальное угловое отклонение между хордами в градусах |
+| `max_edge_length` | `number` | Нет | Ограничение максимальной длины ребра в метрах |
 
 #### Пример запроса
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 8,
+  "id": 10,
   "method": "tools/call",
   "params": {
-    "name": "create_joint",
+    "name": "tessellate_part",
     "arguments": {
-      "joint_type": "revolute",
-      "part_a": "part-base",
-      "part_b": "part-crank",
-      "anchor_a": [0.0, 0.05, 0.0],
-      "anchor_b": [-0.05, 0.0, 0.0],
-      "axis": [0.0, 0.0, 1.0]
+      "part_id": "part-a1b2c3d4e5f64789",
+      "quality": "fine"
     }
   }
 }
@@ -504,7 +509,89 @@
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 8,
+  "id": 10,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"part_id\": \"part-a1b2c3d4e5f64789\",\n  \"quality\": \"Fine\",\n  \"triangles_count\": 12480,\n  \"vertices_count\": 6242\n}"
+      }
+    ]
+  }
+}
+```
+
+---
+
+## Группа 3: Кинематика и физика механизмов
+
+### 11. `create_joint`
+
+Устанавливает кинематическое или силовое сопряжение между двумя деталями в физическом мире Rapier3D. Поддерживает сопряжения с неподвижным пространством (`"ground"` / `"world"`), а также кинематические зубчатые передачи (`"gear"`).
+
+#### Входные параметры
+| Параметр | Тип | Обязательный | Описание |
+|---|---|---|---|
+| `joint_type` | `string` | Да | `"revolute"`, `"prismatic"`, `"spherical"`, `"fixed"`, `"gear"` |
+| `part_a` | `string` | Да | Идентификатор первой сопрягаемой детали (или `"ground"` / `"world"` для привязки к неподвижному пространству) |
+| `part_b` | `string` | Да | Идентификатор второй сопрягаемой детали (или `"ground"` / `"world"`) |
+| `anchor_a` | `[number, number, number]` | Нет | Точка крепления `[x, y, z]` в СК детали A (м). По умолчанию `[0, 0, 0]` |
+| `anchor_b` | `[number, number, number]` | Нет | Точка крепления `[x, y, z]` в СК детали B (м). По умолчанию `[0, 0, 0]` |
+| `axis` | `[number, number, number]` | Нет | Направляющая ось `[x, y, z]` (обязательна для revolute/prismatic) |
+| `limits` | `[number, number]` | Нет | Пределы движения `[min, max]` (в радианах или метрах) |
+| `ratio` | `number` | Нет | Передаточное отношение для `joint_type: "gear"` ($i = \omega_B / \omega_A$). Отрицательное значение указывает на встречное вращение (внешнее зацепление) |
+| `teeth_a` | `integer` | Нет | Число зубьев ведущей шестерни $z_A$ (альтернатива `ratio`; рассчитывает $i = -z_A / z_B$) |
+| `teeth_b` | `integer` | Нет | Число зубьев ведомой шестерни $z_B$ (альтернатива `ratio`) |
+| `axis_a` | `[number, number, number]` | Нет | Ось вращения шестерни A (по умолчанию `[0, 0, 1]`) |
+| `axis_b` | `[number, number, number]` | Нет | Ось вращения шестерни B (по умолчанию `[0, 0, 1]`) |
+
+> **Примечание по зубчатым передачам (`"gear"`):**  
+> При создании сопряжения типа `"gear"` физический движок автоматически отключает прямой полигональный контакт между зубьями (`contacts_enabled(false)`), исключая заклинивание выпуклых оболочек colliders, и на каждом шаге времени строго синхронизирует угловые скорости шестерней согласно передаточному отношению $\omega_B = -\text{ratio} \cdot \omega_A$.
+
+#### Пример запроса (вращательный шарнир на неподвижную раму)
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 11,
+  "method": "tools/call",
+  "params": {
+    "name": "create_joint",
+    "arguments": {
+      "joint_type": "revolute",
+      "part_a": "gearbox_housing",
+      "part_b": "pinion_gear",
+      "anchor_a": [0.0, 0.0, 0.0],
+      "anchor_b": [0.0, 0.0, 0.0],
+      "axis": [0.0, 0.0, 1.0]
+    }
+  }
+}
+```
+
+#### Пример запроса (зубчатое зацепление шестерней)
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 12,
+  "method": "tools/call",
+  "params": {
+    "name": "create_joint",
+    "arguments": {
+      "joint_type": "gear",
+      "part_a": "pinion_gear",
+      "part_b": "driven_gear",
+      "teeth_a": 20,
+      "teeth_b": 40
+    }
+  }
+}
+```
+
+#### Пример ответа
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 11,
   "result": {
     "content": [
       {
@@ -518,7 +605,7 @@
 
 ---
 
-### 9. `set_joint_motor`
+### 12. `set_joint_motor`
 
 Активирует сервопривод или мотор поддержания скорости на сочленении.
 
@@ -533,7 +620,7 @@
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 9,
+  "id": 12,
   "method": "tools/call",
   "params": {
     "name": "set_joint_motor",
@@ -550,7 +637,7 @@
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 9,
+  "id": 12,
   "result": {
     "content": [
       {
@@ -564,15 +651,18 @@
 
 ---
 
-### 10. `run_physics_simulation`
+### 13. `run_physics_simulation`
 
-Запускает динамическую симуляцию механизма вперед во времени с записью траекторий, реакций в шарнирах и детекцией соударений.
+Запускает динамическую симуляцию механизма вперед во времени с записью траекторий, реакций в шарнирах и детекцией соударений. При наличии открытого окна предварительного просмотра автоматически генерирует ключевые кадры динамической анимации и передает их в графический конвейер для живого интерактивного воспроизведения.
 
 #### Входные параметры
 | Параметр | Тип | Обязательный | Описание |
 |---|---|---|---|
 | `duration_seconds` | `number` | Да | Длительность физической симуляции в секундах |
 | `step_size_ms` | `number` | Нет | Шаг численного интегрирования в мс (по умолчанию `16.67` мс = 60 Гц) |
+
+> **Интерактивное воспроизведение:**  
+> После завершения симуляции все трансформации деталей компонуются в массив кадров полигональной сетки. Окно предварительного просмотра (`open_preview_window`) переходит в режим циклического воспроизведения анимации движения со скоростью симуляции. Пользователь может приостанавливать и продолжать анимацию нажатием клавиши `P`.
 
 #### Пример запроса
 ```json
@@ -610,7 +700,7 @@
 
 ## Группа 4: Конечно-элементный анализ прочности (FEA)
 
-### 11. `run_fea_analysis`
+### 14. `run_fea_analysis`
 
 Выполняет автоматическую тетраэдризацию детали (TET4), решает 3D уравнения линейной упругости ($K \cdot u = F$), вычисляет эквивалентные напряжения по Мизесу и запас прочности.
 
@@ -628,7 +718,7 @@
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 11,
+  "id": 14,
   "method": "tools/call",
   "params": {
     "name": "run_fea_analysis",
@@ -651,7 +741,7 @@
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 11,
+  "id": 14,
   "result": {
     "content": [
       {
@@ -665,7 +755,7 @@
 
 ---
 
-### 12. `get_fea_heatmap_image`
+### 15. `get_fea_heatmap_image`
 
 Рендерит оффскрин 3D-снимок детали, раскрашенной градиентной тепловой картой напряжений по Мизесу, в формат PNG/Base64.
 
@@ -681,7 +771,7 @@
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 12,
+  "id": 15,
   "method": "tools/call",
   "params": {
     "name": "get_fea_heatmap_image",
@@ -699,7 +789,7 @@
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 12,
+  "id": 15,
   "result": {
     "content": [
       {
@@ -718,9 +808,9 @@
 
 ---
 
-## Группа 5: Визуализация, экспорт и метрики
+## Группа 5: Визуализация, превью, экспорт и импорт
 
-### 13. `capture_viewport`
+### 16. `capture_viewport`
 
 Делает 3D-снимок всей сборки или отдельной детали с затенением Blinn-Phong и контурной обводкой ребер.
 
@@ -736,7 +826,7 @@
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 13,
+  "id": 16,
   "method": "tools/call",
   "params": {
     "name": "capture_viewport",
@@ -753,7 +843,7 @@
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 13,
+  "id": 16,
   "result": {
     "content": [
       {
@@ -772,29 +862,33 @@
 
 ---
 
-### 14. `export_stl`
+### 17. `open_preview_window`
 
-Экспортирует поверхностную сетку детали в файл стандартного формата STL для 3D-печати или станков ЧПУ.
+Открывает или фокусирует интерактивное нативное окно 3D-просмотра на Windows (Winit + WGPU DirectX 12/Vulkan). Поддерживает вращение, панорамирование и зум орбитальной камерой мышь/клавиатура, переключение качества тесселяции клавишей `'Q'`, а также воспроизведение и паузу динамической анимации симуляции механизмов клавишей `'P'`.
+
+Если симуляция (`run_physics_simulation`) уже была выполнена, окно автоматически инициализируется в режиме циклического воспроизведения рассчитанной анимации (`mode: "animation_playback"`).
+
+#### Горячие клавиши окна:
+- **ЛКМ + Перетаскивание**: Вращение орбитальной камеры вокруг сцены.
+- **ПКМ + Перетаскивание** или **Колесико мыши**: Панорамирование и зум.
+- **Клавиша `Q`**: Переключение качества адаптивной тесселяции (`Coarse` $\to$ `Medium` $\to$ `Fine`).
+- **Клавиша `P`**: Пауза / продолжение циклического воспроизведения анимации физической симуляции.
 
 #### Входные параметры
 | Параметр | Тип | Обязательный | Описание |
 |---|---|---|---|
-| `part_id` | `string` | Да | Идентификатор детали |
-| `filepath` | `string` | Да | Путь для сохранения файла на диске (например, `"./output/bracket.stl"`) |
-| `binary` | `boolean` | Нет | `true` — компактный Binary STL (по умолчанию); `false` — ASCII STL |
+| `part_id` | `string` | Нет | Опциональный идентификатор детали для фокусировки |
 
 #### Пример запроса
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 14,
+  "id": 17,
   "method": "tools/call",
   "params": {
-    "name": "export_stl",
+    "name": "open_preview_window",
     "arguments": {
-      "part_id": "part-a1b2c3d4e5f64789",
-      "filepath": "./output/cantilever_beam.stl",
-      "binary": true
+      "part_id": "part-a1b2c3d4e5f64789"
     }
   }
 }
@@ -804,12 +898,12 @@
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 14,
+  "id": 17,
   "result": {
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"file_path\": \"./output/cantilever_beam.stl\",\n  \"triangles_count\": 12\n}"
+        "text": "{\n  \"status\": \"preview_window_opened\"\n}"
       }
     ]
   }
@@ -818,7 +912,102 @@
 
 ---
 
-### 15. `get_simulation_metrics_json`
+### 18. `import_stl`
+
+Импортирует внешнюю 3D-модель из файла формата STL (бинарного или ASCII) в сцену как новую деталь с автоматической оптимизацией и сшивкой вершин.
+
+#### Входные параметры
+| Параметр | Тип | Обязательный | Описание |
+|---|---|---|---|
+| `filepath` | `string` | Да | Путь к STL-файлу на диске |
+| `name` | `string` | Нет | Пользовательское имя детали (по умолчанию имя файла) |
+| `material` | `string` | Нет | Идентификатор материала из реестра (по умолчанию `steel_structural_aisi1020`) |
+
+#### Пример запроса
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 18,
+  "method": "tools/call",
+  "params": {
+    "name": "import_stl",
+    "arguments": {
+      "filepath": "./output/external_bracket.stl",
+      "name": "imported_bracket",
+      "material": "aluminum_6061_t6"
+    }
+  }
+}
+```
+
+#### Пример ответа
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 18,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"material\": \"aluminum_6061_t6\",\n  \"name\": \"imported_bracket\",\n  \"part_id\": \"part-imported-1234\",\n  \"status\": \"stl_imported\",\n  \"triangles_count\": 5420,\n  \"vertices_count\": 2712\n}"
+      }
+    ]
+  }
+}
+```
+
+---
+
+### 19. `export_stl`
+
+Экспортирует поверхностную сетку детали в файл стандартного формата STL с поддержкой адаптивной тесселяции по хорде для прецизионного производства и 3D-печати.
+
+#### Входные параметры
+| Параметр | Тип | Обязательный | Описание |
+|---|---|---|---|
+| `part_id` | `string` | Да | Идентификатор детали |
+| `filepath` | `string` | Да | Путь для сохранения файла на диске (например, `"./output/bracket.stl"`) |
+| `binary` | `boolean` | Нет | `true` — компактный Binary STL (по умолчанию); `false` — ASCII STL |
+| `quality` | `string` | Нет | Пресет тесселяции: `"coarse"`, `"medium"`, `"fine"` (по умолчанию: `"fine"`) |
+| `chord_tolerance` | `number` | Нет | Пользовательский допуск хорды (стрела прогиба) в метрах (например, `0.00005`) |
+
+#### Пример запроса
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 19,
+  "method": "tools/call",
+  "params": {
+    "name": "export_stl",
+    "arguments": {
+      "part_id": "part-a1b2c3d4e5f64789",
+      "filepath": "./output/cantilever_beam.stl",
+      "binary": true,
+      "quality": "fine"
+    }
+  }
+}
+```
+
+#### Пример ответа
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 19,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"file_path\": \"./output/cantilever_beam.stl\",\n  \"triangles_count\": 2480\n}"
+      }
+    ]
+  }
+}
+```
+
+---
+
+### 20. `get_simulation_metrics_json`
 
 Возвращает полный агрегированный инженерный отчет по всей сцене: геометрические метаданные всех деталей, результаты последних МКЭ-расчетов и телеметрию физической симуляции.
 
@@ -829,7 +1018,7 @@
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 15,
+  "id": 20,
   "method": "tools/call",
   "params": {
     "name": "get_simulation_metrics_json",
@@ -842,12 +1031,316 @@
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 15,
+  "id": 20,
   "result": {
     "content": [
       {
         "type": "text",
         "text": "{\n  \"current_metrics\": {\n    \"parts_count\": 1,\n    \"parts\": [\n      {\n        \"part_id\": \"part-a1b2c3d4e5f64789\",\n        \"name\": \"cantilever_beam\",\n        \"material\": \"steel_structural_aisi1020\",\n        \"volume_m3\": 0.001,\n        \"mass_kg\": 7.85,\n        \"triangle_count\": 12,\n        \"bounding_box\": {\"min\": [-0.5, -0.025, -0.01], \"max\": [0.5, 0.025, 0.01]}\n      }\n    ],\n    \"fea_reports\": [\n      {\n        \"part_id\": \"part-a1b2c3d4e5f64789\",\n        \"verdict\": \"PASS\",\n        \"factor_of_safety\": 2.54,\n        \"max_von_mises_mpa\": 98.42,\n        \"yield_strength_mpa\": 250.0,\n        \"max_displacement_mm\": 0.184,\n        \"nodes\": 275,\n        \"elements\": 864,\n        \"time_ms\": 245\n      }\n    ],\n    \"physics\": {\n      \"accumulated_time_s\": 1.5,\n      \"gravity\": [0.0, -9.81, 0.0],\n      \"last_simulation\": {\n        \"step_count\": 90,\n        \"peak_joint_forces\": {\"joint-550e8400-e29b-41d4-a716-446655440000\": 34.2},\n        \"collisions\": []\n      }\n    }\n  }\n}"
+      }
+    ]
+  }
+}
+```
+
+---
+
+## Группа 6: Топология, CSG операции, кастомные материалы и пакетная оптимизация
+
+### 21. `query_part_geometry`
+
+Выполняет глубокую топологическую и геометрическую инспекцию твердотельной детали. Возвращает точный габаритный ящик AABB (`min`, `max`, `dimensions`), абсолютный объем, площадь поверхности, центр масс (centroid), количество полигонов и вершин, а также массив до 15 крупнейших компланарных плоских граней (`detected_planar_faces`) с вычисленными нормалями и средневзвешенными центрами. Это исключает проблему "слепоты координат" у ИИ-агентов при сверлении отверстий и закреплении граней.
+
+#### Входные параметры
+| Параметр | Тип | Обязательный | Описание |
+|---|---|:---:|---|
+| `part_id` | `string` | **Да** | Уникальный идентификатор инспектируемой детали |
+
+#### Пример запроса
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 21,
+  "method": "tools/call",
+  "params": {
+    "name": "query_part_geometry",
+    "arguments": {
+      "part_id": "part-bracket-001"
+    }
+  }
+}
+```
+
+#### Пример ответа
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 21,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"part_id\": \"part-bracket-001\",\n  \"bounding_box\": {\n    \"min\": [-0.06, -0.015, -0.03],\n    \"max\": [0.06, 0.015, 0.03],\n    \"dimensions\": [0.12, 0.03, 0.06]\n  },\n  \"volume\": 0.000216,\n  \"surface_area\": 0.0252,\n  \"center_of_mass\": [0.0, 0.0, 0.0],\n  \"faces_count\": 12,\n  \"vertices_count\": 24,\n  \"detected_planar_faces\": [\n    {\n      \"normal\": [0.0, 1.0, 0.0],\n      \"center\": [0.0, 0.015, 0.0],\n      \"area\": 0.0072,\n      \"triangles_count\": 2\n    },\n    {\n      \"normal\": [0.0, -1.0, 0.0],\n      \"center\": [0.0, -0.015, 0.0],\n      \"area\": 0.0072,\n      \"triangles_count\": 2\n    },\n    {\n      \"normal\": [1.0, 0.0, 0.0],\n      \"center\": [0.06, 0.0, 0.0],\n      \"area\": 0.0018,\n      \"triangles_count\": 2\n    },\n    {\n      \"normal\": [-1.0, 0.0, 0.0],\n      \"center\": [-0.06, 0.0, 0.0],\n      \"area\": 0.0018,\n      \"triangles_count\": 2\n    }\n  ]\n}"
+      }
+    ]
+  }
+}
+```
+
+---
+
+### 22. `boolean_union`
+
+Выполняет CSG булево объединение (Union) твердотельных сеток: объединяет форму детали-инструмента (`tool_part_id`) с целевой деталью (`target_part_id`). Добавляет узел `BooleanUnionMesh` в параметрическое дерево DAG целевой детали, пересчитывает геометрию, обновляет отображение во вьюпорте и синхронизирует физический коллайдер в Rapier3D.
+
+#### Входные параметры
+| Параметр | Тип | Обязательный | Описание |
+|---|---|:---:|---|
+| `target_part_id` | `string` | **Да** | ID целевой детали, принимающей объединение |
+| `tool_part_id` | `string` | **Да** | ID детали-инструмента, чья сетка объединяется с целевой (должен отличаться от target_part_id) |
+
+#### Пример запроса
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 22,
+  "method": "tools/call",
+  "params": {
+    "name": "boolean_union",
+    "arguments": {
+      "target_part_id": "part-housing-main",
+      "tool_part_id": "part-flange-boss"
+    }
+  }
+}
+```
+
+#### Пример ответа
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 22,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"target_part_id\": \"part-housing-main\",\n  \"feature_id\": \"9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d\",\n  \"status\": \"union_applied\",\n  \"vertices_count\": 842,\n  \"triangles_count\": 1680\n}"
+      }
+    ]
+  }
+}
+```
+
+---
+
+### 23. `boolean_intersection`
+
+Выполняет CSG булево пересечение (Intersection) твердотельных сеток: сохраняет только общий объем пересечения целевой детали (`target_part_id`) и инструмента (`tool_part_id`). Добавляет узел `BooleanIntersectionMesh` в параметрическое дерево DAG, перестраивает меш, обновляет вьюпорт и физический мир.
+
+#### Входные параметры
+| Параметр | Тип | Обязательный | Описание |
+|---|---|:---:|---|
+| `target_part_id` | `string` | **Да** | ID целевой детали |
+| `tool_part_id` | `string` | **Да** | ID детали-инструмента (должен отличаться от target_part_id) |
+
+#### Пример запроса
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 23,
+  "method": "tools/call",
+  "params": {
+    "name": "boolean_intersection",
+    "arguments": {
+      "target_part_id": "part-cylinder-base",
+      "tool_part_id": "part-sphere-cutter"
+    }
+  }
+}
+```
+
+#### Пример ответа
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 23,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"target_part_id\": \"part-cylinder-base\",\n  \"feature_id\": \"1f38e4a9-82bc-4402-9988-6617a23c3a4f\",\n  \"status\": \"intersection_applied\",\n  \"vertices_count\": 512,\n  \"triangles_count\": 1020\n}"
+      }
+    ]
+  }
+}
+```
+
+---
+
+### 24. `transform_part`
+
+Применяет пространственные преобразования к твердотельному телу в дереве построений DAG (`FeatureOp::Transform`): линейное перемещение (`translation`), углы вращения Эйлера Roll-Pitch-Yaw в градусах (`rotation_deg`) и масштабирование (`scale`). Пересчитывает габариты AABB, объем и обновляет физические свойства.
+
+#### Входные параметры
+| Параметр | Тип | Обязательный | Описание |
+|---|---|:---:|---|
+| `part_id` | `string` | **Да** | ID трансформируемой детали |
+| `translation` | `[f64; 3]` | Нет | Вектор смещения $[x, y, z]$ в метрах (по умолчанию `[0.0, 0.0, 0.0]`) |
+| `rotation_deg` | `[f64; 3]` | Нет | Углы поворота $[roll_x, pitch_y, yaw_z]$ в градусах (по умолчанию `[0.0, 0.0, 0.0]`) |
+| `scale` | `[f64; 3]` | Нет | Коэффициенты масштабирования $[s_x, s_y, s_z]$ (по умолчанию `[1.0, 1.0, 1.0]`, компоненты $\ne 0$) |
+
+#### Пример запроса
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 24,
+  "method": "tools/call",
+  "params": {
+    "name": "transform_part",
+    "arguments": {
+      "part_id": "part-bracket-001",
+      "translation": [0.05, 0.0, 0.1],
+      "rotation_deg": [0.0, 90.0, 0.0],
+      "scale": [1.0, 1.0, 1.0]
+    }
+  }
+}
+```
+
+#### Пример ответа
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 24,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"part_id\": \"part-bracket-001\",\n  \"feature_id\": \"7c28a1e4-6a84-48f5-93df-f41cb87a1928\",\n  \"status\": \"transformed\",\n  \"bounding_box\": {\n    \"min\": [0.02, -0.015, 0.04],\n    \"max\": [0.08, 0.015, 0.16],\n    \"dimensions\": [0.06, 0.03, 0.12]\n  },\n  \"volume\": 0.000216\n}"
+      }
+    ]
+  }
+}
+```
+
+---
+
+### 25. `define_material`
+
+Динамически регистрирует новый инженерный конструкционный материал в глобальном реестре материалов системы. Зарегистрированный материал немедленно становится доступным для назначения деталям (`create_part`), расчета массы деталей и тензоров инерции в физике (`Rapier3D`), а также для 3D МКЭ-расчета прочности (`run_fea_analysis`).
+
+#### Входные параметры
+| Параметр | Тип | Обязательный | Описание |
+|---|---|:---:|---|
+| `id` | `string` | **Да** | Уникальный буквенно-цифровой идентификатор материала (например, `"carbon_fiber_t700"`) |
+| `young_modulus_gpa` | `number` | **Да** | Модуль продольной упругости Юнга $E$ в гигапаскалях ($GPa > 0$) |
+| `poisson_ratio` | `number` | **Да** | Коэффициент Пуассона $\nu$ (безразмерный, $0.0 < \nu < 0.5$) |
+| `yield_strength_mpa` | `number` | **Да** | Предел текучести $\sigma_y$ в мегапаскалях ($MPa > 0$) |
+| `density_kg_m3` | `number` | **Да** | Плотность материала $\rho$ в $кг/м^3$ ($> 0$) |
+| `name` | `string` | Нет | Человекочитаемое наименование материала (создает синоним) |
+
+#### Пример запроса
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 25,
+  "method": "tools/call",
+  "params": {
+    "name": "define_material",
+    "arguments": {
+      "id": "carbon_fiber_t700",
+      "name": "Carbon Fiber High Modulus T700",
+      "young_modulus_gpa": 230.0,
+      "poisson_ratio": 0.30,
+      "yield_strength_mpa": 1600.0,
+      "density_kg_m3": 1750.0
+    }
+  }
+}
+```
+
+#### Пример ответа
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 25,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"status\": \"material_registered\",\n  \"material_id\": \"carbon_fiber_t700\",\n  \"properties\": {\n    \"name\": \"Carbon Fiber High Modulus T700\",\n    \"young_modulus_gpa\": 230.0,\n    \"young_modulus_pa\": 230000000000.0,\n    \"poisson_ratio\": 0.3,\n    \"yield_strength_mpa\": 1600.0,\n    \"yield_strength_pa\": 1600000000.0,\n    \"density_kg_m3\": 1750.0\n  }\n}"
+      }
+    ]
+  }
+}
+```
+
+---
+
+### 26. `batch_cad_operations`
+
+Последовательно выполняет массив инструментов MCP CAD в едином контексте движка за один сетевой запрос JSON-RPC. Инструмент устраняет десятки повторных сетевых вызовов (roundtrip latency) при моделировании составных деталей. Все шаги валидируются и выполняются по порядку. Если любая операция завершается с ошибкой, выполнение немедленно прерывается с указанием индекса сбойного шага и подробной диагностикой. Вложенные вызовы `batch_cad_operations` запрещены.
+
+#### Входные параметры
+| Параметр | Тип | Обязательный | Описание |
+|---|---|:---:|---|
+| `operations` | `array` | **Да** | Массив объектов операций `[{ tool: string, params: object }]` |
+
+#### Пример запроса
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 26,
+  "method": "tools/call",
+  "params": {
+    "name": "batch_cad_operations",
+    "arguments": {
+      "operations": [
+        {
+          "tool": "create_part",
+          "params": {
+            "name": "stepped_shaft",
+            "material": "steel_structural_aisi1020",
+            "part_id": "part-shaft-01"
+          }
+        },
+        {
+          "tool": "add_feature_primitive",
+          "params": {
+            "part_id": "part-shaft-01",
+            "primitive_type": "cylinder",
+            "params": {
+              "radius": 0.02,
+              "height": 0.1
+            }
+          }
+        },
+        {
+          "tool": "cut_hole",
+          "params": {
+            "part_id": "part-shaft-01",
+            "position": [0.0, 0.0, 0.05],
+            "normal": [0.0, 0.0, 1.0],
+            "radius": 0.008,
+            "depth": 0.04
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+#### Пример ответа
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 26,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"success\": true,\n  \"count\": 3,\n  \"results\": [\n    {\n      \"part_id\": \"part-shaft-01\"\n    },\n    {\n      \"feature_id\": \"8a9c3f2b-1a2d-4e5f-b6a7-c8d9e0f1a2b3\"\n    },\n    {\n      \"feature_id\": \"4c5d6e7f-8a9b-0c1d-2e3f-4a5b6c7d8e9f\"\n    }\n  ]\n}"
       }
     ]
   }

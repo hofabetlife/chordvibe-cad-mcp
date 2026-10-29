@@ -3,6 +3,8 @@
 use std::sync::mpsc::channel;
 use base64::Engine;
 use wgpu::util::DeviceExt;
+use mcp_cad_core::part::Part;
+use mcp_cad_core::tessellation::{TessellationQuality, TessellationSettings};
 use mcp_cad_core::topology::TriangleMesh;
 
 use crate::camera::{CameraPreset, OrbitCamera};
@@ -359,6 +361,99 @@ impl OffscreenRenderer {
             width,
             height,
         )
+    }
+
+    /// Renders a CAD `Part` with the specified tessellation quality into PNG encoded bytes.
+    pub fn render_part_png(
+        &self,
+        part: &mut Part,
+        quality: TessellationQuality,
+        camera_preset: CameraPreset,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, ViewerError> {
+        let mesh = part.tessellate_quality(quality)?;
+        self.render_mesh_png(mesh, camera_preset, width, height)
+    }
+
+    /// Renders a CAD `Part` with explicit adaptive tessellation settings into PNG encoded bytes.
+    pub fn render_part_png_with_settings(
+        &self,
+        part: &mut Part,
+        settings: &TessellationSettings,
+        camera_preset: CameraPreset,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, ViewerError> {
+        let mesh = part.tessellate(settings)?;
+        self.render_mesh_png(mesh, camera_preset, width, height)
+    }
+
+    /// Renders a CAD `Part` with the specified tessellation quality into a Base64 encoded PNG string.
+    pub fn render_part_base64(
+        &self,
+        part: &mut Part,
+        quality: TessellationQuality,
+        camera_preset: CameraPreset,
+        width: u32,
+        height: u32,
+    ) -> Result<String, ViewerError> {
+        let png = self.render_part_png(part, quality, camera_preset, width, height)?;
+        self.render_to_base64(&png)
+    }
+
+    /// Renders a fast preview snapshot (TessellationQuality::Coarse) of a CAD `Part`.
+    pub fn render_part_preview_coarse(
+        &self,
+        part: &mut Part,
+        camera_preset: CameraPreset,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, ViewerError> {
+        self.render_part_png(part, TessellationQuality::Coarse, camera_preset, width, height)
+    }
+
+    /// Renders a high-detail snapshot (TessellationQuality::Fine) of a CAD `Part`.
+    pub fn render_part_snapshot_fine(
+        &self,
+        part: &mut Part,
+        camera_preset: CameraPreset,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, ViewerError> {
+        self.render_part_png(part, TessellationQuality::Fine, camera_preset, width, height)
+    }
+
+    /// Renders a CAD `Part` with tessellation quality without modifying the part's internal cache.
+    pub fn render_part_immutable_png(
+        &self,
+        part: &Part,
+        quality: TessellationQuality,
+        camera_preset: CameraPreset,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, ViewerError> {
+        let settings = TessellationSettings::from(quality);
+        let mesh = if !part.dag.nodes.is_empty() {
+            part.dag.evaluate_with_settings(&settings)?
+        } else {
+            part.mesh().clone()
+        };
+        self.render_mesh_png(&mesh, camera_preset, width, height)
+    }
+
+    /// Renders a CAD `Part` evaluated at `quality` colored by FEA normalized stress scalars into PNG bytes.
+    pub fn render_part_fea_heatmap_png(
+        &self,
+        part: &mut Part,
+        quality: TessellationQuality,
+        stress_scalars: &[f32],
+        camera_preset: CameraPreset,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, ViewerError> {
+        let mesh = part.tessellate_quality(quality)?;
+        self.render_fea_heatmap_png(mesh, stress_scalars, camera_preset, width, height)
     }
 
     /// Renders a triangular mesh colored by normalized FEA stress scalars [0.0, 1.0] into PNG bytes.

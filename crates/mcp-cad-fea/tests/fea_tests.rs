@@ -298,3 +298,68 @@ fn test_analyze_part_pipeline() {
     assert_eq!(report.normalized_stresses.len(), report.node_count);
     assert!(!report.to_json().unwrap().is_empty());
 }
+
+#[test]
+fn test_adaptive_fea_part_pipeline() {
+    use mcp_cad_core::dag::FeatureOp;
+    use mcp_cad_fea::{analyze_part_adaptive, analyze_part_with_settings, TessellationSettings};
+
+    let material = Material::new(
+        "steel_structural_aisi1020",
+        205.0,
+        0.29,
+        250.0,
+        7850.0,
+        "Structural steel",
+    );
+
+    let mut part = Part::new("param_beam", "Parametric Cantilever", material);
+    part.dag.add_feature(
+        FeatureOp::AddBox {
+            width: 0.6,
+            height: 0.08,
+            depth: 0.08,
+            position: None,
+            rotation_deg: None,
+        },
+        Some("cantilever".to_string()),
+    );
+
+    let mut bc = BoundaryConditions::new();
+    bc.fix_aabb_face(AabbFace::MinX, 1e-4);
+    bc.add_aabb_face_force(AabbFace::MaxX, 1e-4, [0.0, -1000.0, 0.0]);
+
+    // Test analyze_part_adaptive
+    let report = analyze_part_adaptive(&mut part, &bc, MeshDensity::Coarse, None)
+        .expect("analyze_part_adaptive should succeed with parametric DAG");
+
+    assert!(report.node_count > 0);
+    assert!(report.element_count > 0);
+    assert!(report.max_displacement_m > 0.0);
+    assert!(part.cached_mesh.is_some());
+
+    // Test analyze_part_with_settings
+    let fine_settings = TessellationSettings::fine().with_max_edge_length(Some(0.04));
+    let report_fine = analyze_part_with_settings(&mut part, &bc, &fine_settings, MeshDensity::Coarse, None)
+        .expect("analyze_part_with_settings should succeed");
+    assert!(report_fine.node_count > 0);
+}
+
+#[test]
+fn test_mesh_edge_refinement() {
+    use mcp_cad_fea::{mesh_max_edge_length, refine_mesh_max_edge_length};
+
+    let box_mesh = create_box(1.0, 1.0, 1.0);
+    let initial_max_len = mesh_max_edge_length(&box_mesh);
+    // In a 1x1x1 box, face diagonal is sqrt(1^2 + 1^2) ~ 1.414
+    assert!(initial_max_len > 1.0);
+
+    let refined = refine_mesh_max_edge_length(&box_mesh, 0.8);
+    let refined_max_len = mesh_max_edge_length(&refined);
+    assert!(
+        refined_max_len <= 0.8,
+        "Refined maximum edge length ({}) must be <= 0.8",
+        refined_max_len
+    );
+    assert!(refined.indices.len() > box_mesh.indices.len());
+}
