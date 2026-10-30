@@ -1,0 +1,573 @@
+{
+  "phase": "phase_2_primitives_scan",
+  "results": [
+    {
+      "euler_chi": 2,
+      "genus": 0.0,
+      "issues": [],
+      "orientation_consistent": true,
+      "quality": "coarse",
+      "signed_volume": 0.005999999999999999,
+      "status": "PASS",
+      "target": "box",
+      "triangles": 12,
+      "vertices": 24,
+      "warnings": [
+        "Notice: 16 un-welded duplicate vertices found (CAD split normals)"
+      ],
+      "watertight": true
+    },
+    {
+      "euler_chi": 2,
+      "genus": 0.0,
+      "issues": [],
+      "orientation_consistent": true,
+      "quality": "medium",
+      "signed_volume": 0.005999999999999999,
+      "status": "PASS",
+      "target": "box",
+      "triangles": 12,
+      "vertices": 24,
+      "warnings": [
+        "Notice: 16 un-welded duplicate vertices found (CAD split normals)"
+      ],
+      "watertight": true
+    },
+    {
+      "euler_chi": 2,
+      "genus": 0.0,
+      "issues": [],
+      "orientation_consistent": true,
+      "quality": "fine",
+      "signed_volume": 0.005999999999999999,
+      "status": "PASS",
+      "target": "box",
+      "triangles": 12,
+      "vertices": 24,
+      "warnings": [
+        "Notice: 16 un-welded duplicate vertices found (CAD split normals)"
+      ],
+      "watertight": true
+    },
+    {
+      "euler_chi": 2,
+      "genus": 0.0,
+      "issues": [],
+      "orientation_consistent": true,
+      "quality": "coarse",
+      "signed_volume": 0.0015513314341528903,
+      "status": "PASS",
+      "target": "cylinder",
+      "triangles": 92,
+      "vertices": 94,
+      "warnings": [
+        "Notice: 46 sliver triangles detected (min angle < 5° or aspect ratio > 100)",
+        "Notice: 46 un-welded duplicate vertices found (CAD split normals)"
+      ],
+      "watertight": true
+    },
+    {
+      "euler_chi": 2,
+      "genus": 0.0,
+      "issues": [],
+      "orientation_consistent": true,
+      "quality": "medium",
+      "signed_volume": 0.0015666654195538065,
+      "status": "PASS",
+      "target": "cylinder",
+      "triangles": 200,
+      "vertices": 202,
+      "warnings": [
+        "Notice: 100 sliver triangles detected (min angle < 5° or aspect ratio > 100)",
+        "Notice: 100 un-welded duplicate vertices found (CAD split normals)"
+      ],
+      "watertight": true
+    },
+    {
+      "euler_chi": 2,
+      "genus": 0.0,
+      "issues": [],
+      "orientation_consistent": true,
+      "quality": "fine",
+      "signed_volume": 0.0015699725226413694,
+      "status": "PASS",
+      "target": "cylinder",
+      "triangles": 448,
+      "vertices": 450,
+      "warnings": [
+        "Notice: 448 sliver triangles detected (min angle < 5° or aspect ratio > 100)",
+        "Notice: 224 un-welded duplicate vertices found (CAD split normals)"
+      ],
+      "watertight": true
+    },
+    {
+      "euler_chi": 2,
+      "genus": 0.0,
+      "issues": [],
+      "orientation_consistent": true,
+      "quality": "coarse",
+      "signed_volume": 0.000506637174161645,
+      "status": "PASS",
+      "target": "sphere",
+      "triangles": 460,
+      "vertices": 288,
+      "warnings": [
+        "Notice: 56 un-welded duplicate vertices found (CAD split normals)"
+      ],
+      "watertight": true
+    },
+    {
+      "euler_chi": 2,
+      "genus": 0.0,
+      "issues": [],
+      "orientation_consistent": true,
+      "quality": "medium",
+      "signed_volume": 0.000520162869055691,
+      "status": "PASS",
+      "target": "sphere",
+      "triangles": 2400,
+      "vertices": 1326,
+      "warnings": [
+        "Notice: 124 un-welded duplicate vertices found (CAD split normals)"
+      ],
+      "watertight": true
+    },
+    {
+      "euler_chi": 2,
+      "genus": 0.0,
+      "issues": [],
+      "orientation_consistent": true,
+      "quality": "fine",
+      "signed_volume": 0.0005229125313479194,
+      "status": "PASS",
+      "target": "sphere",
+      "triangles": 12320,
+      "vertices": 6441,
+      "warnings": [
+        "Notice: 448 sliver triangles detected (min angle < 5° or aspect ratio > 100)",
+        "Notice: 279 un-welded duplicate vertices found (CAD split normals)"
+      ],
+      "watertight": true
+    },
+    {
+      "euler_chi": 2,
+      "genus": 0.0,
+      "issues": [],
+      "orientation_consistent": true,
+      "quality": "coarse",
+      "signed_volume": 0.0002585552390254817,
+      "status": "PASS",
+      "target": "cone_sharp",
+      "triangles": 46,
+      "warnings": [
+        "Notice: 23 un-welded duplicate vertices found (CAD split normals)"
+      ],
+      "watertight": true
+    },
+    {
+      "euler_chi": 2,
+      "genus": 0.0,
+      "issues": [],
+      "orientation_consistent": true,
+      "quality": "coarse",
+      "signed_volume": 0.00040334617287975127,
+      "status": "PASS",
+      "target": "cone_frustum",
+      "triangles": 92,
+      "warnings": [
+        "Notice: 23 sliver triangles detected (min angle < 5° or aspect ratio > 100)",
+        "Notice: 46 un-welded duplicate vertices found (CAD split normals)"
+      ],
+      "watertight": true
+    },
+    {
+      "euler_chi": 2,
+      "genus": 0.0,
+      "issues": [],
+      "orientation_consistent": true,
+      "quality": "medium",
+      "signed_volume": 0.0002611109032589673,
+      "status": "PASS",
+      "target": "cone_sharp",
+      "triangles": 100,
+      "warnings": [
+        "Notice: 50 sliver triangles detected (min angle < 5° or aspect ratio > 100)",
+        "Notice: 50 un-welded duplicate vertices found (CAD split normals)"
+      ],
+      "watertight": true
+    },
+    {
+      "euler_chi": 2,
+      "genus": 0.0,
+      "issues": [],
+      "orientation_consistent": true,
+      "quality": "medium",
+      "signed_volume": 0.000407333009083989,
+      "status": "PASS",
+      "target": "cone_frustum",
+      "triangles": 200,
+      "warnings": [
+        "Notice: 100 sliver triangles detected (min angle < 5° or aspect ratio > 100)",
+        "Notice: 100 un-welded duplicate vertices found (CAD split normals)"
+      ],
+      "watertight": true
+    },
+    {
+      "euler_chi": 2,
+      "genus": 0.0,
+      "issues": [],
+      "orientation_consistent": true,
+      "quality": "fine",
+      "signed_volume": 0.00026166208710689517,
+      "status": "PASS",
+      "target": "cone_sharp",
+      "triangles": 224,
+      "warnings": [
+        "Notice: 224 sliver triangles detected (min angle < 5° or aspect ratio > 100)",
+        "Notice: 112 un-welded duplicate vertices found (CAD split normals)"
+      ],
+      "watertight": true
+    },
+    {
+      "euler_chi": 2,
+      "genus": 0.0,
+      "issues": [],
+      "orientation_consistent": true,
+      "quality": "fine",
+      "signed_volume": 0.00040819285588675593,
+      "status": "PASS",
+      "target": "cone_frustum",
+      "triangles": 448,
+      "warnings": [
+        "Notice: 448 sliver triangles detected (min angle < 5° or aspect ratio > 100)",
+        "Notice: 224 un-welded duplicate vertices found (CAD split normals)"
+      ],
+      "watertight": true
+    },
+    {
+      "chamfer": 0.0,
+      "euler_chi": 2,
+      "genus": 0.0,
+      "issues": [],
+      "orientation_consistent": true,
+      "sides": 3,
+      "signed_volume": 0.00010392304845413261,
+      "status": "PASS",
+      "target": "polygon_prism_3sides_chamfer_0",
+      "triangles": 12,
+      "warnings": [
+        "Notice: 12 un-welded duplicate vertices found (CAD split normals)"
+      ],
+      "watertight": true
+    },
+    {
+      "chamfer": 0.002,
+      "euler_chi": 2,
+      "genus": 0.0,
+      "issues": [],
+      "orientation_consistent": true,
+      "sides": 3,
+      "signed_volume": 0.00010392304845413261,
+      "status": "PASS",
+      "target": "polygon_prism_3sides_chamfer_0.002",
+      "triangles": 12,
+      "warnings": [
+        "Notice: 28 un-welded duplicate vertices found (CAD split normals)"
+      ],
+      "watertight": true
+    },
+    {
+      "chamfer": 0.0,
+      "euler_chi": 2,
+      "genus": 0.0,
+      "issues": [],
+      "orientation_consistent": true,
+      "sides": 4,
+      "signed_volume": 0.00007999999999999999,
+      "status": "PASS",
+      "target": "polygon_prism_4sides_chamfer_0",
+      "triangles": 16,
+      "warnings": [
+        "Notice: 16 un-welded duplicate vertices found (CAD split normals)"
+      ],
+      "watertight": true
+    },
+    {
+      "chamfer": 0.002,
+      "euler_chi": 2,
+      "genus": 0.0,
+      "issues": [],
+      "orientation_consistent": true,
+      "sides": 4,
+      "signed_volume": 0.00007999999999999999,
+      "status": "PASS",
+      "target": "polygon_prism_4sides_chamfer_0.002",
+      "triangles": 16,
+      "warnings": [
+        "Notice: 38 un-welded duplicate vertices found (CAD split normals)"
+      ],
+      "watertight": true
+    },
+    {
+      "chamfer": 0.0,
+      "euler_chi": 2,
+      "genus": 0.0,
+      "issues": [],
+      "orientation_consistent": true,
+      "sides": 6,
+      "signed_volume": 0.0000692820323027551,
+      "status": "PASS",
+      "target": "polygon_prism_6sides_chamfer_0",
+      "triangles": 24,
+      "warnings": [
+        "Notice: 24 un-welded duplicate vertices found (CAD split normals)"
+      ],
+      "watertight": true
+    },
+    {
+      "chamfer": 0.002,
+      "euler_chi": -18,
+      "genus": 10.0,
+      "issues": [
+        "Mesh is not watertight: 60 boundary edges (holes), 0 non-manifold edges",
+        "Found 6 self-intersecting non-adjacent triangle pairs",
+        "Euler genus mismatch: computed 10.0 (round 10), expected 0"
+      ],
+      "orientation_consistent": true,
+      "sides": 6,
+      "signed_volume": 0.00006928202787047063,
+      "status": "FAIL",
+      "target": "polygon_prism_6sides_chamfer_0.002",
+      "triangles": 100,
+      "warnings": [
+        "Notice: 60 sliver triangles detected (min angle < 5° or aspect ratio > 100)",
+        "Notice: 8 T-junction vertices detected",
+        "Notice: 118 un-welded duplicate vertices found (CAD split normals)",
+        "Notice: 31 coplanar overlapping triangle pairs detected"
+      ],
+      "watertight": false
+    },
+    {
+      "chamfer": 0.0,
+      "euler_chi": 2,
+      "genus": 0.0,
+      "issues": [],
+      "orientation_consistent": true,
+      "sides": 8,
+      "signed_volume": 0.00006627416997969525,
+      "status": "PASS",
+      "target": "polygon_prism_8sides_chamfer_0",
+      "triangles": 32,
+      "warnings": [
+        "Notice: 32 un-welded duplicate vertices found (CAD split normals)"
+      ],
+      "watertight": true
+    },
+    {
+      "chamfer": 0.002,
+      "euler_chi": -30,
+      "genus": 16.0,
+      "issues": [
+        "Mesh is not watertight: 112 boundary edges (holes), 0 non-manifold edges",
+        "Found 23 self-intersecting non-adjacent triangle pairs",
+        "Euler genus mismatch: computed 16.0 (round 16), expected 0"
+      ],
+      "orientation_consistent": true,
+      "sides": 8,
+      "signed_volume": 0.00006627415268832595,
+      "status": "FAIL",
+      "target": "polygon_prism_8sides_chamfer_0.002",
+      "triangles": 176,
+      "warnings": [
+        "Notice: 96 sliver triangles detected (min angle < 5° or aspect ratio > 100)",
+        "Notice: 32 T-junction vertices detected",
+        "Notice: 222 un-welded duplicate vertices found (CAD split normals)",
+        "Notice: 67 coplanar overlapping triangle pairs detected"
+      ],
+      "watertight": false
+    },
+    {
+      "euler_chi": 2,
+      "genus": 0.0,
+      "issues": [
+        "Found 32 degenerate triangles (zero area or collapsed edges)",
+        "Found 32 self-intersecting non-adjacent triangle pairs"
+      ],
+      "orientation_consistent": true,
+      "signed_volume": 0.0038144553755056084,
+      "status": "FAIL",
+      "target": "spur_gear_teeth_8_plain",
+      "teeth": 8,
+      "triangles": 448,
+      "warnings": [
+        "Notice: 352 sliver triangles detected (min angle < 5° or aspect ratio > 100)",
+        "Notice: 896 T-junction vertices detected",
+        "Notice: 448 un-welded duplicate vertices found (CAD split normals)",
+        "Notice: 16 stored normals mismatch geometric face normal"
+      ],
+      "watertight": true
+    },
+    {
+      "euler_chi": -202,
+      "genus": 102.0,
+      "issues": [
+        "Mesh is not watertight: 988 boundary edges (holes), 0 non-manifold edges",
+        "Found 59 degenerate triangles (zero area or collapsed edges)",
+        "Found 108 self-intersecting non-adjacent triangle pairs",
+        "Euler genus mismatch: computed 102.0 (round 102), expected 1"
+      ],
+      "orientation_consistent": true,
+      "signed_volume": 0.007384421648749375,
+      "status": "FAIL",
+      "target": "spur_gear_teeth_8_with_hub_bore_keyway",
+      "teeth": 8,
+      "triangles": 2649,
+      "warnings": [
+        "Notice: 841 sliver triangles detected (min angle < 5° or aspect ratio > 100)",
+        "Notice: 23645 T-junction vertices detected",
+        "Notice: 4874 un-welded duplicate vertices found (CAD split normals)",
+        "Notice: 5422 coplanar overlapping triangle pairs detected"
+      ],
+      "watertight": false
+    },
+    {
+      "euler_chi": 2,
+      "genus": 0.0,
+      "issues": [
+        "Found 80 degenerate triangles (zero area or collapsed edges)",
+        "Found 80 self-intersecting non-adjacent triangle pairs"
+      ],
+      "orientation_consistent": true,
+      "signed_volume": 0.02440877724914681,
+      "status": "FAIL",
+      "target": "spur_gear_teeth_20_plain",
+      "teeth": 20,
+      "triangles": 1120,
+      "warnings": [
+        "Notice: 1040 sliver triangles detected (min angle < 5° or aspect ratio > 100)",
+        "Notice: 1280 T-junction vertices detected",
+        "Notice: 1120 un-welded duplicate vertices found (CAD split normals)",
+        "Notice: 40 stored normals mismatch geometric face normal"
+      ],
+      "watertight": true
+    },
+    {
+      "euler_chi": -289,
+      "genus": 145.5,
+      "issues": [
+        "Mesh is not watertight: 2007 boundary edges (holes), 0 non-manifold edges",
+        "Found 54 degenerate triangles (zero area or collapsed edges)",
+        "Found 563 self-intersecting non-adjacent triangle pairs",
+        "Euler genus mismatch: computed 145.5 (round 146), expected 1"
+      ],
+      "orientation_consistent": true,
+      "signed_volume": 0.022035936578926548,
+      "status": "FAIL",
+      "target": "spur_gear_teeth_20_with_hub_bore_keyway",
+      "teeth": 20,
+      "triangles": 6957,
+      "warnings": [
+        "Notice: 3887 sliver triangles detected (min angle < 5° or aspect ratio > 100)",
+        "Notice: 14157 un-welded duplicate vertices found (CAD split normals)",
+        "Notice: 39489 coplanar overlapping triangle pairs detected"
+      ],
+      "watertight": false
+    },
+    {
+      "euler_chi": 2,
+      "genus": 0.0,
+      "issues": [
+        "Found 240 degenerate triangles (zero area or collapsed edges)",
+        "Found 240 self-intersecting non-adjacent triangle pairs"
+      ],
+      "orientation_consistent": true,
+      "signed_volume": 0.22393162572247424,
+      "status": "FAIL",
+      "target": "spur_gear_teeth_60_plain",
+      "teeth": 60,
+      "triangles": 3360,
+      "warnings": [
+        "Notice: 3120 sliver triangles detected (min angle < 5° or aspect ratio > 100)",
+        "Notice: 1680 T-junction vertices detected",
+        "Notice: 3360 un-welded duplicate vertices found (CAD split normals)",
+        "Notice: 120 stored normals mismatch geometric face normal"
+      ],
+      "watertight": true
+    },
+    {
+      "euler_chi": -88,
+      "genus": 45.0,
+      "issues": [
+        "Mesh is not watertight: 7304 boundary edges (holes), 0 non-manifold edges",
+        "Found 60 degenerate triangles (zero area or collapsed edges)",
+        "Found 142 self-intersecting non-adjacent triangle pairs",
+        "Euler genus mismatch: computed 45.0 (round 45), expected 1"
+      ],
+      "orientation_consistent": true,
+      "signed_volume": 0.22153373494084103,
+      "status": "FAIL",
+      "target": "spur_gear_teeth_60_with_hub_bore_keyway",
+      "teeth": 60,
+      "triangles": 21040,
+      "warnings": [
+        "Notice: 16553 sliver triangles detected (min angle < 5° or aspect ratio > 100)",
+        "Notice: 47509 un-welded duplicate vertices found (CAD split normals)",
+        "Notice: 81619 coplanar overlapping triangle pairs detected"
+      ],
+      "watertight": false
+    },
+    {
+      "euler_chi": 0,
+      "genus": 1.0,
+      "issues": [],
+      "orientation_consistent": true,
+      "signed_volume": 0.00009988624487225778,
+      "status": "PASS",
+      "target": "revolve_hollow_ring_360",
+      "triangles": 256,
+      "warnings": [
+        "Notice: 64 sliver triangles detected (min angle < 5° or aspect ratio > 100)",
+        "Notice: 405 coplanar overlapping triangle pairs detected"
+      ],
+      "watertight": true
+    },
+    {
+      "euler_chi": 2,
+      "genus": 0.0,
+      "issues": [
+        "Orientation is inconsistent: 8 inverted directed edges detected"
+      ],
+      "orientation_consistent": false,
+      "signed_volume": 0.000050184775848735,
+      "status": "FAIL",
+      "target": "revolve_partial_180",
+      "triangles": 260,
+      "warnings": [
+        "Notice: 192 sliver triangles detected (min angle < 5° or aspect ratio > 100)",
+        "Notice: 937 coplanar overlapping triangle pairs detected"
+      ],
+      "watertight": true
+    },
+    {
+      "euler_chi": -5214,
+      "genus": 2608.0,
+      "issues": [
+        "Mesh is not watertight: 17956 boundary edges (holes), 0 non-manifold edges",
+        "Found 274 self-intersecting non-adjacent triangle pairs"
+      ],
+      "orientation_consistent": true,
+      "signed_volume": 0.003932937524150291,
+      "status": "FAIL",
+      "target": "wheel_rim_5spoke",
+      "triangles": 98578,
+      "warnings": [
+        "Notice: 16888 sliver triangles detected (min angle < 5° or aspect ratio > 100)",
+        "Notice: 164462 un-welded duplicate vertices found (CAD split normals)",
+        "Notice: 48909 coplanar overlapping triangle pairs detected"
+      ],
+      "watertight": false
+    }
+  ],
+  "timestamp": "SystemTime { intervals: 134377926184111482 }",
+  "total_primitives_tested": 32
+}

@@ -2111,3 +2111,113 @@ async fn test_mcp_batch_cad_operations() {
     let err_msg = resp["result"]["content"][0]["text"].as_str().unwrap();
     assert!(err_msg.contains("Batch operation at index 1"));
 }
+
+#[tokio::test]
+async fn test_mcp_validate_mesh_and_debug_viewport_modes() {
+    let state = EngineState::new()
+        .expect("EngineState initialization failed")
+        .into_shared();
+
+    // 1. Create part
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 901,
+        "method": "tools/call",
+        "params": {
+            "name": "create_part",
+            "arguments": {
+                "name": "Diagnostic Box",
+                "material": "aluminum_6061_t6"
+            }
+        }
+    })).await;
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let data: Value = serde_json::from_str(text).unwrap();
+    let part_id = data["part_id"].as_str().unwrap().to_string();
+
+    // 2. Add box primitive
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 902,
+        "method": "tools/call",
+        "params": {
+            "name": "add_feature_primitive",
+            "arguments": {
+                "part_id": part_id,
+                "primitive_type": "box",
+                "params": {
+                    "width": 0.2,
+                    "height": 0.2,
+                    "depth": 0.2
+                }
+            }
+        }
+    })).await;
+    assert_eq!(resp["id"], 902);
+
+    // 3. Test validate_mesh tool call
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 903,
+        "method": "tools/call",
+        "params": {
+            "name": "validate_mesh",
+            "arguments": {
+                "part_id": part_id,
+                "expected_genus": 0
+            }
+        }
+    })).await;
+    assert_eq!(resp["id"], 903);
+    let val_text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let val: Value = serde_json::from_str(val_text).unwrap();
+    assert_eq!(val["status"], "PASS");
+    assert_eq!(val["topology"]["is_watertight"], true);
+    assert_eq!(val["topology"]["orientation_consistent"], true);
+    assert_eq!(val["geometry"]["is_positive_volume"], true);
+    assert_eq!(val["geometry"]["degenerate_triangles_count"], 0);
+
+    // 4. Test query_part_geometry contains mesh_validation
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 904,
+        "method": "tools/call",
+        "params": {
+            "name": "query_part_geometry",
+            "arguments": {
+                "part_id": part_id
+            }
+        }
+    })).await;
+    let q_text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let q_data: Value = serde_json::from_str(q_text).unwrap();
+    assert!(q_data["mesh_validation"].is_object());
+    assert_eq!(q_data["mesh_validation"]["status"], "PASS");
+
+    // 5. Test capture_viewport with all debug_mode options
+    let modes = ["wireframe", "normals", "backfaces", "boundary_edges", "flat_shading"];
+    for (idx, mode) in modes.iter().enumerate() {
+        let resp = rpc_call(&state, json!({
+            "jsonrpc": "2.0",
+            "id": 910 + idx,
+            "method": "tools/call",
+            "params": {
+                "name": "capture_viewport",
+                "arguments": {
+                    "part_id": part_id,
+                    "camera_preset": "isometric",
+                    "debug_mode": mode,
+                    "width": 320,
+                    "height": 240
+                }
+            }
+        })).await;
+
+        let v_text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let v_data: Value = serde_json::from_str(v_text).unwrap();
+        let b64 = v_data["image_base64"].as_str().unwrap();
+        assert!(!b64.is_empty(), "Base64 image for mode {} must not be empty", mode);
+        let bytes = base64::prelude::BASE64_STANDARD.decode(b64).unwrap();
+        assert_eq!(&bytes[0..8], &PNG_MAGIC, "PNG signature mismatch for mode {}", mode);
+    }
+}

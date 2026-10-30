@@ -509,6 +509,11 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     "part_id": {
                         "type": "string",
                         "description": "Optional specific part ID to render"
+                    },
+                    "debug_mode": {
+                        "type": "string",
+                        "enum": ["none", "wireframe", "normals", "backfaces", "boundary_edges", "flat_shading"],
+                        "description": "Optional debug rendering mode for visual inspection and defect audit"
                     }
                 }
             }),
@@ -896,6 +901,10 @@ pub fn dispatch_tool(
         }
         "batch_cad_operations" => {
             let res = cad::batch_cad_operations(args, state)?;
+            ToolCallResult::json(&res).map_err(ServerError::Json)
+        }
+        "validate_mesh" => {
+            let res = cad::validate_mesh_tool(args, state)?;
             ToolCallResult::json(&res).map_err(ServerError::Json)
         }
         other => Err(ServerError::ToolNotFound(other.to_string())),

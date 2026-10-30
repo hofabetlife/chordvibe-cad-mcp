@@ -1,0 +1,4 @@
+[2m2026-10-29T23:38:17.199377Z[0m [32m INFO[0m [2mmcp_cad_server[0m[2m:[0m Initializing MCP-CAD Engine...
+[2m2026-10-29T23:38:17.316121Z[0m [32m INFO[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m Debug utils not enabled: debug_utils_user_data not passed to Instance::from_raw
+[2m2026-10-29T23:38:17.564212Z[0m [32m INFO[0m [2mwgpu_core::instance[0m[2m:[0m Adapter Vulkan AdapterInfo { name: "NVIDIA GeForce RTX 3060", vendor: 4318, device: 9476, device_type: DiscreteGpu, driver: "NVIDIA", driver_info: "610.88", backend: Vulkan }
+[2m2026-10-29T23:38:17.658573Z[0m [32m INFO[0m [2mwgpu_core::device::resource[0m[2m:[0m Device::maintain: waiting for submission index 0
