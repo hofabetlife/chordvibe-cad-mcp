@@ -1,6 +1,0 @@
-{
-  "name": "MCP-CAD Web Studio",
-  "description": "Interactive 3D CAD/CAE & Kinematics Web Studio powered by the Pure-Rust MCP-CAD Engine (Solid DAG, TET4 FEA, Rapier3D & WGPU).",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
