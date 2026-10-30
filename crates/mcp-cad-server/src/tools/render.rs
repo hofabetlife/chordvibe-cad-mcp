@@ -14,6 +14,8 @@ pub fn capture_viewport(args: &Value, state: &EngineState) -> Result<Value, Serv
     let preset = parse_camera_preset(args.get("camera_preset").and_then(|v| v.as_str()));
     let width = args.get("width").and_then(|v| v.as_u64()).unwrap_or(800) as u32;
     let height = args.get("height").and_then(|v| v.as_u64()).unwrap_or(600) as u32;
+    let debug_mode_str = args.get("debug_mode").and_then(|v| v.as_str());
+    let debug_mode = mcp_cad_viewer::DebugRenderMode::parse(debug_mode_str);
 
     let target_mesh = if let Some(part_id) = args.get("part_id").and_then(|v| v.as_str()) {
         let part = state
@@ -49,12 +51,13 @@ pub fn capture_viewport(args: &Value, state: &EngineState) -> Result<Value, Serv
 
     let image_base64 = state
         .offscreen_renderer
-        .render_mesh_base64(&target_mesh, preset, width, height)?;
+        .render_mesh_base64_debug(&target_mesh, preset, debug_mode, width, height)?;
 
     Ok(json!({
         "image_base64": image_base64,
         "format": "image/png",
         "camera_preset": format!("{preset:?}"),
+        "debug_mode": format!("{debug_mode:?}"),
         "width": width,
         "height": height
     }))

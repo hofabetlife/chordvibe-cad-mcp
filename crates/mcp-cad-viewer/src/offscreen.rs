@@ -10,13 +10,66 @@ use mcp_cad_core::topology::TriangleMesh;
 use crate::camera::{CameraPreset, OrbitCamera};
 use crate::error::ViewerError;
 use crate::shader::{
-    CadVertex, FeaVertex, MaterialUniform, CAD_SHADER_WGSL, FEA_HEATMAP_SHADER_WGSL,
+    CadVertex, FeaVertex, MaterialUniform, WireframeUniform, CAD_SHADER_WGSL,
+    FEA_HEATMAP_SHADER_WGSL, WIREFRAME_SHADER_WGSL,
 };
+use crate::window::extract_wireframe_indices;
 
 /// Default width in pixels for offscreen rendering.
 pub const DEFAULT_RENDER_WIDTH: u32 = 800;
 /// Default height in pixels for offscreen rendering.
 pub const DEFAULT_RENDER_HEIGHT: u32 = 600;
+
+/// Debug rendering modes for geometry inspection and defect audit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DebugRenderMode {
+    #[default]
+    None,
+    /// Triangle wireframe lines over solid fill
+    Wireframe,
+    /// Surface normals mapped to RGB color
+    Normals,
+    /// Inverted backfaces highlighted in vivid magenta
+    Backfaces,
+    /// Open boundary edges and non-manifold edges highlighted in vivid amber-yellow
+    BoundaryEdges,
+    /// Pure per-facet flat shading without normal smoothing
+    FlatShading,
+}
+
+impl DebugRenderMode {
+    pub fn parse(s: Option<&str>) -> Self {
+        match s.map(|v| v.to_lowercase()).as_deref() {
+            Some("wireframe") => Self::Wireframe,
+            Some("normals") => Self::Normals,
+            Some("backfaces") => Self::Backfaces,
+            Some("boundary_edges") | Some("boundary") => Self::BoundaryEdges,
+            Some("flat_shading") | Some("flat") => Self::FlatShading,
+            _ => Self::None,
+        }
+    }
+}
+
+/// Extracts edge indices that do not belong to exactly 2 triangles (boundaries and non-manifolds).
+pub fn extract_boundary_indices(mesh: &TriangleMesh) -> Vec<u32> {
+    use std::collections::HashMap;
+    let mut edge_counts: HashMap<(u32, u32), usize> = HashMap::new();
+    for tri in &mesh.indices {
+        for &(u, v) in &[(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+            let key = if u < v { (u, v) } else { (v, u) };
+            *edge_counts.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    let mut line_indices = Vec::new();
+    for (edge, count) in edge_counts {
+        if count != 2 {
+            line_indices.push(edge.0);
+            line_indices.push(edge.1);
+        }
+    }
+    line_indices
+}
 
 /// Headless WGPU offscreen renderer for capturing PNG snapshots and Base64 images.
 pub struct OffscreenRenderer {
@@ -32,6 +85,10 @@ pub struct OffscreenRenderer {
     fea_pipeline: wgpu::RenderPipeline,
     /// Bind group layout for FEA uniforms.
     fea_bind_group_layout: wgpu::BindGroupLayout,
+    /// Render pipeline for wireframe and boundary line overlay.
+    wireframe_pipeline: wgpu::RenderPipeline,
+    /// Bind group layout for wireframe uniforms.
+    wireframe_bind_group_layout: wgpu::BindGroupLayout,
 }
 
 impl OffscreenRenderer {
@@ -239,6 +296,90 @@ impl OffscreenRenderer {
             cache: None,
         });
 
+        // 3. Build Wireframe / Line Overlay Pipeline
+        let wireframe_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Wireframe Shader Module"),
+            source: wgpu::ShaderSource::Wgsl(WIREFRAME_SHADER_WGSL.into()),
+        });
+
+        let wireframe_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Wireframe Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let wireframe_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Wireframe Pipeline Layout"),
+                bind_group_layouts: &[&wireframe_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        let wireframe_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Wireframe Render Pipeline"),
+            layout: Some(&wireframe_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &wireframe_shader,
+                entry_point: "vs_main",
+                buffers: &[CadVertex::LAYOUT],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &wireframe_shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth24Plus,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState {
+                    constant: -2,
+                    slope_scale: -2.0,
+                    clamp: 0.0,
+                },
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         Ok(Self {
             device,
             queue,
@@ -246,6 +387,8 @@ impl OffscreenRenderer {
             cad_bind_group_layout,
             fea_pipeline,
             fea_bind_group_layout,
+            wireframe_pipeline,
+            wireframe_bind_group_layout,
         })
     }
 
@@ -358,9 +501,237 @@ impl OffscreenRenderer {
             &vertex_buffer,
             &index_buffer,
             flat_indices.len() as u32,
+            None,
             width,
             height,
         )
+    }
+
+    /// Renders a triangular solid CAD mesh in a specified debug visualization mode.
+    pub fn render_mesh_png_debug(
+        &self,
+        mesh: &TriangleMesh,
+        camera_preset: CameraPreset,
+        mode: DebugRenderMode,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, ViewerError> {
+        if width == 0 || height == 0 {
+            return Err(ViewerError::InvalidDimensions { width, height });
+        }
+        if mesh.vertices.is_empty() || mesh.indices.is_empty() {
+            return Err(ViewerError::EmptyMesh);
+        }
+
+        let bbox = mesh.bounding_box();
+        let min_f32 = [bbox.min[0] as f32, bbox.min[1] as f32, bbox.min[2] as f32];
+        let max_f32 = [bbox.max[0] as f32, bbox.max[1] as f32, bbox.max[2] as f32];
+        let mut camera = OrbitCamera::from_preset(
+            camera_preset,
+            [0.0, 0.0, 0.0],
+            5.0,
+            width as f32 / height as f32,
+        );
+        camera.fit_bounding_box(min_f32, max_f32);
+        let camera_uniform = camera.build_uniform();
+
+        let cad_vertices: Vec<CadVertex> = mesh
+            .vertices
+            .iter()
+            .map(|v| CadVertex {
+                position: [v.position[0] as f32, v.position[1] as f32, v.position[2] as f32],
+                normal: [v.normal[0] as f32, v.normal[1] as f32, v.normal[2] as f32],
+            })
+            .collect();
+
+        let flat_indices: Vec<u32> = mesh
+            .indices
+            .iter()
+            .flat_map(|tri| tri.iter().copied())
+            .collect();
+
+        let vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("CAD Debug Vertex Buffer"),
+                contents: bytemuck::cast_slice(&cad_vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+
+        let index_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("CAD Debug Index Buffer"),
+                contents: bytemuck::cast_slice(&flat_indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+
+        let camera_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("CAD Debug Camera Uniform Buffer"),
+                contents: bytemuck::bytes_of(&camera_uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        let (material, line_indices_opt, line_color) = match mode {
+            DebugRenderMode::None => (
+                MaterialUniform {
+                    color: [0.72, 0.77, 0.84, 1.0],
+                    debug_mode: 0,
+                    _pad0: 0,
+                    _pad1: 0,
+                    _pad2: 0,
+                },
+                None,
+                [0.0; 4],
+            ),
+            DebugRenderMode::Normals => (
+                MaterialUniform {
+                    color: [1.0, 1.0, 1.0, 1.0],
+                    debug_mode: 2,
+                    _pad0: 0,
+                    _pad1: 0,
+                    _pad2: 0,
+                },
+                None,
+                [0.0; 4],
+            ),
+            DebugRenderMode::Backfaces => (
+                MaterialUniform {
+                    color: [0.72, 0.77, 0.84, 1.0],
+                    debug_mode: 3,
+                    _pad0: 0,
+                    _pad1: 0,
+                    _pad2: 0,
+                },
+                None,
+                [0.0; 4],
+            ),
+            DebugRenderMode::FlatShading => (
+                MaterialUniform {
+                    color: [0.72, 0.77, 0.84, 1.0],
+                    debug_mode: 4,
+                    _pad0: 0,
+                    _pad1: 0,
+                    _pad2: 0,
+                },
+                None,
+                [0.0; 4],
+            ),
+            DebugRenderMode::Wireframe => (
+                MaterialUniform {
+                    color: [0.65, 0.70, 0.78, 1.0],
+                    debug_mode: 0,
+                    _pad0: 0,
+                    _pad1: 0,
+                    _pad2: 0,
+                },
+                Some(extract_wireframe_indices(&mesh.indices)),
+                [0.05, 0.08, 0.12, 1.0],
+            ),
+            DebugRenderMode::BoundaryEdges => (
+                MaterialUniform {
+                    color: [0.25, 0.28, 0.32, 1.0],
+                    debug_mode: 0,
+                    _pad0: 0,
+                    _pad1: 0,
+                    _pad2: 0,
+                },
+                Some(extract_boundary_indices(mesh)),
+                [1.0, 0.85, 0.0, 1.0],
+            ),
+        };
+
+        let material_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("CAD Debug Material Uniform Buffer"),
+                contents: bytemuck::bytes_of(&material),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        let cad_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("CAD Debug Draw Bind Group"),
+            layout: &self.cad_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: material_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let line_overlay_data = if let Some(ref lines) = line_indices_opt {
+            if !lines.is_empty() {
+                let line_ib = self
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("CAD Debug Line Index Buffer"),
+                        contents: bytemuck::cast_slice(lines),
+                        usage: wgpu::BufferUsages::INDEX,
+                    });
+                let wire_uniform = WireframeUniform { color: line_color };
+                let wire_buffer = self
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("CAD Debug Wireframe Uniform Buffer"),
+                        contents: bytemuck::bytes_of(&wire_uniform),
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    });
+                let line_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("CAD Debug Line Bind Group"),
+                    layout: &self.wireframe_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: camera_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wire_buffer.as_entire_binding(),
+                        },
+                    ],
+                });
+                Some((line_bg, line_ib, lines.len() as u32))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let line_param = line_overlay_data.as_ref().map(|(bg, ib, count)| {
+            (&self.wireframe_pipeline, bg, ib, *count)
+        });
+
+        self.execute_render_pass(
+            &self.cad_pipeline,
+            &cad_bind_group,
+            &vertex_buffer,
+            &index_buffer,
+            flat_indices.len() as u32,
+            line_param,
+            width,
+            height,
+        )
+    }
+
+    /// Helper to render CAD mesh in debug mode directly to a Base64 encoded PNG string.
+    pub fn render_mesh_base64_debug(
+        &self,
+        mesh: &TriangleMesh,
+        camera_preset: CameraPreset,
+        mode: DebugRenderMode,
+        width: u32,
+        height: u32,
+    ) -> Result<String, ViewerError> {
+        let png = self.render_mesh_png_debug(mesh, camera_preset, mode, width, height)?;
+        self.render_to_base64(&png)
     }
 
     /// Renders a CAD `Part` with the specified tessellation quality into PNG encoded bytes.
@@ -548,6 +919,7 @@ impl OffscreenRenderer {
             &vertex_buffer,
             &index_buffer,
             flat_indices.len() as u32,
+            None,
             width,
             height,
         )
@@ -562,6 +934,7 @@ impl OffscreenRenderer {
         vertex_buffer: &wgpu::Buffer,
         index_buffer: &wgpu::Buffer,
         index_count: u32,
+        lines_overlay: Option<(&wgpu::RenderPipeline, &wgpu::BindGroup, &wgpu::Buffer, u32)>,
         width: u32,
         height: u32,
     ) -> Result<Vec<u8>, ViewerError> {
@@ -651,6 +1024,16 @@ impl OffscreenRenderer {
             render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
             render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             render_pass.draw_indexed(0..index_count, 0, 0..1);
+
+            if let Some((line_pipe, line_bg, line_ib, line_count)) = lines_overlay {
+                if line_count > 0 {
+                    render_pass.set_pipeline(line_pipe);
+                    render_pass.set_bind_group(0, line_bg, &[]);
+                    render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                    render_pass.set_index_buffer(line_ib.slice(..), wgpu::IndexFormat::Uint32);
+                    render_pass.draw_indexed(0..line_count, 0, 0..1);
+                }
+            }
         }
 
         encoder.copy_texture_to_buffer(

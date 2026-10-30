@@ -355,3 +355,35 @@ fn test_cad_window_viewer_with_part() {
     assert_eq!(viewer.tessellation_quality(), TessellationQuality::Fine);
     assert_eq!(viewer.mesh().unwrap().triangle_count(), 12);
 }
+
+#[test]
+fn test_debug_render_modes() {
+    use mcp_cad_core::create_box;
+    use mcp_cad_viewer::{CameraPreset, DebugRenderMode, OffscreenRenderer};
+
+    let renderer = OffscreenRenderer::new().expect("OffscreenRenderer initialization");
+    let mut cube = create_box(1.0, 1.0, 1.0);
+    // Delete one triangle to create a boundary edge
+    cube.indices.remove(0);
+
+    let modes = [
+        DebugRenderMode::None,
+        DebugRenderMode::Wireframe,
+        DebugRenderMode::Normals,
+        DebugRenderMode::Backfaces,
+        DebugRenderMode::BoundaryEdges,
+        DebugRenderMode::FlatShading,
+    ];
+
+    for mode in modes {
+        let png = renderer
+            .render_mesh_png_debug(&cube, CameraPreset::Isometric, mode, 320, 240)
+            .unwrap_or_else(|e| panic!("Failed to render in mode {:?}: {}", mode, e));
+        assert!(
+            png.len() > 100,
+            "Render output in mode {:?} must produce valid PNG bytes",
+            mode
+        );
+        assert_eq!(&png[0..8], &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    }
+}

@@ -1284,6 +1284,7 @@ pub fn query_part_geometry(args: &Value, state: &mut EngineState) -> Result<Valu
         .ok_or_else(|| ServerError::PartNotFound(part_id.to_string()))?;
 
     let inspection = part.inspect_geometry();
+    let mesh_validation = mcp_cad_core::validate_mesh(&part.mesh, None);
 
     Ok(json!({
         "part_id": part_id,
@@ -1298,7 +1299,29 @@ pub fn query_part_geometry(args: &Value, state: &mut EngineState) -> Result<Valu
         "faces_count": inspection.faces_count,
         "vertices_count": inspection.vertices_count,
         "detected_planar_faces": inspection.detected_planar_faces,
+        "mesh_validation": mesh_validation,
     }))
+}
+
+/// Dev/diagnostic tool: `validate_mesh`: Performs thorough topology, manifoldness, and geometry validation.
+pub fn validate_mesh_tool(args: &Value, state: &mut EngineState) -> Result<Value, ServerError> {
+    let part_id = args
+        .get("part_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'part_id'".to_string()))?;
+
+    let part = state
+        .parts
+        .get(part_id)
+        .ok_or_else(|| ServerError::PartNotFound(part_id.to_string()))?;
+
+    let expected_genus = args
+        .get("expected_genus")
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32);
+
+    let report = mcp_cad_core::validate_mesh(&part.mesh, expected_genus);
+    serde_json::to_value(&report).map_err(ServerError::Json)
 }
 
 /// 22. `boolean_union`: Combines tool_part into target_part using CSG union.

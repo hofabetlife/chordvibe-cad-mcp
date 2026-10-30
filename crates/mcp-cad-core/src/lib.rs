@@ -11,11 +11,13 @@ pub mod dag;
 pub mod part;
 pub mod export_stl;
 pub mod import_stl;
+pub mod diagnostics;
 
 pub use error::CadError;
 pub use material::{Material, MaterialRegistry};
 pub use tessellation::{TessellationQuality, TessellationSettings};
 pub use topology::{BoundingBox, GeometryInspection, PlanarFaceInfo, TriangleMesh, Vertex};
+pub use diagnostics::{validate_mesh, MeshValidationReport, TopologyMetrics, GeometryMetrics, AngleStatistics};
 pub use primitives::{
     create_box, create_cone, create_cone_with_settings, create_cylinder,
     create_cylinder_oriented, create_cylinder_oriented_with_settings,
