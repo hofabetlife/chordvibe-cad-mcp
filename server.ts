@@ -161,11 +161,6 @@ async function startServer() {
   const app = express();
   app.use(express.json({ limit: '50mb' }));
 
-  // Boot the Rust MCP-CAD server in the background so port 3000 binds immediately
-  void ensureRustMcpServer().catch((err) => {
-    pushLog(`Startup error: ${String(err)}`);
-  });
-
   // 1. Health & Rust Engine Status
   app.get('/api/rust/status', async (_req, res) => {
     const healthy = await ensureRustMcpServer();
@@ -412,7 +407,14 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    pushLog(`MCP-CAD Web Studio listening on http://localhost:${PORT}`);
+    const msg = `MCP-CAD Web Studio listening on http://localhost:${PORT}`;
+    pushLog(msg);
+    console.log(msg);
+    if (fs.existsSync(resolveRustBinaryPath())) {
+      void ensureRustMcpServer().catch((err) => {
+        pushLog(`Startup error: ${String(err)}`);
+      });
+    }
   });
 }
 
