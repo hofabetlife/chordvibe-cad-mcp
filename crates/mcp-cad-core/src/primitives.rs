@@ -1835,103 +1835,437 @@ pub fn create_wheel_rim_with_settings(
 
     let et = offset_et.unwrap_or(0.035).clamp(-w_rim * 0.4, w_rim * 0.4);
 
-    // 1. Construct stepped rim barrel profile (in mm/m): outer flanges, bead seats, drop center well
+    // 1. Key radial & axial dimensions with safe geometric clearances
     let t_w = (r_bead * 0.045).clamp(0.006, 0.012);
     let drop_depth = (r_bead * 0.08).clamp(0.015, 0.035);
-    let r_well = r_bead - drop_depth;
+    let r_well = (r_bead - drop_depth).max(r_hub + t_w + 0.015);
+    let r_inner_barrel = r_well - t_w;
     let r_hump = r_bead + (r_bead * 0.012).clamp(0.002, 0.005);
 
+    let r_hub_eff = r_hub.min(r_inner_barrel * 0.78).max(r_bore + 0.018);
+    let r_bore_eff = r_bore.min(r_hub_eff * 0.65);
+    let r_bolt_ring = (r_hub_eff - (r_hub_eff - r_bore_eff) * 0.15).max(r_bore_eff + 0.012);
+    let radial_band = r_bolt_ring - r_bore_eff;
+    let r_pcd_eff = r_pcd.clamp(
+        r_bore_eff + radial_band * 0.28,
+        r_bolt_ring - radial_band * 0.28,
+    );
+    let max_r_bolt = (r_pcd_eff - r_bore_eff)
+        .min(r_bolt_ring - r_pcd_eff)
+        .min(r_pcd_eff * (PI / (n_bolts as f64)).sin())
+        * 0.55;
+    let r_bolt_eff = r_bolt.clamp(0.002, max_r_bolt.max(0.0025));
+
     let h_w = w_rim * 0.5;
-    let barrel_profile: Vec<[f64; 2]> = vec![
-        // Outer surface: from inner flange (-h_w) to outer flange (+h_w)
-        [r_flange, -h_w],
-        [r_flange, -h_w + 0.05 * w_rim],
-        [r_bead + 0.004, -h_w + 0.08 * w_rim],
-        [r_bead, -h_w + 0.12 * w_rim],
-        [r_bead, -h_w + 0.28 * w_rim],
-        [r_well, -h_w + 0.38 * w_rim],
-        [r_well, h_w - 0.35 * w_rim],
-        [r_hump, h_w - 0.24 * w_rim],
-        [r_bead, h_w - 0.20 * w_rim],
-        [r_bead, h_w - 0.08 * w_rim],
-        [r_flange, h_w - 0.04 * w_rim],
-        [r_flange, h_w],
-        // Outer lip thickness
-        [r_flange - t_w, h_w],
-        // Inner surface: from outer lip back to inner lip
-        [r_bead - t_w, h_w - 0.08 * w_rim],
-        [r_well - t_w, h_w - 0.35 * w_rim],
-        [r_well - t_w, -h_w + 0.38 * w_rim],
-        [r_bead - t_w, -h_w + 0.28 * w_rim],
-        [r_flange - t_w, -h_w],
-    ];
+    let z_well_bot = -h_w + 0.30 * w_rim;
+    let z_well_top = h_w - 0.30 * w_rim;
+    let max_disc_t = (z_well_top - z_well_bot) * 0.55;
+    let t_disc = t_spoke.clamp(0.010, max_disc_t.max(0.012));
+    let z_disc_center = (et - t_disc * 0.5).clamp(
+        z_well_bot + t_disc * 0.65,
+        z_well_top - t_disc * 0.65,
+    );
+    let z_back = z_disc_center - t_disc * 0.5;
+    let z_front = z_disc_center + t_disc * 0.5;
 
-    let barrel = create_revolve_with_settings(&barrel_profile, 360.0, settings);
-
-    // 2. Central hub cylinder with bore hole and PCD bolt pattern
-    let t_hub = (w_rim * 0.15).clamp(0.015, 0.035);
-    let z_hub_center = et - t_hub * 0.5;
-
-    let mut hub_solid = create_cylinder_with_settings(r_hub, t_hub, settings);
-    hub_solid.translate([0.0, 0.0, z_hub_center]);
-
-    let cutter_height = t_hub + 0.010;
-    let mut cutter_vertices = Vec::new();
-    let mut cutter_indices = Vec::new();
-
-    let mut add_to_cutters = |cyl: &TriangleMesh| {
-        let base_idx = cutter_vertices.len() as u32;
-        cutter_vertices.extend_from_slice(&cyl.vertices);
-        for tri in &cyl.indices {
-            cutter_indices.push([tri[0] + base_idx, tri[1] + base_idx, tri[2] + base_idx]);
-        }
+    let q_mult = match settings.quality {
+        TessellationQuality::Coarse => 1,
+        TessellationQuality::Medium => 2,
+        TessellationQuality::Fine => 3,
+        TessellationQuality::Custom { .. } => 2,
     };
 
-    let mut bore_cyl = create_cylinder_with_settings(r_bore, cutter_height, settings);
-    bore_cyl.translate([0.0, 0.0, z_hub_center]);
-    add_to_cutters(&bore_cyl);
+    // 2. Angular discretization of the spoke + window sectors (N_theta stations around 360 deg)
+    let k_s = 2 * q_mult; // segments across each spoke
+    let k_w = 4 * q_mult; // segments across each ventilation window
+    let k_sec = k_s + k_w;
+    let n_theta = n_spokes * k_sec;
+    let d_theta_sec = 2.0 * PI / (n_spokes as f64);
 
-    for b in 0..n_bolts {
-        let beta = (b as f64) * 2.0 * PI / (n_bolts as f64) + PI / (n_bolts as f64);
-        let bx = r_pcd * beta.cos();
-        let by = r_pcd * beta.sin();
-        let mut bolt_cyl = create_cylinder_with_settings(r_bolt, cutter_height, settings);
-        bolt_cyl.translate([bx, by, z_hub_center]);
-        add_to_cutters(&bolt_cyl);
-    }
-    let all_cutters = TriangleMesh::new(cutter_vertices, cutter_indices);
+    let delta_hub = (w_spoke / (2.0 * r_hub_eff)).clamp(0.12 * d_theta_sec, 0.34 * d_theta_sec);
+    let delta_barrel =
+        (w_spoke / (2.0 * r_inner_barrel)).clamp(0.08 * d_theta_sec, 0.34 * d_theta_sec);
 
-    let hub_finished = csg_difference(&hub_solid, &all_cutters);
-
-    // 3. Structural spokes with open cooling windows between them
-    let r_spoke_inner = r_hub - 0.003;
-    let r_spoke_outer = (r_bead - t_w) + 0.004;
-    let l_spoke = r_spoke_outer - r_spoke_inner;
-    let r_spoke_mid = (r_spoke_inner + r_spoke_outer) * 0.5;
-
-    let mut spoke_vertices = Vec::new();
-    let mut spoke_indices = Vec::new();
-
+    let mut phi_hub = Vec::with_capacity(n_theta);
+    let mut phi_barrel = Vec::with_capacity(n_theta);
     for s in 0..n_spokes {
-        let theta_s = (s as f64) * 2.0 * PI / (n_spokes as f64);
-        let mut spoke = create_box(l_spoke, w_spoke, t_spoke);
-        spoke.translate([r_spoke_mid, 0.0, z_hub_center]);
-        spoke.rotate_rpy_deg(0.0, 0.0, theta_s * 180.0 / PI);
-
-        let base_idx = spoke_vertices.len() as u32;
-        spoke_vertices.extend_from_slice(&spoke.vertices);
-        for tri in &spoke.indices {
-            spoke_indices.push([tri[0] + base_idx, tri[1] + base_idx, tri[2] + base_idx]);
+        let base_ang = (s as f64) * d_theta_sec;
+        // Spoke indices: 0..k_s covers [-delta, +delta] around base_ang + 0.5 * d_theta_sec?
+        // Place spoke centered at base_ang + delta_max so phi starts >= 0 and increases strictly in [0, 2*PI)
+        let spoke_center = base_ang + 0.25 * d_theta_sec;
+        let next_spoke_center = base_ang + 1.25 * d_theta_sec;
+        for m in 0..k_s {
+            let t = (m as f64) / (k_s as f64);
+            phi_hub.push(spoke_center - delta_hub + t * (2.0 * delta_hub));
+            phi_barrel.push(spoke_center - delta_barrel + t * (2.0 * delta_barrel));
+        }
+        for m in 0..k_w {
+            let t = (m as f64) / (k_w as f64);
+            let h_start = spoke_center + delta_hub;
+            let h_end = next_spoke_center - delta_hub;
+            let b_start = spoke_center + delta_barrel;
+            let b_end = next_spoke_center - delta_barrel;
+            phi_hub.push(h_start + t * (h_end - h_start));
+            phi_barrel.push(b_start + t * (b_end - b_start));
         }
     }
-    let all_spokes = TriangleMesh::new(spoke_vertices, spoke_indices);
 
-    // 4. Union hub, spokes, and barrel
-    let hub_and_spokes = csg_union(&hub_finished, &all_spokes);
-    let mut wheel = csg_union(&hub_and_spokes, &barrel);
-    wheel.recompute_vertex_normals();
+    let hub_outer_ring: Vec<[f64; 2]> = phi_hub
+        .iter()
+        .map(|&a| [r_hub_eff * a.cos(), r_hub_eff * a.sin()])
+        .collect();
+    let barrel_inner_ring: Vec<[f64; 2]> = phi_barrel
+        .iter()
+        .map(|&a| [r_inner_barrel * a.cos(), r_inner_barrel * a.sin()])
+        .collect();
 
-    wheel
+    let mut vertices: Vec<Vertex> = Vec::new();
+    let mut indices: Vec<[u32; 3]> = Vec::new();
+
+    // Helper: emit a single quad (2 triangles) with explicit normal
+    let mut push_quad = |p0: [f64; 3], p1: [f64; 3], p2: [f64; 3], p3: [f64; 3], n: [f64; 3]| {
+        let base = vertices.len() as u32;
+        vertices.push(Vertex::new(p0, n));
+        vertices.push(Vertex::new(p1, n));
+        vertices.push(Vertex::new(p2, n));
+        vertices.push(Vertex::new(p3, n));
+        indices.push([base, base + 1, base + 2]);
+        indices.push([base, base + 2, base + 3]);
+    };
+
+    // 3. Build stepped rim barrel profile in CCW (r, z) order
+    // Segment 14 ([r_inner_barrel, z_front] -> [r_inner_barrel, z_back]) is the spoke/window attachment band.
+    let barrel_pts: Vec<[f64; 2]> = vec![
+        [r_flange, -h_w],                           // 0
+        [r_flange, -h_w + 0.05 * w_rim],            // 1
+        [r_bead + 0.004, -h_w + 0.08 * w_rim],      // 2
+        [r_bead, -h_w + 0.12 * w_rim],              // 3
+        [r_bead, -h_w + 0.22 * w_rim],              // 4
+        [r_well, z_well_bot],                       // 5
+        [r_well, z_well_top],                       // 6
+        [r_hump, h_w - 0.22 * w_rim],               // 7
+        [r_bead, h_w - 0.18 * w_rim],               // 8
+        [r_bead, h_w - 0.08 * w_rim],               // 9
+        [r_flange, h_w - 0.04 * w_rim],             // 10
+        [r_flange, h_w],                            // 11
+        [r_flange - t_w, h_w],                      // 12
+        [r_bead - t_w, h_w - 0.08 * w_rim],         // 13
+        [r_inner_barrel, z_well_top],               // 14
+        [r_inner_barrel, z_front],                  // 15 (top of spoke/window band)
+        [r_inner_barrel, z_back],                   // 16 (bottom of spoke/window band)
+        [r_inner_barrel, z_well_bot],               // 17
+        [r_bead - t_w, -h_w + 0.22 * w_rim],        // 18
+        [r_flange - t_w, -h_w],                     // 19
+    ];
+
+    let n_b_pts = barrel_pts.len();
+    for seg_i in 0..n_b_pts {
+        let next_i = (seg_i + 1) % n_b_pts;
+        let ra = barrel_pts[seg_i][0];
+        let za = barrel_pts[seg_i][1];
+        let rb = barrel_pts[next_i][0];
+        let zb = barrel_pts[next_i][1];
+
+        let dr = rb - ra;
+        let dz = zb - za;
+        let len = dr.hypot(dz).max(1e-12);
+        let nr = dz / len;
+        let nz = -dr / len;
+
+        let is_spoke_band = seg_i == 15; // [r_inner_barrel, z_front] -> [r_inner_barrel, z_back]
+
+        for j in 0..n_theta {
+            if is_spoke_band {
+                let in_sec = j % k_sec;
+                if in_sec < k_s {
+                    // Spoke attaches here; no barrel wall across the spoke cross-section
+                    continue;
+                }
+            }
+            let next_j = (j + 1) % n_theta;
+            let a0 = phi_barrel[j];
+            let a1 = phi_barrel[next_j];
+            let mid_a = 0.5 * (a0 + if next_j == 0 { a1 + 2.0 * PI } else { a1 });
+            let n3 = [nr * mid_a.cos(), nr * mid_a.sin(), nz];
+
+            let p0 = [ra * a0.cos(), ra * a0.sin(), za];
+            let p1 = [ra * a1.cos(), ra * a1.sin(), za];
+            let p2 = [rb * a1.cos(), rb * a1.sin(), zb];
+            let p3 = [rb * a0.cos(), rb * a0.sin(), zb];
+            push_quad(p0, p1, p2, p3, n3);
+        }
+    }
+
+    // 4. Spokes and Ventilation Window Walls between r_hub_eff and r_inner_barrel (z in [z_back, z_front])
+    for s in 0..n_spokes {
+        let sec_start = s * k_sec;
+
+        // 4a. Spoke top (+Z) and bottom (-Z) faces across k_s segments
+        for m in 0..k_s {
+            let j0 = sec_start + m;
+            let j1 = (j0 + 1) % n_theta;
+            let h0 = hub_outer_ring[j0];
+            let h1 = hub_outer_ring[j1];
+            let b0 = barrel_inner_ring[j0];
+            let b1 = barrel_inner_ring[j1];
+
+            // Front face at z_front (normal [0, 0, 1])
+            push_quad(
+                [h0[0], h0[1], z_front],
+                [b0[0], b0[1], z_front],
+                [b1[0], b1[1], z_front],
+                [h1[0], h1[1], z_front],
+                [0.0, 0.0, 1.0],
+            );
+            // Back face at z_back (normal [0, 0, -1])
+            push_quad(
+                [h0[0], h0[1], z_back],
+                [h1[0], h1[1], z_back],
+                [b1[0], b1[1], z_back],
+                [b0[0], b0[1], z_back],
+                [0.0, 0.0, -1.0],
+            );
+        }
+
+        // 4b. Leading side wall of spoke s at j_lead = sec_start (from barrel to hub, facing -theta)
+        let j_lead = sec_start;
+        let hl = hub_outer_ring[j_lead];
+        let bl = barrel_inner_ring[j_lead];
+        let dxl = bl[0] - hl[0];
+        let dyl = bl[1] - hl[1];
+        let len_l = dxl.hypot(dyl).max(1e-12);
+        let nl = [dyl / len_l, -dxl / len_l, 0.0];
+        push_quad(
+            [hl[0], hl[1], z_front],
+            [hl[0], hl[1], z_back],
+            [bl[0], bl[1], z_back],
+            [bl[0], bl[1], z_front],
+            nl,
+        );
+
+        // 4c. Trailing side wall of spoke s at j_trail = sec_start + k_s (facing +theta)
+        let j_trail = sec_start + k_s;
+        let ht = hub_outer_ring[j_trail];
+        let bt = barrel_inner_ring[j_trail];
+        let dxt = bt[0] - ht[0];
+        let dyt = bt[1] - ht[1];
+        let len_t = dxt.hypot(dyt).max(1e-12);
+        let nt = [-dyt / len_t, dxt / len_t, 0.0];
+        push_quad(
+            [bt[0], bt[1], z_front],
+            [bt[0], bt[1], z_back],
+            [ht[0], ht[1], z_back],
+            [ht[0], ht[1], z_front],
+            nt,
+        );
+
+        // 4d. Hub outer cylindrical wall along the ventilation window (k_s .. k_sec)
+        for m in k_s..k_sec {
+            let j0 = sec_start + m;
+            let j1 = (j0 + 1) % n_theta;
+            let h0 = hub_outer_ring[j0];
+            let h1 = hub_outer_ring[j1];
+            let dxh = h1[0] - h0[0];
+            let dyh = h1[1] - h0[1];
+            let len_h = dxh.hypot(dyh).max(1e-12);
+            let nh = [dyh / len_h, -dxh / len_h, 0.0];
+            push_quad(
+                [h0[0], h0[1], z_front],
+                [h0[0], h0[1], z_back],
+                [h1[0], h1[1], z_back],
+                [h1[0], h1[1], z_front],
+                nh,
+            );
+        }
+    }
+
+    // 5. Bolt Sector O-Grids inside [r_bore_eff, r_bolt_ring] for each of the n_bolts PCD holes
+    let k_b = 2 * q_mult; // segments per side of each bolt sector
+    let d_beta = 2.0 * PI / (n_bolts as f64);
+    let mut bolt_outer_ring: Vec<[f64; 2]> = Vec::with_capacity(n_bolts * k_b);
+    let mut bore_ring: Vec<[f64; 2]> = Vec::with_capacity(n_bolts * k_b);
+
+    for b in 0..n_bolts {
+        let beta_min = (b as f64) * d_beta;
+        let beta_max = ((b + 1) as f64) * d_beta;
+        let beta_mid = 0.5 * (beta_min + beta_max);
+        let er = [beta_mid.cos(), beta_mid.sin()];
+        let et_vec = [-beta_mid.sin(), beta_mid.cos()];
+        let bolt_center = [r_pcd_eff * er[0], r_pcd_eff * er[1]];
+
+        // Record global CCW rings at r_bore_eff and r_bolt_ring
+        for m in 0..k_b {
+            let t = (m as f64) / (k_b as f64);
+            let ang = beta_min + t * d_beta;
+            bore_ring.push([r_bore_eff * ang.cos(), r_bore_eff * ang.sin()]);
+            bolt_outer_ring.push([r_bolt_ring * ang.cos(), r_bolt_ring * ang.sin()]);
+        }
+
+        // Build 4 * k_b perimeter points in CCW order around bolt_center:
+        // Side 0: theta = beta_min, r from r_bore_eff to r_bolt_ring
+        // Side 1: r = r_bolt_ring, theta from beta_min to beta_max
+        // Side 2: theta = beta_max, r from r_bolt_ring to r_bore_eff
+        // Side 3: r = r_bore_eff, theta from beta_max to beta_min
+        let n_loop = 4 * k_b;
+        let mut perim_loop: Vec<[f64; 2]> = Vec::with_capacity(n_loop);
+        for m in 0..k_b {
+            let t = (m as f64) / (k_b as f64);
+            let r = r_bore_eff + t * (r_bolt_ring - r_bore_eff);
+            perim_loop.push([r * beta_min.cos(), r * beta_min.sin()]);
+        }
+        for m in 0..k_b {
+            let t = (m as f64) / (k_b as f64);
+            let ang = beta_min + t * d_beta;
+            perim_loop.push([r_bolt_ring * ang.cos(), r_bolt_ring * ang.sin()]);
+        }
+        for m in 0..k_b {
+            let t = (m as f64) / (k_b as f64);
+            let r = r_bolt_ring - t * (r_bolt_ring - r_bore_eff);
+            perim_loop.push([r * beta_max.cos(), r * beta_max.sin()]);
+        }
+        for m in 0..k_b {
+            let t = (m as f64) / (k_b as f64);
+            let ang = beta_max - t * d_beta;
+            perim_loop.push([r_bore_eff * ang.cos(), r_bore_eff * ang.sin()]);
+        }
+
+        // Build 4 * k_b bolt hole points in matching CCW order around bolt_center
+        let mut hole_loop: Vec<[f64; 2]> = Vec::with_capacity(n_loop);
+        for idx in 0..n_loop {
+            let psi = -0.75 * PI + (idx as f64) * 2.0 * PI / (n_loop as f64);
+            let c_p = psi.cos();
+            let s_p = psi.sin();
+            let px = bolt_center[0] + r_bolt_eff * (c_p * er[0] + s_p * et_vec[0]);
+            let py = bolt_center[1] + r_bolt_eff * (c_p * er[1] + s_p * et_vec[1]);
+            hole_loop.push([px, py]);
+        }
+
+        // Emit front (+Z), back (-Z), and inner bolt-hole cylindrical wall for sector b
+        for idx in 0..n_loop {
+            let next_idx = (idx + 1) % n_loop;
+            let h0 = hole_loop[idx];
+            let h1 = hole_loop[next_idx];
+            let p0 = perim_loop[idx];
+            let p1 = perim_loop[next_idx];
+
+            // Front cap quad at z_front
+            push_quad(
+                [h0[0], h0[1], z_front],
+                [p0[0], p0[1], z_front],
+                [p1[0], p1[1], z_front],
+                [h1[0], h1[1], z_front],
+                [0.0, 0.0, 1.0],
+            );
+            // Back cap quad at z_back
+            push_quad(
+                [h0[0], h0[1], z_back],
+                [h1[0], h1[1], z_back],
+                [p1[0], p1[1], z_back],
+                [p0[0], p0[1], z_back],
+                [0.0, 0.0, -1.0],
+            );
+            // Bolt hole inner vertical wall (normal pointing inward toward bolt_center)
+            let dx = h1[0] - h0[0];
+            let dy = h1[1] - h0[1];
+            let len = dx.hypot(dy).max(1e-12);
+            let n_in = [-dy / len, dx / len, 0.0];
+            push_quad(
+                [h1[0], h1[1], z_front],
+                [h1[0], h1[1], z_back],
+                [h0[0], h0[1], z_back],
+                [h0[0], h0[1], z_front],
+                n_in,
+            );
+        }
+    }
+
+    // 6. Central bore inner cylindrical wall at r = r_bore_eff
+    let n_bore = bore_ring.len();
+    for i in 0..n_bore {
+        let next_i = (i + 1) % n_bore;
+        let b0 = bore_ring[i];
+        let b1 = bore_ring[next_i];
+        let dx = b1[0] - b0[0];
+        let dy = b1[1] - b0[1];
+        let len = dx.hypot(dy).max(1e-12);
+        let n_in = [-dy / len, dx / len, 0.0];
+        push_quad(
+            [b1[0], b1[1], z_front],
+            [b1[0], b1[1], z_back],
+            [b0[0], b0[1], z_back],
+            [b0[0], b0[1], z_front],
+            n_in,
+        );
+    }
+
+    // 7. Zipper-stitch the hub annulus between bolt_outer_ring (at r_bolt_ring) and hub_outer_ring (at r_hub_eff)
+    // Align starting index of hub_outer_ring closest to bolt_outer_ring[0] angle (0.0)
+    let n1 = bolt_outer_ring.len();
+    let n2 = hub_outer_ring.len();
+    let ang1 = |idx: usize| -> f64 {
+        let wraps = idx / n1;
+        let rem = idx % n1;
+        let p = bolt_outer_ring[rem];
+        p[1].atan2(p[0]).rem_euclid(2.0 * PI) + (wraps as f64) * 2.0 * PI
+    };
+    let ang2 = |idx: usize| -> f64 {
+        let wraps = idx / n2;
+        let rem = idx % n2;
+        phi_hub[rem] + (wraps as f64) * 2.0 * PI
+    };
+
+    let mut i1 = 0usize;
+    let mut i2 = 0usize;
+    while i1 < n1 || i2 < n2 {
+        let advance_1 = if i1 >= n1 {
+            false
+        } else if i2 >= n2 {
+            true
+        } else {
+            ang1(i1 + 1) <= ang2(i2 + 1)
+        };
+
+        let a_curr = bolt_outer_ring[i1 % n1];
+        let b_curr = hub_outer_ring[i2 % n2];
+
+        if advance_1 {
+            let a_next = bolt_outer_ring[(i1 + 1) % n1];
+            // Front cap (+Z): [a_curr, b_curr, a_next]
+            let bf = vertices.len() as u32;
+            vertices.push(Vertex::new([a_curr[0], a_curr[1], z_front], [0.0, 0.0, 1.0]));
+            vertices.push(Vertex::new([b_curr[0], b_curr[1], z_front], [0.0, 0.0, 1.0]));
+            vertices.push(Vertex::new([a_next[0], a_next[1], z_front], [0.0, 0.0, 1.0]));
+            indices.push([bf, bf + 1, bf + 2]);
+
+            // Back cap (-Z): [a_curr, a_next, b_curr]
+            let bb = vertices.len() as u32;
+            vertices.push(Vertex::new([a_curr[0], a_curr[1], z_back], [0.0, 0.0, -1.0]));
+            vertices.push(Vertex::new([a_next[0], a_next[1], z_back], [0.0, 0.0, -1.0]));
+            vertices.push(Vertex::new([b_curr[0], b_curr[1], z_back], [0.0, 0.0, -1.0]));
+            indices.push([bb, bb + 1, bb + 2]);
+
+            i1 += 1;
+        } else {
+            let b_next = hub_outer_ring[(i2 + 1) % n2];
+            // Front cap (+Z): [a_curr, b_curr, b_next]
+            let bf = vertices.len() as u32;
+            vertices.push(Vertex::new([a_curr[0], a_curr[1], z_front], [0.0, 0.0, 1.0]));
+            vertices.push(Vertex::new([b_curr[0], b_curr[1], z_front], [0.0, 0.0, 1.0]));
+            vertices.push(Vertex::new([b_next[0], b_next[1], z_front], [0.0, 0.0, 1.0]));
+            indices.push([bf, bf + 1, bf + 2]);
+
+            // Back cap (-Z): [a_curr, b_next, b_curr]
+            let bb = vertices.len() as u32;
+            vertices.push(Vertex::new([a_curr[0], a_curr[1], z_back], [0.0, 0.0, -1.0]));
+            vertices.push(Vertex::new([b_next[0], b_next[1], z_back], [0.0, 0.0, -1.0]));
+            vertices.push(Vertex::new([b_curr[0], b_curr[1], z_back], [0.0, 0.0, -1.0]));
+            indices.push([bb, bb + 1, bb + 2]);
+
+            i2 += 1;
+        }
+    }
+
+    TriangleMesh::new(vertices, indices)
 }
 
 #[cfg(test)]
