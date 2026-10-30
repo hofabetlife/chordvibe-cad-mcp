@@ -1048,32 +1048,40 @@ pub fn create_spur_gear_with_settings(
     let z = teeth as f64;
     let r = module * z * 0.5;
     let r_a = r + module;
-    let r_f = r - 1.25 * module;
+    let r_f = (r - 1.25 * module).max(0.1 * module);
     let r_b = r * alpha.cos();
     let h2 = face_width * 0.5;
 
     // Pitch circle tooth thickness half-angle: psi = pi / (2 * z)
     let psi = PI / (2.0 * z);
+    let trough_half_angle = PI / z;
     // Involute function at pressure angle alpha: inv(alpha) = tan(alpha) - alpha
     let inv_alpha = alpha.tan() - alpha;
 
     // Angle theta from tooth centerline at radius R >= r_b
+    let min_tip_half_angle = (trough_half_angle * 0.15).max(1e-4);
     let theta_at_r = |radius: f64| -> f64 {
-        if radius < r_b {
+        let raw = if radius < r_b {
             psi + inv_alpha
         } else {
             let cos_ar = (r_b / radius).clamp(0.0, 1.0);
             let alpha_r = cos_ar.acos();
             let inv_alpha_r = alpha_r.tan() - alpha_r;
-            (psi + inv_alpha - inv_alpha_r).max(1e-6)
-        }
+            (psi + inv_alpha - inv_alpha_r).max(min_tip_half_angle)
+        };
+        raw.min(trough_half_angle * 0.70)
     };
 
-    let theta_base = psi + inv_alpha;
-    let theta_root = if r_f < r_b { theta_base } else { theta_at_r(r_f) };
+    let theta_base = theta_at_r(r_b);
+    // Root fillet angle widens slightly past theta_base when r_f < r_b so that polar angle
+    // increases strictly monotonically and radial steps never create collinear cap triangles.
+    let theta_root = if r_f < r_b - 1e-9 {
+        (theta_base + 0.25 * (trough_half_angle - theta_base).max(1e-4)).min(trough_half_angle * 0.75)
+    } else {
+        theta_at_r(r_f)
+    };
 
-    // 1. Construct 2D contour points in CCW order around origin
-    let mut poly_2d: Vec<[f64; 2]> = Vec::new();
+    // 1. Build structured per-tooth levels and root-circle ring
     let n_flank_steps = match settings.quality {
         TessellationQuality::Coarse => 2,
         TessellationQuality::Medium => 4,
@@ -1082,189 +1090,385 @@ pub fn create_spur_gear_with_settings(
     };
     let r_inv_start = r_b.max(r_f);
 
+    // Build radial levels for each tooth from level 0 (r_f) up to level M (r_a)
+    let mut radial_levels: Vec<(f64, f64)> = Vec::new(); // (radius, half_angle_from_tooth_center)
+    radial_levels.push((r_f, theta_root));
+    if r_f < r_b - 1e-9 {
+        radial_levels.push((r_b, theta_base));
+    }
+    for s_idx in 1..=n_flank_steps {
+        let s = (s_idx as f64) / (n_flank_steps as f64);
+        let r_curr = r_inv_start + s * (r_a - r_inv_start);
+        radial_levels.push((r_curr, theta_at_r(r_curr)));
+    }
+    let m_levels = radial_levels.len() - 1; // index of top level at r_a
+
+    // Root circle ring has L_{k,0} and R_{k,0} per tooth, plus trough midpoint T_k when trough arc is wide
+    let include_trough_mid = (trough_half_angle - theta_root) > 0.12;
+    let mut root_angles: Vec<f64> = Vec::with_capacity(teeth * 3 + 4);
     for k in 0..teeth {
         let phi_k = (k as f64) * 2.0 * PI / z;
-
-        // 1a. Leading flank root point
-        let phi_root_lead = phi_k - theta_root;
-        poly_2d.push([r_f * phi_root_lead.cos(), r_f * phi_root_lead.sin()]);
-
-        // 1b. If r_f < r_b, radial line from r_f to r_b on leading flank
-        if r_f < r_b - 1e-9 {
-            let phi_base_lead = phi_k - theta_base;
-            poly_2d.push([r_b * phi_base_lead.cos(), r_b * phi_base_lead.sin()]);
+        root_angles.push((phi_k - theta_root).rem_euclid(2.0 * PI));
+        root_angles.push((phi_k + theta_root).rem_euclid(2.0 * PI));
+        if include_trough_mid {
+            root_angles.push((phi_k + trough_half_angle).rem_euclid(2.0 * PI));
         }
-
-        // 1c. Involute points on leading flank from r_inv_start up to r_a
-        for s_idx in 1..=n_flank_steps {
-            let s = (s_idx as f64) / (n_flank_steps as f64);
-            let r_curr = r_inv_start + s * (r_a - r_inv_start);
-            let th = theta_at_r(r_curr);
-            let phi = phi_k - th;
-            poly_2d.push([r_curr * phi.cos(), r_curr * phi.sin()]);
-        }
-
-        // 1d. Tip crest center point
-        poly_2d.push([r_a * phi_k.cos(), r_a * phi_k.sin()]);
-
-        // 1e. Involute points on trailing flank from r_a down to r_inv_start
-        for s_idx in 0..=n_flank_steps {
-            let s = 1.0 - (s_idx as f64) / (n_flank_steps as f64);
-            let r_curr = r_inv_start + s * (r_a - r_inv_start);
-            let th = theta_at_r(r_curr);
-            let phi = phi_k + th;
-            poly_2d.push([r_curr * phi.cos(), r_curr * phi.sin()]);
-        }
-
-        // 1f. If r_f < r_b, radial line from r_b down to r_f on trailing flank
-        if r_f < r_b - 1e-9 {
-            let phi_base_trail = phi_k + theta_base;
-            poly_2d.push([r_f * phi_base_trail.cos(), r_f * phi_base_trail.sin()]);
-        }
-
-        // 1g. Root trough point between tooth k and tooth k+1
-        let phi_trough = phi_k + PI / z;
-        poly_2d.push([r_f * phi_trough.cos(), r_f * phi_trough.sin()]);
     }
+    root_angles.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Filter duplicate consecutive points if any
-    let mut cleaned_poly: Vec<[f64; 2]> = Vec::with_capacity(poly_2d.len());
-    for p in poly_2d {
-        if let Some(last) = cleaned_poly.last() {
-            let d2 = (p[0] - last[0]).powi(2) + (p[1] - last[1]).powi(2);
-            if d2 > 1e-14 {
-                cleaned_poly.push(p);
-            }
+    // Determine optional bore, keyway, and hub parameters
+    let bore_r = bore_radius.unwrap_or(0.0);
+    let has_bore = bore_r > 1e-6 && bore_r < r_f * 0.96;
+
+    let kw_w = keyway_width.unwrap_or(0.0);
+    let kw_d = keyway_depth.unwrap_or(0.0);
+    let has_keyway = has_bore && kw_w > 1e-6 && kw_d > 1e-6 && (bore_r + kw_d) < r_f * 0.96;
+
+    let hub_r = hub_diameter.map(|d| d * 0.5).unwrap_or(0.0);
+    let hub_l = hub_length.unwrap_or(0.0);
+    let max_inner_r = if has_keyway {
+        ((bore_r + kw_d).hypot(kw_w * 0.5)).max(bore_r)
+    } else {
+        bore_r
+    };
+    let has_hub = hub_r > 1e-6
+        && hub_l > 1e-6
+        && hub_r < r_f * 0.98
+        && (!has_bore || hub_r > max_inner_r * 1.02);
+
+    let total_hub_len = if has_hub {
+        if hub_l > face_width {
+            hub_l
         } else {
-            cleaned_poly.push(p);
+            face_width + hub_l
         }
-    }
-    if cleaned_poly.len() > 2 {
-        let first = cleaned_poly[0];
-        let last = *cleaned_poly.last().unwrap();
-        let d2 = (first[0] - last[0]).powi(2) + (first[1] - last[1]).powi(2);
-        if d2 <= 1e-14 {
-            cleaned_poly.pop();
+    } else {
+        face_width
+    };
+    let z_hub_top = -h2 + total_hub_len;
+
+    // If a keyway is present, ensure exact keyway corner angles are in root_angles
+    let (kw_half, kw_y_top, kw_corners) = if has_keyway {
+        let w_half = (kw_w * 0.5).min(bore_r * 0.85);
+        let y_shoulder = (bore_r * bore_r - w_half * w_half).max(0.0).sqrt();
+        let y_top = bore_r + kw_d;
+        let c1 = y_shoulder.atan2(w_half).rem_euclid(2.0 * PI);
+        let c2 = y_top.atan2(w_half).rem_euclid(2.0 * PI);
+        let c3 = y_top.atan2(-w_half).rem_euclid(2.0 * PI);
+        let c4 = y_shoulder.atan2(-w_half).rem_euclid(2.0 * PI);
+        (w_half, y_top, Some([c1, c2, c3, c4]))
+    } else {
+        (0.0, 0.0, None)
+    };
+
+    if let Some(corners) = kw_corners {
+        for &c_ang in &corners {
+            let exists = root_angles.iter().any(|&a| (a - c_ang).abs() < 1e-4);
+            if !exists {
+                root_angles.push(c_ang);
+            }
         }
+        root_angles.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     }
 
-    let m_pts = cleaned_poly.len();
-    if m_pts < 3 {
-        return TriangleMesh::empty();
-    }
+    // Helper to find index of angle in root_angles
+    let find_root_angle_idx = |target_ang: f64| -> usize {
+        let norm = target_ang.rem_euclid(2.0 * PI);
+        let mut best_i = 0;
+        let mut best_d = f64::INFINITY;
+        for (i, &a) in root_angles.iter().enumerate() {
+            let diff = (a - norm)
+                .abs()
+                .min((a - norm + 2.0 * PI).abs())
+                .min((a - norm - 2.0 * PI).abs());
+            if diff < best_d {
+                best_d = diff;
+                best_i = i;
+            }
+        }
+        best_i
+    };
 
-    // 2. Extrude the star-shaped 2D polygon into a watertight 3D solid mesh
+    let root_poly: Vec<[f64; 2]> = root_angles
+        .iter()
+        .map(|&a| [r_f * a.cos(), r_f * a.sin()])
+        .collect();
+
+    // Build inner bore/keyway ring and hub ring matching root_angles
+    let inner_poly: Vec<[f64; 2]> = if has_bore {
+        root_angles
+            .iter()
+            .map(|&ang| {
+                if let Some([c1, c2, c3, c4]) = kw_corners {
+                    if ang >= c1 - 1e-4 && ang <= c2 + 1e-4 {
+                        let r_in = kw_half / ang.cos();
+                        [r_in * ang.cos(), r_in * ang.sin()]
+                    } else if ang > c2 + 1e-4 && ang < c3 - 1e-4 {
+                        let r_in = kw_y_top / ang.sin();
+                        [r_in * ang.cos(), r_in * ang.sin()]
+                    } else if ang >= c3 - 1e-4 && ang <= c4 + 1e-4 {
+                        let r_in = -kw_half / ang.cos();
+                        [r_in * ang.cos(), r_in * ang.sin()]
+                    } else {
+                        [bore_r * ang.cos(), bore_r * ang.sin()]
+                    }
+                } else {
+                    [bore_r * ang.cos(), bore_r * ang.sin()]
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let hub_poly: Vec<[f64; 2]> = if has_hub {
+        root_angles
+            .iter()
+            .map(|&ang| [hub_r * ang.cos(), hub_r * ang.sin()])
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
 
-    // 2a. Top cap at z = +h2 (normal = [0, 0, 1])
-    let top_center_idx = vertices.len() as u32;
-    vertices.push(Vertex::new([0.0, 0.0, h2], [0.0, 0.0, 1.0]));
+    // Helper: add planar fan cap around [0, 0, z]
+    let add_fan_cap = |verts: &mut Vec<Vertex>,
+                       idxs: &mut Vec<[u32; 3]>,
+                       ring: &[[f64; 2]],
+                       z_val: f64,
+                       is_top: bool| {
+        let n_z = if is_top { 1.0 } else { -1.0 };
+        let center_idx = verts.len() as u32;
+        verts.push(Vertex::new([0.0, 0.0, z_val], [0.0, 0.0, n_z]));
+        let start_idx = verts.len() as u32;
+        for p in ring {
+            verts.push(Vertex::new([p[0], p[1], z_val], [0.0, 0.0, n_z]));
+        }
+        let n = ring.len();
+        for i in 0..n {
+            let next = (i + 1) % n;
+            if is_top {
+                idxs.push([center_idx, start_idx + (i as u32), start_idx + (next as u32)]);
+            } else {
+                idxs.push([center_idx, start_idx + (next as u32), start_idx + (i as u32)]);
+            }
+        }
+    };
 
-    let top_rim_start = vertices.len() as u32;
-    for p in &cleaned_poly {
-        vertices.push(Vertex::new([p[0], p[1], h2], [0.0, 0.0, 1.0]));
-    }
-    for i in 0..m_pts {
-        let next = (i + 1) % m_pts;
-        indices.push([
-            top_center_idx,
-            top_rim_start + (i as u32),
-            top_rim_start + (next as u32),
-        ]);
-    }
+    // Helper: add planar annular cap between inner_ring and outer_ring at z_val
+    let add_annulus_cap = |verts: &mut Vec<Vertex>,
+                           idxs: &mut Vec<[u32; 3]>,
+                           in_ring: &[[f64; 2]],
+                           out_ring: &[[f64; 2]],
+                           z_val: f64,
+                           is_top: bool| {
+        let n_z = if is_top { 1.0 } else { -1.0 };
+        let in_start = verts.len() as u32;
+        for p in in_ring {
+            verts.push(Vertex::new([p[0], p[1], z_val], [0.0, 0.0, n_z]));
+        }
+        let out_start = verts.len() as u32;
+        for p in out_ring {
+            verts.push(Vertex::new([p[0], p[1], z_val], [0.0, 0.0, n_z]));
+        }
+        let n = in_ring.len();
+        for i in 0..n {
+            let next = (i + 1) % n;
+            let in_c = in_start + (i as u32);
+            let in_n = in_start + (next as u32);
+            let out_c = out_start + (i as u32);
+            let out_n = out_start + (next as u32);
+            if is_top {
+                idxs.push([in_c, out_c, out_n]);
+                idxs.push([in_c, out_n, in_n]);
+            } else {
+                idxs.push([in_c, out_n, out_c]);
+                idxs.push([in_c, in_n, out_n]);
+            }
+        }
+    };
 
-    // 2b. Bottom cap at z = -h2 (normal = [0, 0, -1])
-    let bot_center_idx = vertices.len() as u32;
-    vertices.push(Vertex::new([0.0, 0.0, -h2], [0.0, 0.0, -1.0]));
-
-    let bot_rim_start = vertices.len() as u32;
-    for p in &cleaned_poly {
-        vertices.push(Vertex::new([p[0], p[1], -h2], [0.0, 0.0, -1.0]));
-    }
-    for i in 0..m_pts {
-        let next = (i + 1) % m_pts;
-        indices.push([
-            bot_center_idx,
-            bot_rim_start + (next as u32),
-            bot_rim_start + (i as u32),
-        ]);
-    }
-
-    // 2c. Side walls quads (2 triangles each) with outward facet normals
-    for i in 0..m_pts {
-        let next = (i + 1) % m_pts;
-        let p1 = cleaned_poly[i];
-        let p2 = cleaned_poly[next];
-
-        let dx = p2[0] - p1[0];
-        let dy = p2[1] - p1[1];
-        let edge_len = (dx * dx + dy * dy).sqrt();
-        let normal = if edge_len > 1e-12 {
-            [dy / edge_len, -dx / edge_len, 0.0]
-        } else {
-            [1.0, 0.0, 0.0]
+    // Helper: add tooth-ladder caps at z_val for all teeth, stitched to root_poly
+    let add_teeth_caps = |verts: &mut Vec<Vertex>,
+                          idxs: &mut Vec<[u32; 3]>,
+                          z_val: f64,
+                          is_top: bool| {
+        let n_z = if is_top { 1.0 } else { -1.0 };
+        let mut push_tri = |a: u32, b: u32, c: u32| {
+            if is_top {
+                idxs.push([a, b, c]);
+            } else {
+                idxs.push([a, c, b]);
+            }
         };
 
-        let base = vertices.len() as u32;
-        vertices.push(Vertex::new([p1[0], p1[1], h2], normal));  // 0: top curr
-        vertices.push(Vertex::new([p1[0], p1[1], -h2], normal)); // 1: bot curr
-        vertices.push(Vertex::new([p2[0], p2[1], -h2], normal)); // 2: bot next
-        vertices.push(Vertex::new([p2[0], p2[1], h2], normal));  // 3: top next
+        let n_r = root_poly.len();
+        for k in 0..teeth {
+            let phi_k = (k as f64) * 2.0 * PI / z;
+            let idx_l = find_root_angle_idx(phi_k - theta_root);
+            let idx_r = find_root_angle_idx(phi_k + theta_root);
 
-        indices.push([base, base + 1, base + 3]);
-        indices.push([base + 1, base + 2, base + 3]);
-    }
+            // Create level >= 1 flank vertices for tooth k
+            let mut l_idxs: Vec<u32> = Vec::with_capacity(m_levels + 1);
+            let mut r_idxs: Vec<u32> = Vec::with_capacity(m_levels + 1);
+            l_idxs.push(0); // placeholder for level 0
+            r_idxs.push(0);
 
-    let mut solid = TriangleMesh::new(vertices, indices);
+            for &(r_lvl, th_lvl) in radial_levels.iter().skip(1) {
+                let p_l = [r_lvl * (phi_k - th_lvl).cos(), r_lvl * (phi_k - th_lvl).sin()];
+                let p_r = [r_lvl * (phi_k + th_lvl).cos(), r_lvl * (phi_k + th_lvl).sin()];
+                let il = verts.len() as u32;
+                verts.push(Vertex::new([p_l[0], p_l[1], z_val], [0.0, 0.0, n_z]));
+                let ir = verts.len() as u32;
+                verts.push(Vertex::new([p_r[0], p_r[1], z_val], [0.0, 0.0, n_z]));
+                l_idxs.push(il);
+                r_idxs.push(ir);
+            }
 
-    // 3. Optional Hub support
-    if let (Some(hub_d), Some(hub_l)) = (hub_diameter, hub_length) {
-        if hub_d > 1e-6 && hub_l > 1e-6 {
-            let hub_r = hub_d * 0.5;
-            let total_hub_len = if hub_l > face_width {
-                hub_l
+            // Connect root vertices between idx_l and idx_r to level 1 (l_idxs[1], r_idxs[1])
+            let steps_lr = (idx_r + n_r - idx_l) % n_r;
+            let mut base_verts: Vec<u32> = Vec::with_capacity(steps_lr + 1);
+            for s in 0..=steps_lr {
+                let rp = root_poly[(idx_l + s) % n_r];
+                let vi = verts.len() as u32;
+                verts.push(Vertex::new([rp[0], rp[1], z_val], [0.0, 0.0, n_z]));
+                base_verts.push(vi);
+            }
+            if steps_lr == 1 {
+                push_tri(base_verts[0], l_idxs[1], r_idxs[1]);
+                push_tri(base_verts[0], r_idxs[1], base_verts[1]);
             } else {
-                face_width + hub_l
-            };
-            let hub_z_center = -h2 + total_hub_len * 0.5;
-            let mut hub_mesh = create_cylinder_with_settings(hub_r, total_hub_len, settings);
-            hub_mesh.translate([0.0, 0.0, hub_z_center]);
-            solid = csg_union(&solid, &hub_mesh);
-        }
-    }
-
-    // 4. Optional Bore Hole & DIN 6885 Keyway support
-    if let Some(bore_r) = bore_radius {
-        if bore_r > 1e-6 {
-            let aabb = solid.bounding_box();
-            let z_min = aabb.min[2];
-            let z_max = aabb.max[2];
-            let total_span = z_max - z_min;
-            let margin = (total_span * 0.05).clamp(1e-4, 0.02);
-            let cutter_height = total_span + margin * 2.0;
-            let z_center = (z_min + z_max) * 0.5;
-
-            let mut bore_tool = create_cylinder_with_settings(bore_r, cutter_height, settings);
-            bore_tool.translate([0.0, 0.0, z_center]);
-
-            let cutter = if let (Some(kw), Some(kd)) = (keyway_width, keyway_depth) {
-                if kw > 1e-6 && kd > 1e-6 {
-                    let mut keyway_box = create_box(kw, bore_r + kd, cutter_height);
-                    keyway_box.translate([0.0, (bore_r + kd) * 0.5, z_center]);
-                    csg_union(&bore_tool, &keyway_box)
-                } else {
-                    bore_tool
+                let mid = steps_lr / 2;
+                for s in 0..mid {
+                    push_tri(base_verts[s], l_idxs[1], base_verts[s + 1]);
                 }
-            } else {
-                bore_tool
-            };
+                push_tri(base_verts[mid], l_idxs[1], r_idxs[1]);
+                for s in mid..steps_lr {
+                    push_tri(base_verts[s], r_idxs[1], base_verts[s + 1]);
+                }
+            }
 
-            solid = csg_difference(&solid, &cutter);
+            // Quad ladder across tooth for levels 1..(m_levels - 1)
+            for j in 1..(m_levels - 1) {
+                push_tri(l_idxs[j], l_idxs[j + 1], r_idxs[j + 1]);
+                push_tri(l_idxs[j], r_idxs[j + 1], r_idxs[j]);
+            }
+
+            // Top band (m_levels - 1) -> m_levels including tip crest point Tip_k at r_a
+            // Connecting Tip_k to level (m_levels - 1) avoids 3 nearly-collinear points on r_a!
+            let p_tip = [r_a * phi_k.cos(), r_a * phi_k.sin()];
+            let tip_idx = verts.len() as u32;
+            verts.push(Vertex::new([p_tip[0], p_tip[1], z_val], [0.0, 0.0, n_z]));
+            let prev_lvl = m_levels - 1;
+            push_tri(l_idxs[prev_lvl], l_idxs[m_levels], tip_idx);
+            push_tri(l_idxs[prev_lvl], tip_idx, r_idxs[prev_lvl]);
+            push_tri(r_idxs[prev_lvl], tip_idx, r_idxs[m_levels]);
+        }
+    };
+
+    // Build outer gear perimeter polygon matching the exact cap boundary edges
+    let mut outer_perimeter: Vec<[f64; 2]> = Vec::new();
+    let n_r = root_poly.len();
+    for k in 0..teeth {
+        let phi_k = (k as f64) * 2.0 * PI / z;
+        let idx_l = find_root_angle_idx(phi_k - theta_root);
+        let idx_r = find_root_angle_idx(phi_k + theta_root);
+        let next_k = (k + 1) % teeth;
+        let phi_next = (next_k as f64) * 2.0 * PI / z;
+        let idx_next_l = find_root_angle_idx(phi_next - theta_root);
+
+        // Leading root corner L_{k,0}
+        outer_perimeter.push(root_poly[idx_l]);
+        // Leading flank levels 1..=m_levels
+        for &(r_lvl, th_lvl) in radial_levels.iter().skip(1) {
+            outer_perimeter.push([r_lvl * (phi_k - th_lvl).cos(), r_lvl * (phi_k - th_lvl).sin()]);
+        }
+        // Tip crest center
+        outer_perimeter.push([r_a * phi_k.cos(), r_a * phi_k.sin()]);
+        // Trailing flank levels m_levels..=1
+        for &(r_lvl, th_lvl) in radial_levels.iter().skip(1).rev() {
+            outer_perimeter.push([r_lvl * (phi_k + th_lvl).cos(), r_lvl * (phi_k + th_lvl).sin()]);
+        }
+        // Trailing root corner R_{k,0} and all root trough vertices up to (excluding) L_{k+1,0}
+        let trough_steps = (idx_next_l + n_r - idx_r) % n_r;
+        for s in 0..trough_steps {
+            outer_perimeter.push(root_poly[(idx_r + s) % n_r]);
         }
     }
 
-    solid
+    // Helper: add vertical side wall between z_bot and z_top
+    let add_vertical_wall = |verts: &mut Vec<Vertex>,
+                             idxs: &mut Vec<[u32; 3]>,
+                             ring: &[[f64; 2]],
+                             z_bot: f64,
+                             z_top: f64,
+                             is_outer: bool| {
+        let n = ring.len();
+        for i in 0..n {
+            let next = (i + 1) % n;
+            let p1 = ring[i];
+            let p2 = ring[next];
+            let dx = p2[0] - p1[0];
+            let dy = p2[1] - p1[1];
+            let edge_len = dx.hypot(dy);
+            let sign = if is_outer { 1.0 } else { -1.0 };
+            let normal = if edge_len > 1e-12 {
+                [sign * dy / edge_len, -sign * dx / edge_len, 0.0]
+            } else {
+                [sign, 0.0, 0.0]
+            };
+
+            let base = verts.len() as u32;
+            verts.push(Vertex::new([p1[0], p1[1], z_top], normal)); // 0: top curr
+            verts.push(Vertex::new([p1[0], p1[1], z_bot], normal)); // 1: bot curr
+            verts.push(Vertex::new([p2[0], p2[1], z_bot], normal)); // 2: bot next
+            verts.push(Vertex::new([p2[0], p2[1], z_top], normal)); // 3: top next
+
+            if is_outer {
+                idxs.push([base, base + 1, base + 3]);
+                idxs.push([base + 1, base + 2, base + 3]);
+            } else {
+                idxs.push([base, base + 3, base + 1]);
+                idxs.push([base + 1, base + 3, base + 2]);
+            }
+        }
+    };
+
+    // Outer gear tooth wall from -h2 to +h2
+    add_vertical_wall(&mut vertices, &mut indices, &outer_perimeter, -h2, h2, true);
+    // Top and bottom tooth caps (outside r_f)
+    add_teeth_caps(&mut vertices, &mut indices, h2, true);
+    add_teeth_caps(&mut vertices, &mut indices, -h2, false);
+
+    // Inner disk/annulus inside r_f
+    match (has_hub, has_bore) {
+        (false, false) => {
+            add_fan_cap(&mut vertices, &mut indices, &root_poly, h2, true);
+            add_fan_cap(&mut vertices, &mut indices, &root_poly, -h2, false);
+        }
+        (true, false) => {
+            add_annulus_cap(&mut vertices, &mut indices, &hub_poly, &root_poly, h2, true);
+            add_vertical_wall(&mut vertices, &mut indices, &hub_poly, h2, z_hub_top, true);
+            add_fan_cap(&mut vertices, &mut indices, &hub_poly, z_hub_top, true);
+            add_fan_cap(&mut vertices, &mut indices, &root_poly, -h2, false);
+        }
+        (false, true) => {
+            add_annulus_cap(&mut vertices, &mut indices, &inner_poly, &root_poly, h2, true);
+            add_annulus_cap(&mut vertices, &mut indices, &inner_poly, &root_poly, -h2, false);
+            add_vertical_wall(&mut vertices, &mut indices, &inner_poly, -h2, h2, false);
+        }
+        (true, true) => {
+            add_annulus_cap(&mut vertices, &mut indices, &hub_poly, &root_poly, h2, true);
+            add_vertical_wall(&mut vertices, &mut indices, &hub_poly, h2, z_hub_top, true);
+            add_annulus_cap(&mut vertices, &mut indices, &inner_poly, &hub_poly, z_hub_top, true);
+            add_annulus_cap(&mut vertices, &mut indices, &inner_poly, &root_poly, -h2, false);
+            add_vertical_wall(&mut vertices, &mut indices, &inner_poly, -h2, z_hub_top, false);
+        }
+    }
+
+    TriangleMesh::new(vertices, indices)
 }
 
 /// Helper: 2D polygon ear-clipping triangulation for simple polygons.
