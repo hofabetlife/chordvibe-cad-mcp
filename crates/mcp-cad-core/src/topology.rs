@@ -324,6 +324,14 @@ impl TriangleMesh {
                 v.normal = [nx / len, ny / len, nz / len];
             }
         }
+
+        // If an odd number of axes have negative scale factors (mirror reflection),
+        // reverse triangle winding to preserve outward CCW face orientation and positive signed volume.
+        if scale_factors[0] * scale_factors[1] * scale_factors[2] < 0.0 {
+            for tri in &mut self.indices {
+                tri.swap(1, 2);
+            }
+        }
     }
 
     /// Rotates the mesh around X, Y, Z axes using Roll-Pitch-Yaw angles in degrees.
