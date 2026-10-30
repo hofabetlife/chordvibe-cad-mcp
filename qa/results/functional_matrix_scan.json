@@ -1,0 +1,39 @@
+{
+  "phase": "phase_2_functional_matrix",
+  "results": [
+    {
+      "check": "dag_rollback_on_invalid_feature",
+      "dag_nodes_count_after_rejected_op": 1,
+      "expected_dag_nodes_count": 1,
+      "ok_valid_box": true,
+      "query_after_fail": true,
+      "rejected_negative_box": true,
+      "subsequent_op_response": {
+        "feature_id": "e39452e5-cd77-43d3-8027-d10f2f577a9d"
+      },
+      "subsequent_valid_op_succeeded": true,
+      "volume_preserved": 0.0010000000000000005
+    },
+    {
+      "batch_failed_as_expected": true,
+      "check": "batch_cad_operations_atomicity",
+      "orphan_part_left_behind": false,
+      "pass": true
+    },
+    {
+      "check": "polygon_prism_rejects_sides_lt_3",
+      "pass": true,
+      "rejected": true
+    },
+    {
+      "check": "open_preview_window_validates_part_id",
+      "pass": true,
+      "rejected_non_existent_part": true
+    },
+    {
+      "check": "capture_viewport_rejects_zero_dimensions",
+      "pass": true,
+      "rejected": true
+    }
+  ]
+}
