@@ -1,8 +1,9 @@
-/target
-**/*.rs.bk
-*.swp
-*.bak
+node_modules/
+target/
+build/
+dist/
+coverage/
 .DS_Store
-Thumbs.db
-.vscode/
-.idea/
+*.log
+.env*
+!.env.example

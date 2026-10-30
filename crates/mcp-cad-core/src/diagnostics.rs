@@ -183,19 +183,40 @@ pub fn validate_mesh(mesh: &TriangleMesh, expected_genus: Option<i32>) -> MeshVa
     let weld_eps = (diag * 1e-7).max(1e-12);
     let weld_scale = 1.0 / weld_eps;
 
-    // 1. Weld vertices
-    let mut point_to_welded: HashMap<QuantizedPoint, u32> = HashMap::new();
+    // 1. Weld vertices (checking 3x3x3 neighborhood to avoid quantization boundary splits)
+    let mut cell_to_welded: HashMap<QuantizedPoint, Vec<u32>> = HashMap::new();
     let mut vertex_to_welded: Vec<u32> = Vec::with_capacity(mesh.vertices.len());
     let mut welded_positions: Vec<Vector3<f64>> = Vec::new();
+    let weld_eps_sq = weld_eps * weld_eps;
 
     for v in &mesh.vertices {
         let pos = v.pos_vec();
-        let key = QuantizedPoint::new(&pos, weld_scale);
-        let welded_idx = match point_to_welded.get(&key) {
-            Some(&idx) => idx,
+        let base_key = QuantizedPoint::new(&pos, weld_scale);
+        let mut found_idx = None;
+        'search: for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    let k = QuantizedPoint([
+                        base_key.0[0] + dx,
+                        base_key.0[1] + dy,
+                        base_key.0[2] + dz,
+                    ]);
+                    if let Some(candidates) = cell_to_welded.get(&k) {
+                        for &cand_idx in candidates {
+                            if (welded_positions[cand_idx as usize] - pos).norm_squared() <= weld_eps_sq {
+                                found_idx = Some(cand_idx);
+                                break 'search;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let welded_idx = match found_idx {
+            Some(idx) => idx,
             None => {
                 let idx = welded_positions.len() as u32;
-                point_to_welded.insert(key, idx);
+                cell_to_welded.entry(base_key).or_default().push(idx);
                 welded_positions.push(pos);
                 idx
             }
@@ -713,12 +734,19 @@ fn tri_tri_intersection_test(
     let n1 = n1 / n1_len;
     let d1 = -n1.dot(&p0);
 
+    let scale = (p1 - p0)
+        .norm()
+        .max((p2 - p0).norm())
+        .max((q1 - q0).norm())
+        .max((q2 - q0).norm())
+        .max(1e-6);
+    let eps = 1e-6 * scale;
+
     // Distances of triangle Q to plane P
     let dq0 = n1.dot(&q0) + d1;
     let dq1 = n1.dot(&q1) + d1;
     let dq2 = n1.dot(&q2) + d1;
 
-    let eps = 1e-9;
     if (dq0 > eps && dq1 > eps && dq2 > eps) || (dq0 < -eps && dq1 < -eps && dq2 < -eps) {
         return TriIntersectResult::Disjoint;
     }
@@ -744,65 +772,139 @@ fn tri_tri_intersection_test(
     let line_dir = n1.cross(&n2);
     let line_len = line_dir.norm();
 
-    if line_len < 1e-8 {
+    if line_len < 1e-6 {
         // Planes are parallel or coplanar
-        if dq0.abs() < eps && dq1.abs() < eps && dq2.abs() < eps {
+        if dq0.abs() <= eps
+            && dq1.abs() <= eps
+            && dq2.abs() <= eps
+            && coplanar_tri_tri_2d_overlap(&[p0, p1, p2], &[q0, q1, q2], n1, eps)
+        {
             return TriIntersectResult::CoplanarOverlap;
         }
+        return TriIntersectResult::Disjoint;
+    }
+
+    // Require that at least one triangle strictly straddles the plane of the other
+    // (avoiding false positives on triangles that merely touch along a shared plane/T-junction).
+    let q_straddles_p =
+        (dq0 > eps || dq1 > eps || dq2 > eps) && (dq0 < -eps || dq1 < -eps || dq2 < -eps);
+    let p_straddles_q =
+        (dp0 > eps || dp1 > eps || dp2 > eps) && (dp0 < -eps || dp1 < -eps || dp2 < -eps);
+    if !q_straddles_p && !p_straddles_q {
         return TriIntersectResult::Disjoint;
     }
 
     let line_dir = line_dir / line_len;
 
     // Compute intervals on the intersection line
-    let (t1_min, t1_max) = match compute_interval(p0, p1, p2, dp0, dp1, dp2, line_dir) {
+    let (t1_min, t1_max) = match compute_interval(&[p0, p1, p2], [dp0, dp1, dp2], line_dir, eps) {
         Some(res) => res,
         None => return TriIntersectResult::Disjoint,
     };
 
-    let (t2_min, t2_max) = match compute_interval(q0, q1, q2, dq0, dq1, dq2, line_dir) {
+    let (t2_min, t2_max) = match compute_interval(&[q0, q1, q2], [dq0, dq1, dq2], line_dir, eps) {
         Some(res) => res,
         None => return TriIntersectResult::Disjoint,
     };
 
-    if t1_max < t2_min - eps || t2_max < t1_min - eps {
+    if t1_max <= t2_min + eps || t2_max <= t1_min + eps {
         TriIntersectResult::Disjoint
     } else {
         TriIntersectResult::Intersect
     }
 }
 
+/// 2D Separating Axis Theorem (SAT) test for coplanar triangles projected onto their dominant axis plane.
+fn coplanar_tri_tri_2d_overlap(
+    p: &[Vector3<f64>; 3],
+    q: &[Vector3<f64>; 3],
+    normal: Vector3<f64>,
+    eps: f64,
+) -> bool {
+    let ax = normal.x.abs();
+    let ay = normal.y.abs();
+    let az = normal.z.abs();
+
+    let project = |v: Vector3<f64>| -> [f64; 2] {
+        if ax >= ay && ax >= az {
+            [v.y, v.z]
+        } else if ay >= ax && ay >= az {
+            [v.x, v.z]
+        } else {
+            [v.x, v.y]
+        }
+    };
+
+    let tri_p = [project(p[0]), project(p[1]), project(p[2])];
+    let tri_q = [project(q[0]), project(q[1]), project(q[2])];
+
+    for tri in [&tri_p, &tri_q] {
+        for i in 0..3 {
+            let j = (i + 1) % 3;
+            let ex = tri[j][0] - tri[i][0];
+            let ey = tri[j][1] - tri[i][1];
+            let len = (ex * ex + ey * ey).sqrt();
+            if len < 1e-12 {
+                continue;
+            }
+            let nx = -ey / len;
+            let ny = ex / len;
+
+            let mut min_p = f64::INFINITY;
+            let mut max_p = f64::NEG_INFINITY;
+            let mut min_q = f64::INFINITY;
+            let mut max_q = f64::NEG_INFINITY;
+
+            for pt in &tri_p {
+                let d = pt[0] * nx + pt[1] * ny;
+                min_p = min_p.min(d);
+                max_p = max_p.max(d);
+            }
+            for pt in &tri_q {
+                let d = pt[0] * nx + pt[1] * ny;
+                min_q = min_q.min(d);
+                max_q = max_q.max(d);
+            }
+
+            if max_p <= min_q + eps || max_q <= min_p + eps {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
 /// Helper to project triangle intersection points onto the line.
 fn compute_interval(
-    p0: Vector3<f64>,
-    p1: Vector3<f64>,
-    p2: Vector3<f64>,
-    d0: f64,
-    d1: f64,
-    d2: f64,
+    pts: &[Vector3<f64>; 3],
+    dists: [f64; 3],
     dir: Vector3<f64>,
+    eps: f64,
 ) -> Option<(f64, f64)> {
-    let mut isect = Vec::with_capacity(2);
-    let pts = [p0, p1, p2];
-    let dists = [d0, d1, d2];
+    let mut isect = Vec::with_capacity(3);
 
     for i in 0..3 {
         let j = (i + 1) % 3;
         let di = dists[i];
         let dj = dists[j];
 
-        if (di > 0.0 && dj < 0.0) || (di < 0.0 && dj > 0.0) {
+        if (di > eps && dj < -eps) || (di < -eps && dj > eps) {
             let t = di / (di - dj);
             let pt = pts[i] + (pts[j] - pts[i]) * t;
             isect.push(pt.dot(&dir));
-        } else if di.abs() < 1e-12 {
+        } else if di.abs() <= eps {
             isect.push(pts[i].dot(&dir));
         }
     }
 
     if isect.len() >= 2 {
-        let min = isect[0].min(isect[1]);
-        let max = isect[0].max(isect[1]);
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+        for &v in &isect {
+            min = min.min(v);
+            max = max.max(v);
+        }
         Some((min, max))
     } else {
         None

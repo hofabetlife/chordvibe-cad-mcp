@@ -1476,96 +1476,127 @@ pub fn create_revolve(profile: &[[f64; 2]], angle_deg: f64, segments: usize) -> 
         pts.reverse();
     }
 
-    // 3. Generate vertices in angular rings
+    // 3. Generate side-wall quad strips per profile segment with exact analytical normals
     let n_steps = if is_full_circle { segs } else { segs + 1 };
-    let mut vertices = Vec::with_capacity(n_steps * m);
+    let mut vertices = Vec::with_capacity(n_steps * m * 2);
     let mut indices = Vec::new();
 
-    for j in 0..n_steps {
-        let theta = if is_full_circle {
-            (j as f64) * 2.0 * PI / (segs as f64)
-        } else {
-            (j as f64) * sweep_angle_rad / (segs as f64)
-        };
-        let cos_t = theta.cos();
-        let sin_t = theta.sin();
+    let thetas: Vec<(f64, f64)> = (0..n_steps)
+        .map(|j| {
+            let theta = if is_full_circle {
+                (j as f64) * 2.0 * PI / (segs as f64)
+            } else {
+                (j as f64) * sweep_angle_rad / (segs as f64)
+            };
+            (theta.cos(), theta.sin())
+        })
+        .collect();
 
-        for p in &pts {
-            let r = p[0];
-            let z = p[1];
-            let x = r * cos_t;
-            let y = r * sin_t;
-            vertices.push(Vertex::new([x, y, z], [cos_t, sin_t, 0.0]));
+    for i in 0..m {
+        let next_i = (i + 1) % m;
+        let r_a = if pts[i][0] < 1e-9 { 0.0 } else { pts[i][0] };
+        let z_a = pts[i][1];
+        let r_b = if pts[next_i][0] < 1e-9 { 0.0 } else { pts[next_i][0] };
+        let z_b = pts[next_i][1];
+
+        // Edge lying on rotation axis has zero surface area
+        if r_a < 1e-9 && r_b < 1e-9 {
+            continue;
         }
-    }
 
-    // 4. Triangulate quad strips between ring j and ring next_j
-    for j in 0..segs {
-        let next_j = if is_full_circle {
-            (j + 1) % segs
-        } else {
-            j + 1
-        };
+        // Outward 2D normal for CCW profile in (r, z): (dz, -dr) / len
+        let dr = r_b - r_a;
+        let dz = z_b - z_a;
+        let seg_len = (dr * dr + dz * dz).sqrt().max(1e-12);
+        let nr = dz / seg_len;
+        let nz = -dr / seg_len;
 
-        for i in 0..m {
-            let next_i = (i + 1) % m;
+        let base_v = vertices.len() as u32;
+        for &(cos_t, sin_t) in &thetas {
+            let xa = if r_a == 0.0 { 0.0 } else { r_a * cos_t };
+            let ya = if r_a == 0.0 { 0.0 } else { r_a * sin_t };
+            let xb = if r_b == 0.0 { 0.0 } else { r_b * cos_t };
+            let yb = if r_b == 0.0 { 0.0 } else { r_b * sin_t };
+            let n3 = [nr * cos_t, nr * sin_t, nz];
+            vertices.push(Vertex::new([xa, ya, z_a], n3));
+            vertices.push(Vertex::new([xb, yb, z_b], n3));
+        }
 
-            let r_a = pts[i][0];
-            let r_b = pts[next_i][0];
+        for j in 0..segs {
+            let next_j = if is_full_circle {
+                (j + 1) % segs
+            } else {
+                j + 1
+            };
 
-            // Edge lying on rotation axis has zero surface area
-            if r_a < 1e-9 && r_b < 1e-9 {
-                continue;
-            }
-
-            let v_curr_i = (j * m + i) as u32;
-            let v_curr_next = (j * m + next_i) as u32;
-            let v_next_i = (next_j * m + i) as u32;
-            let v_next_next = (next_j * m + next_i) as u32;
+            let v_curr_a = base_v + (j as u32) * 2;
+            let v_curr_b = v_curr_a + 1;
+            let v_next_a = base_v + (next_j as u32) * 2;
+            let v_next_b = v_next_a + 1;
 
             if r_a < 1e-9 {
-                // Triangle fan around axis point at i
-                indices.push([v_curr_i, v_next_next, v_curr_next]);
+                // Triangle fan around axis point at a
+                indices.push([v_curr_a, v_next_b, v_curr_b]);
             } else if r_b < 1e-9 {
-                // Triangle fan around axis point at next_i
-                indices.push([v_curr_i, v_next_i, v_next_next]);
+                // Triangle fan around axis point at b
+                indices.push([v_curr_a, v_next_a, v_next_b]);
             } else {
                 // Regular quad split into 2 triangles
-                indices.push([v_curr_i, v_next_i, v_next_next]);
-                indices.push([v_curr_i, v_next_next, v_curr_next]);
+                indices.push([v_curr_a, v_next_a, v_next_b]);
+                indices.push([v_curr_a, v_next_b, v_curr_b]);
             }
         }
     }
 
-    // 5. If partial angle, cap the planar start and end faces
+    // 4. If partial angle, cap the planar start and end faces with dedicated flat-normal vertices
     if !is_full_circle {
         let cap_triangles = triangulate_simple_polygon_2d(&pts);
-        // Start cap at ring 0 (theta = 0): outward normal points towards -Y
-        for tri in &cap_triangles {
-            let i0 = tri[0];
-            let i1 = tri[1];
-            let i2 = tri[2];
-            indices.push([i0, i2, i1]);
+
+        // Start cap at theta = 0: outward normal points towards -Y (e_r x e_z = [0, -1, 0])
+        let start_cap_base = vertices.len() as u32;
+        let start_normal = [0.0, -1.0, 0.0];
+        for p in &pts {
+            let r = if p[0] < 1e-9 { 0.0 } else { p[0] };
+            vertices.push(Vertex::new([r, 0.0, p[1]], start_normal));
         }
-        // End cap at ring segs (theta = sweep_angle): outward normal points towards +theta
-        let end_offset = (segs * m) as u32;
         for tri in &cap_triangles {
-            let i0 = end_offset + tri[0];
-            let i1 = end_offset + tri[1];
-            let i2 = end_offset + tri[2];
-            indices.push([i0, i1, i2]);
+            indices.push([
+                start_cap_base + tri[0],
+                start_cap_base + tri[1],
+                start_cap_base + tri[2],
+            ]);
+        }
+
+        // End cap at theta = sweep_angle: outward normal points towards +e_theta = [-sin, cos, 0]
+        let end_cap_base = vertices.len() as u32;
+        let (cos_end, sin_end) = thetas[segs];
+        let end_normal = [-sin_end, cos_end, 0.0];
+        for p in &pts {
+            let r = if p[0] < 1e-9 { 0.0 } else { p[0] };
+            let x = if r == 0.0 { 0.0 } else { r * cos_end };
+            let y = if r == 0.0 { 0.0 } else { r * sin_end };
+            vertices.push(Vertex::new([x, y, p[1]], end_normal));
+        }
+        for tri in &cap_triangles {
+            indices.push([
+                end_cap_base + tri[0],
+                end_cap_base + tri[2],
+                end_cap_base + tri[1],
+            ]);
         }
     }
 
     let mut mesh = TriangleMesh::new(vertices, indices);
 
-    // 6. Enforce outward orientation and calculate accurate vertex normals
+    // 5. Enforce outward orientation
     if mesh.signed_volume() < 0.0 {
         for tri in &mut mesh.indices {
             tri.swap(1, 2);
         }
+        for v in &mut mesh.vertices {
+            v.normal = [-v.normal[0], -v.normal[1], -v.normal[2]];
+        }
     }
-    mesh.recompute_vertex_normals();
 
     mesh
 }

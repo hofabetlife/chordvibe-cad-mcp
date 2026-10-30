@@ -9,29 +9,29 @@
 
 | № | Инструмент | HP | BND | INV | IDEM | CONS | Статус |
 |---|---|---|---|---|---|---|---|
-| 1 | `create_part` | UNTESTED | UNTESTED | UNTESTED | UNTESTED | UNTESTED | PENDING |
-| 2 | `list_parts` | UNTESTED | UNTESTED | UNTESTED | UNTESTED | UNTESTED | PENDING |
-| 3 | `delete_part` | UNTESTED | UNTESTED | UNTESTED | UNTESTED | UNTESTED | PENDING |
-| 4 | `add_feature_primitive` | UNTESTED | UNTESTED | UNTESTED | UNTESTED | UNTESTED | PENDING |
-| 5 | `cut_hole` | UNTESTED | UNTESTED | UNTESTED | UNTESTED | UNTESTED | PENDING |
-| 6 | `modify_feature` | UNTESTED | UNTESTED | UNTESTED | UNTESTED | UNTESTED | PENDING |
-| 7 | `get_feature_tree` | UNTESTED | UNTESTED | UNTESTED | UNTESTED | UNTESTED | PENDING |
-| 8 | `cut_helical_groove` | UNTESTED | UNTESTED | UNTESTED | UNTESTED | UNTESTED | PENDING |
-| 9 | `boolean_difference` | UNTESTED | UNTESTED | UNTESTED | UNTESTED | UNTESTED | PENDING |
-| 10 | `tessellate_part` | UNTESTED | UNTESTED | UNTESTED | UNTESTED | UNTESTED | PENDING |
-| 11 | `create_joint` | UNTESTED | UNTESTED | UNTESTED | UNTESTED | UNTESTED | PENDING |
-| 12 | `set_joint_motor` | UNTESTED | UNTESTED | UNTESTED | UNTESTED | UNTESTED | PENDING |
-| 13 | `run_physics_simulation` | UNTESTED | UNTESTED | UNTESTED | UNTESTED | UNTESTED | PENDING |
-| 14 | `run_fea_analysis` | UNTESTED | UNTESTED | UNTESTED | UNTESTED | UNTESTED | PENDING |
-| 15 | `get_fea_heatmap_image` | UNTESTED | UNTESTED | UNTESTED | UNTESTED | UNTESTED | PENDING |
-| 16 | `capture_viewport` | UNTESTED | UNTESTED | UNTESTED | UNTESTED | UNTESTED | PENDING |
-| 17 | `open_preview_window` | UNTESTED | UNTESTED | UNTESTED | UNTESTED | UNTESTED | PENDING |
-| 18 | `import_stl` | UNTESTED | UNTESTED | UNTESTED | UNTESTED | UNTESTED | PENDING |
-| 19 | `export_stl` | UNTESTED | UNTESTED | UNTESTED | UNTESTED | UNTESTED | PENDING |
-| 20 | `get_simulation_metrics_json` | UNTESTED | UNTESTED | UNTESTED | UNTESTED | UNTESTED | PENDING |
-| 21 | `query_part_geometry` | UNTESTED | UNTESTED | UNTESTED | UNTESTED | UNTESTED | PENDING |
-| 22 | `boolean_union` | UNTESTED | UNTESTED | UNTESTED | UNTESTED | UNTESTED | PENDING |
-| 23 | `boolean_intersection` | UNTESTED | UNTESTED | UNTESTED | UNTESTED | UNTESTED | PENDING |
-| 24 | `transform_part` | UNTESTED | UNTESTED | UNTESTED | UNTESTED | UNTESTED | PENDING |
-| 25 | `define_material` | UNTESTED | UNTESTED | UNTESTED | UNTESTED | UNTESTED | PENDING |
-| 26 | `batch_cad_operations` | UNTESTED | UNTESTED | UNTESTED | UNTESTED | UNTESTED | PENDING |
+| 1 | `create_part` | PASS | PASS | PASS | PASS | PASS | TESTED |
+| 2 | `list_parts` | PASS | PASS | PASS | PASS | PASS | TESTED |
+| 3 | `delete_part` | PASS | PASS | PASS | PASS | PASS | TESTED |
+| 4 | `add_feature_primitive` | FAIL (BUG-002..005) | FAIL (BUG-005,008) | PASS | FAIL (BUG-008) | PASS | DEFECTS FOUND |
+| 5 | `cut_hole` | FAIL (BUG-006) | FAIL (BUG-008) | PASS | FAIL (BUG-008) | PASS | DEFECTS FOUND |
+| 6 | `modify_feature` | PASS | FAIL (BUG-008) | PASS | PASS | PASS | DEFECTS FOUND |
+| 7 | `get_feature_tree` | PASS | PASS | PASS | PASS | PASS | TESTED |
+| 8 | `cut_helical_groove` | FAIL (BUG-006) | FAIL (BUG-008) | PASS | FAIL (BUG-008) | PASS | DEFECTS FOUND |
+| 9 | `boolean_difference` | FAIL (BUG-006) | FAIL (BUG-008) | PASS | FAIL (BUG-008) | PASS | DEFECTS FOUND |
+| 10 | `tessellate_part` | PASS | PASS | PASS | PASS | PASS | TESTED |
+| 11 | `create_joint` | PASS | PASS | PASS | PASS | PASS | TESTED |
+| 12 | `set_joint_motor` | PASS | PASS | PASS | PASS | PASS | TESTED |
+| 13 | `run_physics_simulation` | PASS | PASS | PASS | PASS | PASS | TESTED |
+| 14 | `run_fea_analysis` | PASS | PASS | PASS | PASS | PASS | TESTED |
+| 15 | `get_fea_heatmap_image` | PASS | PASS | PASS | PASS | PASS | TESTED |
+| 16 | `capture_viewport` | PASS | PASS | PASS | PASS | PASS | TESTED |
+| 17 | `open_preview_window` | PASS | PASS | FAIL (BUG-010) | PASS | PASS | DEFECTS FOUND |
+| 18 | `import_stl` | PASS | PASS | PASS | PASS | PASS | TESTED |
+| 19 | `export_stl` | PASS | PASS | PASS | PASS | PASS | TESTED |
+| 20 | `get_simulation_metrics_json` | PASS | PASS | PASS | PASS | PASS | TESTED |
+| 21 | `query_part_geometry` | PASS | PASS | PASS | PASS | PASS | TESTED |
+| 22 | `boolean_union` | FAIL (BUG-006) | FAIL (BUG-008) | PASS | FAIL (BUG-008) | PASS | DEFECTS FOUND |
+| 23 | `boolean_intersection` | FAIL (BUG-006) | FAIL (BUG-008) | PASS | FAIL (BUG-008) | PASS | DEFECTS FOUND |
+| 24 | `transform_part` | PASS | FAIL (BUG-007) | PASS | FAIL (BUG-008) | PASS | DEFECTS FOUND |
+| 25 | `define_material` | PASS | PASS | PASS | PASS | PASS | TESTED |
+| 26 | `batch_cad_operations` | PASS | PASS | PASS | FAIL (BUG-009) | PASS | DEFECTS FOUND |
