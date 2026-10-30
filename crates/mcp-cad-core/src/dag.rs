@@ -423,6 +423,12 @@ impl FeatureTree {
                     position,
                     rotation_deg,
                 } => {
+                    if *sides < 3 {
+                        return Err(CadError::InvalidParameter(format!(
+                            "Polygon prism sides must be at least 3, got: {}",
+                            sides
+                        )));
+                    }
                     if *height <= 0.0 {
                         return Err(CadError::InvalidParameter(format!(
                             "Polygon prism height must be positive, got: {}",

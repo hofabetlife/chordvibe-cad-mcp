@@ -1038,4 +1038,64 @@ fn test_bug_007_negative_scale_preserves_outward_winding() {
     }
 }
 
+#[tokio::test]
+async fn test_bug_005_polygon_prism_chamfer_and_sides_validation() {
+    let art_dir = qa_base_dir().join("artifacts");
+    std::fs::create_dir_all(&art_dir).unwrap();
+
+    for sides in [3, 4, 6, 8, 12] {
+        let plain = create_polygon_prism(sides, 0.05, Some(0.04), None, None);
+        let rep_plain = validate_mesh(&plain, Some(0));
+        assert_eq!(rep_plain.status, "PASS", "Plain prism {} sides failed: {:?}", sides, rep_plain.issues);
+
+        let chamf = create_polygon_prism(sides, 0.05, Some(0.04), None, Some(0.003));
+        let rep_chamf = validate_mesh(&chamf, Some(0));
+        assert_eq!(rep_chamf.status, "PASS", "Chamfered prism {} sides failed: {:?}", sides, rep_chamf.issues);
+        assert!(
+            chamf.volume() < plain.volume(),
+            "Chamfer on {}-sided prism must reduce volume: chamf={} vs plain={}",
+            sides,
+            chamf.volume(),
+            plain.volume()
+        );
+    }
+
+    // Verify sides < 3 is rejected by MCP add_feature_primitive
+    let state = EngineState::new().unwrap().into_shared();
+    let (_, p_res) = call_tool(
+        &state,
+        "create_part",
+        json!({"name": "PrismReject", "material": "steel_structural_aisi1020"}),
+    )
+    .await;
+    let pid = p_res["part_id"].as_str().unwrap().to_string();
+    let (ok_s2, _) = call_tool(
+        &state,
+        "add_feature_primitive",
+        json!({"part_id": pid, "primitive_type": "polygon_prism", "sides": 2, "height": 0.05, "radius": 0.02}),
+    )
+    .await;
+    assert!(!ok_s2, "sides=2 must be rejected by add_feature_primitive");
+
+    // Render chamfered hex prism in all 5 debug modes for visual inspection
+    let hex_chamf = create_polygon_prism(6, 0.03, Some(0.04), None, Some(0.004));
+    let engine = state.read();
+    for mode_name in ["shaded", "wireframe", "normals", "backfaces", "boundary_edges"] {
+        let out_path = art_dir.join(format!("polygon_prism_hex_chamfer_{}.png", mode_name));
+        let debug_mode = mcp_cad_viewer::DebugRenderMode::parse(Some(mode_name));
+        let png_bytes = engine
+            .offscreen_renderer
+            .render_mesh_png_debug(
+                &hex_chamf,
+                mcp_cad_viewer::CameraPreset::Isometric,
+                debug_mode,
+                800,
+                600,
+            )
+            .unwrap();
+        std::fs::write(&out_path, &png_bytes).unwrap();
+    }
+}
+
+
 
