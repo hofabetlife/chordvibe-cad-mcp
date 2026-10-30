@@ -1369,3 +1369,65 @@ async fn test_bug_006_csg_booleans_and_holes_watertight() {
     }
 }
 
+#[test]
+fn test_bug_008_dag_rollback_on_failed_rebuild() {
+    let mut state = EngineState::new().unwrap();
+    // 1. Create a valid part with a box
+    let p_res = mcp_cad_server::tools::cad::create_part(&json!({"name": "rollback_test", "material": "aluminum_6061_t6"}), &mut state).unwrap();
+    let part_id = p_res["part_id"].as_str().unwrap();
+
+    let f_box = mcp_cad_server::tools::cad::add_feature_primitive(&json!({
+        "part_id": part_id,
+        "primitive_type": "box",
+        "params": {"width": 0.1, "height": 0.1, "depth": 0.1}
+    }), &mut state).unwrap();
+    let box_feat_id = f_box["feature_id"].as_str().unwrap();
+
+    let initial_verts = state.parts[part_id].mesh.vertices.len();
+    let initial_nodes_len = state.parts[part_id].dag.nodes.len();
+    assert_eq!(initial_nodes_len, 1);
+    assert!(initial_verts > 0);
+
+    // 2. Attempt an invalid cut_hole that produces CadError (e.g. radius <= 0)
+    let bad_hole = mcp_cad_server::tools::cad::cut_hole(&json!({
+        "part_id": part_id,
+        "position": [0.0, 0.0, 0.0],
+        "normal": [0.0, 0.0, 1.0],
+        "radius": 0.0,
+        "depth": 0.1
+    }), &mut state);
+    assert!(bad_hole.is_err());
+
+    // 3. Verify DAG and mesh rolled back cleanly to 1 node
+    assert_eq!(state.parts[part_id].dag.nodes.len(), 1);
+    assert_eq!(state.parts[part_id].mesh.vertices.len(), initial_verts);
+
+    // 4. Attempt an invalid modify_feature (e.g. box width -0.05)
+    let bad_mod = mcp_cad_server::tools::cad::modify_feature(&json!({
+        "part_id": part_id,
+        "feature_id": box_feat_id,
+        "params": {"width": -0.05}
+    }), &mut state);
+    assert!(bad_mod.is_err());
+
+    // Verify DAG and mesh are still intact
+    assert_eq!(state.parts[part_id].dag.nodes.len(), 1);
+    assert_eq!(state.parts[part_id].mesh.vertices.len(), initial_verts);
+}
+
+#[test]
+fn test_bug_010_viewport_and_preview_validation() {
+    let state = EngineState::new().unwrap();
+
+    // 1. capture_viewport with width=0 or height=0 must fail with InvalidArgument
+    let err_w = mcp_cad_server::tools::render::capture_viewport(&json!({"width": 0, "height": 600}), &state);
+    assert!(err_w.is_err());
+
+    let err_h = mcp_cad_server::tools::render::capture_viewport(&json!({"width": 800, "height": 0}), &state);
+    assert!(err_h.is_err());
+
+    // 2. open_preview_window with nonexistent part must fail with PartNotFound even in headless mode
+    let err_preview = mcp_cad_server::tools::render::open_preview_window(&json!({"part_id": "nonexistent_part"}), &state);
+    assert!(err_preview.is_err());
+}
+
