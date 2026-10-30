@@ -1652,16 +1652,33 @@ pub fn batch_cad_operations(args: &Value, state: &mut EngineState) -> Result<Val
         .and_then(|v| v.as_array())
         .ok_or_else(|| ServerError::InvalidArgument("Missing required array 'operations'".to_string()))?;
 
+    let prev_parts = state.parts.clone();
+    let prev_materials = state.materials.clone();
+    let prev_last_fea_reports = state.last_fea_reports.clone();
+    let prev_last_fea_meshes = state.last_fea_meshes.clone();
+    let prev_last_simulation = state.last_simulation.clone();
+
     let mut results = Vec::with_capacity(operations.len());
 
     for (idx, op) in operations.iter().enumerate() {
-        let tool_name = op
-            .get("tool")
-            .or_else(|| op.get("name"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ServerError::InvalidArgument(format!("Operation at index {idx} missing 'tool' field")))?;
+        let tool_name = match op.get("tool").or_else(|| op.get("name")).and_then(|v| v.as_str()) {
+            Some(name) => name,
+            None => {
+                state.parts = prev_parts;
+                state.materials = prev_materials;
+                state.last_fea_reports = prev_last_fea_reports;
+                state.last_fea_meshes = prev_last_fea_meshes;
+                state.last_simulation = prev_last_simulation;
+                return Err(ServerError::InvalidArgument(format!("Operation at index {idx} missing 'tool' field")));
+            }
+        };
 
         if tool_name == "batch_cad_operations" {
+            state.parts = prev_parts;
+            state.materials = prev_materials;
+            state.last_fea_reports = prev_last_fea_reports;
+            state.last_fea_meshes = prev_last_fea_meshes;
+            state.last_simulation = prev_last_simulation;
             return Err(ServerError::InvalidParameter(format!(
                 "Nested 'batch_cad_operations' is not permitted (at index {idx})"
             )));
@@ -1683,6 +1700,11 @@ pub fn batch_cad_operations(args: &Value, state: &mut EngineState) -> Result<Val
                 results.push(val);
             }
             Err(err) => {
+                state.parts = prev_parts;
+                state.materials = prev_materials;
+                state.last_fea_reports = prev_last_fea_reports;
+                state.last_fea_meshes = prev_last_fea_meshes;
+                state.last_simulation = prev_last_simulation;
                 return Err(ServerError::InvalidArgument(format!(
                     "Batch operation at index {idx} ('{tool_name}') failed: {err}"
                 )));
