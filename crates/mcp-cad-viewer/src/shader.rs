@@ -42,7 +42,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 }
 
 @fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+fn fs_main(in: VertexOutput, @builtin(front_facing) is_front: bool) -> @location(0) vec4<f32> {
     var n = normalize(in.world_normal);
     let view_dir = normalize(camera.camera_pos.xyz - in.world_position);
     
@@ -51,9 +51,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(n * 0.5 + 0.5, 1.0);
     }
 
-    // Debug mode 3: Backfaces highlight (bright magenta for inverted faces)
+    // Debug mode 3: Backfaces highlight (bright magenta for geometric back-facing triangles)
     if (material.debug_mode == 3u) {
-        if (dot(in.world_normal, view_dir) < 0.0) {
+        if (!is_front) {
             return vec4<f32>(1.0, 0.05, 0.6, 1.0);
         }
     }
