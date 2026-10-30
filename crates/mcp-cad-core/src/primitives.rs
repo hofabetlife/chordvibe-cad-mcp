@@ -2,7 +2,7 @@
 
 use std::f64::consts::PI;
 use nalgebra::{Matrix3, Rotation3, Vector3};
-use crate::csg::{csg_difference, csg_intersection, csg_union};
+use crate::csg::{csg_difference, csg_union};
 use crate::tessellation::{TessellationQuality, TessellationSettings};
 use crate::topology::{TriangleMesh, Vertex};
 
@@ -571,132 +571,6 @@ pub fn create_cone_with_settings(
     create_cone(radius_bottom, radius_top, height, segments)
 }
 
-/// Helper to generate a convex turned solid for DIN 934 conical chamfering.
-///
-/// Features conical end caps tapering at chamfer angle (~30 deg per DIN 934)
-/// and a central cylindrical body enclosing the polygonal prism.
-fn create_turned_chamfer_solid(
-    circumradius: f64,
-    height: f64,
-    chamfer: f64,
-    sides: usize,
-) -> TriangleMesh {
-    let segs = (sides * 4).max(32);
-    let h2 = height * 0.5;
-
-    // DIN 934 chamfer angle: 30 degrees to the horizontal bearing face
-    let tan_alpha = (PI / 6.0).tan(); // tan(30 deg) = 1 / sqrt(3) ~ 0.57735
-
-    let mut c_r = chamfer;
-    let mut c_z = c_r * tan_alpha;
-
-    if c_z > height * 0.45 {
-        c_z = height * 0.45;
-        c_r = c_z / tan_alpha;
-    }
-
-    let r_top = (circumradius - c_r).max(circumradius * 0.1);
-    let r_outer = circumradius * 2.0;
-
-    // Small axial margin to prevent coplanar surface artifacts
-    let delta = (c_z * 0.05).clamp(1e-4, 0.01);
-    let z_bot_cap = -h2 - delta;
-    let z_bot_shoulder = -h2 + c_z;
-    let z_top_shoulder = h2 - c_z;
-    let z_top_cap = h2 + delta;
-
-    let r_top_cap = (r_top - delta / tan_alpha).max(r_top * 0.5);
-    let r_bot_cap = r_top_cap;
-
-    let mut vertices = Vec::new();
-    let mut indices = Vec::new();
-
-    // 1. Bottom cap at z_bot_cap
-    let bot_center_idx = vertices.len() as u32;
-    vertices.push(Vertex::new([0.0, 0.0, z_bot_cap], [0.0, 0.0, -1.0]));
-
-    let bot_rim_start = vertices.len() as u32;
-    for i in 0..segs {
-        let theta = (i as f64) * 2.0 * PI / (segs as f64);
-        vertices.push(Vertex::new(
-            [r_bot_cap * theta.cos(), r_bot_cap * theta.sin(), z_bot_cap],
-            [0.0, 0.0, -1.0],
-        ));
-    }
-    for i in 0..segs {
-        let next = (i + 1) % segs;
-        indices.push([bot_center_idx, bot_rim_start + (next as u32), bot_rim_start + (i as u32)]);
-    }
-
-    // 2. Top cap at z_top_cap
-    let top_center_idx = vertices.len() as u32;
-    vertices.push(Vertex::new([0.0, 0.0, z_top_cap], [0.0, 0.0, 1.0]));
-
-    let top_rim_start = vertices.len() as u32;
-    for i in 0..segs {
-        let theta = (i as f64) * 2.0 * PI / (segs as f64);
-        vertices.push(Vertex::new(
-            [r_top_cap * theta.cos(), r_top_cap * theta.sin(), z_top_cap],
-            [0.0, 0.0, 1.0],
-        ));
-    }
-    for i in 0..segs {
-        let next = (i + 1) % segs;
-        indices.push([top_center_idx, top_rim_start + (i as u32), top_rim_start + (next as u32)]);
-    }
-
-    // Helper closure to loft a frustum band between two rings
-    let mut add_band = |r_lower: f64, z_lower: f64, r_upper: f64, z_upper: f64, n_lower: [f64; 2], n_upper: [f64; 2]| {
-        let band_start = vertices.len() as u32;
-        for i in 0..segs {
-            let theta = (i as f64) * 2.0 * PI / (segs as f64);
-            let cos_t = theta.cos();
-            let sin_t = theta.sin();
-
-            // Lower vertex: index band_start + 2*i
-            vertices.push(Vertex::new(
-                [r_lower * cos_t, r_lower * sin_t, z_lower],
-                [n_lower[0] * cos_t, n_lower[0] * sin_t, n_lower[1]],
-            ));
-            // Upper vertex: index band_start + 2*i + 1
-            vertices.push(Vertex::new(
-                [r_upper * cos_t, r_upper * sin_t, z_upper],
-                [n_upper[0] * cos_t, n_upper[0] * sin_t, n_upper[1]],
-            ));
-        }
-
-        for i in 0..segs {
-            let next = (i + 1) % segs;
-            let curr_low = band_start + (i as u32) * 2;
-            let curr_up = curr_low + 1;
-            let next_low = band_start + (next as u32) * 2;
-            let next_up = next_low + 1;
-
-            indices.push([curr_low, next_low, next_up]);
-            indices.push([curr_low, next_up, curr_up]);
-        }
-    };
-
-    // Bottom cone frustum (from z_bot_cap to z_bot_shoulder)
-    let dr_bot = r_outer - r_bot_cap;
-    let dz_bot = z_bot_shoulder - z_bot_cap;
-    let slant_bot = (dr_bot * dr_bot + dz_bot * dz_bot).sqrt();
-    let norm_bot = [dz_bot / slant_bot, -dr_bot / slant_bot];
-    add_band(r_bot_cap, z_bot_cap, r_outer, z_bot_shoulder, norm_bot, norm_bot);
-
-    // Middle cylinder (from z_bot_shoulder to z_top_shoulder)
-    add_band(r_outer, z_bot_shoulder, r_outer, z_top_shoulder, [1.0, 0.0], [1.0, 0.0]);
-
-    // Top cone frustum (from z_top_shoulder to z_top_cap)
-    let dr_top = r_outer - r_top_cap;
-    let dz_top = z_top_cap - z_top_shoulder;
-    let slant_top = (dr_top * dr_top + dz_top * dz_top).sqrt();
-    let norm_top = [dz_top / slant_top, dr_top / slant_top];
-    add_band(r_outer, z_top_shoulder, r_top_cap, z_top_cap, norm_top, norm_top);
-
-    TriangleMesh::new(vertices, indices)
-}
-
 /// Generates a solid regular polygonal prism centered at origin along Z axis.
 ///
 /// Parameters:
@@ -704,9 +578,9 @@ fn create_turned_chamfer_solid(
 /// - `height`: prism height along Z axis
 /// - `width_across_flats`: optional flat-to-flat distance (S, e.g. wrench size for nuts/bolts)
 /// - `radius`: optional circumscribed circle radius (distance from center to vertices)
-/// - `chamfer`: optional conical chamfer size at top and bottom faces (DIN 934 30-degree chamfer)
+/// - `chamfer`: optional chamfer size at top and bottom faces (30-degree bevel per DIN 934)
 ///
-/// Features sharp edges and flat facet normals on all side faces and caps.
+/// Features sharp edges, flat facet normals, and 100% watertight manifold topology.
 pub fn create_polygon_prism(
     sides: usize,
     height: f64,
@@ -714,10 +588,10 @@ pub fn create_polygon_prism(
     radius: Option<f64>,
     chamfer: Option<f64>,
 ) -> TriangleMesh {
-    let n = sides.max(3);
-    if height <= 1e-12 {
+    if sides < 3 || height <= 1e-12 {
         return TriangleMesh::empty();
     }
+    let n = sides;
 
     let angle_step = 2.0 * PI / (n as f64);
     let half_angle = PI / (n as f64);
@@ -745,6 +619,22 @@ pub fn create_polygon_prism(
     }
 
     let h2 = height * 0.5;
+    let c_val = chamfer.unwrap_or(0.0);
+    let has_chamfer = c_val > 1e-6;
+
+    let (r_cap, z_bot_mid, z_top_mid) = if has_chamfer {
+        let tan_alpha = (PI / 6.0).tan(); // 30-degree DIN 934 chamfer angle
+        let mut c_r = c_val.min(circumradius * 0.45);
+        let mut c_z = c_r * tan_alpha;
+        if c_z > height * 0.40 {
+            c_z = height * 0.40;
+            c_r = c_z / tan_alpha;
+        }
+        let r_c = (circumradius - c_r).max(circumradius * 0.20);
+        (r_c, -h2 + c_z, h2 - c_z)
+    } else {
+        (circumradius, -h2, h2)
+    };
 
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
@@ -756,8 +646,8 @@ pub fn create_polygon_prism(
     let top_rim_start = vertices.len() as u32;
     for i in 0..n {
         let theta = (i as f64) * angle_step;
-        let x = circumradius * theta.cos();
-        let y = circumradius * theta.sin();
+        let x = r_cap * theta.cos();
+        let y = r_cap * theta.sin();
         vertices.push(Vertex::new([x, y, h2], [0.0, 0.0, 1.0]));
     }
 
@@ -777,8 +667,8 @@ pub fn create_polygon_prism(
     let bot_rim_start = vertices.len() as u32;
     for i in 0..n {
         let theta = (i as f64) * angle_step;
-        let x = circumradius * theta.cos();
-        let y = circumradius * theta.sin();
+        let x = r_cap * theta.cos();
+        let y = r_cap * theta.sin();
         vertices.push(Vertex::new([x, y, -h2], [0.0, 0.0, -1.0]));
     }
 
@@ -791,47 +681,85 @@ pub fn create_polygon_prism(
         ]);
     }
 
-    // 3. Side wall quads with flat facet normals (sharp edges)
-    for i in 0..n {
-        let next = (i + 1) % n;
-        let t1 = (i as f64) * angle_step;
-        let t2 = (next as f64) * angle_step;
-
-        let x1 = circumradius * t1.cos();
-        let y1 = circumradius * t1.sin();
-        let x2 = circumradius * t2.cos();
-        let y2 = circumradius * t2.sin();
-
-        let dx = x2 - x1;
-        let dy = y2 - y1;
-        let edge_len = (dx * dx + dy * dy).sqrt();
-        let normal = if edge_len > 1e-12 {
-            [dy / edge_len, -dx / edge_len, 0.0]
+    // Helper closure to add a quad facet (p0_top, p1_bot, p2_bot_next, p3_top_next) with exact outward normal
+    let mut add_quad_facet = |p0: [f64; 3], p1: [f64; 3], p2: [f64; 3], p3: [f64; 3]| {
+        let v0 = Vector3::new(p0[0], p0[1], p0[2]);
+        let v1 = Vector3::new(p1[0], p1[1], p1[2]);
+        let v2 = Vector3::new(p2[0], p2[1], p2[2]);
+        let v3 = Vector3::new(p3[0], p3[1], p3[2]);
+        let n_vec = (v1 - v0).cross(&(v3 - v0)) + (v2 - v1).cross(&(v3 - v1));
+        let n_len = n_vec.norm();
+        let normal = if n_len > 1e-12 {
+            [n_vec.x / n_len, n_vec.y / n_len, n_vec.z / n_len]
         } else {
             [1.0, 0.0, 0.0]
         };
 
         let base = vertices.len() as u32;
-        vertices.push(Vertex::new([x1, y1, h2], normal));  // 0: top curr
-        vertices.push(Vertex::new([x1, y1, -h2], normal)); // 1: bot curr
-        vertices.push(Vertex::new([x2, y2, -h2], normal)); // 2: bot next
-        vertices.push(Vertex::new([x2, y2, h2], normal));  // 3: top next
+        vertices.push(Vertex::new(p0, normal));
+        vertices.push(Vertex::new(p1, normal));
+        vertices.push(Vertex::new(p2, normal));
+        vertices.push(Vertex::new(p3, normal));
 
         indices.push([base, base + 1, base + 3]);
         indices.push([base + 1, base + 2, base + 3]);
-    }
+    };
 
-    let prism = TriangleMesh::new(vertices, indices);
+    // 3. Side wall quads (and optional top/bottom chamfer bevel bands)
+    for i in 0..n {
+        let next = (i + 1) % n;
+        let t1 = (i as f64) * angle_step;
+        let t2 = (next as f64) * angle_step;
+        let c1 = t1.cos();
+        let s1 = t1.sin();
+        let c2 = t2.cos();
+        let s2 = t2.sin();
 
-    // Conical end chamfering per DIN 934 (30-degree chamfer)
-    if let Some(c) = chamfer {
-        if c > 1e-6 {
-            let chamfer_body = create_turned_chamfer_solid(circumradius, height, c, n);
-            return csg_intersection(&prism, &chamfer_body);
+        let x1_mid = circumradius * c1;
+        let y1_mid = circumradius * s1;
+        let x2_mid = circumradius * c2;
+        let y2_mid = circumradius * s2;
+
+        if has_chamfer {
+            let x1_cap = r_cap * c1;
+            let y1_cap = r_cap * s1;
+            let x2_cap = r_cap * c2;
+            let y2_cap = r_cap * s2;
+
+            // Top bevel band: from z = h2 (r_cap) down to z = z_top_mid (circumradius)
+            add_quad_facet(
+                [x1_cap, y1_cap, h2],
+                [x1_mid, y1_mid, z_top_mid],
+                [x2_mid, y2_mid, z_top_mid],
+                [x2_cap, y2_cap, h2],
+            );
+
+            // Middle vertical band: from z = z_top_mid down to z = z_bot_mid
+            add_quad_facet(
+                [x1_mid, y1_mid, z_top_mid],
+                [x1_mid, y1_mid, z_bot_mid],
+                [x2_mid, y2_mid, z_bot_mid],
+                [x2_mid, y2_mid, z_top_mid],
+            );
+
+            // Bottom bevel band: from z = z_bot_mid (circumradius) down to z = -h2 (r_cap)
+            add_quad_facet(
+                [x1_mid, y1_mid, z_bot_mid],
+                [x1_cap, y1_cap, -h2],
+                [x2_cap, y2_cap, -h2],
+                [x2_mid, y2_mid, z_bot_mid],
+            );
+        } else {
+            add_quad_facet(
+                [x1_mid, y1_mid, h2],
+                [x1_mid, y1_mid, -h2],
+                [x2_mid, y2_mid, -h2],
+                [x2_mid, y2_mid, h2],
+            );
         }
     }
 
-    prism
+    TriangleMesh::new(vertices, indices)
 }
 
 /// Generates a closed, watertight (manifold) 3D mesh for a helical cutting tool
