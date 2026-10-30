@@ -1,25 +1,25 @@
-# Rust build artifacts
-target/
-*.log
-
-# AI Studio environment & temporary artifacts
-.aistudio/
-.playwright-cli/
-metadata.json
-
-# Web Studio interface files (environment-specific runner)
 node_modules/
-dist/
+target/
 build/
+dist/
 coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+.aistudio/
+.vite/
+.playwright-cli/
+bun.lock
+public/assets/
+
+# Web Studio wrapper files (local preview only, omitted from pure-Rust GitHub repo)
 src/
 server.ts
 index.html
 vite.config.ts
-tsconfig*.json
+tsconfig.json
 package.json
 package-lock.json
-bun.lock
+metadata.json
 scripts/
-.env*
-.DS_Store
