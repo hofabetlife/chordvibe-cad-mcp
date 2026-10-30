@@ -1173,3 +1173,73 @@ async fn test_bug_002_spur_gear_manifold_and_keyway() {
         std::fs::write(&out_path, &png_bytes).unwrap();
     }
 }
+
+#[tokio::test]
+async fn test_bug_004_wheel_rim_manifold_and_renders() {
+    let art_dir = qa_base_dir().join("artifacts");
+    std::fs::create_dir_all(&art_dir).unwrap();
+
+    // 1. SKEPTIC grid: (spokes, bolts) combinations -> expected genus = 1 + spokes + bolts
+    for &(spokes, bolts) in &[(3usize, 4usize), (5, 5), (6, 5), (8, 6), (10, 5)] {
+        let expected_genus = (1 + spokes + bolts) as i32;
+        let wheel = create_wheel_rim(
+            0.4572,
+            0.2032,
+            Some(0.490),
+            Some(0.160),
+            Some(0.066),
+            Some(0.1143),
+            Some(bolts),
+            Some(0.014),
+            Some(spokes),
+            Some(0.028),
+            Some(0.018),
+            Some(0.035),
+        );
+        let rep = validate_mesh(&wheel, Some(expected_genus));
+        assert_eq!(
+            rep.status, "PASS",
+            "wheel_rim (spokes={}, bolts={}) failed validate_mesh: {:?}",
+            spokes, bolts, rep.issues
+        );
+        assert!(rep.topology.is_watertight);
+        assert_eq!(rep.topology.non_manifold_edges_count, 0);
+        assert!(rep.topology.orientation_consistent);
+        assert!((rep.topology.genus - (expected_genus as f64)).abs() < 1e-6);
+        assert_eq!(rep.geometry.degenerate_triangles_count, 0);
+        assert_eq!(rep.geometry.self_intersections_count, 0);
+    }
+
+    // 2. Render standard 5-spoke 5-bolt wheel rim in all 5 debug modes for visual inspection
+    let wheel_std = create_wheel_rim(
+        0.4572,
+        0.2032,
+        Some(0.490),
+        Some(0.160),
+        Some(0.066),
+        Some(0.1143),
+        Some(5),
+        Some(0.014),
+        Some(5),
+        Some(0.028),
+        Some(0.018),
+        Some(0.035),
+    );
+    let state = EngineState::new().unwrap().into_shared();
+    let engine = state.read();
+    for mode_name in ["shaded", "wireframe", "normals", "backfaces", "boundary_edges"] {
+        let out_path = art_dir.join(format!("wheel_rim_5spoke_{}.png", mode_name));
+        let debug_mode = mcp_cad_viewer::DebugRenderMode::parse(Some(mode_name));
+        let png_bytes = engine
+            .offscreen_renderer
+            .render_mesh_png_debug(
+                &wheel_std,
+                mcp_cad_viewer::CameraPreset::Isometric,
+                debug_mode,
+                800,
+                600,
+            )
+            .unwrap();
+        std::fs::write(&out_path, &png_bytes).unwrap();
+    }
+}
