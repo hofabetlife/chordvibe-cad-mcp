@@ -26,6 +26,9 @@ pub enum ServerError {
     #[error("Invalid argument: {0}")]
     InvalidArgument(String),
 
+    #[error("Invalid parameter: {0}")]
+    InvalidParameter(String),
+
     #[error("Part not found: {0}")]
     PartNotFound(String),
 

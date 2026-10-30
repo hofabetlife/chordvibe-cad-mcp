@@ -9,6 +9,10 @@ struct CameraUniform {
 
 struct MaterialUniform {
     color: vec4<f32>,
+    debug_mode: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 };
 
 @group(0) @binding(0)
@@ -42,9 +46,33 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var n = normalize(in.world_normal);
     let view_dir = normalize(camera.camera_pos.xyz - in.world_position);
     
-    // Two-sided lighting
-    if (dot(n, view_dir) < 0.0) {
-        n = -n;
+    // Debug mode 2: Normals visualization (RGB = Normal * 0.5 + 0.5)
+    if (material.debug_mode == 2u) {
+        return vec4<f32>(n * 0.5 + 0.5, 1.0);
+    }
+
+    // Debug mode 3: Backfaces highlight (bright magenta for inverted faces)
+    if (material.debug_mode == 3u) {
+        if (dot(in.world_normal, view_dir) < 0.0) {
+            return vec4<f32>(1.0, 0.05, 0.6, 1.0);
+        }
+    }
+
+    // Debug mode 4: Flat shading (pure per-polygon normal from screen-space derivatives)
+    if (material.debug_mode == 4u) {
+        let dpdx = dpdx(in.world_position);
+        let dpdy = dpdy(in.world_position);
+        let geo_n = normalize(cross(dpdx, dpdy));
+        if (dot(geo_n, view_dir) < 0.0) {
+            n = -geo_n;
+        } else {
+            n = geo_n;
+        }
+    } else {
+        // Two-sided lighting
+        if (dot(n, view_dir) < 0.0) {
+            n = -n;
+        }
     }
 
     // Directional Key Light (upper right front)
@@ -205,18 +233,27 @@ impl FeaVertex {
     };
 }
 
-/// Uniform structure representing material properties.
+/// Uniform structure representing material properties and viewport debug mode.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MaterialUniform {
     /// RGBA diffuse color.
     pub color: [f32; 4],
+    /// 0 = standard shaded, 1 = wireframe, 2 = normals, 3 = backfaces, 4 = flat_shading, 5 = boundary_edges
+    pub debug_mode: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
 }
 
 impl Default for MaterialUniform {
     fn default() -> Self {
         Self {
             color: [0.72, 0.77, 0.84, 1.0], // Engineering CAD silver-blue
+            debug_mode: 0,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         }
     }
 }

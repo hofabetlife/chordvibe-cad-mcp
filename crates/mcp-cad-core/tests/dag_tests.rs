@@ -801,3 +801,98 @@ fn test_dag_wheel_rim_model() {
         vol1
     );
 }
+
+#[test]
+fn test_dag_boolean_union_intersection_and_inspection() {
+    let mut tree = FeatureTree::new();
+
+    // 1. Base Box: 10 x 10 x 10 (from -5 to 5 along X, Y, Z), vol = 1000
+    tree.add_feature(
+        FeatureOp::AddBox {
+            width: 10.0,
+            height: 10.0,
+            depth: 10.0,
+            position: None,
+            rotation_deg: None,
+        },
+        Some("Base Box".to_string()),
+    );
+
+    // 2. BooleanUnionMesh: tool box 10 x 10 x 10 shifted by X = 10 (from X = 5 to 15)
+    // Abutting/overlapping from X = 5 to 15, union has vol = 2000
+    let mut tool_union = create_box(10.0, 10.0, 10.0);
+    tool_union.translate([10.0, 0.0, 0.0]);
+    tree.add_feature(
+        FeatureOp::BooleanUnionMesh { tool_mesh: tool_union },
+        Some("Union Box".to_string()),
+    );
+
+    let union_mesh = tree.evaluate().expect("BooleanUnionMesh evaluation failed");
+    let vol_union = union_mesh.volume();
+    assert!(
+        (vol_union - 2000.0).abs() < 1.0,
+        "Expected union volume ~2000, got {}",
+        vol_union
+    );
+
+    // 3. BooleanIntersectionMesh: intersecting with a bounding box of 16 x 8 x 8 (from X = -3 to 13, Y = -4 to 4, Z = -4 to 4)
+    // Overlapping volume with [ -5, 15 ] x [ -5, 5 ] x [ -5, 5 ] is:
+    // (13 - (-3)) * 8 * 8 = 16 * 8 * 8 = 1024
+    let mut tool_intersect = create_box(16.0, 8.0, 8.0);
+    tool_intersect.translate([5.0, 0.0, 0.0]); // from X = -3 to 13
+    tree.add_feature(
+        FeatureOp::BooleanIntersectionMesh { tool_mesh: tool_intersect },
+        Some("Intersect Cutter".to_string()),
+    );
+
+    let intersect_mesh = tree.evaluate().expect("BooleanIntersectionMesh evaluation failed");
+    let vol_intersect = intersect_mesh.volume();
+    assert!(
+        (vol_intersect - 1024.0).abs() < 1.0,
+        "Expected intersection volume ~1024, got {}",
+        vol_intersect
+    );
+
+    // 4. Transform: scale 2x in Z, translate [0, 0, 10]
+    tree.add_feature(
+        FeatureOp::Transform {
+            translation: [0.0, 0.0, 10.0],
+            rotation_deg: [0.0, 0.0, 0.0],
+            scale: [1.0, 1.0, 2.0],
+        },
+        Some("Scale and Lift".to_string()),
+    );
+
+    let transformed_mesh = tree.evaluate().expect("Transform evaluation failed");
+    let vol_transformed = transformed_mesh.volume();
+    assert!(
+        (vol_transformed - 2048.0).abs() < 2.0,
+        "Expected scaled volume ~2048, got {}",
+        vol_transformed
+    );
+
+    // 5. Test GeometryInspection on Part
+    let reg = MaterialRegistry::new();
+    let mat = reg.get("aluminum_6061_t6").unwrap().clone();
+    let mut part = Part::new("test_part", "Machined Block", mat);
+    part.dag = tree;
+    part.rebuild().expect("Part rebuild failed");
+
+    let inspection = part.inspect_geometry();
+    assert!((inspection.volume - 2048.0).abs() < 2.0);
+    assert!(inspection.surface_area > 0.0);
+    assert_eq!(inspection.faces_count, part.mesh().triangle_count());
+    assert_eq!(inspection.vertices_count, part.mesh().vertex_count());
+    // Center of mass Z should be around 10.0 due to translation
+    assert!((inspection.center_of_mass[2] - 10.0).abs() < 1.0);
+    // Detected planar faces should be non-empty and at most 15
+    assert!(!inspection.detected_planar_faces.is_empty());
+    assert!(inspection.detected_planar_faces.len() <= 15);
+    // Each planar face should have valid normal, area, and triangles count
+    for face in &inspection.detected_planar_faces {
+        let norm_len = (face.normal[0].powi(2) + face.normal[1].powi(2) + face.normal[2].powi(2)).sqrt();
+        assert!((norm_len - 1.0).abs() < 1e-3, "Face normal must be unit vector");
+        assert!(face.area > 0.0, "Face area must be positive");
+        assert!(face.triangles_count > 0, "Face must contain at least 1 triangle");
+    }
+}

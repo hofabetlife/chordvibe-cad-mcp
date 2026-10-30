@@ -14,6 +14,8 @@ pub fn capture_viewport(args: &Value, state: &EngineState) -> Result<Value, Serv
     let preset = parse_camera_preset(args.get("camera_preset").and_then(|v| v.as_str()));
     let width = args.get("width").and_then(|v| v.as_u64()).unwrap_or(800) as u32;
     let height = args.get("height").and_then(|v| v.as_u64()).unwrap_or(600) as u32;
+    let debug_mode_str = args.get("debug_mode").and_then(|v| v.as_str());
+    let debug_mode = mcp_cad_viewer::DebugRenderMode::parse(debug_mode_str);
 
     let target_mesh = if let Some(part_id) = args.get("part_id").and_then(|v| v.as_str()) {
         let part = state
@@ -49,12 +51,13 @@ pub fn capture_viewport(args: &Value, state: &EngineState) -> Result<Value, Serv
 
     let image_base64 = state
         .offscreen_renderer
-        .render_mesh_base64(&target_mesh, preset, width, height)?;
+        .render_mesh_base64_debug(&target_mesh, preset, debug_mode, width, height)?;
 
     Ok(json!({
         "image_base64": image_base64,
         "format": "image/png",
         "camera_preset": format!("{preset:?}"),
+        "debug_mode": format!("{debug_mode:?}"),
         "width": width,
         "height": height
     }))
@@ -75,6 +78,22 @@ pub fn open_preview_window(args: &Value, state: &EngineState) -> Result<Value, S
                 "part_id": part_id,
                 "message": format!("Preview window opened showing part '{}'", part.name)
             }))
+        } else if let Some(sim) = &state.last_simulation {
+            let frames = crate::tools::physics::generate_animation_frames(&state.parts, &sim.trajectories, 120);
+            if !frames.is_empty() {
+                state.send_gui_animation(frames, 30.0);
+                Ok(json!({
+                    "status": "opened",
+                    "mode": "animation_playback",
+                    "message": "Preview window opened playing mechanism simulation animation"
+                }))
+            } else {
+                let _ = proxy.send_event(mcp_cad_viewer::window::GuiEvent::Show);
+                Ok(json!({
+                    "status": "opened",
+                    "message": "Preview window opened"
+                }))
+            }
         } else {
             let mut combined_verts = Vec::new();
             let mut combined_indices = Vec::new();

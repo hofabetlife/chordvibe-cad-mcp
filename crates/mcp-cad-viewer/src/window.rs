@@ -8,7 +8,10 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
+use mcp_cad_core::part::Part;
+use mcp_cad_core::tessellation::{TessellationQuality, TessellationSettings};
 use mcp_cad_core::topology::TriangleMesh;
+use mcp_cad_core::CadError;
 use crate::camera::{CameraPreset, OrbitCamera, ProjectionMode};
 use crate::error::ViewerError;
 use crate::shader::{
@@ -21,10 +24,20 @@ use crate::shader::{
 pub enum GuiEvent {
     Show,
     UpdateMesh(TriangleMesh),
+    UpdatePart {
+        part: Box<Part>,
+        quality: TessellationQuality,
+    },
+    SetTessellationQuality(TessellationQuality),
     UpdateFea {
         mesh: TriangleMesh,
         stresses: Vec<f32>,
     },
+    SetAnimation {
+        frames: Vec<TriangleMesh>,
+        fps: f32,
+    },
+    UpdateSimulationFrame(TriangleMesh),
     Close,
 }
 
@@ -119,6 +132,8 @@ pub fn create_default_demo_mesh() -> TriangleMesh {
 pub struct CadWindowViewer {
     title: String,
     mesh: Option<TriangleMesh>,
+    part: Option<Part>,
+    tessellation_quality: TessellationQuality,
     stress_scalars: Option<Vec<f32>>,
     camera: OrbitCamera,
     layout: ViewportLayout,
@@ -130,6 +145,8 @@ impl CadWindowViewer {
         Self {
             title: title.into(),
             mesh: None,
+            part: None,
+            tessellation_quality: TessellationQuality::Medium,
             stress_scalars: None,
             camera: OrbitCamera::default(),
             layout: ViewportLayout::FourView,
@@ -143,6 +160,28 @@ impl CadWindowViewer {
         let max_f32 = [bbox.max[0] as f32, bbox.max[1] as f32, bbox.max[2] as f32];
         self.camera.fit_bounding_box(min_f32, max_f32);
         self.mesh = Some(mesh);
+        self
+    }
+
+    /// Sets the CAD part to display, evaluating it with the requested tessellation quality preset.
+    pub fn with_part(mut self, mut part: Part, quality: TessellationQuality) -> Result<Self, CadError> {
+        let mesh = part.tessellate_quality(quality)?.clone();
+        self.part = Some(part);
+        self.tessellation_quality = quality;
+        Ok(self.with_mesh(mesh))
+    }
+
+    /// Sets the CAD part to display, evaluating it with explicit adaptive tessellation settings.
+    pub fn with_part_settings(mut self, mut part: Part, settings: &TessellationSettings) -> Result<Self, CadError> {
+        let mesh = part.tessellate(settings)?.clone();
+        self.part = Some(part);
+        self.tessellation_quality = settings.quality;
+        Ok(self.with_mesh(mesh))
+    }
+
+    /// Sets preferred initial tessellation quality preset.
+    pub fn with_tessellation_quality(mut self, quality: TessellationQuality) -> Self {
+        self.tessellation_quality = quality;
         self
     }
 
@@ -169,6 +208,16 @@ impl CadWindowViewer {
         self.mesh.as_ref()
     }
 
+    /// Returns a reference to the loaded part, if any.
+    pub fn part(&self) -> Option<&Part> {
+        self.part.as_ref()
+    }
+
+    /// Returns the configured tessellation quality preset.
+    pub fn tessellation_quality(&self) -> TessellationQuality {
+        self.tessellation_quality
+    }
+
     /// Returns a reference to the configured stress scalars, if any.
     pub fn stress_scalars(&self) -> Option<&[f32]> {
         self.stress_scalars.as_deref()
@@ -179,6 +228,8 @@ impl CadWindowViewer {
         let event_loop = create_gui_event_loop()?;
         let mut app = CadWindowApp::new(self.title);
         app.mesh = self.mesh;
+        app.part = self.part;
+        app.tessellation_quality = self.tessellation_quality;
         app.stress_scalars = self.stress_scalars;
         app.camera = self.camera;
         app.layout = self.layout;
@@ -296,6 +347,8 @@ impl UiBatch {
 pub struct CadWindowApp {
     pub title: String,
     pub mesh: Option<TriangleMesh>,
+    pub part: Option<Part>,
+    pub tessellation_quality: TessellationQuality,
     pub stress_scalars: Option<Vec<f32>>,
 
     // 4 Cameras for Cinema 4D multi-view layout
@@ -358,6 +411,13 @@ pub struct CadWindowApp {
     pub is_rmb_down: bool,
     pub last_mouse_pos: Option<(f64, f64)>,
     pub exit_on_close: bool,
+
+    // Simulation Animation Playback
+    pub animation_frames: Vec<TriangleMesh>,
+    pub current_frame_idx: usize,
+    pub animation_playing: bool,
+    pub last_frame_time: std::time::Instant,
+    pub frame_duration: std::time::Duration,
 }
 
 impl Default for CadWindowApp {
@@ -384,6 +444,8 @@ impl CadWindowApp {
         Self {
             title: title.into(),
             mesh: None,
+            part: None,
+            tessellation_quality: TessellationQuality::Medium,
             stress_scalars: None,
             camera: OrbitCamera::default(),
             camera_top,
@@ -428,6 +490,11 @@ impl CadWindowApp {
             is_rmb_down: false,
             last_mouse_pos: None,
             exit_on_close: false,
+            animation_frames: Vec::new(),
+            current_frame_idx: 0,
+            animation_playing: false,
+            last_frame_time: std::time::Instant::now(),
+            frame_duration: std::time::Duration::from_millis(33),
         }
     }
 
@@ -1184,6 +1251,58 @@ impl CadWindowApp {
         self.wireframe_index_count = line_indices.len() as u32;
     }
 
+    /// Uploads a single animation frame into GPU buffers without resetting camera parameters.
+    pub fn upload_simulation_frame(&mut self, mesh: &TriangleMesh) {
+        let Some(device) = &self.device else { return };
+        if mesh.vertices.is_empty() || mesh.indices.is_empty() {
+            return;
+        }
+
+        self.mesh = Some(mesh.clone());
+        self.current_mode = RenderMode::Cad;
+
+        let cad_verts: Vec<CadVertex> = mesh
+            .vertices
+            .iter()
+            .map(|v| CadVertex {
+                position: [v.position[0] as f32, v.position[1] as f32, v.position[2] as f32],
+                normal: [v.normal[0] as f32, v.normal[1] as f32, v.normal[2] as f32],
+            })
+            .collect();
+
+        let flat_indices: Vec<u32> = mesh
+            .indices
+            .iter()
+            .flat_map(|tri| tri.iter().copied())
+            .collect();
+
+        let line_indices = extract_wireframe_indices(&mesh.indices);
+
+        let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Window Sim Frame VB"),
+            contents: bytemuck::cast_slice(&cad_verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Window Sim Frame IB"),
+            contents: bytemuck::cast_slice(&flat_indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        let wib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Window Sim Frame Wireframe IB"),
+            contents: bytemuck::cast_slice(&line_indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        self.vertex_buffer = Some(vb);
+        self.index_buffer = Some(ib);
+        self.wireframe_index_buffer = Some(wib);
+        self.index_count = flat_indices.len() as u32;
+        self.wireframe_index_count = line_indices.len() as u32;
+    }
+
     /// Uploads FEA surface mesh geometry and scalar stress values into GPU buffers and fits all cameras.
     pub fn upload_fea_mesh(&mut self, mesh: &TriangleMesh, stresses: &[f32]) {
         self.mesh = Some(mesh.clone());
@@ -1266,6 +1385,60 @@ impl CadWindowApp {
         self.wireframe_index_buffer = Some(wib);
         self.index_count = flat_indices.len() as u32;
         self.wireframe_index_count = line_indices.len() as u32;
+    }
+
+    /// Uploads CAD Part geometry into GPU buffers, evaluating with the specified tessellation quality.
+    pub fn upload_cad_part(&mut self, part: &mut Part, quality: TessellationQuality) -> Result<(), CadError> {
+        let mesh = part.tessellate_quality(quality)?.clone();
+        self.upload_cad_mesh(&mesh);
+        self.part = Some(part.clone());
+        self.tessellation_quality = quality;
+        Ok(())
+    }
+
+    /// Uploads CAD Part geometry into GPU buffers, evaluating with explicit tessellation settings.
+    pub fn upload_cad_part_with_settings(&mut self, part: &mut Part, settings: &TessellationSettings) -> Result<(), CadError> {
+        let mesh = part.tessellate(settings)?.clone();
+        self.upload_cad_mesh(&mesh);
+        self.part = Some(part.clone());
+        self.tessellation_quality = settings.quality;
+        Ok(())
+    }
+
+    /// Updates the tessellation quality of the loaded part and re-uploads GPU vertex buffers.
+    pub fn set_tessellation_quality(&mut self, quality: TessellationQuality) -> Result<(), CadError> {
+        if let Some(mut part) = self.part.take() {
+            let res = self.upload_cad_part(&mut part, quality);
+            self.part = Some(part);
+            res
+        } else {
+            self.tessellation_quality = quality;
+            Ok(())
+        }
+    }
+
+    /// Captures a snapshot of the current viewport scene using an offscreen headless renderer.
+    ///
+    /// If `quality` is provided and a `Part` is loaded, re-evaluates the geometry at the requested quality
+    /// (e.g. `TessellationQuality::Fine` for high-resolution snapshots).
+    pub fn capture_snapshot(
+        &mut self,
+        camera_preset: CameraPreset,
+        width: u32,
+        height: u32,
+        quality: Option<TessellationQuality>,
+    ) -> Result<Vec<u8>, ViewerError> {
+        let renderer = crate::offscreen::OffscreenRenderer::new()?;
+        if let Some(q) = quality {
+            if let Some(ref mut part) = self.part {
+                return renderer.render_part_png(part, q, camera_preset, width, height);
+            }
+        }
+        if let Some(mesh) = &self.mesh {
+            renderer.render_mesh_png(mesh, camera_preset, width, height)
+        } else {
+            Err(ViewerError::EmptyMesh)
+        }
     }
 
     /// Writes the current camera uniform buffers to the GPU for all active viewports.
@@ -1786,6 +1959,20 @@ impl ApplicationHandler<GuiEvent> for CadWindowApp {
                     w.request_redraw();
                 }
             }
+            GuiEvent::UpdatePart { mut part, quality } => {
+                self.ensure_window(event_loop);
+                let _ = self.upload_cad_part(&mut part, quality);
+                if let Some(w) = &self.window {
+                    w.focus_window();
+                    w.request_redraw();
+                }
+            }
+            GuiEvent::SetTessellationQuality(quality) => {
+                let _ = self.set_tessellation_quality(quality);
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
             GuiEvent::UpdateFea { mesh, stresses } => {
                 self.ensure_window(event_loop);
                 self.upload_fea_mesh(&mesh, &stresses);
@@ -1794,9 +1981,47 @@ impl ApplicationHandler<GuiEvent> for CadWindowApp {
                     w.request_redraw();
                 }
             }
+            GuiEvent::SetAnimation { frames, fps } => {
+                self.ensure_window(event_loop);
+                if !frames.is_empty() {
+                    self.upload_cad_mesh(&frames[0]);
+                    self.animation_frames = frames;
+                    self.current_frame_idx = 0;
+                    self.animation_playing = true;
+                    self.frame_duration = std::time::Duration::from_secs_f32(1.0 / fps.max(1.0));
+                    self.last_frame_time = std::time::Instant::now();
+                    if let Some(w) = &self.window {
+                        w.focus_window();
+                        w.request_redraw();
+                    }
+                }
+            }
+            GuiEvent::UpdateSimulationFrame(mesh) => {
+                self.ensure_window(event_loop);
+                self.upload_simulation_frame(&mesh);
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
             GuiEvent::Close => {
                 event_loop.exit();
             }
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.animation_frames.is_empty() && self.animation_playing {
+            let now = std::time::Instant::now();
+            if now.duration_since(self.last_frame_time) >= self.frame_duration {
+                self.last_frame_time = now;
+                self.current_frame_idx = (self.current_frame_idx + 1) % self.animation_frames.len();
+                let frame_mesh = self.animation_frames[self.current_frame_idx].clone();
+                self.upload_simulation_frame(&frame_mesh);
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::wait_duration(self.frame_duration));
         }
     }
 
@@ -1818,7 +2043,7 @@ impl ApplicationHandler<GuiEvent> for CadWindowApp {
                 if path
                     .extension()
                     .and_then(|ext| ext.to_str())
-                    .map_or(false, |ext| ext.eq_ignore_ascii_case("stl"))
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("stl"))
                 {
                     match mcp_cad_core::import_stl_file(&path) {
                         Ok(mesh) => {
@@ -1914,41 +2139,39 @@ impl ApplicationHandler<GuiEvent> for CadWindowApp {
                     MouseButton::Right => {
                         self.is_rmb_down = pressed;
                     }
-                    MouseButton::Middle => {
-                        if pressed {
-                            let (screen_w, screen_h) = if let Some(cfg) = &self.surface_config {
-                                (cfg.width as f32, cfg.height as f32)
-                            } else {
-                                (1024.0, 768.0)
-                            };
+                    MouseButton::Middle if pressed => {
+                        let (screen_w, screen_h) = if let Some(cfg) = &self.surface_config {
+                            (cfg.width as f32, cfg.height as f32)
+                        } else {
+                            (1024.0, 768.0)
+                        };
 
-                            let (mx, my) = if let Some((mx_f64, my_f64)) = self.last_mouse_pos {
-                                (mx_f64 as f32, my_f64 as f32)
-                            } else {
-                                (screen_w * 0.5, screen_h * 0.5)
-                            };
+                        let (mx, my) = if let Some((mx_f64, my_f64)) = self.last_mouse_pos {
+                            (mx_f64 as f32, my_f64 as f32)
+                        } else {
+                            (screen_w * 0.5, screen_h * 0.5)
+                        };
 
-                            // Cinema 4D style MMB view toggle
-                            match self.layout {
-                                ViewportLayout::FourView => {
-                                    let target_view = self
-                                        .calculate_viewport_at(mx, my, screen_w, screen_h)
-                                        .unwrap_or(self.active_viewport);
-                                    self.layout = ViewportLayout::Single(target_view);
-                                    self.active_viewport = target_view;
-                                }
-                                ViewportLayout::Single(_) => {
-                                    self.layout = ViewportLayout::FourView;
-                                }
+                        // Cinema 4D style MMB view toggle
+                        match self.layout {
+                            ViewportLayout::FourView => {
+                                let target_view = self
+                                    .calculate_viewport_at(mx, my, screen_w, screen_h)
+                                    .unwrap_or(self.active_viewport);
+                                self.layout = ViewportLayout::Single(target_view);
+                                self.active_viewport = target_view;
                             }
+                            ViewportLayout::Single(_) => {
+                                self.layout = ViewportLayout::FourView;
+                            }
+                        }
 
-                            if let Some(cfg) = &self.surface_config {
-                                self.update_camera_aspects(cfg.width, cfg.height);
-                            }
-                            self.update_camera_buffer();
-                            if let Some(w) = &self.window {
-                                w.request_redraw();
-                            }
+                        if let Some(cfg) = &self.surface_config {
+                            self.update_camera_aspects(cfg.width, cfg.height);
+                        }
+                        self.update_camera_buffer();
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
                         }
                     }
                     _ => {}
@@ -2191,6 +2414,26 @@ impl ApplicationHandler<GuiEvent> for CadWindowApp {
                 KeyCode::KeyR => {
                     self.camera.apply_preset(CameraPreset::Right);
                     self.update_camera_buffer();
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                }
+                KeyCode::KeyP => {
+                    // Toggle simulation animation play/pause
+                    if !self.animation_frames.is_empty() {
+                        self.animation_playing = !self.animation_playing;
+                    }
+                }
+                KeyCode::KeyQ => {
+                    // Cycle tessellation quality: Coarse -> Medium -> Fine -> Coarse
+                    let next_q = match self.tessellation_quality {
+                        TessellationQuality::Coarse => TessellationQuality::Medium,
+                        TessellationQuality::Medium => TessellationQuality::Fine,
+                        TessellationQuality::Fine | TessellationQuality::Custom { .. } => {
+                            TessellationQuality::Coarse
+                        }
+                    };
+                    let _ = self.set_tessellation_quality(next_q);
                     if let Some(w) = &self.window {
                         w.request_redraw();
                     }

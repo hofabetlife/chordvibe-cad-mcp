@@ -68,8 +68,8 @@ async fn test_mcp_tools_list() {
         .as_array()
         .expect("tools must be an array");
 
-    // Must declare exactly 19 tools
-    assert_eq!(tools.len(), 19, "Server must expose exactly 19 MCP tools");
+    // Must declare exactly 26 tools
+    assert_eq!(tools.len(), 26, "Server must expose exactly 26 MCP tools");
 
     let expected_tools = [
         "create_part",
@@ -91,6 +91,13 @@ async fn test_mcp_tools_list() {
         "get_simulation_metrics_json",
         "open_preview_window",
         "import_stl",
+        "tessellate_part",
+        "query_part_geometry",
+        "boolean_union",
+        "boolean_intersection",
+        "transform_part",
+        "define_material",
+        "batch_cad_operations",
     ];
 
     let mut found_names = HashSet::new();
@@ -1402,4 +1409,815 @@ async fn test_mcp_import_stl() {
 
     // Clean up
     let _ = std::fs::remove_file(&stl_path);
+}
+
+#[tokio::test]
+async fn test_mcp_tessellation_and_stl_quality() {
+    let state = EngineState::new()
+        .expect("EngineState initialization failed")
+        .into_shared();
+
+    // 1. Create a part (cylinder bracket)
+    let create_req = json!({
+        "jsonrpc": "2.0",
+        "id": 701,
+        "method": "tools/call",
+        "params": {
+            "name": "create_part",
+            "arguments": {
+                "name": "adaptive_cylinder",
+                "material": "aluminum_6061_t6"
+            }
+        }
+    });
+    let resp = rpc_call(&state, create_req).await;
+    let part_id = resp["result"]["content"][0]["text"]
+        .as_str()
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .and_then(|v| v["part_id"].as_str().map(|s| s.to_string()))
+        .expect("part_id expected");
+
+    // 2. Add a cylinder primitive (curved geometry benefits from adaptive tessellation)
+    let add_cyl_req = json!({
+        "jsonrpc": "2.0",
+        "id": 702,
+        "method": "tools/call",
+        "params": {
+            "name": "add_feature_primitive",
+            "arguments": {
+                "part_id": part_id,
+                "primitive_type": "cylinder",
+                "params": {
+                    "radius": 0.05,
+                    "height": 0.2
+                }
+            }
+        }
+    });
+    let _ = rpc_call(&state, add_cyl_req).await;
+
+    // 3. Test tessellate_part with coarse quality
+    let tess_coarse_req = json!({
+        "jsonrpc": "2.0",
+        "id": 703,
+        "method": "tools/call",
+        "params": {
+            "name": "tessellate_part",
+            "arguments": {
+                "part_id": part_id,
+                "quality": "coarse"
+            }
+        }
+    });
+    let resp = rpc_call(&state, tess_coarse_req).await;
+    assert_eq!(resp["id"], 703);
+    assert!(resp["error"].is_null());
+    let coarse_data: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let coarse_tris = coarse_data["triangle_count"].as_u64().unwrap();
+    let coarse_verts = coarse_data["vertex_count"].as_u64().unwrap();
+    assert_eq!(coarse_data["quality_applied"], "coarse");
+    assert!(coarse_tris > 0);
+    assert!(coarse_verts > 0);
+    assert!(coarse_data["volume"].as_f64().unwrap() > 0.0);
+
+    // 4. Test tessellate_part with fine quality
+    let tess_fine_req = json!({
+        "jsonrpc": "2.0",
+        "id": 704,
+        "method": "tools/call",
+        "params": {
+            "name": "tessellate_part",
+            "arguments": {
+                "part_id": part_id,
+                "quality": "fine"
+            }
+        }
+    });
+    let resp = rpc_call(&state, tess_fine_req).await;
+    assert_eq!(resp["id"], 704);
+    assert!(resp["error"].is_null());
+    let fine_data: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let fine_tris = fine_data["triangle_count"].as_u64().unwrap();
+    assert_eq!(fine_data["quality_applied"], "fine");
+    assert!(
+        fine_tris > coarse_tris,
+        "Fine tessellation triangles ({fine_tris}) must exceed Coarse triangles ({coarse_tris})"
+    );
+
+    // 5. Test tessellate_part with custom chord tolerance
+    let tess_custom_req = json!({
+        "jsonrpc": "2.0",
+        "id": 705,
+        "method": "tools/call",
+        "params": {
+            "name": "tessellate_part",
+            "arguments": {
+                "part_id": part_id,
+                "chord_tolerance": 0.000005,
+                "angular_tolerance_deg": 2.0
+            }
+        }
+    });
+    let resp = rpc_call(&state, tess_custom_req).await;
+    assert_eq!(resp["id"], 705);
+    assert!(resp["error"].is_null());
+    let custom_data: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(custom_data["quality_applied"], "custom");
+    let custom_tris = custom_data["triangle_count"].as_u64().unwrap();
+    assert!(custom_tris >= fine_tris);
+
+    // 6. Test export_stl with quality "coarse"
+    let tmp_dir = std::env::temp_dir();
+    let coarse_path = tmp_dir.join(format!("test_coarse_{}.stl", uuid::Uuid::new_v4().simple()));
+    let coarse_path_str = coarse_path.to_str().unwrap().to_string();
+
+    let export_coarse_req = json!({
+        "jsonrpc": "2.0",
+        "id": 706,
+        "method": "tools/call",
+        "params": {
+            "name": "export_stl",
+            "arguments": {
+                "part_id": part_id,
+                "filepath": coarse_path_str,
+                "binary": true,
+                "quality": "coarse"
+            }
+        }
+    });
+    let resp = rpc_call(&state, export_coarse_req).await;
+    assert_eq!(resp["id"], 706);
+    assert!(resp["error"].is_null());
+    let exp_coarse_data: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let exp_coarse_tris = exp_coarse_data["triangles_count"].as_u64().unwrap();
+    assert_eq!(exp_coarse_data["quality_applied"], "coarse");
+    assert!(coarse_path.exists());
+    let coarse_file_size = std::fs::metadata(&coarse_path).unwrap().len();
+
+    // 7. Test export_stl with quality "fine"
+    let fine_path = tmp_dir.join(format!("test_fine_{}.stl", uuid::Uuid::new_v4().simple()));
+    let fine_path_str = fine_path.to_str().unwrap().to_string();
+
+    let export_fine_req = json!({
+        "jsonrpc": "2.0",
+        "id": 707,
+        "method": "tools/call",
+        "params": {
+            "name": "export_stl",
+            "arguments": {
+                "part_id": part_id,
+                "filepath": fine_path_str,
+                "binary": true,
+                "quality": "fine"
+            }
+        }
+    });
+    let resp = rpc_call(&state, export_fine_req).await;
+    assert_eq!(resp["id"], 707);
+    assert!(resp["error"].is_null());
+    let exp_fine_data: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let exp_fine_tris = exp_fine_data["triangles_count"].as_u64().unwrap();
+    assert_eq!(exp_fine_data["quality_applied"], "fine");
+    assert!(fine_path.exists());
+    let fine_file_size = std::fs::metadata(&fine_path).unwrap().len();
+
+    // Assert: polygon count and file size for Fine > Coarse
+    assert!(
+        exp_fine_tris > exp_coarse_tris,
+        "Fine STL triangles ({exp_fine_tris}) must exceed Coarse STL triangles ({exp_coarse_tris})"
+    );
+    assert!(
+        fine_file_size > coarse_file_size,
+        "Fine STL file size ({fine_file_size} bytes) must exceed Coarse STL file size ({coarse_file_size} bytes)"
+    );
+
+    // Clean up temporary files
+    let _ = std::fs::remove_file(&coarse_path);
+    let _ = std::fs::remove_file(&fine_path);
+}
+
+#[tokio::test]
+async fn test_mcp_query_part_geometry() {
+    let state = EngineState::new()
+        .expect("EngineState initialization failed")
+        .into_shared();
+
+    // 1. Create part
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 801,
+        "method": "tools/call",
+        "params": {
+            "name": "create_part",
+            "arguments": {
+                "name": "box_inspect",
+                "material": "steel_structural_aisi1020"
+            }
+        }
+    })).await;
+    assert_eq!(resp["id"], 801);
+    let part_data: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let part_id = part_data["part_id"].as_str().unwrap();
+
+    // 2. Add box: 10 x 20 x 30
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 802,
+        "method": "tools/call",
+        "params": {
+            "name": "add_feature_primitive",
+            "arguments": {
+                "part_id": part_id,
+                "primitive_type": "box",
+                "width": 10.0,
+                "height": 20.0,
+                "depth": 30.0
+            }
+        }
+    })).await;
+    assert_eq!(resp["id"], 802);
+
+    // 3. Query geometry
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 803,
+        "method": "tools/call",
+        "params": {
+            "name": "query_part_geometry",
+            "arguments": {
+                "part_id": part_id
+            }
+        }
+    })).await;
+    assert_eq!(resp["id"], 803);
+    assert!(resp["error"].is_null());
+    let geom: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+
+    assert_eq!(geom["part_id"], part_id);
+    assert!((geom["volume"].as_f64().unwrap() - 6000.0).abs() < 1e-3);
+    assert!((geom["surface_area"].as_f64().unwrap() - 2200.0).abs() < 1e-3);
+    assert_eq!(geom["faces_count"], 12);
+    assert_eq!(geom["vertices_count"], 24);
+
+    let dims = geom["bounding_box"]["dimensions"].as_array().unwrap();
+    assert!((dims[0].as_f64().unwrap() - 10.0).abs() < 1e-4);
+    assert!((dims[1].as_f64().unwrap() - 20.0).abs() < 1e-4);
+    assert!((dims[2].as_f64().unwrap() - 30.0).abs() < 1e-4);
+
+    let planar_faces = geom["detected_planar_faces"].as_array().unwrap();
+    assert_eq!(planar_faces.len(), 6, "Box should have 6 detected planar faces");
+}
+
+#[tokio::test]
+async fn test_mcp_boolean_union_and_intersection() {
+    let state = EngineState::new()
+        .expect("EngineState initialization failed")
+        .into_shared();
+
+    // 1. Create target and tool parts
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 810,
+        "method": "tools/call",
+        "params": {
+            "name": "create_part",
+            "arguments": {
+                "name": "box_a",
+                "material": "steel_structural_aisi1020"
+            }
+        }
+    })).await;
+    let part_a = serde_json::from_str::<Value>(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap()["part_id"].as_str().unwrap().to_string();
+
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 811,
+        "method": "tools/call",
+        "params": {
+            "name": "create_part",
+            "arguments": {
+                "name": "box_b",
+                "material": "steel_structural_aisi1020"
+            }
+        }
+    })).await;
+    let part_b = serde_json::from_str::<Value>(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap()["part_id"].as_str().unwrap().to_string();
+
+    // Add box to Part A: 10 x 10 x 10 at [0, 0, 0]
+    rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 812,
+        "method": "tools/call",
+        "params": {
+            "name": "add_feature_primitive",
+            "arguments": {
+                "part_id": part_a,
+                "primitive_type": "box",
+                "width": 10.0,
+                "height": 10.0,
+                "depth": 10.0,
+                "position": [0.0, 0.0, 0.0]
+            }
+        }
+    })).await;
+
+    // Add box to Part B: 10 x 10 x 10 at [5, 0, 0]
+    rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 813,
+        "method": "tools/call",
+        "params": {
+            "name": "add_feature_primitive",
+            "arguments": {
+                "part_id": part_b,
+                "primitive_type": "box",
+                "width": 10.0,
+                "height": 10.0,
+                "depth": 10.0,
+                "position": [5.0, 0.0, 0.0]
+            }
+        }
+    })).await;
+
+    // Test boolean_union
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 814,
+        "method": "tools/call",
+        "params": {
+            "name": "boolean_union",
+            "arguments": {
+                "target_part_id": part_a,
+                "tool_part_id": part_b
+            }
+        }
+    })).await;
+    assert_eq!(resp["id"], 814);
+    assert!(resp["error"].is_null());
+    let union_data: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(union_data["status"], "union_applied");
+    assert!(union_data["triangles_count"].as_u64().unwrap() > 0);
+
+    // Test boolean_intersection
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 815,
+        "method": "tools/call",
+        "params": {
+            "name": "create_part",
+            "arguments": {
+                "name": "box_c",
+                "material": "steel_structural_aisi1020"
+            }
+        }
+    })).await;
+    let part_c = serde_json::from_str::<Value>(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap()["part_id"].as_str().unwrap().to_string();
+
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 816,
+        "method": "tools/call",
+        "params": {
+            "name": "create_part",
+            "arguments": {
+                "name": "box_d",
+                "material": "steel_structural_aisi1020"
+            }
+        }
+    })).await;
+    let part_d = serde_json::from_str::<Value>(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap()["part_id"].as_str().unwrap().to_string();
+
+    rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 817,
+        "method": "tools/call",
+        "params": {
+            "name": "add_feature_primitive",
+            "arguments": {
+                "part_id": part_c,
+                "primitive_type": "box",
+                "width": 10.0,
+                "height": 10.0,
+                "depth": 10.0,
+                "position": [0.0, 0.0, 0.0]
+            }
+        }
+    })).await;
+
+    rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 818,
+        "method": "tools/call",
+        "params": {
+            "name": "add_feature_primitive",
+            "arguments": {
+                "part_id": part_d,
+                "primitive_type": "box",
+                "width": 10.0,
+                "height": 10.0,
+                "depth": 10.0,
+                "position": [5.0, 0.0, 0.0]
+            }
+        }
+    })).await;
+
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 819,
+        "method": "tools/call",
+        "params": {
+            "name": "boolean_intersection",
+            "arguments": {
+                "target_part_id": part_c,
+                "tool_part_id": part_d
+            }
+        }
+    })).await;
+    assert_eq!(resp["id"], 819);
+    assert!(resp["error"].is_null());
+    let inter_data: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(inter_data["status"], "intersection_applied");
+    assert!(inter_data["triangles_count"].as_u64().unwrap() > 0);
+
+    // Test error: target == tool
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 820,
+        "method": "tools/call",
+        "params": {
+            "name": "boolean_union",
+            "arguments": {
+                "target_part_id": part_c,
+                "tool_part_id": part_c
+            }
+        }
+    })).await;
+    assert_eq!(resp["result"]["isError"], true);
+}
+
+#[tokio::test]
+async fn test_mcp_transform_part() {
+    let state = EngineState::new()
+        .expect("EngineState initialization failed")
+        .into_shared();
+
+    // 1. Create part & box
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 830,
+        "method": "tools/call",
+        "params": {
+            "name": "create_part",
+            "arguments": {
+                "name": "transform_target",
+                "material": "steel_structural_aisi1020"
+            }
+        }
+    })).await;
+    let part_id = serde_json::from_str::<Value>(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap()["part_id"].as_str().unwrap().to_string();
+
+    rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 831,
+        "method": "tools/call",
+        "params": {
+            "name": "add_feature_primitive",
+            "arguments": {
+                "part_id": part_id,
+                "primitive_type": "box",
+                "width": 2.0,
+                "height": 4.0,
+                "depth": 6.0
+            }
+        }
+    })).await;
+
+    // Original volume = 48
+    // Transform: scale 2x on X, rotate 90 deg around Z, translate [10, 20, 30]
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 832,
+        "method": "tools/call",
+        "params": {
+            "name": "transform_part",
+            "arguments": {
+                "part_id": part_id,
+                "scale": [2.0, 1.0, 1.0],
+                "rotation_deg": [0.0, 0.0, 90.0],
+                "translation": [10.0, 20.0, 30.0]
+            }
+        }
+    })).await;
+    assert_eq!(resp["id"], 832);
+    assert!(resp["error"].is_null());
+    let trans_data: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(trans_data["status"], "transformed");
+    // Volume after 2x scale: 48 * 2 = 96
+    assert!((trans_data["volume"].as_f64().unwrap() - 96.0).abs() < 1e-3);
+
+    let min = trans_data["bounding_box"]["min"].as_array().unwrap();
+    let max = trans_data["bounding_box"]["max"].as_array().unwrap();
+    let center_x = (min[0].as_f64().unwrap() + max[0].as_f64().unwrap()) / 2.0;
+    let center_y = (min[1].as_f64().unwrap() + max[1].as_f64().unwrap()) / 2.0;
+    let center_z = (min[2].as_f64().unwrap() + max[2].as_f64().unwrap()) / 2.0;
+    assert!((center_x - 10.0).abs() < 1e-3);
+    assert!((center_y - 20.0).abs() < 1e-3);
+    assert!((center_z - 30.0).abs() < 1e-3);
+}
+
+#[tokio::test]
+async fn test_mcp_define_material() {
+    let state = EngineState::new()
+        .expect("EngineState initialization failed")
+        .into_shared();
+
+    // 1. Register new custom material
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 840,
+        "method": "tools/call",
+        "params": {
+            "name": "define_material",
+            "arguments": {
+                "id": "carbon_fiber_t700",
+                "name": "Toray T700 Carbon Fiber",
+                "young_modulus_gpa": 230.0,
+                "poisson_ratio": 0.30,
+                "yield_strength_mpa": 2500.0,
+                "density_kg_m3": 1780.0
+            }
+        }
+    })).await;
+    assert_eq!(resp["id"], 840);
+    assert!(resp["error"].is_null());
+    let mat_data: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(mat_data["status"], "material_registered");
+    assert_eq!(mat_data["material_id"], "carbon_fiber_t700");
+    assert!((mat_data["properties"]["young_modulus_pa"].as_f64().unwrap() - 230e9).abs() < 1.0);
+    assert!((mat_data["properties"]["yield_strength_pa"].as_f64().unwrap() - 2500e6).abs() < 1.0);
+
+    // 2. Create part using newly defined material
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 841,
+        "method": "tools/call",
+        "params": {
+            "name": "create_part",
+            "arguments": {
+                "name": "cf_bracket",
+                "material": "carbon_fiber_t700"
+            }
+        }
+    })).await;
+    assert_eq!(resp["id"], 841);
+    assert!(resp["error"].is_null());
+
+    // 3. Validation: negative young's modulus
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 842,
+        "method": "tools/call",
+        "params": {
+            "name": "define_material",
+            "arguments": {
+                "id": "bad_mat",
+                "young_modulus_gpa": -50.0,
+                "poisson_ratio": 0.3,
+                "yield_strength_mpa": 100.0,
+                "density_kg_m3": 1000.0
+            }
+        }
+    })).await;
+    assert_eq!(resp["result"]["isError"], true);
+
+    // 4. Validation: invalid Poisson ratio (>= 0.5)
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 843,
+        "method": "tools/call",
+        "params": {
+            "name": "define_material",
+            "arguments": {
+                "id": "bad_nu",
+                "young_modulus_gpa": 100.0,
+                "poisson_ratio": 0.55,
+                "yield_strength_mpa": 100.0,
+                "density_kg_m3": 1000.0
+            }
+        }
+    })).await;
+    assert_eq!(resp["result"]["isError"], true);
+}
+
+#[tokio::test]
+async fn test_mcp_batch_cad_operations() {
+    let state = EngineState::new()
+        .expect("EngineState initialization failed")
+        .into_shared();
+
+    // 1. Successful batch of 3 operations
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 850,
+        "method": "tools/call",
+        "params": {
+            "name": "batch_cad_operations",
+            "arguments": {
+                "operations": [
+                    {
+                        "tool": "create_part",
+                        "params": {
+                            "part_id": "batch_part_1",
+                            "name": "batch_part_1",
+                            "material": "aluminum_6061_t6"
+                        }
+                    },
+                    {
+                        "tool": "add_feature_primitive",
+                        "params": {
+                            "part_id": "batch_part_1",
+                            "primitive_type": "box",
+                            "width": 5.0,
+                            "height": 5.0,
+                            "depth": 5.0
+                        }
+                    },
+                    {
+                        "tool": "query_part_geometry",
+                        "params": {
+                            "part_id": "batch_part_1"
+                        }
+                    }
+                ]
+            }
+        }
+    })).await;
+    assert_eq!(resp["id"], 850);
+    assert!(resp["error"].is_null());
+    let batch_data: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(batch_data["success"], true);
+    assert_eq!(batch_data["count"], 3);
+    let results = batch_data["results"].as_array().unwrap();
+    assert_eq!(results.len(), 3);
+    assert!(results[1]["feature_id"].is_string());
+    assert!((results[2]["volume"].as_f64().unwrap() - 125.0).abs() < 1e-3);
+
+    // 2. Nested batch recursion prevention
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 851,
+        "method": "tools/call",
+        "params": {
+            "name": "batch_cad_operations",
+            "arguments": {
+                "operations": [
+                    {
+                        "tool": "batch_cad_operations",
+                        "params": { "operations": [] }
+                    }
+                ]
+            }
+        }
+    })).await;
+    assert_eq!(resp["result"]["isError"], true);
+    let err_msg = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(err_msg.contains("Nested 'batch_cad_operations' is not permitted"));
+
+    // 3. Operation failure reports step index
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 852,
+        "method": "tools/call",
+        "params": {
+            "name": "batch_cad_operations",
+            "arguments": {
+                "operations": [
+                    {
+                        "tool": "create_part",
+                        "params": {
+                            "name": "valid_part",
+                            "material": "steel_structural_aisi1020"
+                        }
+                    },
+                    {
+                        "tool": "query_part_geometry",
+                        "params": { "part_id": "non_existent_part" }
+                    }
+                ]
+            }
+        }
+    })).await;
+    assert_eq!(resp["result"]["isError"], true);
+    let err_msg = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(err_msg.contains("Batch operation at index 1"));
+}
+
+#[tokio::test]
+async fn test_mcp_validate_mesh_and_debug_viewport_modes() {
+    let state = EngineState::new()
+        .expect("EngineState initialization failed")
+        .into_shared();
+
+    // 1. Create part
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 901,
+        "method": "tools/call",
+        "params": {
+            "name": "create_part",
+            "arguments": {
+                "name": "Diagnostic Box",
+                "material": "aluminum_6061_t6"
+            }
+        }
+    })).await;
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let data: Value = serde_json::from_str(text).unwrap();
+    let part_id = data["part_id"].as_str().unwrap().to_string();
+
+    // 2. Add box primitive
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 902,
+        "method": "tools/call",
+        "params": {
+            "name": "add_feature_primitive",
+            "arguments": {
+                "part_id": part_id,
+                "primitive_type": "box",
+                "params": {
+                    "width": 0.2,
+                    "height": 0.2,
+                    "depth": 0.2
+                }
+            }
+        }
+    })).await;
+    assert_eq!(resp["id"], 902);
+
+    // 3. Test validate_mesh tool call
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 903,
+        "method": "tools/call",
+        "params": {
+            "name": "validate_mesh",
+            "arguments": {
+                "part_id": part_id,
+                "expected_genus": 0
+            }
+        }
+    })).await;
+    assert_eq!(resp["id"], 903);
+    let val_text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let val: Value = serde_json::from_str(val_text).unwrap();
+    assert_eq!(val["status"], "PASS");
+    assert_eq!(val["topology"]["is_watertight"], true);
+    assert_eq!(val["topology"]["orientation_consistent"], true);
+    assert_eq!(val["geometry"]["is_positive_volume"], true);
+    assert_eq!(val["geometry"]["degenerate_triangles_count"], 0);
+
+    // 4. Test query_part_geometry contains mesh_validation
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 904,
+        "method": "tools/call",
+        "params": {
+            "name": "query_part_geometry",
+            "arguments": {
+                "part_id": part_id
+            }
+        }
+    })).await;
+    let q_text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let q_data: Value = serde_json::from_str(q_text).unwrap();
+    assert!(q_data["mesh_validation"].is_object());
+    assert_eq!(q_data["mesh_validation"]["status"], "PASS");
+
+    // 5. Test capture_viewport with all debug_mode options
+    let modes = ["wireframe", "normals", "backfaces", "boundary_edges", "flat_shading"];
+    for (idx, mode) in modes.iter().enumerate() {
+        let resp = rpc_call(&state, json!({
+            "jsonrpc": "2.0",
+            "id": 910 + idx,
+            "method": "tools/call",
+            "params": {
+                "name": "capture_viewport",
+                "arguments": {
+                    "part_id": part_id,
+                    "camera_preset": "isometric",
+                    "debug_mode": mode,
+                    "width": 320,
+                    "height": 240
+                }
+            }
+        })).await;
+
+        let v_text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let v_data: Value = serde_json::from_str(v_text).unwrap();
+        let b64 = v_data["image_base64"].as_str().unwrap();
+        assert!(!b64.is_empty(), "Base64 image for mode {} must not be empty", mode);
+        let bytes = base64::prelude::BASE64_STANDARD.decode(b64).unwrap();
+        assert_eq!(&bytes[0..8], &PNG_MAGIC, "PNG signature mismatch for mode {}", mode);
+    }
 }

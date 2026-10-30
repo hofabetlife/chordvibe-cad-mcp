@@ -115,8 +115,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             });
         });
 
-        let mut app = mcp_cad_viewer::CadWindowApp::default();
-        app.exit_on_close = true;
+        let mut app = mcp_cad_viewer::CadWindowApp {
+            exit_on_close: true,
+            ..Default::default()
+        };
 
         let stl_to_load = args.stl.as_ref().or(args.file.as_ref());
         if let Some(stl_path) = stl_to_load {
