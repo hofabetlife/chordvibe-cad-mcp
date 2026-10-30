@@ -1416,6 +1416,43 @@ fn test_bug_008_dag_rollback_on_failed_rebuild() {
 }
 
 #[test]
+fn test_bug_009_batch_operations_atomic_rollback() {
+    let mut state = EngineState::new().unwrap();
+    let p_res = mcp_cad_server::tools::cad::create_part(&json!({"name": "batch_part", "material": "aluminum_6061_t6"}), &mut state).unwrap();
+    let part_id = p_res["part_id"].as_str().unwrap();
+
+    // Valid box
+    mcp_cad_server::tools::cad::add_feature_primitive(&json!({
+        "part_id": part_id,
+        "primitive_type": "box",
+        "params": {"width": 0.1, "height": 0.1, "depth": 0.1}
+    }), &mut state).unwrap();
+
+    let initial_parts_count = state.parts.len();
+    let initial_nodes_len = state.parts[part_id].dag.nodes.len();
+
+    // Run a batch where op 1 succeeds (create new part) and op 2 fails (unknown primitive)
+    let batch_call = mcp_cad_server::tools::cad::batch_cad_operations(&json!({
+        "operations": [
+            {
+                "tool": "create_part",
+                "params": {"name": "temporary_part", "material": "aluminum_6061_t6"}
+            },
+            {
+                "tool": "add_feature_primitive",
+                "params": {"part_id": part_id, "primitive_type": "nonexistent_primitive"}
+            }
+        ]
+    }), &mut state);
+
+    assert!(batch_call.is_err());
+    // Verify atomicity: temporary_part must NOT exist! state.parts must be exactly as before.
+    assert_eq!(state.parts.len(), initial_parts_count);
+    assert_eq!(state.parts[part_id].dag.nodes.len(), initial_nodes_len);
+    assert!(!state.parts.values().any(|p| p.name == "temporary_part"));
+}
+
+#[test]
 fn test_bug_010_viewport_and_preview_validation() {
     let state = EngineState::new().unwrap();
 
