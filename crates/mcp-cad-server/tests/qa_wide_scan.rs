@@ -999,3 +999,43 @@ async fn test_bug_003_partial_revolve_mesh_and_renders() {
     }
 }
 
+#[test]
+fn test_bug_007_negative_scale_preserves_outward_winding() {
+    let art_dir = qa_base_dir().join("artifacts");
+    std::fs::create_dir_all(&art_dir).unwrap();
+
+    // SKEPTIC cases: 1 negative axis [-1, 1, 1], 2 negative axes [-1, -1, 1], 3 negative axes [-2, -1, -0.5]
+    for scale in [[-1.0, 1.0, 1.0], [-1.0, -1.0, 1.0], [-2.0, -1.0, -0.5]] {
+        let mut mesh = create_box(0.1, 0.2, 0.3);
+        mesh.scale(scale);
+        let rep = validate_mesh(&mesh, Some(0));
+        assert_eq!(rep.status, "PASS", "Scale {:?} failed: {:?}", scale, rep.issues);
+        assert!(rep.geometry.signed_volume > 0.0, "Signed volume must be positive for {:?}", scale);
+        assert_eq!(rep.geometry.normals_vs_winding_mismatches, 0);
+    }
+
+    let mut cyl = create_cylinder(0.04, 0.12, 32);
+    cyl.scale([-1.0, 1.0, 1.0]);
+    let rep_cyl = validate_mesh(&cyl, Some(0));
+    assert_eq!(rep_cyl.status, "PASS", "Mirrored cylinder failed: {:?}", rep_cyl.issues);
+
+    let state = EngineState::new().unwrap().into_shared();
+    let engine = state.read();
+    for mode_name in ["normals", "backfaces"] {
+        let out_path = art_dir.join(format!("neg_scale_cyl_{}.png", mode_name));
+        let debug_mode = mcp_cad_viewer::DebugRenderMode::parse(Some(mode_name));
+        let png_bytes = engine
+            .offscreen_renderer
+            .render_mesh_png_debug(
+                &cyl,
+                mcp_cad_viewer::CameraPreset::Isometric,
+                debug_mode,
+                800,
+                600,
+            )
+            .unwrap();
+        std::fs::write(&out_path, &png_bytes).unwrap();
+    }
+}
+
+
