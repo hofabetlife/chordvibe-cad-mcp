@@ -14,6 +14,11 @@ pub fn capture_viewport(args: &Value, state: &EngineState) -> Result<Value, Serv
     let preset = parse_camera_preset(args.get("camera_preset").and_then(|v| v.as_str()));
     let width = args.get("width").and_then(|v| v.as_u64()).unwrap_or(800) as u32;
     let height = args.get("height").and_then(|v| v.as_u64()).unwrap_or(600) as u32;
+    if width == 0 || height == 0 {
+        return Err(ServerError::InvalidArgument(
+            "Viewport width and height must be greater than zero".to_string(),
+        ));
+    }
     let debug_mode_str = args.get("debug_mode").and_then(|v| v.as_str());
     let debug_mode = mcp_cad_viewer::DebugRenderMode::parse(debug_mode_str);
 
@@ -65,6 +70,13 @@ pub fn capture_viewport(args: &Value, state: &EngineState) -> Result<Value, Serv
 
 /// 16. `open_preview_window`: Opens or focuses the interactive native 3D CAD preview window on Windows.
 pub fn open_preview_window(args: &Value, state: &EngineState) -> Result<Value, ServerError> {
+    let part_id_opt = args.get("part_id").and_then(|v| v.as_str());
+    if let Some(part_id) = part_id_opt {
+        if !state.parts.contains_key(part_id) {
+            return Err(ServerError::PartNotFound(part_id.to_string()));
+        }
+    }
+
     if let Some(proxy) = &state.gui_proxy {
         let part_id_opt = args.get("part_id").and_then(|v| v.as_str());
         if let Some(part_id) = part_id_opt {
