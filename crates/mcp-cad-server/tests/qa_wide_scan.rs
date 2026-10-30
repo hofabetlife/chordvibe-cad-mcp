@@ -1243,3 +1243,129 @@ async fn test_bug_004_wheel_rim_manifold_and_renders() {
         std::fs::write(&out_path, &png_bytes).unwrap();
     }
 }
+
+#[tokio::test]
+async fn test_bug_006_csg_booleans_and_holes_watertight() {
+    let base_dir = qa_base_dir();
+    let art_dir = base_dir.join("artifacts");
+    std::fs::create_dir_all(&art_dir).unwrap();
+    let settings = TessellationSettings::medium();
+
+    // 1. Coplanar and offset box booleans: exact analytical volume & genus 0
+    let box_a = create_box(0.1, 0.1, 0.1);
+    let mut box_b = create_box(0.1, 0.1, 0.1);
+    box_b.translate([0.05, 0.0, 0.0]);
+
+    let m_union = csg_union(&box_a, &box_b);
+    let r_union = validate_mesh(&m_union, Some(0));
+    assert_eq!(r_union.status, "PASS", "Union failed: {:?}", r_union.issues);
+    assert!((r_union.geometry.signed_volume - 0.0015).abs() < 1e-6);
+    assert_eq!(r_union.geometry.t_junctions_count, 0);
+
+    let m_diff = csg_difference(&box_a, &box_b);
+    let r_diff = validate_mesh(&m_diff, Some(0));
+    assert_eq!(r_diff.status, "PASS", "Diff failed: {:?}", r_diff.issues);
+    assert!((r_diff.geometry.signed_volume - 0.0005).abs() < 1e-6);
+    assert_eq!(r_diff.geometry.t_junctions_count, 0);
+
+    let m_inter = csg_intersection(&box_a, &box_b);
+    let r_inter = validate_mesh(&m_inter, Some(0));
+    assert_eq!(r_inter.status, "PASS", "Inter failed: {:?}", r_inter.issues);
+    assert!((r_inter.geometry.signed_volume - 0.0005).abs() < 1e-6);
+    assert_eq!(r_inter.geometry.t_junctions_count, 0);
+
+    // 2. CutHole variations: through, blind, keyway, angled
+    let plate = create_box(0.1, 0.1, 0.04);
+    let m_thru = cut_hole_with_settings(&plate, [0.0, 0.0, 0.0], [0.0, 0.0, 1.0], 0.015, 0.10, None, None, &settings);
+    let r_thru = validate_mesh(&m_thru, Some(1));
+    assert_eq!(r_thru.status, "PASS", "Thru hole failed: {:?}", r_thru.issues);
+    assert_eq!(r_thru.geometry.t_junctions_count, 0);
+
+    let m_blind = cut_hole_with_settings(&plate, [0.0, 0.0, 0.01], [0.0, 0.0, 1.0], 0.015, 0.03, None, None, &settings);
+    let r_blind = validate_mesh(&m_blind, Some(0));
+    assert_eq!(r_blind.status, "PASS", "Blind hole failed: {:?}", r_blind.issues);
+    assert_eq!(r_blind.geometry.t_junctions_count, 0);
+
+    let m_key = cut_hole_with_settings(
+        &plate,
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+        0.015,
+        0.10,
+        Some(0.006),
+        Some(0.003),
+        &settings,
+    );
+    let r_key = validate_mesh(&m_key, Some(1));
+    assert_eq!(r_key.status, "PASS", "Keyway hole failed: {:?}", r_key.issues);
+    assert_eq!(r_key.geometry.t_junctions_count, 0);
+
+    let m_ang = cut_hole_with_settings(&plate, [0.0, 0.0, 0.0], [1.0, 0.0, 1.0], 0.01, 0.20, None, None, &settings);
+    let r_ang = validate_mesh(&m_ang, Some(1));
+    assert_eq!(r_ang.status, "PASS", "Angled hole failed: {:?}", r_ang.issues);
+    assert_eq!(r_ang.geometry.t_junctions_count, 0);
+
+    // 3. Multi-hole CSG chain (genus 2)
+    let m_two_holes = cut_hole_with_settings(
+        &cut_hole_with_settings(&plate, [-0.025, 0.0, 0.0], [0.0, 0.0, 1.0], 0.012, 0.10, Some(0.005), Some(0.0025), &settings),
+        [0.025, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+        0.012,
+        0.10,
+        None,
+        None,
+        &settings,
+    );
+    let r_two_holes = validate_mesh(&m_two_holes, Some(2));
+    assert_eq!(r_two_holes.status, "PASS", "Two holes chain failed: {:?}", r_two_holes.issues);
+    assert_eq!(r_two_holes.topology.boundary_edges_count, 0);
+    assert_eq!(r_two_holes.topology.non_manifold_edges_count, 0);
+    assert_eq!(r_two_holes.geometry.t_junctions_count, 0);
+
+    // 4. Helical cutters manifold & watertight (circular and metric_60)
+    for profile_type in ["circular", "metric_60"] {
+        let cutter = create_helical_cutter_with_settings(
+            0.01,
+            0.002,
+            0.008,
+            0.03,
+            -0.015,
+            1,
+            true,
+            0.03 / 0.008,
+            profile_type,
+            &settings,
+        );
+        let val_cutter = validate_mesh(&cutter, Some(0));
+        assert_eq!(
+            val_cutter.status, "PASS",
+            "Helical cutter ({}) failed: {:?}",
+            profile_type, val_cutter.issues
+        );
+        assert_eq!(val_cutter.topology.boundary_edges_count, 0);
+        assert_eq!(val_cutter.topology.non_manifold_edges_count, 0);
+        assert!(val_cutter.topology.orientation_consistent);
+        assert_eq!(val_cutter.geometry.self_intersections_count, 0);
+        assert!(val_cutter.geometry.signed_volume > 0.0);
+    }
+
+    // 5. Render m_two_holes in all 5 debug modes for visual inspection (Rule R1/R2)
+    let state = EngineState::new().unwrap().into_shared();
+    let engine = state.read();
+    for mode_name in ["shaded", "wireframe", "normals", "backfaces", "boundary_edges"] {
+        let out_path = art_dir.join(format!("csg_chain_two_holes_{}.png", mode_name));
+        let debug_mode = mcp_cad_viewer::DebugRenderMode::parse(Some(mode_name));
+        let png_bytes = engine
+            .offscreen_renderer
+            .render_mesh_png_debug(
+                &m_two_holes,
+                mcp_cad_viewer::CameraPreset::Isometric,
+                debug_mode,
+                800,
+                600,
+            )
+            .unwrap();
+        std::fs::write(&out_path, &png_bytes).unwrap();
+    }
+}
+
