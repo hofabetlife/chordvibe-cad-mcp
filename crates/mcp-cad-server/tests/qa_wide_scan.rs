@@ -1097,5 +1097,79 @@ async fn test_bug_005_polygon_prism_chamfer_and_sides_validation() {
     }
 }
 
+#[tokio::test]
+async fn test_bug_002_spur_gear_manifold_and_keyway() {
+    let art_dir = qa_base_dir().join("artifacts");
+    std::fs::create_dir_all(&art_dir).unwrap();
 
+    // 1. SKEPTIC grid: teeth in [8, 20, 60], pressure angle in [14.5, 20.0, 25.0]
+    for &teeth in &[8usize, 20, 60] {
+        for &pa in &[14.5f64, 20.0, 25.0] {
+            let gear = create_spur_gear(0.002, teeth, pa, 0.015, None, None, None, None, None);
+            let rep = validate_mesh(&gear, Some(0));
+            assert_eq!(
+                rep.status, "PASS",
+                "Plain gear (teeth={}, pa={}) failed validate_mesh: {:?}",
+                teeth, pa, rep.issues
+            );
+            assert!(
+                rep.geometry.max_aspect_ratio < 50.0,
+                "Plain gear (teeth={}, pa={}) max_aspect_ratio too high: {}",
+                teeth, pa, rep.geometry.max_aspect_ratio
+            );
+        }
+    }
 
+    // 2. Bore only (genus = 1)
+    let gear_bore = create_spur_gear(0.002, 20, 20.0, 0.015, Some(0.006), None, None, None, None);
+    let rep_bore = validate_mesh(&gear_bore, Some(1));
+    assert_eq!(rep_bore.status, "PASS", "Gear with bore failed: {:?}", rep_bore.issues);
+
+    // 3. Hub only (genus = 0)
+    let gear_hub = create_spur_gear(0.002, 20, 20.0, 0.015, None, None, None, Some(0.025), Some(0.010));
+    let rep_hub = validate_mesh(&gear_hub, Some(0));
+    assert_eq!(rep_hub.status, "PASS", "Gear with hub failed: {:?}", rep_hub.issues);
+
+    // 4. Full Hub + Bore + DIN 6885 Keyway (genus = 1)
+    let gear_full = create_spur_gear(
+        0.002,
+        20,
+        20.0,
+        0.015,
+        Some(0.006),
+        Some(0.004),
+        Some(0.0018),
+        Some(0.025),
+        Some(0.010),
+    );
+    let rep_full = validate_mesh(&gear_full, Some(1));
+    assert_eq!(
+        rep_full.status, "PASS",
+        "Gear with hub, bore, and keyway failed: {:?}",
+        rep_full.issues
+    );
+    assert!(rep_full.topology.is_watertight);
+    assert_eq!(rep_full.topology.non_manifold_edges_count, 0);
+    assert!(rep_full.topology.orientation_consistent);
+    assert_eq!(rep_full.geometry.degenerate_triangles_count, 0);
+    assert_eq!(rep_full.geometry.self_intersections_count, 0);
+
+    // 5. Render gear_full in all 5 debug modes for visual inspection
+    let state = EngineState::new().unwrap().into_shared();
+    let engine = state.read();
+    for mode_name in ["shaded", "wireframe", "normals", "backfaces", "boundary_edges"] {
+        let out_path = art_dir.join(format!("spur_gear_hub_keyway_{}.png", mode_name));
+        let debug_mode = mcp_cad_viewer::DebugRenderMode::parse(Some(mode_name));
+        let png_bytes = engine
+            .offscreen_renderer
+            .render_mesh_png_debug(
+                &gear_full,
+                mcp_cad_viewer::CameraPreset::Isometric,
+                debug_mode,
+                800,
+                600,
+            )
+            .unwrap();
+        std::fs::write(&out_path, &png_bytes).unwrap();
+    }
+}
