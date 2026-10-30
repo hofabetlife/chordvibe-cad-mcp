@@ -1,8 +1,8 @@
 //! 3D solid primitive generators: Box, Cylinder, Sphere, and CutHole.
 
 use std::f64::consts::PI;
-use nalgebra::{Matrix3, Rotation3, Vector3};
-use crate::csg::{csg_difference, csg_union};
+use nalgebra::{Rotation3, Vector3};
+use crate::csg::csg_difference;
 use crate::tessellation::{TessellationQuality, TessellationSettings};
 use crate::topology::{TriangleMesh, Vertex};
 
@@ -327,6 +327,10 @@ pub fn cut_hole_with_settings(
     keyway_depth: Option<f64>,
     settings: &TessellationSettings,
 ) -> TriangleMesh {
+    if radius <= 1e-12 || depth <= 1e-12 || mesh.indices.is_empty() {
+        return mesh.clone();
+    }
+
     let norm_v = Vector3::new(normal[0], normal[1], normal[2]);
     let norm_len = norm_v.norm();
     let unit_norm = if norm_len > 1e-12 {
@@ -335,62 +339,185 @@ pub fn cut_hole_with_settings(
         Vector3::new(0.0, 0.0, 1.0)
     };
 
-    // To prevent coplanar artifact issues at the surface,
-    // slightly extend the cutting tool outward along +normal,
-    // and drill into -normal.
-    let margin = (depth * 0.02).clamp(1e-4, 0.05);
-    let tool_height = depth + margin * 2.0;
+    let center_vec = Vector3::new(center[0], center[1], center[2]);
+    let mut t_min = f64::INFINITY;
+    let mut t_max = f64::NEG_INFINITY;
+    for v in &mesh.vertices {
+        let t = (v.pos_vec() - center_vec).dot(&unit_norm);
+        if t < t_min {
+            t_min = t;
+        }
+        if t > t_max {
+            t_max = t;
+        }
+    }
+    let span = (t_max - t_min).max(0.0);
+    let margin = (depth * 0.05).clamp(1e-3, 0.05);
 
-    // Drill inward in direction: -unit_norm
+    // Determine axial start/end along +unit_norm relative to center_vec:
+    // If depth covers the part span along unit_norm, treat as a through-hole spanning [t_min - margin, t_max + margin].
+    // Otherwise drill from the entry side (t_entry) inward by depth along -unit_norm.
+    let (t_high, t_low) = if span > 1e-9 && depth >= span - 1e-4 {
+        (t_max + margin, t_min - margin)
+    } else {
+        let t_entry = if t_max.abs() <= 1e-4 { 0.0 } else { t_max };
+        let mut t_bottom = t_entry - depth;
+        if span > 1e-9 && (t_bottom - t_min).abs() < 5e-4 {
+            if depth >= span * 0.95 {
+                t_bottom = t_min - margin;
+            } else {
+                t_bottom = t_min + 1e-3;
+            }
+        }
+        (t_entry + margin, t_bottom)
+    };
+
+    let tool_height = (t_high - t_low).max(1e-5);
     let drill_dir = -unit_norm;
-    let tool_center = Vector3::new(center[0], center[1], center[2])
-        + drill_dir * (depth * 0.5)
-        + unit_norm * margin;
-
-    let cyl_tool = create_cylinder_oriented_with_settings(
-        [tool_center.x, tool_center.y, tool_center.z],
-        [drill_dir.x, drill_dir.y, drill_dir.z],
-        radius,
-        tool_height,
-        settings,
-    );
+    let tool_center = center_vec + unit_norm * (0.5 * (t_high + t_low));
 
     let final_tool = if let (Some(kw), Some(kd)) = (keyway_width, keyway_depth) {
         if kw > 1e-6 && kd > 1e-6 {
-            // Find orthonormal basis (u, v, w) where w = drill_dir
-            let w = drill_dir;
-            let up = if w.y.abs() < 0.9 {
-                Vector3::new(0.0, 1.0, 0.0)
-            } else {
-                Vector3::new(0.0, 0.0, 1.0)
-            };
-            let u = w.cross(&up).normalize();
-            let v = w.cross(&u).normalize();
-
-            // DIN 6885 keyway slot:
-            // width kw along u, radial depth (radius + kd) along v, length tool_height along w.
-            let mut box_mesh = create_box(kw, radius + kd, tool_height);
-            let rot_mat = Matrix3::from_columns(&[u, v, w]);
-            let box_center = tool_center + v * ((radius + kd) * 0.5);
-
-            for vert in &mut box_mesh.vertices {
-                let p = Vector3::new(vert.position[0], vert.position[1], vert.position[2]);
-                let n = Vector3::new(vert.normal[0], vert.normal[1], vert.normal[2]);
-                let world_p = box_center + rot_mat * p;
-                let world_n = rot_mat * n;
-                vert.position = [world_p.x, world_p.y, world_p.z];
-                vert.normal = [world_n.x, world_n.y, world_n.z];
-            }
-
-            csg_union(&cyl_tool, &box_mesh)
+            build_keyway_cutter_prism(
+                tool_center,
+                drill_dir,
+                radius,
+                tool_height,
+                kw,
+                kd,
+                settings.calculate_segments(radius).max(24),
+            )
         } else {
-            cyl_tool
+            create_cylinder_oriented_with_settings(
+                [tool_center.x, tool_center.y, tool_center.z],
+                [drill_dir.x, drill_dir.y, drill_dir.z],
+                radius,
+                tool_height,
+                settings,
+            )
         }
     } else {
-        cyl_tool
+        create_cylinder_oriented_with_settings(
+            [tool_center.x, tool_center.y, tool_center.z],
+            [drill_dir.x, drill_dir.y, drill_dir.z],
+            radius,
+            tool_height,
+            settings,
+        )
     };
 
     csg_difference(mesh, &final_tool)
+}
+
+/// Builds a single watertight manifold cutter prism consisting of a cylinder of `radius`
+/// with a rectangular keyway slot (`kw` wide, `kd` deep beyond `radius`) extruded along `axis`.
+fn build_keyway_cutter_prism(
+    center: Vector3<f64>,
+    axis: Vector3<f64>,
+    radius: f64,
+    height: f64,
+    keyway_width: f64,
+    keyway_depth: f64,
+    segments: usize,
+) -> TriangleMesh {
+    let w = axis.normalize();
+    let up = if w.y.abs() < 0.9 {
+        Vector3::new(0.0, 1.0, 0.0)
+    } else {
+        Vector3::new(0.0, 0.0, 1.0)
+    };
+    let u = w.cross(&up).normalize();
+    let v = w.cross(&u).normalize();
+
+    let half_kw = (keyway_width * 0.5).clamp(radius * 0.02, radius * 0.92);
+    let alpha = (half_kw / radius).clamp(0.02, 0.95).asin();
+    let y_shoulder = (radius * radius - half_kw * half_kw).max(0.0).sqrt();
+    let y_top = radius + keyway_depth;
+
+    let mut profile: Vec<[f64; 2]> = Vec::with_capacity(segments + 4);
+    profile.push([half_kw, y_shoulder]);
+    profile.push([half_kw, y_top]);
+    profile.push([-half_kw, y_top]);
+    profile.push([-half_kw, y_shoulder]);
+
+    let start_ang = std::f64::consts::FRAC_PI_2 + alpha;
+    let end_ang = 2.5 * std::f64::consts::PI - alpha;
+    let arc_steps = segments.max(16);
+    for i in 1..arc_steps {
+        let t = i as f64 / arc_steps as f64;
+        let ang = start_ang + t * (end_ang - start_ang);
+        profile.push([radius * ang.cos(), radius * ang.sin()]);
+    }
+
+    let n = profile.len();
+    let half_h = height * 0.5;
+    let to_world = |px: f64, py: f64, pz: f64| -> [f64; 3] {
+        let p = center + u * px + v * py + w * pz;
+        [p.x, p.y, p.z]
+    };
+    let norm_world = |nx: f64, ny: f64, nz: f64| -> [f64; 3] {
+        let d = (u * nx + v * ny + w * nz).normalize();
+        [d.x, d.y, d.z]
+    };
+
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+
+    // Bottom cap at z = -half_h (normal -w)
+    let n_bot = norm_world(0.0, 0.0, -1.0);
+    let bot_center_idx = vertices.len() as u32;
+    vertices.push(Vertex::new(to_world(0.0, 0.0, -half_h), n_bot));
+    let bot_ring_start = vertices.len() as u32;
+    for &[px, py] in &profile {
+        vertices.push(Vertex::new(to_world(px, py, -half_h), n_bot));
+    }
+    for i in 0..n {
+        let next = (i + 1) % n;
+        indices.push([
+            bot_center_idx,
+            bot_ring_start + next as u32,
+            bot_ring_start + i as u32,
+        ]);
+    }
+
+    // Top cap at z = +half_h (normal +w)
+    let n_top = norm_world(0.0, 0.0, 1.0);
+    let top_center_idx = vertices.len() as u32;
+    vertices.push(Vertex::new(to_world(0.0, 0.0, half_h), n_top));
+    let top_ring_start = vertices.len() as u32;
+    for &[px, py] in &profile {
+        vertices.push(Vertex::new(to_world(px, py, half_h), n_top));
+    }
+    for i in 0..n {
+        let next = (i + 1) % n;
+        indices.push([
+            top_center_idx,
+            top_ring_start + i as u32,
+            top_ring_start + next as u32,
+        ]);
+    }
+
+    // Side walls connecting bottom ring to top ring
+    for i in 0..n {
+        let next = (i + 1) % n;
+        let p0 = profile[i];
+        let p1 = profile[next];
+        let dx = p1[0] - p0[0];
+        let dy = p1[1] - p0[1];
+        let len = (dx * dx + dy * dy).sqrt().max(1e-12);
+        let n_side = norm_world(dy / len, -dx / len, 0.0);
+
+        let base = vertices.len() as u32;
+        vertices.push(Vertex::new(to_world(p0[0], p0[1], -half_h), n_side));
+        vertices.push(Vertex::new(to_world(p1[0], p1[1], -half_h), n_side));
+        vertices.push(Vertex::new(to_world(p1[0], p1[1], half_h), n_side));
+        vertices.push(Vertex::new(to_world(p0[0], p0[1], half_h), n_side));
+
+        indices.push([base, base + 1, base + 2]);
+        indices.push([base, base + 2, base + 3]);
+    }
+
+    TriangleMesh::new(vertices, indices)
 }
 
 /// Generates a solid 3D cone or truncated cone (frustum) centered at the origin along the Z axis.
@@ -850,7 +977,10 @@ pub fn create_helical_cutter_with_settings(
         let phi_0 = (start_idx as f64) * 2.0 * PI / (num_starts as f64);
         let start_vertex_offset = all_vertices.len() as u32;
 
-        // Generate circular ring vertices at each step j along the helix
+        let is_metric = profile_type.eq_ignore_ascii_case("metric_60");
+        let m = if is_metric { 4 } else { cross_segments };
+
+        // Generate ring vertices at each step j along the helix
         for j in 0..=k_steps {
             let u = (j as f64) / (k_steps as f64);
             let t = u * total_sweep_angle;
@@ -868,54 +998,35 @@ pub fn create_helical_cutter_with_settings(
                 Vector3::new(0.0, 0.0, 1.0)
             };
 
-            let is_metric = profile_type.eq_ignore_ascii_case("metric_60");
             if is_metric {
-                // ISO 68-1 60-degree triangular metric thread profile (rhombus cutter)
-                // Flank angle is 30 deg to thread axis: tan(30) = 1 / sqrt(3)
+                // ISO 68-1 60-degree triangular metric thread profile (symmetric rhombus cutter
+                // supporting both external shaft threads and internal nut threads).
+                // Flank angle is 30 deg to radial axis: tan(30) = 1 / sqrt(3).
                 let tan30 = (PI / 6.0).tan();
                 let w = (groove_radius * tan30).min(0.48 * pitch);
                 let h_eff = w / tan30;
 
-                // 4 corners of 60-deg diamond in (e_r, e_b) plane:
-                // (+h_eff, 0) -> (0, +w) -> (-h_eff, 0) -> (0, -w)
-                let segs_per_flank = cross_segments / 4;
-                for flank in 0..4 {
-                    let (p_start, p_end, n_flank) = match flank {
-                        0 => (
-                            Vector3::new(h_eff, 0.0, 0.0),
-                            Vector3::new(0.0, w, 0.0),
-                            Vector3::new(w, h_eff, 0.0).normalize(),
-                        ),
-                        1 => (
-                            Vector3::new(0.0, w, 0.0),
-                            Vector3::new(-h_eff, 0.0, 0.0),
-                            Vector3::new(-w, h_eff, 0.0).normalize(),
-                        ),
-                        2 => (
-                            Vector3::new(-h_eff, 0.0, 0.0),
-                            Vector3::new(0.0, -w, 0.0),
-                            Vector3::new(-w, -h_eff, 0.0).normalize(),
-                        ),
-                        _ => (
-                            Vector3::new(0.0, -w, 0.0),
-                            Vector3::new(h_eff, 0.0, 0.0),
-                            Vector3::new(w, -h_eff, 0.0).normalize(),
-                        ),
-                    };
-
-                    for k in 0..segs_per_flank {
-                        let frac = (k as f64) / (segs_per_flank as f64);
-                        let r_coord = p_start.x + (p_end.x - p_start.x) * frac;
-                        let b_coord = p_start.y + (p_end.y - p_start.y) * frac;
-
-                        let pos = center + e_r * r_coord + e_b * b_coord;
-                        let n = (e_r * n_flank.x + e_b * n_flank.y).normalize();
-                        all_vertices.push(Vertex::new([pos.x, pos.y, pos.z], [n.x, n.y, n.z]));
-                    }
+                let corners = [
+                    (Vector3::new(h_eff, 0.0, 0.0), Vector3::new(1.0, 0.0, 0.0)),
+                    (
+                        Vector3::new(1e-3 * h_eff, w, 0.0),
+                        Vector3::new(0.0, 1.0, 0.0),
+                    ),
+                    (Vector3::new(-h_eff, 0.0, 0.0), Vector3::new(-1.0, 0.0, 0.0)),
+                    (
+                        Vector3::new(1e-3 * h_eff, -w, 0.0),
+                        Vector3::new(0.0, -1.0, 0.0),
+                    ),
+                ];
+                for (p_c, n_c) in corners {
+                    let pos = center + e_r * p_c.x + e_b * p_c.y;
+                    let n = (e_r * n_c.x + e_b * n_c.y).normalize();
+                    all_vertices.push(Vertex::new([pos.x, pos.y, pos.z], [n.x, n.y, n.z]));
                 }
             } else {
+                // Half-step angular offset ensures no longitudinal edge lies at cos(alpha) == 0 (r_coord == 0)
                 for i in 0..cross_segments {
-                    let alpha = (i as f64) * 2.0 * PI / (cross_segments as f64);
+                    let alpha = ((i as f64) + 0.5) * 2.0 * PI / (cross_segments as f64);
                     let cos_a = alpha.cos();
                     let sin_a = alpha.sin();
 
@@ -928,7 +1039,6 @@ pub fn create_helical_cutter_with_settings(
         }
 
         // Quads along the helical tube
-        let m = cross_segments;
         for j in 0..k_steps {
             for i in 0..m {
                 let next_i = (i + 1) % m;

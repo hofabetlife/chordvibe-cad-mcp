@@ -444,12 +444,12 @@ pub fn validate_mesh(mesh: &TriangleMesh, expected_genus: Option<i32>) -> MeshVa
     };
 
     // T-junctions detection:
-    // A vertex P lies strictly on edge AB if dist(P, AB) < eps and projection is in (0.05, 0.95).
-    // Bounded with vertex count and AABB check for fast execution.
+    // A vertex P (not belonging to any triangle incident to edge AB) lies strictly on edge AB
+    // if dist(P, AB) < eps and projection is in (0.05, 0.95).
     let t_eps = (diag * 1e-4).max(1e-7);
     let mut t_junctions_count = 0usize;
-    if welded_positions.len() <= 2000 {
-        for &edge in undirected_edge_counts.keys() {
+    if welded_positions.len() <= 5000 {
+        for (&edge, incident_tris) in &edge_to_triangles {
             let pa = welded_positions[edge.0 as usize];
             let pb = welded_positions[edge.1 as usize];
             let edge_min_x = pa.x.min(pb.x) - t_eps;
@@ -470,7 +470,20 @@ pub fn validate_mesh(mesh: &TriangleMesh, expected_genus: Option<i32>) -> MeshVa
                 if u_idx == edge.0 || u_idx == edge.1 {
                     continue;
                 }
-                if pv.x < edge_min_x || pv.x > edge_max_x || pv.y < edge_min_y || pv.y > edge_max_y || pv.z < edge_min_z || pv.z > edge_max_z {
+                if pv.x < edge_min_x
+                    || pv.x > edge_max_x
+                    || pv.y < edge_min_y
+                    || pv.y > edge_max_y
+                    || pv.z < edge_min_z
+                    || pv.z > edge_max_z
+                {
+                    continue;
+                }
+                // Skip if u_idx is the opposite vertex of a triangle that owns `edge`
+                if incident_tris.iter().any(|&t_i| {
+                    let tri = welded_indices[t_i];
+                    tri[0] == u_idx || tri[1] == u_idx || tri[2] == u_idx
+                }) {
                     continue;
                 }
                 let ap = pv - pa;
