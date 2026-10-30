@@ -431,8 +431,14 @@ pub fn add_feature_primitive(args: &Value, state: &mut EngineState) -> Result<Va
         .get_mut(part_id)
         .ok_or_else(|| ServerError::PartNotFound(part_id.to_string()))?;
 
+    let prev_dag = part.dag.clone();
+    let prev_mesh = part.mesh.clone();
     let feature_id = part.dag.add_feature(op, None);
-    part.rebuild()?;
+    if let Err(e) = part.rebuild() {
+        part.dag = prev_dag;
+        part.mesh = prev_mesh;
+        return Err(ServerError::Cad(e));
+    }
 
     let mesh_clone = part.mesh.clone();
     state.send_gui_mesh(&mesh_clone);
@@ -500,6 +506,8 @@ pub fn cut_hole(args: &Value, state: &mut EngineState) -> Result<Value, ServerEr
         .get_mut(part_id)
         .ok_or_else(|| ServerError::PartNotFound(part_id.to_string()))?;
 
+    let prev_dag = part.dag.clone();
+    let prev_mesh = part.mesh.clone();
     let feature_id = part.dag.add_feature(
         FeatureOp::CutHole {
             center,
@@ -511,7 +519,11 @@ pub fn cut_hole(args: &Value, state: &mut EngineState) -> Result<Value, ServerEr
         },
         None,
     );
-    part.rebuild()?;
+    if let Err(e) = part.rebuild() {
+        part.dag = prev_dag;
+        part.mesh = prev_mesh;
+        return Err(ServerError::Cad(e));
+    }
 
     let mesh_clone = part.mesh.clone();
     state.send_gui_mesh(&mesh_clone);
@@ -859,8 +871,14 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
         }
     };
 
+    let prev_dag = part.dag.clone();
+    let prev_mesh = part.mesh.clone();
     part.dag.modify_feature(feature_id, updated_op)?;
-    part.rebuild()?;
+    if let Err(e) = part.rebuild() {
+        part.dag = prev_dag;
+        part.mesh = prev_mesh;
+        return Err(ServerError::Cad(e));
+    }
 
     let aabb = part.bounding_box();
     let mesh_clone = part.mesh.clone();
@@ -946,6 +964,8 @@ pub fn cut_helical_groove(args: &Value, state: &mut EngineState) -> Result<Value
         .get_mut(part_id)
         .ok_or_else(|| ServerError::PartNotFound(part_id.to_string()))?;
 
+    let prev_dag = part.dag.clone();
+    let prev_mesh = part.mesh.clone();
     let feature_id = part.dag.add_feature(
         FeatureOp::CutHelicalGroove {
             helix_radius,
@@ -959,7 +979,11 @@ pub fn cut_helical_groove(args: &Value, state: &mut EngineState) -> Result<Value
         },
         None,
     );
-    part.rebuild()?;
+    if let Err(e) = part.rebuild() {
+        part.dag = prev_dag;
+        part.mesh = prev_mesh;
+        return Err(ServerError::Cad(e));
+    }
 
     let mesh_clone = part.mesh.clone();
     state.send_gui_mesh(&mesh_clone);
@@ -1001,11 +1025,17 @@ pub fn boolean_difference(args: &Value, state: &mut EngineState) -> Result<Value
         .get_mut(target_part_id)
         .ok_or_else(|| ServerError::PartNotFound(target_part_id.to_string()))?;
 
+    let prev_dag = target_part.dag.clone();
+    let prev_mesh = target_part.mesh.clone();
     let feature_id = target_part.dag.add_feature(
         FeatureOp::BooleanDifferenceMesh { tool_mesh },
         None,
     );
-    target_part.rebuild()?;
+    if let Err(e) = target_part.rebuild() {
+        target_part.dag = prev_dag;
+        target_part.mesh = prev_mesh;
+        return Err(ServerError::Cad(e));
+    }
 
     let mesh_clone = target_part.mesh.clone();
     state.send_gui_mesh(&mesh_clone);
@@ -1356,11 +1386,17 @@ pub fn boolean_union(args: &Value, state: &mut EngineState) -> Result<Value, Ser
             .get_mut(target_part_id)
             .ok_or_else(|| ServerError::PartNotFound(target_part_id.to_string()))?;
 
+        let prev_dag = target_part.dag.clone();
+        let prev_mesh = target_part.mesh.clone();
         let feature_id = target_part.dag.add_feature(
             FeatureOp::BooleanUnionMesh { tool_mesh },
             None,
         );
-        target_part.rebuild()?;
+        if let Err(e) = target_part.rebuild() {
+            target_part.dag = prev_dag;
+            target_part.mesh = prev_mesh;
+            return Err(ServerError::Cad(e));
+        }
 
         let mesh = target_part.mesh().clone();
         (feature_id, mesh.vertices.len(), mesh.triangle_count(), mesh)
@@ -1416,11 +1452,17 @@ pub fn boolean_intersection(args: &Value, state: &mut EngineState) -> Result<Val
             .get_mut(target_part_id)
             .ok_or_else(|| ServerError::PartNotFound(target_part_id.to_string()))?;
 
+        let prev_dag = target_part.dag.clone();
+        let prev_mesh = target_part.mesh.clone();
         let feature_id = target_part.dag.add_feature(
             FeatureOp::BooleanIntersectionMesh { tool_mesh },
             None,
         );
-        target_part.rebuild()?;
+        if let Err(e) = target_part.rebuild() {
+            target_part.dag = prev_dag;
+            target_part.mesh = prev_mesh;
+            return Err(ServerError::Cad(e));
+        }
 
         let mesh = target_part.mesh().clone();
         (feature_id, mesh.vertices.len(), mesh.triangle_count(), mesh)
@@ -1469,6 +1511,8 @@ pub fn transform_part(args: &Value, state: &mut EngineState) -> Result<Value, Se
             .get_mut(part_id)
             .ok_or_else(|| ServerError::PartNotFound(part_id.to_string()))?;
 
+        let prev_dag = part.dag.clone();
+        let prev_mesh = part.mesh.clone();
         let feature_id = part.dag.add_feature(
             FeatureOp::Transform {
                 translation,
@@ -1477,7 +1521,11 @@ pub fn transform_part(args: &Value, state: &mut EngineState) -> Result<Value, Se
             },
             None,
         );
-        part.rebuild()?;
+        if let Err(e) = part.rebuild() {
+            part.dag = prev_dag;
+            part.mesh = prev_mesh;
+            return Err(ServerError::Cad(e));
+        }
 
         let aabb = part.bounding_box();
         let volume = part.volume();
