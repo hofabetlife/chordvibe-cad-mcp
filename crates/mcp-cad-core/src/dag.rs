@@ -423,6 +423,12 @@ impl FeatureTree {
                     position,
                     rotation_deg,
                 } => {
+                    if *sides < 3 {
+                        return Err(CadError::InvalidParameter(format!(
+                            "Polygon prism sides must be at least 3, got: {}",
+                            sides
+                        )));
+                    }
                     if *height <= 0.0 {
                         return Err(CadError::InvalidParameter(format!(
                             "Polygon prism height must be positive, got: {}",
@@ -546,11 +552,16 @@ impl FeatureTree {
                             "Revolve profile must contain at least 3 points [r, z]".into(),
                         ));
                     }
-                    if *angle_deg <= 0.0 {
+                    if *angle_deg <= 0.0 || *angle_deg > 360.0 {
                         return Err(CadError::InvalidParameter(format!(
-                            "Revolve angle_deg must be positive, got: {}",
+                            "Revolve angle_deg must be in (0, 360], got: {}",
                             angle_deg
                         )));
+                    }
+                    if profile.iter().any(|p| p[0] < -1e-9) {
+                        return Err(CadError::InvalidParameter(
+                            "Revolve profile radius r must be non-negative (r >= 0)".into(),
+                        ));
                     }
                     let mut mesh = create_revolve_with_settings(profile, *angle_deg, settings);
                     apply_pos_rot(&mut mesh, position, rotation_deg);

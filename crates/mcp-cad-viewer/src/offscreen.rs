@@ -50,22 +50,83 @@ impl DebugRenderMode {
     }
 }
 
-/// Extracts edge indices that do not belong to exactly 2 triangles (boundaries and non-manifolds).
+/// Extracts edge indices that do not belong to exactly 2 triangles after spatial vertex welding
+/// (true open boundary edges and non-manifold edges, excluding split-normal CAD creases).
 pub fn extract_boundary_indices(mesh: &TriangleMesh) -> Vec<u32> {
     use std::collections::HashMap;
-    let mut edge_counts: HashMap<(u32, u32), usize> = HashMap::new();
+    if mesh.vertices.is_empty() || mesh.indices.is_empty() {
+        return Vec::new();
+    }
+
+    let aabb = mesh.bounding_box();
+    let dims = aabb.dimensions();
+    let diag = (dims[0] * dims[0] + dims[1] * dims[1] + dims[2] * dims[2]).sqrt();
+    let weld_eps = (diag * 1e-7).max(1e-12);
+    let weld_scale = 1.0 / weld_eps;
+    let weld_eps_sq = weld_eps * weld_eps;
+
+    let mut cell_to_welded: HashMap<[i64; 3], Vec<u32>> = HashMap::new();
+    let mut vertex_to_welded: Vec<u32> = Vec::with_capacity(mesh.vertices.len());
+    let mut welded_positions: Vec<[f64; 3]> = Vec::new();
+
+    for v in &mesh.vertices {
+        let p = v.position;
+        let base_cell = [
+            (p[0] * weld_scale).round() as i64,
+            (p[1] * weld_scale).round() as i64,
+            (p[2] * weld_scale).round() as i64,
+        ];
+        let mut found_idx = None;
+        'search: for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    let cell = [base_cell[0] + dx, base_cell[1] + dy, base_cell[2] + dz];
+                    if let Some(cands) = cell_to_welded.get(&cell) {
+                        for &cand in cands {
+                            let cp = welded_positions[cand as usize];
+                            let d2 = (cp[0] - p[0]).powi(2)
+                                + (cp[1] - p[1]).powi(2)
+                                + (cp[2] - p[2]).powi(2);
+                            if d2 <= weld_eps_sq {
+                                found_idx = Some(cand);
+                                break 'search;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let w_idx = match found_idx {
+            Some(idx) => idx,
+            None => {
+                let idx = welded_positions.len() as u32;
+                cell_to_welded.entry(base_cell).or_default().push(idx);
+                welded_positions.push(p);
+                idx
+            }
+        };
+        vertex_to_welded.push(w_idx);
+    }
+
+    let mut edge_counts: HashMap<(u32, u32), (usize, (u32, u32))> = HashMap::new();
     for tri in &mesh.indices {
-        for &(u, v) in &[(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
-            let key = if u < v { (u, v) } else { (v, u) };
-            *edge_counts.entry(key).or_insert(0) += 1;
+        for &(orig_u, orig_v) in &[(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+            let wu = vertex_to_welded[orig_u as usize];
+            let wv = vertex_to_welded[orig_v as usize];
+            if wu == wv {
+                continue;
+            }
+            let key = if wu < wv { (wu, wv) } else { (wv, wu) };
+            let entry = edge_counts.entry(key).or_insert((0, (orig_u, orig_v)));
+            entry.0 += 1;
         }
     }
 
     let mut line_indices = Vec::new();
-    for (edge, count) in edge_counts {
+    for (_welded_edge, (count, (orig_u, orig_v))) in edge_counts {
         if count != 2 {
-            line_indices.push(edge.0);
-            line_indices.push(edge.1);
+            line_indices.push(orig_u);
+            line_indices.push(orig_v);
         }
     }
     line_indices

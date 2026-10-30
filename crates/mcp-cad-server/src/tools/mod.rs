@@ -13,7 +13,7 @@ use crate::error::ServerError;
 use crate::protocol::{ToolCallResult, ToolDefinition};
 use crate::state::EngineState;
 
-/// Returns the complete registry of all 20 MCP engineering tools with strict input schemas.
+/// Returns the complete registry of all 26 MCP engineering tools with strict input schemas.
 pub fn list_tools() -> Vec<ToolDefinition> {
     vec![
         // 1. create_part

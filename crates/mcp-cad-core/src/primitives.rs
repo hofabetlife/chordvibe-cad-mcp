@@ -1,8 +1,8 @@
 //! 3D solid primitive generators: Box, Cylinder, Sphere, and CutHole.
 
 use std::f64::consts::PI;
-use nalgebra::{Matrix3, Rotation3, Vector3};
-use crate::csg::{csg_difference, csg_intersection, csg_union};
+use nalgebra::{Rotation3, Vector3};
+use crate::csg::csg_difference;
 use crate::tessellation::{TessellationQuality, TessellationSettings};
 use crate::topology::{TriangleMesh, Vertex};
 
@@ -327,6 +327,10 @@ pub fn cut_hole_with_settings(
     keyway_depth: Option<f64>,
     settings: &TessellationSettings,
 ) -> TriangleMesh {
+    if radius <= 1e-12 || depth <= 1e-12 || mesh.indices.is_empty() {
+        return mesh.clone();
+    }
+
     let norm_v = Vector3::new(normal[0], normal[1], normal[2]);
     let norm_len = norm_v.norm();
     let unit_norm = if norm_len > 1e-12 {
@@ -335,62 +339,185 @@ pub fn cut_hole_with_settings(
         Vector3::new(0.0, 0.0, 1.0)
     };
 
-    // To prevent coplanar artifact issues at the surface,
-    // slightly extend the cutting tool outward along +normal,
-    // and drill into -normal.
-    let margin = (depth * 0.02).clamp(1e-4, 0.05);
-    let tool_height = depth + margin * 2.0;
+    let center_vec = Vector3::new(center[0], center[1], center[2]);
+    let mut t_min = f64::INFINITY;
+    let mut t_max = f64::NEG_INFINITY;
+    for v in &mesh.vertices {
+        let t = (v.pos_vec() - center_vec).dot(&unit_norm);
+        if t < t_min {
+            t_min = t;
+        }
+        if t > t_max {
+            t_max = t;
+        }
+    }
+    let span = (t_max - t_min).max(0.0);
+    let margin = (depth * 0.05).clamp(1e-3, 0.05);
 
-    // Drill inward in direction: -unit_norm
+    // Determine axial start/end along +unit_norm relative to center_vec:
+    // If depth covers the part span along unit_norm, treat as a through-hole spanning [t_min - margin, t_max + margin].
+    // Otherwise drill from the entry side (t_entry) inward by depth along -unit_norm.
+    let (t_high, t_low) = if span > 1e-9 && depth >= span - 1e-4 {
+        (t_max + margin, t_min - margin)
+    } else {
+        let t_entry = if t_max.abs() <= 1e-4 { 0.0 } else { t_max };
+        let mut t_bottom = t_entry - depth;
+        if span > 1e-9 && (t_bottom - t_min).abs() < 5e-4 {
+            if depth >= span * 0.95 {
+                t_bottom = t_min - margin;
+            } else {
+                t_bottom = t_min + 1e-3;
+            }
+        }
+        (t_entry + margin, t_bottom)
+    };
+
+    let tool_height = (t_high - t_low).max(1e-5);
     let drill_dir = -unit_norm;
-    let tool_center = Vector3::new(center[0], center[1], center[2])
-        + drill_dir * (depth * 0.5)
-        + unit_norm * margin;
-
-    let cyl_tool = create_cylinder_oriented_with_settings(
-        [tool_center.x, tool_center.y, tool_center.z],
-        [drill_dir.x, drill_dir.y, drill_dir.z],
-        radius,
-        tool_height,
-        settings,
-    );
+    let tool_center = center_vec + unit_norm * (0.5 * (t_high + t_low));
 
     let final_tool = if let (Some(kw), Some(kd)) = (keyway_width, keyway_depth) {
         if kw > 1e-6 && kd > 1e-6 {
-            // Find orthonormal basis (u, v, w) where w = drill_dir
-            let w = drill_dir;
-            let up = if w.y.abs() < 0.9 {
-                Vector3::new(0.0, 1.0, 0.0)
-            } else {
-                Vector3::new(0.0, 0.0, 1.0)
-            };
-            let u = w.cross(&up).normalize();
-            let v = w.cross(&u).normalize();
-
-            // DIN 6885 keyway slot:
-            // width kw along u, radial depth (radius + kd) along v, length tool_height along w.
-            let mut box_mesh = create_box(kw, radius + kd, tool_height);
-            let rot_mat = Matrix3::from_columns(&[u, v, w]);
-            let box_center = tool_center + v * ((radius + kd) * 0.5);
-
-            for vert in &mut box_mesh.vertices {
-                let p = Vector3::new(vert.position[0], vert.position[1], vert.position[2]);
-                let n = Vector3::new(vert.normal[0], vert.normal[1], vert.normal[2]);
-                let world_p = box_center + rot_mat * p;
-                let world_n = rot_mat * n;
-                vert.position = [world_p.x, world_p.y, world_p.z];
-                vert.normal = [world_n.x, world_n.y, world_n.z];
-            }
-
-            csg_union(&cyl_tool, &box_mesh)
+            build_keyway_cutter_prism(
+                tool_center,
+                drill_dir,
+                radius,
+                tool_height,
+                kw,
+                kd,
+                settings.calculate_segments(radius).max(24),
+            )
         } else {
-            cyl_tool
+            create_cylinder_oriented_with_settings(
+                [tool_center.x, tool_center.y, tool_center.z],
+                [drill_dir.x, drill_dir.y, drill_dir.z],
+                radius,
+                tool_height,
+                settings,
+            )
         }
     } else {
-        cyl_tool
+        create_cylinder_oriented_with_settings(
+            [tool_center.x, tool_center.y, tool_center.z],
+            [drill_dir.x, drill_dir.y, drill_dir.z],
+            radius,
+            tool_height,
+            settings,
+        )
     };
 
     csg_difference(mesh, &final_tool)
+}
+
+/// Builds a single watertight manifold cutter prism consisting of a cylinder of `radius`
+/// with a rectangular keyway slot (`kw` wide, `kd` deep beyond `radius`) extruded along `axis`.
+fn build_keyway_cutter_prism(
+    center: Vector3<f64>,
+    axis: Vector3<f64>,
+    radius: f64,
+    height: f64,
+    keyway_width: f64,
+    keyway_depth: f64,
+    segments: usize,
+) -> TriangleMesh {
+    let w = axis.normalize();
+    let up = if w.y.abs() < 0.9 {
+        Vector3::new(0.0, 1.0, 0.0)
+    } else {
+        Vector3::new(0.0, 0.0, 1.0)
+    };
+    let u = w.cross(&up).normalize();
+    let v = w.cross(&u).normalize();
+
+    let half_kw = (keyway_width * 0.5).clamp(radius * 0.02, radius * 0.92);
+    let alpha = (half_kw / radius).clamp(0.02, 0.95).asin();
+    let y_shoulder = (radius * radius - half_kw * half_kw).max(0.0).sqrt();
+    let y_top = radius + keyway_depth;
+
+    let mut profile: Vec<[f64; 2]> = Vec::with_capacity(segments + 4);
+    profile.push([half_kw, y_shoulder]);
+    profile.push([half_kw, y_top]);
+    profile.push([-half_kw, y_top]);
+    profile.push([-half_kw, y_shoulder]);
+
+    let start_ang = std::f64::consts::FRAC_PI_2 + alpha;
+    let end_ang = 2.5 * std::f64::consts::PI - alpha;
+    let arc_steps = segments.max(16);
+    for i in 1..arc_steps {
+        let t = i as f64 / arc_steps as f64;
+        let ang = start_ang + t * (end_ang - start_ang);
+        profile.push([radius * ang.cos(), radius * ang.sin()]);
+    }
+
+    let n = profile.len();
+    let half_h = height * 0.5;
+    let to_world = |px: f64, py: f64, pz: f64| -> [f64; 3] {
+        let p = center + u * px + v * py + w * pz;
+        [p.x, p.y, p.z]
+    };
+    let norm_world = |nx: f64, ny: f64, nz: f64| -> [f64; 3] {
+        let d = (u * nx + v * ny + w * nz).normalize();
+        [d.x, d.y, d.z]
+    };
+
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+
+    // Bottom cap at z = -half_h (normal -w)
+    let n_bot = norm_world(0.0, 0.0, -1.0);
+    let bot_center_idx = vertices.len() as u32;
+    vertices.push(Vertex::new(to_world(0.0, 0.0, -half_h), n_bot));
+    let bot_ring_start = vertices.len() as u32;
+    for &[px, py] in &profile {
+        vertices.push(Vertex::new(to_world(px, py, -half_h), n_bot));
+    }
+    for i in 0..n {
+        let next = (i + 1) % n;
+        indices.push([
+            bot_center_idx,
+            bot_ring_start + next as u32,
+            bot_ring_start + i as u32,
+        ]);
+    }
+
+    // Top cap at z = +half_h (normal +w)
+    let n_top = norm_world(0.0, 0.0, 1.0);
+    let top_center_idx = vertices.len() as u32;
+    vertices.push(Vertex::new(to_world(0.0, 0.0, half_h), n_top));
+    let top_ring_start = vertices.len() as u32;
+    for &[px, py] in &profile {
+        vertices.push(Vertex::new(to_world(px, py, half_h), n_top));
+    }
+    for i in 0..n {
+        let next = (i + 1) % n;
+        indices.push([
+            top_center_idx,
+            top_ring_start + i as u32,
+            top_ring_start + next as u32,
+        ]);
+    }
+
+    // Side walls connecting bottom ring to top ring
+    for i in 0..n {
+        let next = (i + 1) % n;
+        let p0 = profile[i];
+        let p1 = profile[next];
+        let dx = p1[0] - p0[0];
+        let dy = p1[1] - p0[1];
+        let len = (dx * dx + dy * dy).sqrt().max(1e-12);
+        let n_side = norm_world(dy / len, -dx / len, 0.0);
+
+        let base = vertices.len() as u32;
+        vertices.push(Vertex::new(to_world(p0[0], p0[1], -half_h), n_side));
+        vertices.push(Vertex::new(to_world(p1[0], p1[1], -half_h), n_side));
+        vertices.push(Vertex::new(to_world(p1[0], p1[1], half_h), n_side));
+        vertices.push(Vertex::new(to_world(p0[0], p0[1], half_h), n_side));
+
+        indices.push([base, base + 1, base + 2]);
+        indices.push([base, base + 2, base + 3]);
+    }
+
+    TriangleMesh::new(vertices, indices)
 }
 
 /// Generates a solid 3D cone or truncated cone (frustum) centered at the origin along the Z axis.
@@ -571,132 +698,6 @@ pub fn create_cone_with_settings(
     create_cone(radius_bottom, radius_top, height, segments)
 }
 
-/// Helper to generate a convex turned solid for DIN 934 conical chamfering.
-///
-/// Features conical end caps tapering at chamfer angle (~30 deg per DIN 934)
-/// and a central cylindrical body enclosing the polygonal prism.
-fn create_turned_chamfer_solid(
-    circumradius: f64,
-    height: f64,
-    chamfer: f64,
-    sides: usize,
-) -> TriangleMesh {
-    let segs = (sides * 4).max(32);
-    let h2 = height * 0.5;
-
-    // DIN 934 chamfer angle: 30 degrees to the horizontal bearing face
-    let tan_alpha = (PI / 6.0).tan(); // tan(30 deg) = 1 / sqrt(3) ~ 0.57735
-
-    let mut c_r = chamfer;
-    let mut c_z = c_r * tan_alpha;
-
-    if c_z > height * 0.45 {
-        c_z = height * 0.45;
-        c_r = c_z / tan_alpha;
-    }
-
-    let r_top = (circumradius - c_r).max(circumradius * 0.1);
-    let r_outer = circumradius * 2.0;
-
-    // Small axial margin to prevent coplanar surface artifacts
-    let delta = (c_z * 0.05).clamp(1e-4, 0.01);
-    let z_bot_cap = -h2 - delta;
-    let z_bot_shoulder = -h2 + c_z;
-    let z_top_shoulder = h2 - c_z;
-    let z_top_cap = h2 + delta;
-
-    let r_top_cap = (r_top - delta / tan_alpha).max(r_top * 0.5);
-    let r_bot_cap = r_top_cap;
-
-    let mut vertices = Vec::new();
-    let mut indices = Vec::new();
-
-    // 1. Bottom cap at z_bot_cap
-    let bot_center_idx = vertices.len() as u32;
-    vertices.push(Vertex::new([0.0, 0.0, z_bot_cap], [0.0, 0.0, -1.0]));
-
-    let bot_rim_start = vertices.len() as u32;
-    for i in 0..segs {
-        let theta = (i as f64) * 2.0 * PI / (segs as f64);
-        vertices.push(Vertex::new(
-            [r_bot_cap * theta.cos(), r_bot_cap * theta.sin(), z_bot_cap],
-            [0.0, 0.0, -1.0],
-        ));
-    }
-    for i in 0..segs {
-        let next = (i + 1) % segs;
-        indices.push([bot_center_idx, bot_rim_start + (next as u32), bot_rim_start + (i as u32)]);
-    }
-
-    // 2. Top cap at z_top_cap
-    let top_center_idx = vertices.len() as u32;
-    vertices.push(Vertex::new([0.0, 0.0, z_top_cap], [0.0, 0.0, 1.0]));
-
-    let top_rim_start = vertices.len() as u32;
-    for i in 0..segs {
-        let theta = (i as f64) * 2.0 * PI / (segs as f64);
-        vertices.push(Vertex::new(
-            [r_top_cap * theta.cos(), r_top_cap * theta.sin(), z_top_cap],
-            [0.0, 0.0, 1.0],
-        ));
-    }
-    for i in 0..segs {
-        let next = (i + 1) % segs;
-        indices.push([top_center_idx, top_rim_start + (i as u32), top_rim_start + (next as u32)]);
-    }
-
-    // Helper closure to loft a frustum band between two rings
-    let mut add_band = |r_lower: f64, z_lower: f64, r_upper: f64, z_upper: f64, n_lower: [f64; 2], n_upper: [f64; 2]| {
-        let band_start = vertices.len() as u32;
-        for i in 0..segs {
-            let theta = (i as f64) * 2.0 * PI / (segs as f64);
-            let cos_t = theta.cos();
-            let sin_t = theta.sin();
-
-            // Lower vertex: index band_start + 2*i
-            vertices.push(Vertex::new(
-                [r_lower * cos_t, r_lower * sin_t, z_lower],
-                [n_lower[0] * cos_t, n_lower[0] * sin_t, n_lower[1]],
-            ));
-            // Upper vertex: index band_start + 2*i + 1
-            vertices.push(Vertex::new(
-                [r_upper * cos_t, r_upper * sin_t, z_upper],
-                [n_upper[0] * cos_t, n_upper[0] * sin_t, n_upper[1]],
-            ));
-        }
-
-        for i in 0..segs {
-            let next = (i + 1) % segs;
-            let curr_low = band_start + (i as u32) * 2;
-            let curr_up = curr_low + 1;
-            let next_low = band_start + (next as u32) * 2;
-            let next_up = next_low + 1;
-
-            indices.push([curr_low, next_low, next_up]);
-            indices.push([curr_low, next_up, curr_up]);
-        }
-    };
-
-    // Bottom cone frustum (from z_bot_cap to z_bot_shoulder)
-    let dr_bot = r_outer - r_bot_cap;
-    let dz_bot = z_bot_shoulder - z_bot_cap;
-    let slant_bot = (dr_bot * dr_bot + dz_bot * dz_bot).sqrt();
-    let norm_bot = [dz_bot / slant_bot, -dr_bot / slant_bot];
-    add_band(r_bot_cap, z_bot_cap, r_outer, z_bot_shoulder, norm_bot, norm_bot);
-
-    // Middle cylinder (from z_bot_shoulder to z_top_shoulder)
-    add_band(r_outer, z_bot_shoulder, r_outer, z_top_shoulder, [1.0, 0.0], [1.0, 0.0]);
-
-    // Top cone frustum (from z_top_shoulder to z_top_cap)
-    let dr_top = r_outer - r_top_cap;
-    let dz_top = z_top_cap - z_top_shoulder;
-    let slant_top = (dr_top * dr_top + dz_top * dz_top).sqrt();
-    let norm_top = [dz_top / slant_top, dr_top / slant_top];
-    add_band(r_outer, z_top_shoulder, r_top_cap, z_top_cap, norm_top, norm_top);
-
-    TriangleMesh::new(vertices, indices)
-}
-
 /// Generates a solid regular polygonal prism centered at origin along Z axis.
 ///
 /// Parameters:
@@ -704,9 +705,9 @@ fn create_turned_chamfer_solid(
 /// - `height`: prism height along Z axis
 /// - `width_across_flats`: optional flat-to-flat distance (S, e.g. wrench size for nuts/bolts)
 /// - `radius`: optional circumscribed circle radius (distance from center to vertices)
-/// - `chamfer`: optional conical chamfer size at top and bottom faces (DIN 934 30-degree chamfer)
+/// - `chamfer`: optional chamfer size at top and bottom faces (30-degree bevel per DIN 934)
 ///
-/// Features sharp edges and flat facet normals on all side faces and caps.
+/// Features sharp edges, flat facet normals, and 100% watertight manifold topology.
 pub fn create_polygon_prism(
     sides: usize,
     height: f64,
@@ -714,10 +715,10 @@ pub fn create_polygon_prism(
     radius: Option<f64>,
     chamfer: Option<f64>,
 ) -> TriangleMesh {
-    let n = sides.max(3);
-    if height <= 1e-12 {
+    if sides < 3 || height <= 1e-12 {
         return TriangleMesh::empty();
     }
+    let n = sides;
 
     let angle_step = 2.0 * PI / (n as f64);
     let half_angle = PI / (n as f64);
@@ -745,6 +746,22 @@ pub fn create_polygon_prism(
     }
 
     let h2 = height * 0.5;
+    let c_val = chamfer.unwrap_or(0.0);
+    let has_chamfer = c_val > 1e-6;
+
+    let (r_cap, z_bot_mid, z_top_mid) = if has_chamfer {
+        let tan_alpha = (PI / 6.0).tan(); // 30-degree DIN 934 chamfer angle
+        let mut c_r = c_val.min(circumradius * 0.45);
+        let mut c_z = c_r * tan_alpha;
+        if c_z > height * 0.40 {
+            c_z = height * 0.40;
+            c_r = c_z / tan_alpha;
+        }
+        let r_c = (circumradius - c_r).max(circumradius * 0.20);
+        (r_c, -h2 + c_z, h2 - c_z)
+    } else {
+        (circumradius, -h2, h2)
+    };
 
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
@@ -756,8 +773,8 @@ pub fn create_polygon_prism(
     let top_rim_start = vertices.len() as u32;
     for i in 0..n {
         let theta = (i as f64) * angle_step;
-        let x = circumradius * theta.cos();
-        let y = circumradius * theta.sin();
+        let x = r_cap * theta.cos();
+        let y = r_cap * theta.sin();
         vertices.push(Vertex::new([x, y, h2], [0.0, 0.0, 1.0]));
     }
 
@@ -777,8 +794,8 @@ pub fn create_polygon_prism(
     let bot_rim_start = vertices.len() as u32;
     for i in 0..n {
         let theta = (i as f64) * angle_step;
-        let x = circumradius * theta.cos();
-        let y = circumradius * theta.sin();
+        let x = r_cap * theta.cos();
+        let y = r_cap * theta.sin();
         vertices.push(Vertex::new([x, y, -h2], [0.0, 0.0, -1.0]));
     }
 
@@ -791,47 +808,85 @@ pub fn create_polygon_prism(
         ]);
     }
 
-    // 3. Side wall quads with flat facet normals (sharp edges)
-    for i in 0..n {
-        let next = (i + 1) % n;
-        let t1 = (i as f64) * angle_step;
-        let t2 = (next as f64) * angle_step;
-
-        let x1 = circumradius * t1.cos();
-        let y1 = circumradius * t1.sin();
-        let x2 = circumradius * t2.cos();
-        let y2 = circumradius * t2.sin();
-
-        let dx = x2 - x1;
-        let dy = y2 - y1;
-        let edge_len = (dx * dx + dy * dy).sqrt();
-        let normal = if edge_len > 1e-12 {
-            [dy / edge_len, -dx / edge_len, 0.0]
+    // Helper closure to add a quad facet (p0_top, p1_bot, p2_bot_next, p3_top_next) with exact outward normal
+    let mut add_quad_facet = |p0: [f64; 3], p1: [f64; 3], p2: [f64; 3], p3: [f64; 3]| {
+        let v0 = Vector3::new(p0[0], p0[1], p0[2]);
+        let v1 = Vector3::new(p1[0], p1[1], p1[2]);
+        let v2 = Vector3::new(p2[0], p2[1], p2[2]);
+        let v3 = Vector3::new(p3[0], p3[1], p3[2]);
+        let n_vec = (v1 - v0).cross(&(v3 - v0)) + (v2 - v1).cross(&(v3 - v1));
+        let n_len = n_vec.norm();
+        let normal = if n_len > 1e-12 {
+            [n_vec.x / n_len, n_vec.y / n_len, n_vec.z / n_len]
         } else {
             [1.0, 0.0, 0.0]
         };
 
         let base = vertices.len() as u32;
-        vertices.push(Vertex::new([x1, y1, h2], normal));  // 0: top curr
-        vertices.push(Vertex::new([x1, y1, -h2], normal)); // 1: bot curr
-        vertices.push(Vertex::new([x2, y2, -h2], normal)); // 2: bot next
-        vertices.push(Vertex::new([x2, y2, h2], normal));  // 3: top next
+        vertices.push(Vertex::new(p0, normal));
+        vertices.push(Vertex::new(p1, normal));
+        vertices.push(Vertex::new(p2, normal));
+        vertices.push(Vertex::new(p3, normal));
 
         indices.push([base, base + 1, base + 3]);
         indices.push([base + 1, base + 2, base + 3]);
-    }
+    };
 
-    let prism = TriangleMesh::new(vertices, indices);
+    // 3. Side wall quads (and optional top/bottom chamfer bevel bands)
+    for i in 0..n {
+        let next = (i + 1) % n;
+        let t1 = (i as f64) * angle_step;
+        let t2 = (next as f64) * angle_step;
+        let c1 = t1.cos();
+        let s1 = t1.sin();
+        let c2 = t2.cos();
+        let s2 = t2.sin();
 
-    // Conical end chamfering per DIN 934 (30-degree chamfer)
-    if let Some(c) = chamfer {
-        if c > 1e-6 {
-            let chamfer_body = create_turned_chamfer_solid(circumradius, height, c, n);
-            return csg_intersection(&prism, &chamfer_body);
+        let x1_mid = circumradius * c1;
+        let y1_mid = circumradius * s1;
+        let x2_mid = circumradius * c2;
+        let y2_mid = circumradius * s2;
+
+        if has_chamfer {
+            let x1_cap = r_cap * c1;
+            let y1_cap = r_cap * s1;
+            let x2_cap = r_cap * c2;
+            let y2_cap = r_cap * s2;
+
+            // Top bevel band: from z = h2 (r_cap) down to z = z_top_mid (circumradius)
+            add_quad_facet(
+                [x1_cap, y1_cap, h2],
+                [x1_mid, y1_mid, z_top_mid],
+                [x2_mid, y2_mid, z_top_mid],
+                [x2_cap, y2_cap, h2],
+            );
+
+            // Middle vertical band: from z = z_top_mid down to z = z_bot_mid
+            add_quad_facet(
+                [x1_mid, y1_mid, z_top_mid],
+                [x1_mid, y1_mid, z_bot_mid],
+                [x2_mid, y2_mid, z_bot_mid],
+                [x2_mid, y2_mid, z_top_mid],
+            );
+
+            // Bottom bevel band: from z = z_bot_mid (circumradius) down to z = -h2 (r_cap)
+            add_quad_facet(
+                [x1_mid, y1_mid, z_bot_mid],
+                [x1_cap, y1_cap, -h2],
+                [x2_cap, y2_cap, -h2],
+                [x2_mid, y2_mid, z_bot_mid],
+            );
+        } else {
+            add_quad_facet(
+                [x1_mid, y1_mid, h2],
+                [x1_mid, y1_mid, -h2],
+                [x2_mid, y2_mid, -h2],
+                [x2_mid, y2_mid, h2],
+            );
         }
     }
 
-    prism
+    TriangleMesh::new(vertices, indices)
 }
 
 /// Generates a closed, watertight (manifold) 3D mesh for a helical cutting tool
@@ -922,7 +977,10 @@ pub fn create_helical_cutter_with_settings(
         let phi_0 = (start_idx as f64) * 2.0 * PI / (num_starts as f64);
         let start_vertex_offset = all_vertices.len() as u32;
 
-        // Generate circular ring vertices at each step j along the helix
+        let is_metric = profile_type.eq_ignore_ascii_case("metric_60");
+        let m = if is_metric { 4 } else { cross_segments };
+
+        // Generate ring vertices at each step j along the helix
         for j in 0..=k_steps {
             let u = (j as f64) / (k_steps as f64);
             let t = u * total_sweep_angle;
@@ -940,54 +998,35 @@ pub fn create_helical_cutter_with_settings(
                 Vector3::new(0.0, 0.0, 1.0)
             };
 
-            let is_metric = profile_type.eq_ignore_ascii_case("metric_60");
             if is_metric {
-                // ISO 68-1 60-degree triangular metric thread profile (rhombus cutter)
-                // Flank angle is 30 deg to thread axis: tan(30) = 1 / sqrt(3)
+                // ISO 68-1 60-degree triangular metric thread profile (symmetric rhombus cutter
+                // supporting both external shaft threads and internal nut threads).
+                // Flank angle is 30 deg to radial axis: tan(30) = 1 / sqrt(3).
                 let tan30 = (PI / 6.0).tan();
                 let w = (groove_radius * tan30).min(0.48 * pitch);
                 let h_eff = w / tan30;
 
-                // 4 corners of 60-deg diamond in (e_r, e_b) plane:
-                // (+h_eff, 0) -> (0, +w) -> (-h_eff, 0) -> (0, -w)
-                let segs_per_flank = cross_segments / 4;
-                for flank in 0..4 {
-                    let (p_start, p_end, n_flank) = match flank {
-                        0 => (
-                            Vector3::new(h_eff, 0.0, 0.0),
-                            Vector3::new(0.0, w, 0.0),
-                            Vector3::new(w, h_eff, 0.0).normalize(),
-                        ),
-                        1 => (
-                            Vector3::new(0.0, w, 0.0),
-                            Vector3::new(-h_eff, 0.0, 0.0),
-                            Vector3::new(-w, h_eff, 0.0).normalize(),
-                        ),
-                        2 => (
-                            Vector3::new(-h_eff, 0.0, 0.0),
-                            Vector3::new(0.0, -w, 0.0),
-                            Vector3::new(-w, -h_eff, 0.0).normalize(),
-                        ),
-                        _ => (
-                            Vector3::new(0.0, -w, 0.0),
-                            Vector3::new(h_eff, 0.0, 0.0),
-                            Vector3::new(w, -h_eff, 0.0).normalize(),
-                        ),
-                    };
-
-                    for k in 0..segs_per_flank {
-                        let frac = (k as f64) / (segs_per_flank as f64);
-                        let r_coord = p_start.x + (p_end.x - p_start.x) * frac;
-                        let b_coord = p_start.y + (p_end.y - p_start.y) * frac;
-
-                        let pos = center + e_r * r_coord + e_b * b_coord;
-                        let n = (e_r * n_flank.x + e_b * n_flank.y).normalize();
-                        all_vertices.push(Vertex::new([pos.x, pos.y, pos.z], [n.x, n.y, n.z]));
-                    }
+                let corners = [
+                    (Vector3::new(h_eff, 0.0, 0.0), Vector3::new(1.0, 0.0, 0.0)),
+                    (
+                        Vector3::new(1e-3 * h_eff, w, 0.0),
+                        Vector3::new(0.0, 1.0, 0.0),
+                    ),
+                    (Vector3::new(-h_eff, 0.0, 0.0), Vector3::new(-1.0, 0.0, 0.0)),
+                    (
+                        Vector3::new(1e-3 * h_eff, -w, 0.0),
+                        Vector3::new(0.0, -1.0, 0.0),
+                    ),
+                ];
+                for (p_c, n_c) in corners {
+                    let pos = center + e_r * p_c.x + e_b * p_c.y;
+                    let n = (e_r * n_c.x + e_b * n_c.y).normalize();
+                    all_vertices.push(Vertex::new([pos.x, pos.y, pos.z], [n.x, n.y, n.z]));
                 }
             } else {
+                // Half-step angular offset ensures no longitudinal edge lies at cos(alpha) == 0 (r_coord == 0)
                 for i in 0..cross_segments {
-                    let alpha = (i as f64) * 2.0 * PI / (cross_segments as f64);
+                    let alpha = ((i as f64) + 0.5) * 2.0 * PI / (cross_segments as f64);
                     let cos_a = alpha.cos();
                     let sin_a = alpha.sin();
 
@@ -1000,7 +1039,6 @@ pub fn create_helical_cutter_with_settings(
         }
 
         // Quads along the helical tube
-        let m = cross_segments;
         for j in 0..k_steps {
             for i in 0..m {
                 let next_i = (i + 1) % m;
@@ -1120,32 +1158,40 @@ pub fn create_spur_gear_with_settings(
     let z = teeth as f64;
     let r = module * z * 0.5;
     let r_a = r + module;
-    let r_f = r - 1.25 * module;
+    let r_f = (r - 1.25 * module).max(0.1 * module);
     let r_b = r * alpha.cos();
     let h2 = face_width * 0.5;
 
     // Pitch circle tooth thickness half-angle: psi = pi / (2 * z)
     let psi = PI / (2.0 * z);
+    let trough_half_angle = PI / z;
     // Involute function at pressure angle alpha: inv(alpha) = tan(alpha) - alpha
     let inv_alpha = alpha.tan() - alpha;
 
     // Angle theta from tooth centerline at radius R >= r_b
+    let min_tip_half_angle = (trough_half_angle * 0.15).max(1e-4);
     let theta_at_r = |radius: f64| -> f64 {
-        if radius < r_b {
+        let raw = if radius < r_b {
             psi + inv_alpha
         } else {
             let cos_ar = (r_b / radius).clamp(0.0, 1.0);
             let alpha_r = cos_ar.acos();
             let inv_alpha_r = alpha_r.tan() - alpha_r;
-            (psi + inv_alpha - inv_alpha_r).max(1e-6)
-        }
+            (psi + inv_alpha - inv_alpha_r).max(min_tip_half_angle)
+        };
+        raw.min(trough_half_angle * 0.70)
     };
 
-    let theta_base = psi + inv_alpha;
-    let theta_root = if r_f < r_b { theta_base } else { theta_at_r(r_f) };
+    let theta_base = theta_at_r(r_b);
+    // Root fillet angle widens slightly past theta_base when r_f < r_b so that polar angle
+    // increases strictly monotonically and radial steps never create collinear cap triangles.
+    let theta_root = if r_f < r_b - 1e-9 {
+        (theta_base + 0.25 * (trough_half_angle - theta_base).max(1e-4)).min(trough_half_angle * 0.75)
+    } else {
+        theta_at_r(r_f)
+    };
 
-    // 1. Construct 2D contour points in CCW order around origin
-    let mut poly_2d: Vec<[f64; 2]> = Vec::new();
+    // 1. Build structured per-tooth levels and root-circle ring
     let n_flank_steps = match settings.quality {
         TessellationQuality::Coarse => 2,
         TessellationQuality::Medium => 4,
@@ -1154,189 +1200,385 @@ pub fn create_spur_gear_with_settings(
     };
     let r_inv_start = r_b.max(r_f);
 
+    // Build radial levels for each tooth from level 0 (r_f) up to level M (r_a)
+    let mut radial_levels: Vec<(f64, f64)> = Vec::new(); // (radius, half_angle_from_tooth_center)
+    radial_levels.push((r_f, theta_root));
+    if r_f < r_b - 1e-9 {
+        radial_levels.push((r_b, theta_base));
+    }
+    for s_idx in 1..=n_flank_steps {
+        let s = (s_idx as f64) / (n_flank_steps as f64);
+        let r_curr = r_inv_start + s * (r_a - r_inv_start);
+        radial_levels.push((r_curr, theta_at_r(r_curr)));
+    }
+    let m_levels = radial_levels.len() - 1; // index of top level at r_a
+
+    // Root circle ring has L_{k,0} and R_{k,0} per tooth, plus trough midpoint T_k when trough arc is wide
+    let include_trough_mid = (trough_half_angle - theta_root) > 0.12;
+    let mut root_angles: Vec<f64> = Vec::with_capacity(teeth * 3 + 4);
     for k in 0..teeth {
         let phi_k = (k as f64) * 2.0 * PI / z;
-
-        // 1a. Leading flank root point
-        let phi_root_lead = phi_k - theta_root;
-        poly_2d.push([r_f * phi_root_lead.cos(), r_f * phi_root_lead.sin()]);
-
-        // 1b. If r_f < r_b, radial line from r_f to r_b on leading flank
-        if r_f < r_b - 1e-9 {
-            let phi_base_lead = phi_k - theta_base;
-            poly_2d.push([r_b * phi_base_lead.cos(), r_b * phi_base_lead.sin()]);
+        root_angles.push((phi_k - theta_root).rem_euclid(2.0 * PI));
+        root_angles.push((phi_k + theta_root).rem_euclid(2.0 * PI));
+        if include_trough_mid {
+            root_angles.push((phi_k + trough_half_angle).rem_euclid(2.0 * PI));
         }
-
-        // 1c. Involute points on leading flank from r_inv_start up to r_a
-        for s_idx in 1..=n_flank_steps {
-            let s = (s_idx as f64) / (n_flank_steps as f64);
-            let r_curr = r_inv_start + s * (r_a - r_inv_start);
-            let th = theta_at_r(r_curr);
-            let phi = phi_k - th;
-            poly_2d.push([r_curr * phi.cos(), r_curr * phi.sin()]);
-        }
-
-        // 1d. Tip crest center point
-        poly_2d.push([r_a * phi_k.cos(), r_a * phi_k.sin()]);
-
-        // 1e. Involute points on trailing flank from r_a down to r_inv_start
-        for s_idx in 0..=n_flank_steps {
-            let s = 1.0 - (s_idx as f64) / (n_flank_steps as f64);
-            let r_curr = r_inv_start + s * (r_a - r_inv_start);
-            let th = theta_at_r(r_curr);
-            let phi = phi_k + th;
-            poly_2d.push([r_curr * phi.cos(), r_curr * phi.sin()]);
-        }
-
-        // 1f. If r_f < r_b, radial line from r_b down to r_f on trailing flank
-        if r_f < r_b - 1e-9 {
-            let phi_base_trail = phi_k + theta_base;
-            poly_2d.push([r_f * phi_base_trail.cos(), r_f * phi_base_trail.sin()]);
-        }
-
-        // 1g. Root trough point between tooth k and tooth k+1
-        let phi_trough = phi_k + PI / z;
-        poly_2d.push([r_f * phi_trough.cos(), r_f * phi_trough.sin()]);
     }
+    root_angles.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Filter duplicate consecutive points if any
-    let mut cleaned_poly: Vec<[f64; 2]> = Vec::with_capacity(poly_2d.len());
-    for p in poly_2d {
-        if let Some(last) = cleaned_poly.last() {
-            let d2 = (p[0] - last[0]).powi(2) + (p[1] - last[1]).powi(2);
-            if d2 > 1e-14 {
-                cleaned_poly.push(p);
-            }
+    // Determine optional bore, keyway, and hub parameters
+    let bore_r = bore_radius.unwrap_or(0.0);
+    let has_bore = bore_r > 1e-6 && bore_r < r_f * 0.96;
+
+    let kw_w = keyway_width.unwrap_or(0.0);
+    let kw_d = keyway_depth.unwrap_or(0.0);
+    let has_keyway = has_bore && kw_w > 1e-6 && kw_d > 1e-6 && (bore_r + kw_d) < r_f * 0.96;
+
+    let hub_r = hub_diameter.map(|d| d * 0.5).unwrap_or(0.0);
+    let hub_l = hub_length.unwrap_or(0.0);
+    let max_inner_r = if has_keyway {
+        ((bore_r + kw_d).hypot(kw_w * 0.5)).max(bore_r)
+    } else {
+        bore_r
+    };
+    let has_hub = hub_r > 1e-6
+        && hub_l > 1e-6
+        && hub_r < r_f * 0.98
+        && (!has_bore || hub_r > max_inner_r * 1.02);
+
+    let total_hub_len = if has_hub {
+        if hub_l > face_width {
+            hub_l
         } else {
-            cleaned_poly.push(p);
+            face_width + hub_l
         }
-    }
-    if cleaned_poly.len() > 2 {
-        let first = cleaned_poly[0];
-        let last = *cleaned_poly.last().unwrap();
-        let d2 = (first[0] - last[0]).powi(2) + (first[1] - last[1]).powi(2);
-        if d2 <= 1e-14 {
-            cleaned_poly.pop();
+    } else {
+        face_width
+    };
+    let z_hub_top = -h2 + total_hub_len;
+
+    // If a keyway is present, ensure exact keyway corner angles are in root_angles
+    let (kw_half, kw_y_top, kw_corners) = if has_keyway {
+        let w_half = (kw_w * 0.5).min(bore_r * 0.85);
+        let y_shoulder = (bore_r * bore_r - w_half * w_half).max(0.0).sqrt();
+        let y_top = bore_r + kw_d;
+        let c1 = y_shoulder.atan2(w_half).rem_euclid(2.0 * PI);
+        let c2 = y_top.atan2(w_half).rem_euclid(2.0 * PI);
+        let c3 = y_top.atan2(-w_half).rem_euclid(2.0 * PI);
+        let c4 = y_shoulder.atan2(-w_half).rem_euclid(2.0 * PI);
+        (w_half, y_top, Some([c1, c2, c3, c4]))
+    } else {
+        (0.0, 0.0, None)
+    };
+
+    if let Some(corners) = kw_corners {
+        for &c_ang in &corners {
+            let exists = root_angles.iter().any(|&a| (a - c_ang).abs() < 1e-4);
+            if !exists {
+                root_angles.push(c_ang);
+            }
         }
+        root_angles.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     }
 
-    let m_pts = cleaned_poly.len();
-    if m_pts < 3 {
-        return TriangleMesh::empty();
-    }
+    // Helper to find index of angle in root_angles
+    let find_root_angle_idx = |target_ang: f64| -> usize {
+        let norm = target_ang.rem_euclid(2.0 * PI);
+        let mut best_i = 0;
+        let mut best_d = f64::INFINITY;
+        for (i, &a) in root_angles.iter().enumerate() {
+            let diff = (a - norm)
+                .abs()
+                .min((a - norm + 2.0 * PI).abs())
+                .min((a - norm - 2.0 * PI).abs());
+            if diff < best_d {
+                best_d = diff;
+                best_i = i;
+            }
+        }
+        best_i
+    };
 
-    // 2. Extrude the star-shaped 2D polygon into a watertight 3D solid mesh
+    let root_poly: Vec<[f64; 2]> = root_angles
+        .iter()
+        .map(|&a| [r_f * a.cos(), r_f * a.sin()])
+        .collect();
+
+    // Build inner bore/keyway ring and hub ring matching root_angles
+    let inner_poly: Vec<[f64; 2]> = if has_bore {
+        root_angles
+            .iter()
+            .map(|&ang| {
+                if let Some([c1, c2, c3, c4]) = kw_corners {
+                    if ang >= c1 - 1e-4 && ang <= c2 + 1e-4 {
+                        let r_in = kw_half / ang.cos();
+                        [r_in * ang.cos(), r_in * ang.sin()]
+                    } else if ang > c2 + 1e-4 && ang < c3 - 1e-4 {
+                        let r_in = kw_y_top / ang.sin();
+                        [r_in * ang.cos(), r_in * ang.sin()]
+                    } else if ang >= c3 - 1e-4 && ang <= c4 + 1e-4 {
+                        let r_in = -kw_half / ang.cos();
+                        [r_in * ang.cos(), r_in * ang.sin()]
+                    } else {
+                        [bore_r * ang.cos(), bore_r * ang.sin()]
+                    }
+                } else {
+                    [bore_r * ang.cos(), bore_r * ang.sin()]
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let hub_poly: Vec<[f64; 2]> = if has_hub {
+        root_angles
+            .iter()
+            .map(|&ang| [hub_r * ang.cos(), hub_r * ang.sin()])
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
 
-    // 2a. Top cap at z = +h2 (normal = [0, 0, 1])
-    let top_center_idx = vertices.len() as u32;
-    vertices.push(Vertex::new([0.0, 0.0, h2], [0.0, 0.0, 1.0]));
+    // Helper: add planar fan cap around [0, 0, z]
+    let add_fan_cap = |verts: &mut Vec<Vertex>,
+                       idxs: &mut Vec<[u32; 3]>,
+                       ring: &[[f64; 2]],
+                       z_val: f64,
+                       is_top: bool| {
+        let n_z = if is_top { 1.0 } else { -1.0 };
+        let center_idx = verts.len() as u32;
+        verts.push(Vertex::new([0.0, 0.0, z_val], [0.0, 0.0, n_z]));
+        let start_idx = verts.len() as u32;
+        for p in ring {
+            verts.push(Vertex::new([p[0], p[1], z_val], [0.0, 0.0, n_z]));
+        }
+        let n = ring.len();
+        for i in 0..n {
+            let next = (i + 1) % n;
+            if is_top {
+                idxs.push([center_idx, start_idx + (i as u32), start_idx + (next as u32)]);
+            } else {
+                idxs.push([center_idx, start_idx + (next as u32), start_idx + (i as u32)]);
+            }
+        }
+    };
 
-    let top_rim_start = vertices.len() as u32;
-    for p in &cleaned_poly {
-        vertices.push(Vertex::new([p[0], p[1], h2], [0.0, 0.0, 1.0]));
-    }
-    for i in 0..m_pts {
-        let next = (i + 1) % m_pts;
-        indices.push([
-            top_center_idx,
-            top_rim_start + (i as u32),
-            top_rim_start + (next as u32),
-        ]);
-    }
+    // Helper: add planar annular cap between inner_ring and outer_ring at z_val
+    let add_annulus_cap = |verts: &mut Vec<Vertex>,
+                           idxs: &mut Vec<[u32; 3]>,
+                           in_ring: &[[f64; 2]],
+                           out_ring: &[[f64; 2]],
+                           z_val: f64,
+                           is_top: bool| {
+        let n_z = if is_top { 1.0 } else { -1.0 };
+        let in_start = verts.len() as u32;
+        for p in in_ring {
+            verts.push(Vertex::new([p[0], p[1], z_val], [0.0, 0.0, n_z]));
+        }
+        let out_start = verts.len() as u32;
+        for p in out_ring {
+            verts.push(Vertex::new([p[0], p[1], z_val], [0.0, 0.0, n_z]));
+        }
+        let n = in_ring.len();
+        for i in 0..n {
+            let next = (i + 1) % n;
+            let in_c = in_start + (i as u32);
+            let in_n = in_start + (next as u32);
+            let out_c = out_start + (i as u32);
+            let out_n = out_start + (next as u32);
+            if is_top {
+                idxs.push([in_c, out_c, out_n]);
+                idxs.push([in_c, out_n, in_n]);
+            } else {
+                idxs.push([in_c, out_n, out_c]);
+                idxs.push([in_c, in_n, out_n]);
+            }
+        }
+    };
 
-    // 2b. Bottom cap at z = -h2 (normal = [0, 0, -1])
-    let bot_center_idx = vertices.len() as u32;
-    vertices.push(Vertex::new([0.0, 0.0, -h2], [0.0, 0.0, -1.0]));
-
-    let bot_rim_start = vertices.len() as u32;
-    for p in &cleaned_poly {
-        vertices.push(Vertex::new([p[0], p[1], -h2], [0.0, 0.0, -1.0]));
-    }
-    for i in 0..m_pts {
-        let next = (i + 1) % m_pts;
-        indices.push([
-            bot_center_idx,
-            bot_rim_start + (next as u32),
-            bot_rim_start + (i as u32),
-        ]);
-    }
-
-    // 2c. Side walls quads (2 triangles each) with outward facet normals
-    for i in 0..m_pts {
-        let next = (i + 1) % m_pts;
-        let p1 = cleaned_poly[i];
-        let p2 = cleaned_poly[next];
-
-        let dx = p2[0] - p1[0];
-        let dy = p2[1] - p1[1];
-        let edge_len = (dx * dx + dy * dy).sqrt();
-        let normal = if edge_len > 1e-12 {
-            [dy / edge_len, -dx / edge_len, 0.0]
-        } else {
-            [1.0, 0.0, 0.0]
+    // Helper: add tooth-ladder caps at z_val for all teeth, stitched to root_poly
+    let add_teeth_caps = |verts: &mut Vec<Vertex>,
+                          idxs: &mut Vec<[u32; 3]>,
+                          z_val: f64,
+                          is_top: bool| {
+        let n_z = if is_top { 1.0 } else { -1.0 };
+        let mut push_tri = |a: u32, b: u32, c: u32| {
+            if is_top {
+                idxs.push([a, b, c]);
+            } else {
+                idxs.push([a, c, b]);
+            }
         };
 
-        let base = vertices.len() as u32;
-        vertices.push(Vertex::new([p1[0], p1[1], h2], normal));  // 0: top curr
-        vertices.push(Vertex::new([p1[0], p1[1], -h2], normal)); // 1: bot curr
-        vertices.push(Vertex::new([p2[0], p2[1], -h2], normal)); // 2: bot next
-        vertices.push(Vertex::new([p2[0], p2[1], h2], normal));  // 3: top next
+        let n_r = root_poly.len();
+        for k in 0..teeth {
+            let phi_k = (k as f64) * 2.0 * PI / z;
+            let idx_l = find_root_angle_idx(phi_k - theta_root);
+            let idx_r = find_root_angle_idx(phi_k + theta_root);
 
-        indices.push([base, base + 1, base + 3]);
-        indices.push([base + 1, base + 2, base + 3]);
-    }
+            // Create level >= 1 flank vertices for tooth k
+            let mut l_idxs: Vec<u32> = Vec::with_capacity(m_levels + 1);
+            let mut r_idxs: Vec<u32> = Vec::with_capacity(m_levels + 1);
+            l_idxs.push(0); // placeholder for level 0
+            r_idxs.push(0);
 
-    let mut solid = TriangleMesh::new(vertices, indices);
+            for &(r_lvl, th_lvl) in radial_levels.iter().skip(1) {
+                let p_l = [r_lvl * (phi_k - th_lvl).cos(), r_lvl * (phi_k - th_lvl).sin()];
+                let p_r = [r_lvl * (phi_k + th_lvl).cos(), r_lvl * (phi_k + th_lvl).sin()];
+                let il = verts.len() as u32;
+                verts.push(Vertex::new([p_l[0], p_l[1], z_val], [0.0, 0.0, n_z]));
+                let ir = verts.len() as u32;
+                verts.push(Vertex::new([p_r[0], p_r[1], z_val], [0.0, 0.0, n_z]));
+                l_idxs.push(il);
+                r_idxs.push(ir);
+            }
 
-    // 3. Optional Hub support
-    if let (Some(hub_d), Some(hub_l)) = (hub_diameter, hub_length) {
-        if hub_d > 1e-6 && hub_l > 1e-6 {
-            let hub_r = hub_d * 0.5;
-            let total_hub_len = if hub_l > face_width {
-                hub_l
+            // Connect root vertices between idx_l and idx_r to level 1 (l_idxs[1], r_idxs[1])
+            let steps_lr = (idx_r + n_r - idx_l) % n_r;
+            let mut base_verts: Vec<u32> = Vec::with_capacity(steps_lr + 1);
+            for s in 0..=steps_lr {
+                let rp = root_poly[(idx_l + s) % n_r];
+                let vi = verts.len() as u32;
+                verts.push(Vertex::new([rp[0], rp[1], z_val], [0.0, 0.0, n_z]));
+                base_verts.push(vi);
+            }
+            if steps_lr == 1 {
+                push_tri(base_verts[0], l_idxs[1], r_idxs[1]);
+                push_tri(base_verts[0], r_idxs[1], base_verts[1]);
             } else {
-                face_width + hub_l
-            };
-            let hub_z_center = -h2 + total_hub_len * 0.5;
-            let mut hub_mesh = create_cylinder_with_settings(hub_r, total_hub_len, settings);
-            hub_mesh.translate([0.0, 0.0, hub_z_center]);
-            solid = csg_union(&solid, &hub_mesh);
-        }
-    }
-
-    // 4. Optional Bore Hole & DIN 6885 Keyway support
-    if let Some(bore_r) = bore_radius {
-        if bore_r > 1e-6 {
-            let aabb = solid.bounding_box();
-            let z_min = aabb.min[2];
-            let z_max = aabb.max[2];
-            let total_span = z_max - z_min;
-            let margin = (total_span * 0.05).clamp(1e-4, 0.02);
-            let cutter_height = total_span + margin * 2.0;
-            let z_center = (z_min + z_max) * 0.5;
-
-            let mut bore_tool = create_cylinder_with_settings(bore_r, cutter_height, settings);
-            bore_tool.translate([0.0, 0.0, z_center]);
-
-            let cutter = if let (Some(kw), Some(kd)) = (keyway_width, keyway_depth) {
-                if kw > 1e-6 && kd > 1e-6 {
-                    let mut keyway_box = create_box(kw, bore_r + kd, cutter_height);
-                    keyway_box.translate([0.0, (bore_r + kd) * 0.5, z_center]);
-                    csg_union(&bore_tool, &keyway_box)
-                } else {
-                    bore_tool
+                let mid = steps_lr / 2;
+                for s in 0..mid {
+                    push_tri(base_verts[s], l_idxs[1], base_verts[s + 1]);
                 }
-            } else {
-                bore_tool
-            };
+                push_tri(base_verts[mid], l_idxs[1], r_idxs[1]);
+                for s in mid..steps_lr {
+                    push_tri(base_verts[s], r_idxs[1], base_verts[s + 1]);
+                }
+            }
 
-            solid = csg_difference(&solid, &cutter);
+            // Quad ladder across tooth for levels 1..(m_levels - 1)
+            for j in 1..(m_levels - 1) {
+                push_tri(l_idxs[j], l_idxs[j + 1], r_idxs[j + 1]);
+                push_tri(l_idxs[j], r_idxs[j + 1], r_idxs[j]);
+            }
+
+            // Top band (m_levels - 1) -> m_levels including tip crest point Tip_k at r_a
+            // Connecting Tip_k to level (m_levels - 1) avoids 3 nearly-collinear points on r_a!
+            let p_tip = [r_a * phi_k.cos(), r_a * phi_k.sin()];
+            let tip_idx = verts.len() as u32;
+            verts.push(Vertex::new([p_tip[0], p_tip[1], z_val], [0.0, 0.0, n_z]));
+            let prev_lvl = m_levels - 1;
+            push_tri(l_idxs[prev_lvl], l_idxs[m_levels], tip_idx);
+            push_tri(l_idxs[prev_lvl], tip_idx, r_idxs[prev_lvl]);
+            push_tri(r_idxs[prev_lvl], tip_idx, r_idxs[m_levels]);
+        }
+    };
+
+    // Build outer gear perimeter polygon matching the exact cap boundary edges
+    let mut outer_perimeter: Vec<[f64; 2]> = Vec::new();
+    let n_r = root_poly.len();
+    for k in 0..teeth {
+        let phi_k = (k as f64) * 2.0 * PI / z;
+        let idx_l = find_root_angle_idx(phi_k - theta_root);
+        let idx_r = find_root_angle_idx(phi_k + theta_root);
+        let next_k = (k + 1) % teeth;
+        let phi_next = (next_k as f64) * 2.0 * PI / z;
+        let idx_next_l = find_root_angle_idx(phi_next - theta_root);
+
+        // Leading root corner L_{k,0}
+        outer_perimeter.push(root_poly[idx_l]);
+        // Leading flank levels 1..=m_levels
+        for &(r_lvl, th_lvl) in radial_levels.iter().skip(1) {
+            outer_perimeter.push([r_lvl * (phi_k - th_lvl).cos(), r_lvl * (phi_k - th_lvl).sin()]);
+        }
+        // Tip crest center
+        outer_perimeter.push([r_a * phi_k.cos(), r_a * phi_k.sin()]);
+        // Trailing flank levels m_levels..=1
+        for &(r_lvl, th_lvl) in radial_levels.iter().skip(1).rev() {
+            outer_perimeter.push([r_lvl * (phi_k + th_lvl).cos(), r_lvl * (phi_k + th_lvl).sin()]);
+        }
+        // Trailing root corner R_{k,0} and all root trough vertices up to (excluding) L_{k+1,0}
+        let trough_steps = (idx_next_l + n_r - idx_r) % n_r;
+        for s in 0..trough_steps {
+            outer_perimeter.push(root_poly[(idx_r + s) % n_r]);
         }
     }
 
-    solid
+    // Helper: add vertical side wall between z_bot and z_top
+    let add_vertical_wall = |verts: &mut Vec<Vertex>,
+                             idxs: &mut Vec<[u32; 3]>,
+                             ring: &[[f64; 2]],
+                             z_bot: f64,
+                             z_top: f64,
+                             is_outer: bool| {
+        let n = ring.len();
+        for i in 0..n {
+            let next = (i + 1) % n;
+            let p1 = ring[i];
+            let p2 = ring[next];
+            let dx = p2[0] - p1[0];
+            let dy = p2[1] - p1[1];
+            let edge_len = dx.hypot(dy);
+            let sign = if is_outer { 1.0 } else { -1.0 };
+            let normal = if edge_len > 1e-12 {
+                [sign * dy / edge_len, -sign * dx / edge_len, 0.0]
+            } else {
+                [sign, 0.0, 0.0]
+            };
+
+            let base = verts.len() as u32;
+            verts.push(Vertex::new([p1[0], p1[1], z_top], normal)); // 0: top curr
+            verts.push(Vertex::new([p1[0], p1[1], z_bot], normal)); // 1: bot curr
+            verts.push(Vertex::new([p2[0], p2[1], z_bot], normal)); // 2: bot next
+            verts.push(Vertex::new([p2[0], p2[1], z_top], normal)); // 3: top next
+
+            if is_outer {
+                idxs.push([base, base + 1, base + 3]);
+                idxs.push([base + 1, base + 2, base + 3]);
+            } else {
+                idxs.push([base, base + 3, base + 1]);
+                idxs.push([base + 1, base + 3, base + 2]);
+            }
+        }
+    };
+
+    // Outer gear tooth wall from -h2 to +h2
+    add_vertical_wall(&mut vertices, &mut indices, &outer_perimeter, -h2, h2, true);
+    // Top and bottom tooth caps (outside r_f)
+    add_teeth_caps(&mut vertices, &mut indices, h2, true);
+    add_teeth_caps(&mut vertices, &mut indices, -h2, false);
+
+    // Inner disk/annulus inside r_f
+    match (has_hub, has_bore) {
+        (false, false) => {
+            add_fan_cap(&mut vertices, &mut indices, &root_poly, h2, true);
+            add_fan_cap(&mut vertices, &mut indices, &root_poly, -h2, false);
+        }
+        (true, false) => {
+            add_annulus_cap(&mut vertices, &mut indices, &hub_poly, &root_poly, h2, true);
+            add_vertical_wall(&mut vertices, &mut indices, &hub_poly, h2, z_hub_top, true);
+            add_fan_cap(&mut vertices, &mut indices, &hub_poly, z_hub_top, true);
+            add_fan_cap(&mut vertices, &mut indices, &root_poly, -h2, false);
+        }
+        (false, true) => {
+            add_annulus_cap(&mut vertices, &mut indices, &inner_poly, &root_poly, h2, true);
+            add_annulus_cap(&mut vertices, &mut indices, &inner_poly, &root_poly, -h2, false);
+            add_vertical_wall(&mut vertices, &mut indices, &inner_poly, -h2, h2, false);
+        }
+        (true, true) => {
+            add_annulus_cap(&mut vertices, &mut indices, &hub_poly, &root_poly, h2, true);
+            add_vertical_wall(&mut vertices, &mut indices, &hub_poly, h2, z_hub_top, true);
+            add_annulus_cap(&mut vertices, &mut indices, &inner_poly, &hub_poly, z_hub_top, true);
+            add_annulus_cap(&mut vertices, &mut indices, &inner_poly, &root_poly, -h2, false);
+            add_vertical_wall(&mut vertices, &mut indices, &inner_poly, -h2, z_hub_top, false);
+        }
+    }
+
+    TriangleMesh::new(vertices, indices)
 }
 
 /// Helper: 2D polygon ear-clipping triangulation for simple polygons.
@@ -1476,96 +1718,127 @@ pub fn create_revolve(profile: &[[f64; 2]], angle_deg: f64, segments: usize) -> 
         pts.reverse();
     }
 
-    // 3. Generate vertices in angular rings
+    // 3. Generate side-wall quad strips per profile segment with exact analytical normals
     let n_steps = if is_full_circle { segs } else { segs + 1 };
-    let mut vertices = Vec::with_capacity(n_steps * m);
+    let mut vertices = Vec::with_capacity(n_steps * m * 2);
     let mut indices = Vec::new();
 
-    for j in 0..n_steps {
-        let theta = if is_full_circle {
-            (j as f64) * 2.0 * PI / (segs as f64)
-        } else {
-            (j as f64) * sweep_angle_rad / (segs as f64)
-        };
-        let cos_t = theta.cos();
-        let sin_t = theta.sin();
+    let thetas: Vec<(f64, f64)> = (0..n_steps)
+        .map(|j| {
+            let theta = if is_full_circle {
+                (j as f64) * 2.0 * PI / (segs as f64)
+            } else {
+                (j as f64) * sweep_angle_rad / (segs as f64)
+            };
+            (theta.cos(), theta.sin())
+        })
+        .collect();
 
-        for p in &pts {
-            let r = p[0];
-            let z = p[1];
-            let x = r * cos_t;
-            let y = r * sin_t;
-            vertices.push(Vertex::new([x, y, z], [cos_t, sin_t, 0.0]));
+    for i in 0..m {
+        let next_i = (i + 1) % m;
+        let r_a = if pts[i][0] < 1e-9 { 0.0 } else { pts[i][0] };
+        let z_a = pts[i][1];
+        let r_b = if pts[next_i][0] < 1e-9 { 0.0 } else { pts[next_i][0] };
+        let z_b = pts[next_i][1];
+
+        // Edge lying on rotation axis has zero surface area
+        if r_a < 1e-9 && r_b < 1e-9 {
+            continue;
         }
-    }
 
-    // 4. Triangulate quad strips between ring j and ring next_j
-    for j in 0..segs {
-        let next_j = if is_full_circle {
-            (j + 1) % segs
-        } else {
-            j + 1
-        };
+        // Outward 2D normal for CCW profile in (r, z): (dz, -dr) / len
+        let dr = r_b - r_a;
+        let dz = z_b - z_a;
+        let seg_len = (dr * dr + dz * dz).sqrt().max(1e-12);
+        let nr = dz / seg_len;
+        let nz = -dr / seg_len;
 
-        for i in 0..m {
-            let next_i = (i + 1) % m;
+        let base_v = vertices.len() as u32;
+        for &(cos_t, sin_t) in &thetas {
+            let xa = if r_a == 0.0 { 0.0 } else { r_a * cos_t };
+            let ya = if r_a == 0.0 { 0.0 } else { r_a * sin_t };
+            let xb = if r_b == 0.0 { 0.0 } else { r_b * cos_t };
+            let yb = if r_b == 0.0 { 0.0 } else { r_b * sin_t };
+            let n3 = [nr * cos_t, nr * sin_t, nz];
+            vertices.push(Vertex::new([xa, ya, z_a], n3));
+            vertices.push(Vertex::new([xb, yb, z_b], n3));
+        }
 
-            let r_a = pts[i][0];
-            let r_b = pts[next_i][0];
+        for j in 0..segs {
+            let next_j = if is_full_circle {
+                (j + 1) % segs
+            } else {
+                j + 1
+            };
 
-            // Edge lying on rotation axis has zero surface area
-            if r_a < 1e-9 && r_b < 1e-9 {
-                continue;
-            }
-
-            let v_curr_i = (j * m + i) as u32;
-            let v_curr_next = (j * m + next_i) as u32;
-            let v_next_i = (next_j * m + i) as u32;
-            let v_next_next = (next_j * m + next_i) as u32;
+            let v_curr_a = base_v + (j as u32) * 2;
+            let v_curr_b = v_curr_a + 1;
+            let v_next_a = base_v + (next_j as u32) * 2;
+            let v_next_b = v_next_a + 1;
 
             if r_a < 1e-9 {
-                // Triangle fan around axis point at i
-                indices.push([v_curr_i, v_next_next, v_curr_next]);
+                // Triangle fan around axis point at a
+                indices.push([v_curr_a, v_next_b, v_curr_b]);
             } else if r_b < 1e-9 {
-                // Triangle fan around axis point at next_i
-                indices.push([v_curr_i, v_next_i, v_next_next]);
+                // Triangle fan around axis point at b
+                indices.push([v_curr_a, v_next_a, v_next_b]);
             } else {
                 // Regular quad split into 2 triangles
-                indices.push([v_curr_i, v_next_i, v_next_next]);
-                indices.push([v_curr_i, v_next_next, v_curr_next]);
+                indices.push([v_curr_a, v_next_a, v_next_b]);
+                indices.push([v_curr_a, v_next_b, v_curr_b]);
             }
         }
     }
 
-    // 5. If partial angle, cap the planar start and end faces
+    // 4. If partial angle, cap the planar start and end faces with dedicated flat-normal vertices
     if !is_full_circle {
         let cap_triangles = triangulate_simple_polygon_2d(&pts);
-        // Start cap at ring 0 (theta = 0): outward normal points towards -Y
-        for tri in &cap_triangles {
-            let i0 = tri[0];
-            let i1 = tri[1];
-            let i2 = tri[2];
-            indices.push([i0, i2, i1]);
+
+        // Start cap at theta = 0: outward normal points towards -Y (e_r x e_z = [0, -1, 0])
+        let start_cap_base = vertices.len() as u32;
+        let start_normal = [0.0, -1.0, 0.0];
+        for p in &pts {
+            let r = if p[0] < 1e-9 { 0.0 } else { p[0] };
+            vertices.push(Vertex::new([r, 0.0, p[1]], start_normal));
         }
-        // End cap at ring segs (theta = sweep_angle): outward normal points towards +theta
-        let end_offset = (segs * m) as u32;
         for tri in &cap_triangles {
-            let i0 = end_offset + tri[0];
-            let i1 = end_offset + tri[1];
-            let i2 = end_offset + tri[2];
-            indices.push([i0, i1, i2]);
+            indices.push([
+                start_cap_base + tri[0],
+                start_cap_base + tri[1],
+                start_cap_base + tri[2],
+            ]);
+        }
+
+        // End cap at theta = sweep_angle: outward normal points towards +e_theta = [-sin, cos, 0]
+        let end_cap_base = vertices.len() as u32;
+        let (cos_end, sin_end) = thetas[segs];
+        let end_normal = [-sin_end, cos_end, 0.0];
+        for p in &pts {
+            let r = if p[0] < 1e-9 { 0.0 } else { p[0] };
+            let x = if r == 0.0 { 0.0 } else { r * cos_end };
+            let y = if r == 0.0 { 0.0 } else { r * sin_end };
+            vertices.push(Vertex::new([x, y, p[1]], end_normal));
+        }
+        for tri in &cap_triangles {
+            indices.push([
+                end_cap_base + tri[0],
+                end_cap_base + tri[2],
+                end_cap_base + tri[1],
+            ]);
         }
     }
 
     let mut mesh = TriangleMesh::new(vertices, indices);
 
-    // 6. Enforce outward orientation and calculate accurate vertex normals
+    // 5. Enforce outward orientation
     if mesh.signed_volume() < 0.0 {
         for tri in &mut mesh.indices {
             tri.swap(1, 2);
         }
+        for v in &mut mesh.vertices {
+            v.normal = [-v.normal[0], -v.normal[1], -v.normal[2]];
+        }
     }
-    mesh.recompute_vertex_normals();
 
     mesh
 }
@@ -1672,103 +1945,437 @@ pub fn create_wheel_rim_with_settings(
 
     let et = offset_et.unwrap_or(0.035).clamp(-w_rim * 0.4, w_rim * 0.4);
 
-    // 1. Construct stepped rim barrel profile (in mm/m): outer flanges, bead seats, drop center well
+    // 1. Key radial & axial dimensions with safe geometric clearances
     let t_w = (r_bead * 0.045).clamp(0.006, 0.012);
     let drop_depth = (r_bead * 0.08).clamp(0.015, 0.035);
-    let r_well = r_bead - drop_depth;
+    let r_well = (r_bead - drop_depth).max(r_hub + t_w + 0.015);
+    let r_inner_barrel = r_well - t_w;
     let r_hump = r_bead + (r_bead * 0.012).clamp(0.002, 0.005);
 
+    let r_hub_eff = r_hub.min(r_inner_barrel * 0.78).max(r_bore + 0.018);
+    let r_bore_eff = r_bore.min(r_hub_eff * 0.65);
+    let r_bolt_ring = (r_hub_eff - (r_hub_eff - r_bore_eff) * 0.15).max(r_bore_eff + 0.012);
+    let radial_band = r_bolt_ring - r_bore_eff;
+    let r_pcd_eff = r_pcd.clamp(
+        r_bore_eff + radial_band * 0.28,
+        r_bolt_ring - radial_band * 0.28,
+    );
+    let max_r_bolt = (r_pcd_eff - r_bore_eff)
+        .min(r_bolt_ring - r_pcd_eff)
+        .min(r_pcd_eff * (PI / (n_bolts as f64)).sin())
+        * 0.55;
+    let r_bolt_eff = r_bolt.clamp(0.002, max_r_bolt.max(0.0025));
+
     let h_w = w_rim * 0.5;
-    let barrel_profile: Vec<[f64; 2]> = vec![
-        // Outer surface: from inner flange (-h_w) to outer flange (+h_w)
-        [r_flange, -h_w],
-        [r_flange, -h_w + 0.05 * w_rim],
-        [r_bead + 0.004, -h_w + 0.08 * w_rim],
-        [r_bead, -h_w + 0.12 * w_rim],
-        [r_bead, -h_w + 0.28 * w_rim],
-        [r_well, -h_w + 0.38 * w_rim],
-        [r_well, h_w - 0.35 * w_rim],
-        [r_hump, h_w - 0.24 * w_rim],
-        [r_bead, h_w - 0.20 * w_rim],
-        [r_bead, h_w - 0.08 * w_rim],
-        [r_flange, h_w - 0.04 * w_rim],
-        [r_flange, h_w],
-        // Outer lip thickness
-        [r_flange - t_w, h_w],
-        // Inner surface: from outer lip back to inner lip
-        [r_bead - t_w, h_w - 0.08 * w_rim],
-        [r_well - t_w, h_w - 0.35 * w_rim],
-        [r_well - t_w, -h_w + 0.38 * w_rim],
-        [r_bead - t_w, -h_w + 0.28 * w_rim],
-        [r_flange - t_w, -h_w],
-    ];
+    let z_well_bot = -h_w + 0.30 * w_rim;
+    let z_well_top = h_w - 0.30 * w_rim;
+    let max_disc_t = (z_well_top - z_well_bot) * 0.55;
+    let t_disc = t_spoke.clamp(0.010, max_disc_t.max(0.012));
+    let z_disc_center = (et - t_disc * 0.5).clamp(
+        z_well_bot + t_disc * 0.65,
+        z_well_top - t_disc * 0.65,
+    );
+    let z_back = z_disc_center - t_disc * 0.5;
+    let z_front = z_disc_center + t_disc * 0.5;
 
-    let barrel = create_revolve_with_settings(&barrel_profile, 360.0, settings);
-
-    // 2. Central hub cylinder with bore hole and PCD bolt pattern
-    let t_hub = (w_rim * 0.15).clamp(0.015, 0.035);
-    let z_hub_center = et - t_hub * 0.5;
-
-    let mut hub_solid = create_cylinder_with_settings(r_hub, t_hub, settings);
-    hub_solid.translate([0.0, 0.0, z_hub_center]);
-
-    let cutter_height = t_hub + 0.010;
-    let mut cutter_vertices = Vec::new();
-    let mut cutter_indices = Vec::new();
-
-    let mut add_to_cutters = |cyl: &TriangleMesh| {
-        let base_idx = cutter_vertices.len() as u32;
-        cutter_vertices.extend_from_slice(&cyl.vertices);
-        for tri in &cyl.indices {
-            cutter_indices.push([tri[0] + base_idx, tri[1] + base_idx, tri[2] + base_idx]);
-        }
+    let q_mult = match settings.quality {
+        TessellationQuality::Coarse => 1,
+        TessellationQuality::Medium => 2,
+        TessellationQuality::Fine => 3,
+        TessellationQuality::Custom { .. } => 2,
     };
 
-    let mut bore_cyl = create_cylinder_with_settings(r_bore, cutter_height, settings);
-    bore_cyl.translate([0.0, 0.0, z_hub_center]);
-    add_to_cutters(&bore_cyl);
+    // 2. Angular discretization of the spoke + window sectors (N_theta stations around 360 deg)
+    let k_s = 2 * q_mult; // segments across each spoke
+    let k_w = 4 * q_mult; // segments across each ventilation window
+    let k_sec = k_s + k_w;
+    let n_theta = n_spokes * k_sec;
+    let d_theta_sec = 2.0 * PI / (n_spokes as f64);
 
-    for b in 0..n_bolts {
-        let beta = (b as f64) * 2.0 * PI / (n_bolts as f64) + PI / (n_bolts as f64);
-        let bx = r_pcd * beta.cos();
-        let by = r_pcd * beta.sin();
-        let mut bolt_cyl = create_cylinder_with_settings(r_bolt, cutter_height, settings);
-        bolt_cyl.translate([bx, by, z_hub_center]);
-        add_to_cutters(&bolt_cyl);
-    }
-    let all_cutters = TriangleMesh::new(cutter_vertices, cutter_indices);
+    let delta_hub = (w_spoke / (2.0 * r_hub_eff)).clamp(0.12 * d_theta_sec, 0.34 * d_theta_sec);
+    let delta_barrel =
+        (w_spoke / (2.0 * r_inner_barrel)).clamp(0.08 * d_theta_sec, 0.34 * d_theta_sec);
 
-    let hub_finished = csg_difference(&hub_solid, &all_cutters);
-
-    // 3. Structural spokes with open cooling windows between them
-    let r_spoke_inner = r_hub - 0.003;
-    let r_spoke_outer = (r_bead - t_w) + 0.004;
-    let l_spoke = r_spoke_outer - r_spoke_inner;
-    let r_spoke_mid = (r_spoke_inner + r_spoke_outer) * 0.5;
-
-    let mut spoke_vertices = Vec::new();
-    let mut spoke_indices = Vec::new();
-
+    let mut phi_hub = Vec::with_capacity(n_theta);
+    let mut phi_barrel = Vec::with_capacity(n_theta);
     for s in 0..n_spokes {
-        let theta_s = (s as f64) * 2.0 * PI / (n_spokes as f64);
-        let mut spoke = create_box(l_spoke, w_spoke, t_spoke);
-        spoke.translate([r_spoke_mid, 0.0, z_hub_center]);
-        spoke.rotate_rpy_deg(0.0, 0.0, theta_s * 180.0 / PI);
-
-        let base_idx = spoke_vertices.len() as u32;
-        spoke_vertices.extend_from_slice(&spoke.vertices);
-        for tri in &spoke.indices {
-            spoke_indices.push([tri[0] + base_idx, tri[1] + base_idx, tri[2] + base_idx]);
+        let base_ang = (s as f64) * d_theta_sec;
+        // Spoke indices: 0..k_s covers [-delta, +delta] around base_ang + 0.5 * d_theta_sec?
+        // Place spoke centered at base_ang + delta_max so phi starts >= 0 and increases strictly in [0, 2*PI)
+        let spoke_center = base_ang + 0.25 * d_theta_sec;
+        let next_spoke_center = base_ang + 1.25 * d_theta_sec;
+        for m in 0..k_s {
+            let t = (m as f64) / (k_s as f64);
+            phi_hub.push(spoke_center - delta_hub + t * (2.0 * delta_hub));
+            phi_barrel.push(spoke_center - delta_barrel + t * (2.0 * delta_barrel));
+        }
+        for m in 0..k_w {
+            let t = (m as f64) / (k_w as f64);
+            let h_start = spoke_center + delta_hub;
+            let h_end = next_spoke_center - delta_hub;
+            let b_start = spoke_center + delta_barrel;
+            let b_end = next_spoke_center - delta_barrel;
+            phi_hub.push(h_start + t * (h_end - h_start));
+            phi_barrel.push(b_start + t * (b_end - b_start));
         }
     }
-    let all_spokes = TriangleMesh::new(spoke_vertices, spoke_indices);
 
-    // 4. Union hub, spokes, and barrel
-    let hub_and_spokes = csg_union(&hub_finished, &all_spokes);
-    let mut wheel = csg_union(&hub_and_spokes, &barrel);
-    wheel.recompute_vertex_normals();
+    let hub_outer_ring: Vec<[f64; 2]> = phi_hub
+        .iter()
+        .map(|&a| [r_hub_eff * a.cos(), r_hub_eff * a.sin()])
+        .collect();
+    let barrel_inner_ring: Vec<[f64; 2]> = phi_barrel
+        .iter()
+        .map(|&a| [r_inner_barrel * a.cos(), r_inner_barrel * a.sin()])
+        .collect();
 
-    wheel
+    let mut vertices: Vec<Vertex> = Vec::new();
+    let mut indices: Vec<[u32; 3]> = Vec::new();
+
+    // Helper: emit a single quad (2 triangles) with explicit normal
+    let mut push_quad = |p0: [f64; 3], p1: [f64; 3], p2: [f64; 3], p3: [f64; 3], n: [f64; 3]| {
+        let base = vertices.len() as u32;
+        vertices.push(Vertex::new(p0, n));
+        vertices.push(Vertex::new(p1, n));
+        vertices.push(Vertex::new(p2, n));
+        vertices.push(Vertex::new(p3, n));
+        indices.push([base, base + 1, base + 2]);
+        indices.push([base, base + 2, base + 3]);
+    };
+
+    // 3. Build stepped rim barrel profile in CCW (r, z) order
+    // Segment 14 ([r_inner_barrel, z_front] -> [r_inner_barrel, z_back]) is the spoke/window attachment band.
+    let barrel_pts: Vec<[f64; 2]> = vec![
+        [r_flange, -h_w],                           // 0
+        [r_flange, -h_w + 0.05 * w_rim],            // 1
+        [r_bead + 0.004, -h_w + 0.08 * w_rim],      // 2
+        [r_bead, -h_w + 0.12 * w_rim],              // 3
+        [r_bead, -h_w + 0.22 * w_rim],              // 4
+        [r_well, z_well_bot],                       // 5
+        [r_well, z_well_top],                       // 6
+        [r_hump, h_w - 0.22 * w_rim],               // 7
+        [r_bead, h_w - 0.18 * w_rim],               // 8
+        [r_bead, h_w - 0.08 * w_rim],               // 9
+        [r_flange, h_w - 0.04 * w_rim],             // 10
+        [r_flange, h_w],                            // 11
+        [r_flange - t_w, h_w],                      // 12
+        [r_bead - t_w, h_w - 0.08 * w_rim],         // 13
+        [r_inner_barrel, z_well_top],               // 14
+        [r_inner_barrel, z_front],                  // 15 (top of spoke/window band)
+        [r_inner_barrel, z_back],                   // 16 (bottom of spoke/window band)
+        [r_inner_barrel, z_well_bot],               // 17
+        [r_bead - t_w, -h_w + 0.22 * w_rim],        // 18
+        [r_flange - t_w, -h_w],                     // 19
+    ];
+
+    let n_b_pts = barrel_pts.len();
+    for seg_i in 0..n_b_pts {
+        let next_i = (seg_i + 1) % n_b_pts;
+        let ra = barrel_pts[seg_i][0];
+        let za = barrel_pts[seg_i][1];
+        let rb = barrel_pts[next_i][0];
+        let zb = barrel_pts[next_i][1];
+
+        let dr = rb - ra;
+        let dz = zb - za;
+        let len = dr.hypot(dz).max(1e-12);
+        let nr = dz / len;
+        let nz = -dr / len;
+
+        let is_spoke_band = seg_i == 15; // [r_inner_barrel, z_front] -> [r_inner_barrel, z_back]
+
+        for j in 0..n_theta {
+            if is_spoke_band {
+                let in_sec = j % k_sec;
+                if in_sec < k_s {
+                    // Spoke attaches here; no barrel wall across the spoke cross-section
+                    continue;
+                }
+            }
+            let next_j = (j + 1) % n_theta;
+            let a0 = phi_barrel[j];
+            let a1 = phi_barrel[next_j];
+            let mid_a = 0.5 * (a0 + if next_j == 0 { a1 + 2.0 * PI } else { a1 });
+            let n3 = [nr * mid_a.cos(), nr * mid_a.sin(), nz];
+
+            let p0 = [ra * a0.cos(), ra * a0.sin(), za];
+            let p1 = [ra * a1.cos(), ra * a1.sin(), za];
+            let p2 = [rb * a1.cos(), rb * a1.sin(), zb];
+            let p3 = [rb * a0.cos(), rb * a0.sin(), zb];
+            push_quad(p0, p1, p2, p3, n3);
+        }
+    }
+
+    // 4. Spokes and Ventilation Window Walls between r_hub_eff and r_inner_barrel (z in [z_back, z_front])
+    for s in 0..n_spokes {
+        let sec_start = s * k_sec;
+
+        // 4a. Spoke top (+Z) and bottom (-Z) faces across k_s segments
+        for m in 0..k_s {
+            let j0 = sec_start + m;
+            let j1 = (j0 + 1) % n_theta;
+            let h0 = hub_outer_ring[j0];
+            let h1 = hub_outer_ring[j1];
+            let b0 = barrel_inner_ring[j0];
+            let b1 = barrel_inner_ring[j1];
+
+            // Front face at z_front (normal [0, 0, 1])
+            push_quad(
+                [h0[0], h0[1], z_front],
+                [b0[0], b0[1], z_front],
+                [b1[0], b1[1], z_front],
+                [h1[0], h1[1], z_front],
+                [0.0, 0.0, 1.0],
+            );
+            // Back face at z_back (normal [0, 0, -1])
+            push_quad(
+                [h0[0], h0[1], z_back],
+                [h1[0], h1[1], z_back],
+                [b1[0], b1[1], z_back],
+                [b0[0], b0[1], z_back],
+                [0.0, 0.0, -1.0],
+            );
+        }
+
+        // 4b. Leading side wall of spoke s at j_lead = sec_start (from barrel to hub, facing -theta)
+        let j_lead = sec_start;
+        let hl = hub_outer_ring[j_lead];
+        let bl = barrel_inner_ring[j_lead];
+        let dxl = bl[0] - hl[0];
+        let dyl = bl[1] - hl[1];
+        let len_l = dxl.hypot(dyl).max(1e-12);
+        let nl = [dyl / len_l, -dxl / len_l, 0.0];
+        push_quad(
+            [hl[0], hl[1], z_front],
+            [hl[0], hl[1], z_back],
+            [bl[0], bl[1], z_back],
+            [bl[0], bl[1], z_front],
+            nl,
+        );
+
+        // 4c. Trailing side wall of spoke s at j_trail = sec_start + k_s (facing +theta)
+        let j_trail = sec_start + k_s;
+        let ht = hub_outer_ring[j_trail];
+        let bt = barrel_inner_ring[j_trail];
+        let dxt = bt[0] - ht[0];
+        let dyt = bt[1] - ht[1];
+        let len_t = dxt.hypot(dyt).max(1e-12);
+        let nt = [-dyt / len_t, dxt / len_t, 0.0];
+        push_quad(
+            [bt[0], bt[1], z_front],
+            [bt[0], bt[1], z_back],
+            [ht[0], ht[1], z_back],
+            [ht[0], ht[1], z_front],
+            nt,
+        );
+
+        // 4d. Hub outer cylindrical wall along the ventilation window (k_s .. k_sec)
+        for m in k_s..k_sec {
+            let j0 = sec_start + m;
+            let j1 = (j0 + 1) % n_theta;
+            let h0 = hub_outer_ring[j0];
+            let h1 = hub_outer_ring[j1];
+            let dxh = h1[0] - h0[0];
+            let dyh = h1[1] - h0[1];
+            let len_h = dxh.hypot(dyh).max(1e-12);
+            let nh = [dyh / len_h, -dxh / len_h, 0.0];
+            push_quad(
+                [h0[0], h0[1], z_front],
+                [h0[0], h0[1], z_back],
+                [h1[0], h1[1], z_back],
+                [h1[0], h1[1], z_front],
+                nh,
+            );
+        }
+    }
+
+    // 5. Bolt Sector O-Grids inside [r_bore_eff, r_bolt_ring] for each of the n_bolts PCD holes
+    let k_b = 2 * q_mult; // segments per side of each bolt sector
+    let d_beta = 2.0 * PI / (n_bolts as f64);
+    let mut bolt_outer_ring: Vec<[f64; 2]> = Vec::with_capacity(n_bolts * k_b);
+    let mut bore_ring: Vec<[f64; 2]> = Vec::with_capacity(n_bolts * k_b);
+
+    for b in 0..n_bolts {
+        let beta_min = (b as f64) * d_beta;
+        let beta_max = ((b + 1) as f64) * d_beta;
+        let beta_mid = 0.5 * (beta_min + beta_max);
+        let er = [beta_mid.cos(), beta_mid.sin()];
+        let et_vec = [-beta_mid.sin(), beta_mid.cos()];
+        let bolt_center = [r_pcd_eff * er[0], r_pcd_eff * er[1]];
+
+        // Record global CCW rings at r_bore_eff and r_bolt_ring
+        for m in 0..k_b {
+            let t = (m as f64) / (k_b as f64);
+            let ang = beta_min + t * d_beta;
+            bore_ring.push([r_bore_eff * ang.cos(), r_bore_eff * ang.sin()]);
+            bolt_outer_ring.push([r_bolt_ring * ang.cos(), r_bolt_ring * ang.sin()]);
+        }
+
+        // Build 4 * k_b perimeter points in CCW order around bolt_center:
+        // Side 0: theta = beta_min, r from r_bore_eff to r_bolt_ring
+        // Side 1: r = r_bolt_ring, theta from beta_min to beta_max
+        // Side 2: theta = beta_max, r from r_bolt_ring to r_bore_eff
+        // Side 3: r = r_bore_eff, theta from beta_max to beta_min
+        let n_loop = 4 * k_b;
+        let mut perim_loop: Vec<[f64; 2]> = Vec::with_capacity(n_loop);
+        for m in 0..k_b {
+            let t = (m as f64) / (k_b as f64);
+            let r = r_bore_eff + t * (r_bolt_ring - r_bore_eff);
+            perim_loop.push([r * beta_min.cos(), r * beta_min.sin()]);
+        }
+        for m in 0..k_b {
+            let t = (m as f64) / (k_b as f64);
+            let ang = beta_min + t * d_beta;
+            perim_loop.push([r_bolt_ring * ang.cos(), r_bolt_ring * ang.sin()]);
+        }
+        for m in 0..k_b {
+            let t = (m as f64) / (k_b as f64);
+            let r = r_bolt_ring - t * (r_bolt_ring - r_bore_eff);
+            perim_loop.push([r * beta_max.cos(), r * beta_max.sin()]);
+        }
+        for m in 0..k_b {
+            let t = (m as f64) / (k_b as f64);
+            let ang = beta_max - t * d_beta;
+            perim_loop.push([r_bore_eff * ang.cos(), r_bore_eff * ang.sin()]);
+        }
+
+        // Build 4 * k_b bolt hole points in matching CCW order around bolt_center
+        let mut hole_loop: Vec<[f64; 2]> = Vec::with_capacity(n_loop);
+        for idx in 0..n_loop {
+            let psi = -0.75 * PI + (idx as f64) * 2.0 * PI / (n_loop as f64);
+            let c_p = psi.cos();
+            let s_p = psi.sin();
+            let px = bolt_center[0] + r_bolt_eff * (c_p * er[0] + s_p * et_vec[0]);
+            let py = bolt_center[1] + r_bolt_eff * (c_p * er[1] + s_p * et_vec[1]);
+            hole_loop.push([px, py]);
+        }
+
+        // Emit front (+Z), back (-Z), and inner bolt-hole cylindrical wall for sector b
+        for idx in 0..n_loop {
+            let next_idx = (idx + 1) % n_loop;
+            let h0 = hole_loop[idx];
+            let h1 = hole_loop[next_idx];
+            let p0 = perim_loop[idx];
+            let p1 = perim_loop[next_idx];
+
+            // Front cap quad at z_front
+            push_quad(
+                [h0[0], h0[1], z_front],
+                [p0[0], p0[1], z_front],
+                [p1[0], p1[1], z_front],
+                [h1[0], h1[1], z_front],
+                [0.0, 0.0, 1.0],
+            );
+            // Back cap quad at z_back
+            push_quad(
+                [h0[0], h0[1], z_back],
+                [h1[0], h1[1], z_back],
+                [p1[0], p1[1], z_back],
+                [p0[0], p0[1], z_back],
+                [0.0, 0.0, -1.0],
+            );
+            // Bolt hole inner vertical wall (normal pointing inward toward bolt_center)
+            let dx = h1[0] - h0[0];
+            let dy = h1[1] - h0[1];
+            let len = dx.hypot(dy).max(1e-12);
+            let n_in = [-dy / len, dx / len, 0.0];
+            push_quad(
+                [h1[0], h1[1], z_front],
+                [h1[0], h1[1], z_back],
+                [h0[0], h0[1], z_back],
+                [h0[0], h0[1], z_front],
+                n_in,
+            );
+        }
+    }
+
+    // 6. Central bore inner cylindrical wall at r = r_bore_eff
+    let n_bore = bore_ring.len();
+    for i in 0..n_bore {
+        let next_i = (i + 1) % n_bore;
+        let b0 = bore_ring[i];
+        let b1 = bore_ring[next_i];
+        let dx = b1[0] - b0[0];
+        let dy = b1[1] - b0[1];
+        let len = dx.hypot(dy).max(1e-12);
+        let n_in = [-dy / len, dx / len, 0.0];
+        push_quad(
+            [b1[0], b1[1], z_front],
+            [b1[0], b1[1], z_back],
+            [b0[0], b0[1], z_back],
+            [b0[0], b0[1], z_front],
+            n_in,
+        );
+    }
+
+    // 7. Zipper-stitch the hub annulus between bolt_outer_ring (at r_bolt_ring) and hub_outer_ring (at r_hub_eff)
+    // Align starting index of hub_outer_ring closest to bolt_outer_ring[0] angle (0.0)
+    let n1 = bolt_outer_ring.len();
+    let n2 = hub_outer_ring.len();
+    let ang1 = |idx: usize| -> f64 {
+        let wraps = idx / n1;
+        let rem = idx % n1;
+        let p = bolt_outer_ring[rem];
+        p[1].atan2(p[0]).rem_euclid(2.0 * PI) + (wraps as f64) * 2.0 * PI
+    };
+    let ang2 = |idx: usize| -> f64 {
+        let wraps = idx / n2;
+        let rem = idx % n2;
+        phi_hub[rem] + (wraps as f64) * 2.0 * PI
+    };
+
+    let mut i1 = 0usize;
+    let mut i2 = 0usize;
+    while i1 < n1 || i2 < n2 {
+        let advance_1 = if i1 >= n1 {
+            false
+        } else if i2 >= n2 {
+            true
+        } else {
+            ang1(i1 + 1) <= ang2(i2 + 1)
+        };
+
+        let a_curr = bolt_outer_ring[i1 % n1];
+        let b_curr = hub_outer_ring[i2 % n2];
+
+        if advance_1 {
+            let a_next = bolt_outer_ring[(i1 + 1) % n1];
+            // Front cap (+Z): [a_curr, b_curr, a_next]
+            let bf = vertices.len() as u32;
+            vertices.push(Vertex::new([a_curr[0], a_curr[1], z_front], [0.0, 0.0, 1.0]));
+            vertices.push(Vertex::new([b_curr[0], b_curr[1], z_front], [0.0, 0.0, 1.0]));
+            vertices.push(Vertex::new([a_next[0], a_next[1], z_front], [0.0, 0.0, 1.0]));
+            indices.push([bf, bf + 1, bf + 2]);
+
+            // Back cap (-Z): [a_curr, a_next, b_curr]
+            let bb = vertices.len() as u32;
+            vertices.push(Vertex::new([a_curr[0], a_curr[1], z_back], [0.0, 0.0, -1.0]));
+            vertices.push(Vertex::new([a_next[0], a_next[1], z_back], [0.0, 0.0, -1.0]));
+            vertices.push(Vertex::new([b_curr[0], b_curr[1], z_back], [0.0, 0.0, -1.0]));
+            indices.push([bb, bb + 1, bb + 2]);
+
+            i1 += 1;
+        } else {
+            let b_next = hub_outer_ring[(i2 + 1) % n2];
+            // Front cap (+Z): [a_curr, b_curr, b_next]
+            let bf = vertices.len() as u32;
+            vertices.push(Vertex::new([a_curr[0], a_curr[1], z_front], [0.0, 0.0, 1.0]));
+            vertices.push(Vertex::new([b_curr[0], b_curr[1], z_front], [0.0, 0.0, 1.0]));
+            vertices.push(Vertex::new([b_next[0], b_next[1], z_front], [0.0, 0.0, 1.0]));
+            indices.push([bf, bf + 1, bf + 2]);
+
+            // Back cap (-Z): [a_curr, b_next, b_curr]
+            let bb = vertices.len() as u32;
+            vertices.push(Vertex::new([a_curr[0], a_curr[1], z_back], [0.0, 0.0, -1.0]));
+            vertices.push(Vertex::new([b_next[0], b_next[1], z_back], [0.0, 0.0, -1.0]));
+            vertices.push(Vertex::new([b_curr[0], b_curr[1], z_back], [0.0, 0.0, -1.0]));
+            indices.push([bb, bb + 1, bb + 2]);
+
+            i2 += 1;
+        }
+    }
+
+    TriangleMesh::new(vertices, indices)
 }
 
 #[cfg(test)]
