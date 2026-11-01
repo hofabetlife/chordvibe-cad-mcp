@@ -1,5 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import {
   applyHolesToMesh,
   applyTransformToMesh,
@@ -1068,6 +1070,94 @@ describe('MCP-CAD Core Geometry & Topological Verification Suite', () => {
     const emptyMesh = selfDiff.nextState.parts.find((p) => p.id === 'empty_solid')?.mesh;
     assert.ok(emptyMesh);
     assert.ok(emptyMesh.volume < 1e-7 || emptyMesh.triangleCount === 0);
+  });
+
+  it('verifies BUG-021: 28 MCP tools documentation & contract parity across README, setup guides, architecture, and API reference', () => {
+    // 1. Verify exactly 28 tools in catalog with unique names
+    assert.equal(MCP_TOOLS_CATALOG.length, 28, 'Catalog must contain exactly 28 tools');
+    const catalogNames = new Set(MCP_TOOLS_CATALOG.map((t) => t.name));
+    assert.equal(catalogNames.size, 28, 'All 28 tool names must be unique');
+
+    // Expected 28 tools
+    const EXPECTED_28_TOOLS = [
+      'create_part',
+      'list_parts',
+      'delete_part',
+      'add_feature_primitive',
+      'cut_hole',
+      'cut_helical_groove',
+      'modify_feature',
+      'get_feature_tree',
+      'boolean_difference',
+      'boolean_union',
+      'boolean_intersection',
+      'transform_part',
+      'tessellate_part',
+      'query_part_geometry',
+      'validate_mesh',
+      'define_material',
+      'batch_cad_operations',
+      'create_joint',
+      'set_joint_motor',
+      'run_physics_simulation',
+      'run_fea_analysis',
+      'get_fea_heatmap_image',
+      'capture_viewport',
+      'export_stl',
+      'get_simulation_metrics_json',
+      'open_preview_window',
+      'import_stl',
+      'optimize_feature_tree',
+    ];
+
+    for (const tool of EXPECTED_28_TOOLS) {
+      assert.ok(catalogNames.has(tool), `Missing tool '${tool}' in MCP catalog`);
+    }
+
+    // 2. Automated Contract check against README.md
+    const readmeContent = fs.readFileSync(path.resolve(process.cwd(), 'README.md'), 'utf-8');
+    for (const tool of EXPECTED_28_TOOLS) {
+      assert.ok(
+        readmeContent.includes(`\`${tool}\``),
+        `README.md missing documented entry for tool '${tool}'`
+      );
+    }
+    assert.ok(readmeContent.includes('is_fixed'), 'README must document is_fixed parameter');
+    assert.ok(readmeContent.includes('gear'), 'README must document gear joint');
+    assert.ok(readmeContent.includes('debug_mode'), 'README must document debug_mode parameter');
+
+    // 3. Automated Contract check against docs/CLAUDE_DESKTOP_SETUP.md
+    const claudeContent = fs.readFileSync(path.resolve(process.cwd(), 'docs/CLAUDE_DESKTOP_SETUP.md'), 'utf-8');
+    assert.ok(claudeContent.includes('28 инженерных инструментов'), 'Claude setup must state 28 tools');
+    for (const tool of EXPECTED_28_TOOLS) {
+      assert.ok(
+        claudeContent.includes(`\`${tool}\``),
+        `docs/CLAUDE_DESKTOP_SETUP.md missing tool '${tool}'`
+      );
+    }
+
+    // 4. Automated Contract check against docs/ANTIGRAVITY_SETUP.md
+    const antigravityContent = fs.readFileSync(path.resolve(process.cwd(), 'docs/ANTIGRAVITY_SETUP.md'), 'utf-8');
+    assert.ok(
+      antigravityContent.includes('28 инженерных инструментов'),
+      'Antigravity setup must state 28 tools'
+    );
+
+    // 5. Automated Contract check against docs/ARCHITECTURE.md
+    const archContent = fs.readFileSync(path.resolve(process.cwd(), 'docs/ARCHITECTURE.md'), 'utf-8');
+    assert.ok(archContent.includes('Gear'), 'ARCHITECTURE.md must document Gear joint');
+    assert.ok(archContent.includes('WheelRim'), 'ARCHITECTURE.md must document WheelRim primitive');
+    assert.ok(archContent.includes('SpurGear'), 'ARCHITECTURE.md must document SpurGear primitive');
+    assert.ok(archContent.includes('src/cad'), 'ARCHITECTURE.md must document TypeScript CAD layer');
+
+    // 6. Automated Contract check against docs/MCP_API_REFERENCE.md
+    const apiRefContent = fs.readFileSync(path.resolve(process.cwd(), 'docs/MCP_API_REFERENCE.md'), 'utf-8');
+    for (const tool of EXPECTED_28_TOOLS) {
+      assert.ok(
+        apiRefContent.includes(`\`${tool}\``),
+        `docs/MCP_API_REFERENCE.md missing tool '${tool}'`
+      );
+    }
   });
 });
 
