@@ -1,6 +1,7 @@
-import React, { useRef } from 'react';
+import React, { useRef, useState, useEffect } from 'react';
 import {
   Box,
+  ChevronDown,
   Scissors,
   Eye,
   Activity,
@@ -18,6 +19,7 @@ import {
   ShieldCheck,
   FastForward,
   Grid,
+  X,
 } from 'lucide-react';
 import {
   DagNodeType,
@@ -28,10 +30,6 @@ import {
   RenderMode,
   ViewportLayout,
 } from '../types/cad';
-import {
-  FEA_QUICK_LOAD_PRESETS,
-  buildBoundaryConditionsFromPreset,
-} from '../cad/workbenches';
 
 interface CadRibbonToolbarProps {
   activeWorkbench: EngineeringWorkbench;
@@ -84,25 +82,110 @@ const RENDER_MODES: {
   { id: 'fea_heatmap', label: '[7] Эпюра МКЭ (MPa)', hotkey: '7' },
 ];
 
-const PRIMARY_PRIMITIVE_BTNS: {
+export interface PrimitiveMatrixItem {
   type: DagNodeType;
   label: string;
   title: string;
-}[] = [
-  { type: 'box', label: '+ Блок', title: 'Добавить параметрический параллелепипед' },
-  { type: 'cylinder', label: '+ Цилиндр', title: 'Добавить параметрический цилиндр' },
-  { type: 'polygon_prism', label: '+ Призма', title: 'Добавить шестигранную призму с фаской DIN 934' },
-  { type: 'spur_gear', label: '+ Шестерня', title: 'Добавить эвольвентную шестерню со ступицей и шпонкой' },
-];
+  icon: React.ReactNode;
+}
 
-const EXTRA_PRIMITIVE_OPTIONS: {
-  type: DagNodeType;
-  label: string;
-}[] = [
-  { type: 'sphere', label: '+ Сфера' },
-  { type: 'cone', label: '+ Конус' },
-  { type: 'revolve', label: '+ Тело вращения' },
-  { type: 'wheel_rim', label: '+ Автодиск' },
+const PRIMITIVE_MATRIX_ITEMS: PrimitiveMatrixItem[] = [
+  {
+    type: 'box',
+    label: 'Блок',
+    title: 'Добавить параметрический параллелепипед (Куб)',
+    icon: (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-5 h-5">
+        <path d="M12 2.5L3.5 7.5v9L12 21.5l8.5-5v-9L12 2.5z" strokeLinecap="round" strokeLinejoin="round" />
+        <path d="M12 21.5V12" strokeLinecap="round" strokeLinejoin="round" />
+        <path d="M20.5 7.5L12 12 3.5 7.5" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    ),
+  },
+  {
+    type: 'cylinder',
+    label: 'Цилиндр',
+    title: 'Добавить параметрический цилиндр',
+    icon: (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-5 h-5">
+        <ellipse cx="12" cy="6" rx="8" ry="3.2" />
+        <path d="M4 6v12c0 1.77 3.58 3.2 8 3.2s8-1.43 8-3.2V6" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    ),
+  },
+  {
+    type: 'sphere',
+    label: 'Сфера',
+    title: 'Добавить параметрическую сферу',
+    icon: (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-5 h-5">
+        <circle cx="12" cy="12" r="9" />
+        <path d="M3 12c0 2.5 4 4.5 9 4.5s9-2 9-4.5-4-4.5-9-4.5-9 2-9 4.5z" strokeDasharray="2 2" />
+        <path d="M12 3c-2.5 0-4.5 4-4.5 9s2 9 4.5 9 4.5-4 4.5-9-2-9-4.5-9z" strokeDasharray="2 2" />
+      </svg>
+    ),
+  },
+  {
+    type: 'cone',
+    label: 'Конус',
+    title: 'Добавить параметрический конус',
+    icon: (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-5 h-5">
+        <ellipse cx="12" cy="18" rx="8" ry="3" />
+        <path d="M4 18L12 3l8 15" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    ),
+  },
+  {
+    type: 'polygon_prism',
+    label: 'Призма',
+    title: 'Добавить шестигранную призму с фаской DIN 934',
+    icon: (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-5 h-5">
+        <path d="M12 2.5L18.5 5.5v5L12 13.5L5.5 10.5v-5L12 2.5z" strokeLinecap="round" strokeLinejoin="round" />
+        <path d="M12 13.5v8" strokeLinecap="round" strokeLinejoin="round" />
+        <path d="M18.5 10.5v8L12 21.5L5.5 18.5v-8" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    ),
+  },
+  {
+    type: 'spur_gear',
+    label: 'Шестерня',
+    title: 'Добавить эвольвентную шестерню со ступицей и шпонкой',
+    icon: (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-5 h-5">
+        <circle cx="12" cy="12" r="3" />
+        <path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.93 4.93l1.77 1.77M17.3 17.3l1.77 1.77M4.93 19.07l1.77-1.77M17.3 6.7l1.77-1.77" strokeLinecap="round" />
+        <circle cx="12" cy="12" r="7.5" />
+      </svg>
+    ),
+  },
+  {
+    type: 'revolve',
+    label: 'Вращение',
+    title: 'Добавить тело вращения по замкнутому профилю',
+    icon: (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-5 h-5">
+        <path d="M12 3v18" strokeDasharray="3 2" />
+        <path d="M6 8c0-2.2 2.7-4 6-4s6 1.8 6 4-2.7 4-6 4" strokeLinecap="round" />
+        <path d="M18 16c0 2.2-2.7 4-6 4s-6-1.8-6-4 2.7-4 6-4" strokeLinecap="round" />
+        <path d="M15 14l3 2-3 2" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    ),
+  },
+  {
+    type: 'wheel_rim',
+    label: 'Автодиск',
+    title: 'Добавить параметрический автомобильный диск',
+    icon: (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-5 h-5">
+        <circle cx="12" cy="12" r="9.5" />
+        <circle cx="12" cy="12" r="7.5" opacity="0.6" />
+        <circle cx="12" cy="12" r="2.8" />
+        <path d="M12 4.5v4.7M19.1 9.7l-4.5 1.5M16.4 18.1l-3.8-2.8M7.6 18.1l3.8-2.8M4.9 9.7l4.5 1.5" strokeLinecap="round" strokeWidth="1.6" />
+      </svg>
+    ),
+  },
 ];
 
 export const CadRibbonToolbar: React.FC<CadRibbonToolbarProps> = ({
@@ -142,79 +225,206 @@ export const CadRibbonToolbar: React.FC<CadRibbonToolbarProps> = ({
   onToggleRustStlSource,
 }) => {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  
+  // Bodies Popover State
+  const [isBodiesOpen, setIsBodiesOpen] = useState(false);
+  const [menuCoords, setMenuCoords] = useState<{ top: number; left: number } | null>(null);
+  const bodiesMenuRef = useRef<HTMLDivElement | null>(null);
+
+  // CSG Popover State
+  const [isCsgOpen, setIsCsgOpen] = useState(false);
+  const [csgMenuCoords, setCsgMenuCoords] = useState<{ top: number; left: number } | null>(null);
+  const csgMenuRef = useRef<HTMLDivElement | null>(null);
+
+  const handleToggleBodies = () => {
+    if (!isBodiesOpen && bodiesMenuRef.current) {
+      const rect = bodiesMenuRef.current.getBoundingClientRect();
+      setMenuCoords({ top: rect.bottom + 6, left: rect.left });
+    }
+    setIsBodiesOpen((prev) => !prev);
+    setIsCsgOpen(false);
+  };
+
+  const handleToggleCsg = () => {
+    if (!isCsgOpen && csgMenuRef.current) {
+      const rect = csgMenuRef.current.getBoundingClientRect();
+      setCsgMenuCoords({ top: rect.bottom + 6, left: rect.left });
+    }
+    setIsCsgOpen((prev) => !prev);
+    setIsBodiesOpen(false);
+  };
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (
+        bodiesMenuRef.current &&
+        !bodiesMenuRef.current.contains(target)
+      ) {
+        setIsBodiesOpen(false);
+      }
+      if (
+        csgMenuRef.current &&
+        !csgMenuRef.current.contains(target)
+      ) {
+        setIsCsgOpen(false);
+      }
+    };
+    if (isBodiesOpen || isCsgOpen) {
+      document.addEventListener('mousedown', handleClickOutside);
+    }
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, [isBodiesOpen, isCsgOpen]);
 
   return (
     <div className="h-10 bg-[#151922] border-b border-[#252b38] px-2.5 flex items-center justify-between gap-1.5 select-none shrink-0 overflow-x-auto">
       {/* Contextual Left & Center Controls depending on activeWorkbench */}
       {activeWorkbench === 'modeling' && (
         <div className="flex items-center gap-1 shrink-0">
-          <span className="text-[11px] font-medium text-[#94a3b8] flex items-center gap-1 whitespace-nowrap">
-            <Box className="w-3.5 h-3.5 text-[#38bdf8]" />
-            <span>Тела:</span>
-          </span>
-          {PRIMARY_PRIMITIVE_BTNS.map((p) => (
+          {/* Minimalist Seamless Primitive Matrix Submenu */}
+          <div className="relative shrink-0" ref={bodiesMenuRef}>
             <button
-              key={p.type}
-              onClick={() => onAddPrimitive(p.type)}
-              title={p.title}
-              className="px-1.5 py-1 rounded bg-[#1d222e] hover:bg-[#262d3d] text-[#e2e8f0] border border-[#2d3545] text-[11px] font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0"
+              onClick={handleToggleBodies}
+              title="Открыть матрицу примитивов"
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded border text-[11px] font-semibold transition-all cursor-pointer whitespace-nowrap ${
+                isBodiesOpen
+                  ? 'bg-[#38bdf8]/20 border-[#38bdf8] text-[#38bdf8] shadow-[0_0_10px_rgba(56,189,248,0.25)]'
+                  : 'bg-[#1d222e] hover:bg-[#262d3d] border-[#2d3545] text-[#f1f5f9]'
+              }`}
             >
-              {p.label}
+              <Box className="w-3.5 h-3.5 text-[#38bdf8]" />
+              <span>Тела</span>
+              <ChevronDown
+                className={`w-3 h-3 text-[#94a3b8] transition-transform duration-200 ${
+                  isBodiesOpen ? 'rotate-180 text-[#38bdf8]' : ''
+                }`}
+              />
             </button>
-          ))}
 
-          <select
-            aria-label="Дополнительные примитивы"
-            defaultValue=""
-            onChange={(e) => {
-              const val = e.target.value as DagNodeType;
-              if (!val) return;
-              onAddPrimitive(val);
-              e.target.value = '';
-            }}
-            className="bg-[#1d222e] hover:bg-[#262d3d] text-[#cbd5e1] text-[11px] font-medium px-1.5 py-1 rounded border border-[#2d3545] focus:outline-none cursor-pointer shrink-0"
-          >
-            <option value="" disabled>
-              + Еще...
-            </option>
-            {EXTRA_PRIMITIVE_OPTIONS.map((opt) => (
-              <option key={opt.type} value={opt.type} className="bg-[#181c26]">
-                {opt.label}
-              </option>
-            ))}
-          </select>
+            {isBodiesOpen && (
+              <div
+                style={{
+                  top: menuCoords ? `${menuCoords.top}px` : '42px',
+                  left: menuCoords ? `${menuCoords.left}px` : '10px',
+                }}
+                className="fixed z-[9999] bg-[#141824] border border-[#262f40] rounded-lg shadow-[0_12px_36px_rgba(0,0,0,0.85)] p-1 overflow-hidden select-none"
+              >
+                <div className="grid grid-cols-4 gap-0.5">
+                  {PRIMITIVE_MATRIX_ITEMS.map((item) => (
+                    <button
+                      key={item.type}
+                      onClick={() => {
+                        onAddPrimitive(item.type);
+                        setIsBodiesOpen(false);
+                      }}
+                      title={item.title}
+                      className="group flex flex-col items-center justify-center w-20 h-16 rounded-md hover:bg-[#222b3d] transition-all cursor-pointer text-center"
+                    >
+                      <div className="text-[#94a3b8] group-hover:text-[#38bdf8] transition-colors mb-1 group-hover:scale-110">
+                        {item.icon}
+                      </div>
+                      <span className="text-[11px] font-medium text-[#cbd5e1] group-hover:text-white truncate w-full px-1">
+                        {item.label}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
 
-          <div className="h-4 w-[1px] bg-[#262b36] mx-0.5 shrink-0" />
+          {/* Minimalist Seamless CSG Matrix Submenu */}
+          <div className="relative shrink-0" ref={csgMenuRef}>
+            <button
+              onClick={handleToggleCsg}
+              title="Открыть операции CSG (Отверстия, Резьба, Вырезы)"
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded border text-[11px] font-semibold transition-all cursor-pointer whitespace-nowrap ${
+                isCsgOpen
+                  ? 'bg-[#ef4444]/20 border-[#ef4444] text-[#f87171] shadow-[0_0_10px_rgba(239,68,68,0.25)]'
+                  : 'bg-[#1d222e] hover:bg-[#262d3d] border-[#2d3545] text-[#f1f5f9]'
+              }`}
+            >
+              <Scissors className="w-3.5 h-3.5 text-[#ef4444]" />
+              <span>CSG</span>
+              <ChevronDown
+                className={`w-3 h-3 text-[#94a3b8] transition-transform duration-200 ${
+                  isCsgOpen ? 'rotate-180 text-[#ef4444]' : ''
+                }`}
+              />
+            </button>
 
-          <span className="text-[11px] font-medium text-[#94a3b8] whitespace-nowrap">
-            CSG:
-          </span>
-          <button
-            onClick={onOpenCutHoleModal}
-            title="Вырезать цилиндрическое отверстие со шпоночным пазом DIN 6885"
-            className="flex items-center gap-1 px-1.5 py-1 rounded bg-[#1d222e] hover:bg-[#262d3d] text-[#f1f5f9] border border-[#2d3545] text-[11px] font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0"
-          >
-            <Scissors className="w-3 h-3 text-[#ef4444]" />
-            <span>Отв.</span>
-          </button>
+            {isCsgOpen && (
+              <div
+                style={{
+                  top: csgMenuCoords ? `${csgMenuCoords.top}px` : '42px',
+                  left: csgMenuCoords ? `${csgMenuCoords.left}px` : '85px',
+                }}
+                className="fixed z-[9999] bg-[#141824] border border-[#262f40] rounded-lg shadow-[0_12px_36px_rgba(0,0,0,0.85)] p-1 overflow-hidden select-none"
+              >
+                <div className="grid grid-cols-3 gap-0.5">
+                  <button
+                    onClick={() => {
+                      onOpenCutHoleModal();
+                      setIsCsgOpen(false);
+                    }}
+                    title="Вырезать цилиндрическое отверстие со шпоночным пазом DIN 6885"
+                    className="group flex flex-col items-center justify-center w-20 h-16 rounded-md hover:bg-[#222b3d] transition-all cursor-pointer text-center"
+                  >
+                    <div className="text-[#94a3b8] group-hover:text-[#ef4444] transition-colors mb-1 group-hover:scale-110">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-5 h-5">
+                        <path d="M10 4.5h4v3h-4v-3z" strokeLinecap="round" strokeLinejoin="round" />
+                        <circle cx="12" cy="13.5" r="7" />
+                      </svg>
+                    </div>
+                    <span className="text-[11px] font-medium text-[#cbd5e1] group-hover:text-white truncate w-full px-1">
+                      Отверстие
+                    </span>
+                  </button>
 
-          <button
-            onClick={onOpenHelicalModal}
-            title="Нарезать метрическую резьбу ISO 68-1 или спиральную канавку"
-            className="flex items-center gap-1 px-1.5 py-1 rounded bg-[#1d222e] hover:bg-[#262d3d] text-[#f1f5f9] border border-[#2d3545] text-[11px] font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0"
-          >
-            <Sparkles className="w-3 h-3 text-[#a855f7]" />
-            <span>Резьба</span>
-          </button>
+                  <button
+                    onClick={() => {
+                      onOpenHelicalModal();
+                      setIsCsgOpen(false);
+                    }}
+                    title="Нарезать метрическую резьбу ISO 68-1 или спиральную канавку"
+                    className="group flex flex-col items-center justify-center w-20 h-16 rounded-md hover:bg-[#222b3d] transition-all cursor-pointer text-center"
+                  >
+                    <div className="text-[#94a3b8] group-hover:text-[#a855f7] transition-colors mb-1 group-hover:scale-110">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-5 h-5">
+                        <path d="M7 4.5h10v15H7z" strokeLinecap="round" strokeLinejoin="round" />
+                        <path d="M7 8.5l10-2M7 12.5l10-2M7 16.5l10-2" strokeLinecap="round" />
+                      </svg>
+                    </div>
+                    <span className="text-[11px] font-medium text-[#cbd5e1] group-hover:text-white truncate w-full px-1">
+                      Резьба
+                    </span>
+                  </button>
 
-          <button
-            onClick={onApplyTwoHoleCsgChain}
-            title="Применить цепочку из 2 сквозных отверстий (род поверхности g + 2)"
-            className="flex items-center gap-1 px-1.5 py-1 rounded bg-[#1d222e] hover:bg-[#262d3d] text-[#cbd5e1] border border-[#2d3545] text-[11px] font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0"
-          >
-            <Layers className="w-3 h-3 text-[#38bdf8]" />
-            <span>2 Отв.</span>
-          </button>
+                  <button
+                    onClick={() => {
+                      onApplyTwoHoleCsgChain();
+                      setIsCsgOpen(false);
+                    }}
+                    title="Применить цепочку из 2 сквозных отверстий (род поверхности g + 2)"
+                    className="group flex flex-col items-center justify-center w-20 h-16 rounded-md hover:bg-[#222b3d] transition-all cursor-pointer text-center"
+                  >
+                    <div className="text-[#94a3b8] group-hover:text-[#38bdf8] transition-colors mb-1 group-hover:scale-110">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-5 h-5">
+                        <rect x="3" y="6" width="18" height="12" rx="2" />
+                        <circle cx="8.5" cy="12" r="2.5" />
+                        <circle cx="15.5" cy="12" r="2.5" />
+                      </svg>
+                    </div>
+                    <span className="text-[11px] font-medium text-[#cbd5e1] group-hover:text-white truncate w-full px-1">
+                      2 Отв.
+                    </span>
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
 
           <div className="h-4 w-[1px] bg-[#262b36] mx-0.5 shrink-0" />
 
@@ -276,29 +486,6 @@ export const CadRibbonToolbar: React.FC<CadRibbonToolbarProps> = ({
 
       {activeWorkbench === 'fea' && (
         <div className="flex items-center gap-1.5 shrink-0">
-          <span className="text-[11px] font-medium text-[#94a3b8] flex items-center gap-1 whitespace-nowrap">
-            <Activity className="w-3.5 h-3.5 text-[#ef4444]" />
-            <span>Нагрузки:</span>
-          </span>
-
-          {FEA_QUICK_LOAD_PRESETS.map((preset) => (
-            <button
-              key={preset.id}
-              onClick={() =>
-                onRunQuickFea(
-                  buildBoundaryConditionsFromPreset(preset.id),
-                  preset.label
-                )
-              }
-              title={preset.description}
-              className="px-2 py-1 rounded bg-[#1d222e] hover:bg-[#282f3f] text-[#e2e8f0] border border-[#2d3545] text-[11px] font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0"
-            >
-              {preset.label}
-            </button>
-          ))}
-
-          <div className="h-4 w-[1px] bg-[#262b36] mx-0.5 shrink-0" />
-
           <button
             onClick={() => onRunQuickFea()}
             title="Решить систему линейной упругости TET4 (K*u=f) и построить карту напряжений по Мизесу"

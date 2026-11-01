@@ -23,7 +23,7 @@ MCP-CAD Engine спроектирован для того, чтобы дать �
 Проект разделен на 5 независимых крейтов с четко разграниченными зонами ответственности:
 
 ```
-c:\Users\voley\Documents\3D_MCP\
+C:\Users\<username>\Documents\chordvibe-cad-mcp\
 ├── Cargo.toml                    # Корневой Workspace манифест (resolver = "2")
 ├── PRD.md                        # Спецификация требований к продукту
 ├── PROJECT_CONTEXT.md            # Контекст и соглашения разработки

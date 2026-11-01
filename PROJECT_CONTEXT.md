@@ -34,7 +34,7 @@ $$\text{Проектирование (Solid DAG)} \longrightarrow \text{Симу
 Проект организован как Cargo Workspace из 5 модульных крейтов:
 
 ```
-c:\Users\voley\Documents\3D_MCP/
+C:\Users\<username>\Documents\chordvibe-cad-mcp/
 ├── Cargo.toml                    # Корневой workspace манифест
 ├── PRD.md                        # Product Requirements Document
 ├── PROJECT_CONTEXT.md            # Данный контекст проекта
