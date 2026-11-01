@@ -1,4 +1,4 @@
-# MCP-CAD Engine: Coverage Matrix
+# MCP-CAD Engine: Coverage Matrix (Round 2)
 
 Матрица инструментов (28 шт.) по сценариям тестирования:
 - **HP**: Happy path (корректные параметры, штатное выполнение)
@@ -40,32 +40,45 @@
 
 ---
 
-## Тестовое покрытие по крейтам (Rust Workspace)
+## Тестовое покрытие (Round 2 Full Verification)
 
-1. **`mcp-cad-core`**:
-   - `src/lib.rs` unit tests (включая `query_optimizer`): 44/44 PASS
-   - `tests/dag_tests.rs`: 14/14 PASS
-   - `tests/tessellation_tests.rs`: 6/6 PASS
-   - Итого: **64 теста (100% PASS)**
+### 1. TypeScript & Web Studio Suite (`src/cad/cad_engine.test.ts`)
+- **26 тестов (100% PASS)**:
+  1. Z-axis parity с Rust `mcp-cad-core` и Windows WGPU артефактами (PASS)
+  2. Box объем, площадь, 6 плоских граней, герметичный род 0 (PASS)
+  3. Cylinder, Sphere, Cone аналитические допуски (PASS)
+  4. DIN 934 гайка с фаской 30° и Polygon Prism (BUG-005, PASS)
+  5. Involute Spur Gear со ступицей, отверстием и шпоночным пазом (BUG-002, PASS)
+  6. Partial Revolve 180° с торцевыми крышками и нормалями (BUG-003, PASS)
+  7. 5-spoke Wheel Rim герметичный многогранник (BUG-004, PASS)
+  8. CSG Box со сквозными отверстиями и приращением рода до 2 (BUG-006, PASS)
+  9. Отрицательный масштаб с реверсом обхода граней (BUG-007, PASS)
+  10. STL binary экспорт и импорт round-trip (PASS)
+  11. Cantilever Beam FEA с честным 3D TET4 PCG решателем (PASS)
+  12. Gear Mesh кинематическое передаточное отношение $\omega_2 / \omega_1 = -0.5$ (PASS)
+  13. Транзакционный откат `modify_feature` и `batch_cad_operations` (BUG-008, BUG-009, BUG-010, PASS)
+  14. Cost-Based Optimizer (CBO) правило R4: втулка в 1-проходный Revolve (PASS)
+  15. CBO правила R1, R2, R3: слияние трансформаций, AABB culling, De Morgan CSG (PASS)
+  16. CBO правило R5: слияние PolygonPrism + резьба (PASS)
+  17. Engineering Workbenches и FEA quick load presets (PASS)
+  18. Реестр 28 инструментов MCP, схема `create_joint` gear и `create_part` is_fixed (BUG-015, PASS)
+  19. Валидация профилей `revolve` ($r < 0$, $\theta > 360^\circ$, самопересечения) (BUG-016, PASS)
+  20. Отклонение незакрепленной модели МКЭ (RBM), нулевой отклик и бенчмарк Кирша (BUG-017, PASS)
+  21. 50 детерминированных цепочек DAG фаззинга (PASS)
+  22. BUG-018: 0 sliver-треугольников `<1°` и $\le 1\%$ `<5°` по всем примитивам и CSG (PASS)
+  23. BUG-020: 3D булевы операции CSG, откат `modify_feature` и схема `validate_mesh` (PASS)
+  24. BUG-021: Проверка синхронизации документации по всем 28 инструментам (PASS)
+  25. BUG-022: Все 5 типов шарниров физики, STL edge cases, вырожденные CSG случаи (PASS)
+  26. BUG-023: Расширенный фаззер 1,000 цепочек (5 сидов x 200 цепей) до 10 операций (PASS)
 
-2. **`mcp-cad-physics`**:
-   - `tests/physics_tests.rs`: 6/6 PASS
-   - Итого: **6 тестов (100% PASS)**
+### 2. Rust Workspace Suite
+- `mcp-cad-core`: 64 теста (100% PASS)
+- `mcp-cad-physics`: 6 тестов (100% PASS)
+- `mcp-cad-fea`: 11 тестов (100% PASS)
+- `mcp-cad-viewer`: 10 тестов (100% PASS)
+- `mcp-cad-server`: 35 тестов (100% PASS)
+- Итого: **126 Rust тестов (100% PASS)**
 
-3. **`mcp-cad-fea`**:
-   - `src/lib.rs` unit tests: 5/5 PASS
-   - `tests/fea_tests.rs`: 6/6 PASS
-   - Итого: **11 тестов (100% PASS)**
-
-4. **`mcp-cad-viewer`**:
-   - `tests/viewer_tests.rs`: 10/10 PASS
-   - Итого: **10 тестов (100% PASS)**
-
-5. **`mcp-cad-server`**:
-   - `tests/gear_kinematic_test.rs`: 1/1 PASS
-   - `tests/mcp_contract_tests.rs`: 21/21 PASS
-   - `tests/qa_wide_scan.rs`: 13/13 PASS
-   - Итого: **35 тестов (100% PASS)**
-
-**Всего по проекту: 126 Rust-тестов + 21 TypeScript-тест (включая 50-цепочечный детерминированный DAG-фаззер) = 147 тестов, 0 падений, 0 регрессий, 0 предупреждений Clippy.**
-
+### Общий итог:
+- **126 Rust тестов + 26 TypeScript тестов (включая 1,000 цепочек фаззинга) = 152 теста**.
+- **0 сбоев, 0 паник, 0 регрессий, 0 ошибок сборки/линтера**.
