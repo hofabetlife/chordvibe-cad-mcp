@@ -66,8 +66,19 @@ export interface DetectedPlanarFace {
   triangleCount?: number;
 }
 
+export interface AngleHistogramBuckets {
+  lt1Deg: number;
+  deg1To5: number;
+  deg5To15: number;
+  deg15To30: number;
+  deg30To45: number;
+  deg45To60: number;
+}
+
 export interface MeshValidationReport {
   partId: string;
+  status: 'PASS' | 'WARN' | 'FAIL';
+  warnings: string[];
   rawVerticesCount: number;
   weldedVerticesCount: number;
   trianglesCount: number;
@@ -77,11 +88,27 @@ export interface MeshValidationReport {
   inconsistentEdgesCount: number;
   degenerateTrianglesCount: number;
   zeroNormalsCount: number;
+  selfIntersectionsCount: number;
+  tJunctionsCount: number;
+  connectedComponentsCount: number;
   eulerCharacteristic: number;
   eulerGenus: number;
   isWatertight: boolean;
   isManifold: boolean;
   isOutwardOriented: boolean;
+  sliverTrianglesCount: number; // triangles with min_angle < 5 deg
+  lt5DegCount: number;
+  lt5DegRatio: number;
+  lt1DegCount: number;
+  lt1DegRatio: number;
+  minAngleDeg: number;
+  p5AngleDeg: number;
+  medianAngleDeg: number;
+  angleHistogram: AngleHistogramBuckets;
+  minAspectRatio: number;
+  p5AspectRatio: number;
+  medianAspectRatio: number;
+  maxAspectRatio: number;
   volume: number;
   surfaceArea: number;
   boundingBox: {
@@ -123,6 +150,12 @@ export interface MeshGeometryData {
   inconsistentEdgesCount: number;
   degenerateTrianglesCount: number;
   zeroNormalsCount: number;
+  sliverTrianglesCount?: number;
+  lt1DegCount?: number;
+  minAngleDeg?: number;
+  p5AngleDeg?: number;
+  medianAngleDeg?: number;
+  maxAspectRatio?: number;
   detectedPlanarFaces: DetectedPlanarFace[];
 }
 
@@ -133,6 +166,7 @@ export interface CadPart {
   dag: DagNode[];
   mesh: MeshGeometryData;
   visible: boolean;
+  isFixed?: boolean;
   position: [number, number, number];
   rotation: [number, number, number]; // Euler radians
   scale: [number, number, number];
@@ -146,7 +180,9 @@ export interface KinematicJoint {
   partA: string;
   partB: string;
   anchor: [number, number, number];
+  anchorB?: [number, number, number];
   axis: [number, number, number];
+  limits?: [number, number];
   motorSpeedRpm: number;
   motorTorqueNm: number;
   motorEnabled: boolean;
@@ -160,10 +196,24 @@ export interface FeaBoundaryCondition {
   forceVector?: [number, number, number]; // N
 }
 
+export interface FeaTetraQualityMetrics {
+  minJacobianDeterminant: number;
+  minAspectRatio: number;
+  medianAspectRatio: number;
+  maxAspectRatio: number;
+  minDihedralAngleDeg: number;
+}
+
 export interface FeaSimulationResult {
   partId: string;
   nodeCount: number;
   tetrahedraCount: number;
+  degreesOfFreedom?: number;
+  solverIterations?: number;
+  residualNorm?: number;
+  meshDensity?: 'coarse' | 'medium' | 'fine';
+  tetQuality?: FeaTetraQualityMetrics;
+  discretizationWarning?: string;
   maxDisplacementMm: number;
   maxVonMisesMPa: number;
   minVonMisesMPa: number;

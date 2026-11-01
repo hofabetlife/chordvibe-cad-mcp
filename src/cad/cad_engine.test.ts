@@ -13,6 +13,7 @@ import {
   createWheelRimMesh,
   exportMeshToStlBinary,
   parseStlBuffer,
+  validatePartMesh,
 } from './primitives';
 import { runLinearFeaSolver } from './fea_solver';
 import { stepKinematicsAssembly } from './kinematics';
@@ -788,6 +789,95 @@ describe('MCP-CAD Core Geometry & Topological Verification Suite', () => {
       assert.ok(mesh.volume > 0, `Chain ${chainIdx} must have positive volume`);
     }
   });
+
+  it('verifies BUG-018: zero <1 deg slivers and <=1% <5 deg slivers across all primitives, CSG chains, and SKEPTIC stress tests', () => {
+    const cases = [
+      { name: 'box', mesh: createBoxMesh(0.1, 0.04, 0.05, 7850), expectedGenus: 0 },
+      { name: 'cylinder_std', mesh: createCylinderMesh(0.025, 0.08, 'standard', 7850), expectedGenus: 0 },
+      { name: 'cylinder_fine', mesh: createCylinderMesh(0.025, 0.08, 'fine', 7850), expectedGenus: 0 },
+      { name: 'sphere_std', mesh: createSphereMesh(0.035, 'standard', 7850), expectedGenus: 0 },
+      { name: 'cone_sharp', mesh: createConeMesh(0.03, 0.0, 0.07, 'standard', 7850), expectedGenus: 0 },
+      { name: 'cone_frustum', mesh: createConeMesh(0.035, 0.015, 0.06, 'standard', 7850), expectedGenus: 0 },
+      {
+        name: 'polygon_prism_hex',
+        mesh: createPolygonPrismMesh(6, 0.024 / Math.sqrt(3), 0.018, 0.002, 7850, 0.005, 0.0015, 0.0008),
+        expectedGenus: 1,
+      },
+      {
+        name: 'spur_gear_20t',
+        mesh: createSpurGearMesh(20, 2.0, 20, 0.015, 0.006, 0.024, 0.008, 0.004, 0.002, 7850),
+        expectedGenus: 1,
+      },
+      {
+        name: 'spur_gear_42t_m1_stress',
+        mesh: createSpurGearMesh(42, 1.0, 20, 0.012, 0.005, 0.018, 0.006, 0.003, 0.0015, 7850),
+        expectedGenus: 1,
+      },
+      {
+        name: 'revolve_partial_180',
+        mesh: createRevolveMesh(
+          [
+            [0.01, -0.02],
+            [0.03, -0.02],
+            [0.03, 0.02],
+            [0.01, 0.02],
+          ],
+          180,
+          'standard',
+          7850
+        ),
+        expectedGenus: 0,
+      },
+      {
+        name: 'wheel_rim_5spoke',
+        mesh: createWheelRimMesh(0.4572, 0.2159, 5, 0.15, 0.065, 5),
+        expectedGenus: 11,
+      },
+      {
+        name: 'wheel_rim_10spoke_stress',
+        mesh: createWheelRimMesh(0.4572, 0.2159, 10, 0.15, 0.065, 5),
+        expectedGenus: 16,
+      },
+      {
+        name: 'csg_chain_two_holes',
+        mesh: applyHolesToMesh(createBoxMesh(0.1, 0.04, 0.05, 7850), [
+          { position: [-0.025, 0, 0], normal: [0, 0, -1], radius: 0.01, depth: 0.05 },
+          { position: [0.025, 0, 0], normal: [0, 0, -1], radius: 0.01, depth: 0.05 },
+        ]),
+        expectedGenus: 2,
+      },
+    ];
+
+    for (const c of cases) {
+      const report = validatePartMesh(c.name, c.mesh, c.expectedGenus);
+      assert.equal(report.isWatertight, true, `${c.name} must be watertight`);
+      assert.equal(report.boundaryEdgesCount, 0, `${c.name} must have 0 boundary edges`);
+      assert.equal(report.nonManifoldEdgesCount, 0, `${c.name} must have 0 non-manifold edges`);
+      assert.equal(report.inconsistentEdgesCount, 0, `${c.name} must have 0 inconsistent edges`);
+      assert.equal(report.isOutwardOriented, true, `${c.name} must be outward oriented`);
+      assert.equal(report.eulerGenus, c.expectedGenus, `${c.name} genus mismatch`);
+      assert.equal(report.lt1DegCount, 0, `${c.name} must have 0 triangles < 1 deg`);
+      assert.ok(
+        report.lt5DegRatio <= 0.01,
+        `${c.name} <5 deg ratio (${report.lt5DegRatio}) must be <= 1%`
+      );
+      assert.equal(report.status, 'PASS', `${c.name} must pass strict mesh validation`);
+    }
+
+    // SKEPTIC negative verification: anisotropic scale [1, 1, 0.002] on a cylinder stretches triangles into <1 deg slivers
+    // and MUST be caught and rejected by the strict sliver quality gate!
+    const squashed = applyTransformToMesh(
+      createCylinderMesh(0.025, 0.08, 'standard', 7850),
+      [0, 0, 0],
+      [0, 0, 0],
+      [1, 1, 0.002],
+      7850
+    );
+    const squashedReport = validatePartMesh('squashed_cyl', squashed);
+    assert.ok(squashedReport.lt5DegRatio > 0.01 || squashedReport.lt1DegCount > 0);
+    assert.equal(squashedReport.status, 'FAIL', 'Sliver-contaminated mesh must fail validation gate');
+  });
 });
+
 
 
