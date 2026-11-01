@@ -824,9 +824,27 @@ export function executeMcpToolOnEngineState(
 
     case 'tessellate_part': {
       const part = resolveTargetPart(state, params.part_id);
-      const q = (params.quality as QualityPreset) || state.quality;
-      if (!['draft', 'standard', 'high'].includes(q)) {
-        throw new Error(`Invalid tessellation quality '${q}'`);
+      const rawQ = String(params.quality ?? state.quality).toLowerCase();
+      const qualityMap: Record<string, QualityPreset> = {
+        coarse: 'draft',
+        draft: 'draft',
+        medium: 'standard',
+        standard: 'standard',
+        fine: 'fine',
+        high: 'high',
+      };
+      const q = qualityMap[rawQ];
+      if (!q) {
+        throw new Error(
+          `Invalid tessellation quality '${rawQ}'. Supported: coarse, medium, fine, draft, standard, high`
+        );
+      }
+      if (
+        params.chord_tolerance !== undefined &&
+        (!Number.isFinite(Number(params.chord_tolerance)) ||
+          Number(params.chord_tolerance) <= 0)
+      ) {
+        throw new Error('chord_tolerance must be > 0');
       }
       state.quality = q;
       part.mesh = evaluateFeatureTree(
@@ -836,11 +854,18 @@ export function executeMcpToolOnEngineState(
         part.mesh
       );
       response = {
+        status: 'ok',
         part_id: part.id,
-        quality: q,
+        quality: rawQ,
+        quality_applied: rawQ,
         triangles: part.mesh.triangleCount,
+        triangle_count: part.mesh.triangleCount,
+        triangles_count: part.mesh.triangleCount,
         vertices: part.mesh.vertexCount,
+        vertex_count: part.mesh.vertexCount,
+        vertices_count: part.mesh.vertexCount,
         welded_vertices: part.mesh.weldedVertexCount,
+        volume: part.mesh.volume,
         is_watertight: part.mesh.isWatertight,
       };
       break;
@@ -869,7 +894,19 @@ export function executeMcpToolOnEngineState(
     case 'validate_mesh': {
       const part = resolveTargetPart(state, params.part_id);
       const report = validatePartMesh(part.id, part.mesh);
+      const expectedGenus =
+        params.expected_genus !== undefined ? Number(params.expected_genus) : undefined;
+      const genusMatches =
+        expectedGenus === undefined ||
+        Math.round(report.eulerGenus) === Math.round(expectedGenus);
+      const passed =
+        report.isWatertight &&
+        report.isManifold &&
+        report.isOutwardOriented &&
+        report.degenerateTrianglesCount === 0 &&
+        genusMatches;
       response = {
+        status: passed ? 'PASS' : 'FAIL',
         part_id: report.partId,
         raw_vertices_count: report.rawVerticesCount,
         welded_vertices_count: report.weldedVerticesCount,
@@ -1102,19 +1139,95 @@ export function executeMcpToolOnEngineState(
       const mat =
         state.materials.find((m) => m.id === part.materialId) ||
         state.materials[0];
-      const fixedRegion = (params.fixed_region || 'min_x') as FeaBoundaryCondition['region'];
-      const loads = Array.isArray(params.loads)
-        ? params.loads
-        : [{ region: 'max_x', force_n: [0, -1200, 0] }];
 
-      const conditions: FeaBoundaryCondition[] = [
-        { region: fixedRegion, type: 'fixed' },
-        ...loads.map((l: any) => ({
-          region: (l.region || 'max_x') as FeaBoundaryCondition['region'],
-          type: 'force' as const,
-          forceVector: (l.force_n || [0, -1200, 0]) as [number, number, number],
-        })),
-      ];
+      const conditions: FeaBoundaryCondition[] = [];
+      const hasExplicitFixedParam =
+        params.fixed_region !== undefined ||
+        params.fixed_faces !== undefined ||
+        params.fixed_constraints !== undefined ||
+        params.fixed_plane !== undefined;
+      const hasExplicitLoadParam =
+        params.loads !== undefined ||
+        params.applied_force !== undefined ||
+        params.applied_forces !== undefined;
+
+      if (params.fixed_region && typeof params.fixed_region === 'string') {
+        conditions.push({
+          region: params.fixed_region as FeaBoundaryCondition['region'],
+          type: 'fixed',
+        });
+      }
+      if (Array.isArray(params.fixed_faces)) {
+        for (const f of params.fixed_faces) {
+          conditions.push({
+            region: String(f).toLowerCase() as FeaBoundaryCondition['region'],
+            type: 'fixed',
+          });
+        }
+      }
+      if (Array.isArray(params.fixed_constraints)) {
+        for (const fc of params.fixed_constraints) {
+          const face = String(fc.face ?? fc.region ?? 'min_x').toLowerCase();
+          conditions.push({
+            region: face as FeaBoundaryCondition['region'],
+            type: 'fixed',
+          });
+        }
+      }
+      if (params.fixed_plane && typeof params.fixed_plane === 'object') {
+        const fp = params.fixed_plane as Record<string, any>;
+        const normal = Array.isArray(fp.normal) ? fp.normal.map(Number) : [-1, 0, 0];
+        let region: FeaBoundaryCondition['region'] = 'min_x';
+        if (Math.abs(normal[1]) > Math.abs(normal[0]) && Math.abs(normal[1]) > Math.abs(normal[2])) {
+          region = normal[1] > 0 ? 'max_y' : 'min_y';
+        } else if (Math.abs(normal[2]) > Math.abs(normal[0])) {
+          region = normal[2] > 0 ? 'max_z' : 'min_z';
+        } else {
+          region = normal[0] > 0 ? 'max_x' : 'min_x';
+        }
+        conditions.push({ region, type: 'fixed' });
+      }
+
+      if (!hasExplicitFixedParam && !hasExplicitLoadParam) {
+        conditions.push({ region: 'min_x', type: 'fixed' });
+      }
+
+      if (Array.isArray(params.loads)) {
+        for (const l of params.loads) {
+          const vec = l.force_n ?? l.total_force ?? l.force_vector ?? [0, -1200, 0];
+          conditions.push({
+            region: String(l.region ?? l.face ?? 'max_x').toLowerCase() as FeaBoundaryCondition['region'],
+            type: 'force',
+            forceVector: [Number(vec[0]), Number(vec[1]), Number(vec[2])],
+          });
+        }
+      }
+      if (params.applied_force && typeof params.applied_force === 'object') {
+        const af = params.applied_force as Record<string, any>;
+        const vec = af.force_vector ?? af.force_n ?? [0, -1200, 0];
+        conditions.push({
+          region: 'max_x',
+          type: 'force',
+          forceVector: [Number(vec[0]), Number(vec[1]), Number(vec[2])],
+        });
+      }
+      if (Array.isArray(params.applied_forces)) {
+        for (const af of params.applied_forces) {
+          const vec = af.force_vector ?? af.force_n ?? [0, -1200, 0];
+          conditions.push({
+            region: 'max_x',
+            type: 'force',
+            forceVector: [Number(vec[0]), Number(vec[1]), Number(vec[2])],
+          });
+        }
+      }
+      if (!hasExplicitLoadParam && conditions.some((c) => c.type === 'fixed')) {
+        conditions.push({
+          region: 'max_x',
+          type: 'force',
+          forceVector: [0, -1200, 0],
+        });
+      }
 
       const { result, stressMPa, displacements } = runLinearFeaSolver(
         part,

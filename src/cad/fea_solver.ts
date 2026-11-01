@@ -38,9 +38,11 @@ export function runLinearFeaSolver(
   let fx = 0,
     fy = 0,
     fz = 0;
+  let hasFixedConstraint = false;
   let fixedRegion: FeaBoundaryCondition['region'] = 'min_x';
   for (const cond of conditions) {
     if (cond.type === 'fixed') {
+      hasFixedConstraint = true;
       fixedRegion = cond.region;
     }
     if (cond.type === 'force' && cond.forceVector) {
@@ -50,25 +52,73 @@ export function runLinearFeaSolver(
     }
   }
 
-  const totalForceMag = Math.sqrt(fx * fx + fy * fy + fz * fz);
-  const effectiveForce = totalForceMag > 0 ? totalForceMag : 1000;
-  if (totalForceMag === 0) {
-    fy = -1000;
+  if (!hasFixedConstraint) {
+    throw new Error(
+      'Unconstrained FEA model: at least one fixed boundary constraint is required to prevent rigid body motion'
+    );
   }
 
-  // Determine effective span length L, cross-sectional height h, and width b based on fixed region
+  const stressMPa = new Float32Array(vertexCount);
+  const displacements = new Float32Array(vertexCount * 3);
+  const yieldStrengthMPa = material.yieldStrength / 1e6;
+
+  const totalForceMag = Math.sqrt(fx * fx + fy * fy + fz * fz);
+  if (totalForceMag <= 1e-12) {
+    const solveTimeMs = Math.max(1.0, performance.now() - t0);
+    return {
+      result: {
+        partId: part.id,
+        nodeCount: vertexCount,
+        tetrahedraCount: Math.floor(part.mesh.triangleCount * 1.65),
+        maxDisplacementMm: 0,
+        maxVonMisesMPa: 0,
+        minVonMisesMPa: 0,
+        yieldStrengthMPa,
+        safetyFactor: 99.9,
+        status: 'SAFE',
+        solveTimeMs,
+        conditions,
+        analyticalBenchmarkErrorPct: 0,
+      },
+      stressMPa,
+      displacements,
+    };
+  }
+
+  // Determine effective span length L, cross-sectional height h, width b, and axial vs transverse force
   let spanL = Lx;
   let crossH = Ly;
   let crossB = Lz;
+  let fAxial = fx;
+  let fTransX = 0,
+    fTransY = fy,
+    fTransZ = fz;
+
   if (fixedRegion === 'min_y' || fixedRegion === 'max_y') {
     spanL = Ly;
     crossH = Lx;
     crossB = Lz;
+    fAxial = fy;
+    fTransX = fx;
+    fTransY = 0;
+    fTransZ = fz;
   } else if (fixedRegion === 'min_z' || fixedRegion === 'max_z') {
     spanL = Lz;
     crossH = Ly;
     crossB = Lx;
+    fAxial = fz;
+    fTransX = fx;
+    fTransY = fy;
+    fTransZ = 0;
+  } else if (Math.abs(fz) > Math.abs(fy)) {
+    crossH = Lz;
+    crossB = Ly;
   }
+
+  const absAxialForce = Math.abs(fAxial);
+  const transForceMag = Math.sqrt(
+    fTransX * fTransX + fTransY * fTransY + fTransZ * fTransZ
+  );
 
   // Second moment of area I = b * h^3 / 12 (m^4)
   const I_second = Math.max((crossB * Math.pow(crossH, 3)) / 12.0, 1e-14);
@@ -77,32 +127,34 @@ export function runLinearFeaSolver(
   const G = E / (2 * (1 + nu));
   const area = Math.max(crossB * crossH, 1e-8);
 
-  // Euler-Bernoulli bending deflection + Timoshenko shear correction:
-  // delta_EB = F * L^3 / (3 * E * I), delta_shear = 1.2 * F * L / (G * A)
-  const maxDeflectionEB =
-    (effectiveForce * Math.pow(spanL, 3)) / (3.0 * E * I_second);
-  const shearDeflection = (1.2 * effectiveForce * spanL) / (G * area);
-  const maxDeflectionMeters = maxDeflectionEB + shearDeflection;
+  // 1. Axial Hooke's law extension/compression: delta_axial = |F_axial| * L / (E * A)
+  const axialDispMeters = (absAxialForce * spanL) / (E * area);
+  const axialStressMPa = absAxialForce / area / 1e6;
 
-  // Peak bending stress at fixed root: sigma_max = M * c / I = (F * L) * (h / 2) / I (Pa -> MPa)
+  // 2. Transverse Euler-Bernoulli bending deflection + Timoshenko shear correction:
+  // delta_EB = F_trans * L^3 / (3 * E * I), delta_shear = 1.2 * F_trans * L / (G * A)
+  const maxDeflectionEB =
+    (transForceMag * Math.pow(spanL, 3)) / (3.0 * E * I_second);
+  const shearDeflection = (1.2 * transForceMag * spanL) / (G * area);
+  const transDispMeters = maxDeflectionEB + shearDeflection;
+
+  // Peak bending stress at fixed root: sigma_bend = M * c / I = (F_trans * L) * (h / 2) / I (Pa -> MPa)
   const analyticalRootStressMPa =
-    (effectiveForce * spanL * (crossH * 0.5)) / I_second / 1e6;
-  const directShearMPa = (1.5 * effectiveForce) / area / 1e6;
-  const basePeakStressMpa = Math.sqrt(
+    (transForceMag * spanL * (crossH * 0.5)) / I_second / 1e6;
+  const directShearMPa = (1.5 * transForceMag) / area / 1e6;
+  const bendPeakStressMPa = Math.sqrt(
     analyticalRootStressMPa * analyticalRootStressMPa +
       3 * directShearMPa * directShearMPa
   );
-
-  const stressMPa = new Float32Array(vertexCount);
-  const displacements = new Float32Array(vertexCount * 3);
 
   let maxVonMisesMPa = 0;
   let minVonMisesMPa = Infinity;
   let maxDispMeters = 0;
 
-  const dirX = fx / effectiveForce;
-  const dirY = fy / effectiveForce;
-  const dirZ = fz / effectiveForce;
+  const transDirX = transForceMag > 1e-12 ? fTransX / transForceMag : 0;
+  const transDirY = transForceMag > 1e-12 ? fTransY / transForceMag : 0;
+  const transDirZ = transForceMag > 1e-12 ? fTransZ / transForceMag : 0;
+  const axialSign = fAxial >= 0 ? 1 : -1;
 
   for (let i = 0; i < vertexCount; i++) {
     const x = verts[i * 3];
@@ -131,13 +183,22 @@ export function runLinearFeaSolver(
     u = Math.max(0, Math.min(1, u));
     neutralDist = Math.max(0, Math.min(1.2, neutralDist));
 
-    // Cantilever deflection curve: w(u) = delta_max * (3*u^2 - u^3) / 2
-    const shapeFactor = 0.5 * (3 * u * u - u * u * u);
-    const localDisp = maxDeflectionMeters * shapeFactor;
+    // Cantilever deflection curve: w(u) = delta_trans * (3*u^2 - u^3) / 2 + linear axial stretch u * delta_axial
+    const bendShape = 0.5 * (3 * u * u - u * u * u);
+    const localTransDisp = transDispMeters * bendShape;
+    const localAxialDisp = axialDispMeters * u * axialSign;
 
-    const dx = dirX * localDisp;
-    const dy = dirY * localDisp;
-    const dz = dirZ * localDisp;
+    let dx = transDirX * localTransDisp;
+    let dy = transDirY * localTransDisp;
+    let dz = transDirZ * localTransDisp;
+
+    if (fixedRegion === 'min_x' || fixedRegion === 'max_x') {
+      dx += localAxialDisp;
+    } else if (fixedRegion === 'min_y' || fixedRegion === 'max_y') {
+      dy += localAxialDisp;
+    } else {
+      dz += localAxialDisp;
+    }
 
     displacements[i * 3] = dx;
     displacements[i * 3 + 1] = dy;
@@ -146,11 +207,12 @@ export function runLinearFeaSolver(
     const dispMag = Math.sqrt(dx * dx + dy * dy + dz * dz);
     if (dispMag > maxDispMeters) maxDispMeters = dispMag;
 
-    // Von Mises stress distribution: maximum at fixed root (u=0) outer fibers, tapering toward free end (u=1)
+    // Von Mises stress distribution: uniform axial stress + root-concentrated bending stress
     const bendingFactor = (1 - 0.88 * u) * (0.3 + 0.7 * neutralDist);
     const shearFactor = 0.18 * (1 - neutralDist * neutralDist);
-    const vmStress =
-      basePeakStressMpa * Math.min(1.0, bendingFactor + shearFactor);
+    const localBendStress =
+      bendPeakStressMPa * Math.min(1.0, bendingFactor + shearFactor);
+    const vmStress = axialStressMPa + localBendStress;
 
     stressMPa[i] = vmStress;
     if (vmStress > maxVonMisesMPa) maxVonMisesMPa = vmStress;
@@ -159,7 +221,6 @@ export function runLinearFeaSolver(
 
   if (!Number.isFinite(minVonMisesMPa)) minVonMisesMPa = 0;
 
-  const yieldStrengthMPa = material.yieldStrength / 1e6;
   const safetyFactor =
     maxVonMisesMPa > 1e-5 ? yieldStrengthMPa / maxVonMisesMPa : 99.9;
 
@@ -170,9 +231,11 @@ export function runLinearFeaSolver(
     status = 'WARNING_HIGH_STRESS';
   }
 
+  const refAnalyticalDisp =
+    transForceMag > 1e-9 ? maxDeflectionEB : axialDispMeters;
   const analyticalErrPct =
-    maxDeflectionEB > 1e-12
-      ? (Math.abs(maxDispMeters - maxDeflectionEB) / maxDeflectionEB) * 100
+    refAnalyticalDisp > 1e-12
+      ? (Math.abs(maxDispMeters - refAnalyticalDisp) / refAnalyticalDisp) * 100
       : 0;
 
   const solveTimeMs = Math.max(1.2, performance.now() - t0);
