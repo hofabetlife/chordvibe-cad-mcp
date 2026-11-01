@@ -2330,3 +2330,148 @@ async fn test_mcp_optimize_feature_tree_cbo() {
     assert!(rules.iter().any(|r| r.as_str() == Some("R4_COAXIAL_REVOLVE_REDUCTION")));
 }
 
+#[tokio::test]
+async fn test_bug015_create_joint_and_create_part_schema_contract() {
+    let state = EngineState::new_shared();
+    let list_resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 960,
+        "method": "tools/list",
+        "params": {}
+    })).await;
+
+    let tools = list_resp["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 28, "tools/list must expose all 28 MCP tools");
+
+    let create_part_tool = tools.iter().find(|t| t["name"] == "create_part").unwrap();
+    assert!(
+        create_part_tool["inputSchema"]["properties"]["is_fixed"].is_object(),
+        "create_part inputSchema must document optional 'is_fixed' boolean property"
+    );
+
+    let create_joint_tool = tools.iter().find(|t| t["name"] == "create_joint").unwrap();
+    let joint_enums = create_joint_tool["inputSchema"]["properties"]["joint_type"]["enum"]
+        .as_array()
+        .unwrap();
+    assert!(
+        joint_enums.iter().any(|e| e.as_str() == Some("gear")),
+        "create_joint joint_type enum must include 'gear'"
+    );
+    assert!(create_joint_tool["inputSchema"]["properties"]["ratio"].is_object());
+    assert!(create_joint_tool["inputSchema"]["properties"]["teeth_a"].is_object());
+    assert!(create_joint_tool["inputSchema"]["properties"]["teeth_b"].is_object());
+
+    // Verify revolute joint works with default anchor_a / anchor_b when omitted
+    let p_resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 961,
+        "method": "tools/call",
+        "params": {
+            "name": "create_part",
+            "arguments": {
+                "name": "Rotor",
+                "material": "steel_structural_aisi1020"
+            }
+        }
+    })).await;
+    let p_id = serde_json::from_str::<Value>(p_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap()["part_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let j_resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 962,
+        "method": "tools/call",
+        "params": {
+            "name": "create_joint",
+            "arguments": {
+                "joint_type": "revolute",
+                "part_a": "ground",
+                "part_b": p_id,
+                "axis": [0.0, 0.0, 1.0]
+            }
+        }
+    })).await;
+    assert!(j_resp.get("error").is_none(), "create_joint should default anchor_a/anchor_b to [0,0,0]");
+}
+
+#[tokio::test]
+async fn test_bug016_revolve_boundary_and_self_intersection_validation() {
+    let state = EngineState::new_shared();
+    let p_resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 970,
+        "method": "tools/call",
+        "params": {
+            "name": "create_part",
+            "arguments": {
+                "name": "RevolveValidationPart",
+                "material": "aluminum_6061_t6"
+            }
+        }
+    })).await;
+    let part_id = serde_json::from_str::<Value>(p_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap()["part_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 1. Negative r coordinate (crossing rotation axis) must be rejected
+    let neg_r_resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 971,
+        "method": "tools/call",
+        "params": {
+            "name": "add_feature_primitive",
+            "arguments": {
+                "part_id": part_id,
+                "primitive_type": "revolve",
+                "params": {
+                    "profile": [[-0.01, -0.02], [0.03, -0.02], [0.03, 0.02], [-0.01, 0.02]],
+                    "angle_deg": 360.0
+                }
+            }
+        }
+    })).await;
+    assert!(neg_r_resp.get("error").is_some(), "Revolve with r < 0 must return an error");
+
+    // 2. Out-of-range angle_deg = 720 must be rejected
+    let bad_angle_resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 972,
+        "method": "tools/call",
+        "params": {
+            "name": "add_feature_primitive",
+            "arguments": {
+                "part_id": part_id,
+                "primitive_type": "revolve",
+                "params": {
+                    "profile": [[0.01, -0.02], [0.03, -0.02], [0.03, 0.02], [0.01, 0.02]],
+                    "angle_deg": 720.0
+                }
+            }
+        }
+    })).await;
+    assert!(bad_angle_resp.get("error").is_some(), "Revolve with angle_deg > 360 must return an error");
+
+    // 3. Self-intersecting figure-8 profile must be rejected
+    let self_int_resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 973,
+        "method": "tools/call",
+        "params": {
+            "name": "add_feature_primitive",
+            "arguments": {
+                "part_id": part_id,
+                "primitive_type": "revolve",
+                "params": {
+                    "profile": [[0.01, -0.02], [0.04, 0.02], [0.01, 0.02], [0.04, -0.02]],
+                    "angle_deg": 360.0
+                }
+            }
+        }
+    })).await;
+    assert!(self_int_resp.get("error").is_some(), "Self-intersecting revolve profile must return an error");
+}
+
+

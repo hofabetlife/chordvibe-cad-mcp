@@ -42,7 +42,7 @@ export function analyzeMeshTopology(
   vertices: Float32Array,
   normals: Float32Array,
   indices: Uint32Array,
-  weldTolerance: number = 1e-5
+  weldTolerance: number = 1e-6
 ): TopologyAnalysis {
   const rawVertexCount = vertices.length / 3;
   const invTol = 1 / weldTolerance;
@@ -610,13 +610,34 @@ class MeshBuilder {
   }
 
   build(density: number = 7850, overrideEulerGenus?: number): MeshGeometryData {
-    return computeMeshMetrics(
-      new Float32Array(this.positions),
-      new Float32Array(this.normals),
-      new Uint32Array(this.indices),
+    const posArr = new Float32Array(this.positions);
+    const normArr = new Float32Array(this.normals);
+    const idxArr = new Uint32Array(this.indices);
+    const initial = computeMeshMetrics(
+      posArr,
+      normArr,
+      idxArr,
       density,
       overrideEulerGenus
     );
+    if (!initial.isOutwardOriented && initial.triangleCount > 0) {
+      for (let i = 0; i < idxArr.length; i += 3) {
+        const tmp = idxArr[i + 1];
+        idxArr[i + 1] = idxArr[i + 2];
+        idxArr[i + 2] = tmp;
+      }
+      for (let i = 0; i < normArr.length; i++) {
+        normArr[i] = -normArr[i];
+      }
+      return computeMeshMetrics(
+        posArr,
+        normArr,
+        idxArr,
+        density,
+        overrideEulerGenus
+      );
+    }
+    return initial;
   }
 }
 
@@ -1372,8 +1393,62 @@ export function createRevolveMesh(
   if (!Array.isArray(profile) || profile.length < 2) {
     throw new Error('Revolve requires a profile of at least 2 [r, z] points');
   }
-  if (angleDeg <= 0 || angleDeg > 360) {
+  if (!Number.isFinite(angleDeg) || angleDeg <= 0 || angleDeg > 360) {
     throw new Error('Revolve angle_deg must be in (0, 360]');
+  }
+
+  for (const pt of profile) {
+    if (
+      !Array.isArray(pt) ||
+      pt.length < 2 ||
+      !Number.isFinite(pt[0]) ||
+      !Number.isFinite(pt[1])
+    ) {
+      throw new Error('Revolve profile points must be finite [r, z] coordinates');
+    }
+    if (pt[0] < -1e-9) {
+      throw new Error(
+        `Revolve profile radius r (${pt[0]}) cannot be negative (crosses rotation axis)`
+      );
+    }
+  }
+
+  // Check for self-intersecting non-adjacent segments in the 2D (r, z) profile
+  if (profile.length >= 4) {
+    const nPts = profile.length;
+    const ccw2d = (
+      p1: [number, number],
+      p2: [number, number],
+      p3: [number, number]
+    ): number =>
+      (p2[0] - p1[0]) * (p3[1] - p1[1]) - (p2[1] - p1[1]) * (p3[0] - p1[0]);
+    const segsIntersect = (
+      a: [number, number],
+      b: [number, number],
+      c: [number, number],
+      d: [number, number]
+    ): boolean => {
+      const d1 = ccw2d(a, b, c);
+      const d2 = ccw2d(a, b, d);
+      const d3 = ccw2d(c, d, a);
+      const d4 = ccw2d(c, d, b);
+      return (
+        ((d1 > 1e-9 && d2 < -1e-9) || (d1 < -1e-9 && d2 > 1e-9)) &&
+        ((d3 > 1e-9 && d4 < -1e-9) || (d3 < -1e-9 && d4 > 1e-9))
+      );
+    };
+    for (let i = 0; i < nPts; i++) {
+      const iNext = (i + 1) % nPts;
+      for (let j = i + 2; j < nPts; j++) {
+        const jNext = (j + 1) % nPts;
+        if (i === 0 && jNext === 0) continue;
+        if (segsIntersect(profile[i], profile[iNext], profile[j], profile[jNext])) {
+          throw new Error(
+            'Revolve 2D profile is self-intersecting in the (r, z) plane'
+          );
+        }
+      }
+    }
   }
 
   const isFull = Math.abs(angleDeg - 360) < 1e-4;
