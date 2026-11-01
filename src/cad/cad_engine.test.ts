@@ -19,6 +19,7 @@ import { stepKinematicsAssembly } from './kinematics';
 import { DEFAULT_MATERIALS } from './materials';
 import {
   EngineStateSnapshot,
+  MCP_TOOLS_CATALOG,
   executeMcpToolOnEngineState,
 } from './mcp_dispatcher';
 import {
@@ -493,5 +494,300 @@ describe('MCP-CAD Core Geometry & Topological Verification Suite', () => {
     assert.equal(conds[1].type, 'force');
     assert.deepEqual(conds[1].forceVector, [2500, 0, 0]);
   });
+
+  it('verifies BUG-015: 28 MCP tools catalog including validate_mesh and gear joint schema parity', () => {
+    assert.equal(MCP_TOOLS_CATALOG.length, 28);
+    assert.ok(MCP_TOOLS_CATALOG.some((t) => t.name === 'validate_mesh'));
+
+    const initialState: EngineStateSnapshot = {
+      parts: [],
+      selectedPartId: '',
+      joints: [],
+      materials: [...DEFAULT_MATERIALS],
+      feaResult: null,
+      physicsFrames: [],
+      quality: 'standard',
+      renderMode: 'shaded',
+    };
+
+    const s1 = executeMcpToolOnEngineState(initialState, 'add_feature_primitive', {
+      part_id: 'pinion',
+      primitive_type: 'spur_gear',
+      params: { teeth: 20, module_mm: 2.0, bore_radius: 0.005 },
+    }).nextState;
+    const s2 = executeMcpToolOnEngineState(s1, 'add_feature_primitive', {
+      part_id: 'wheel',
+      primitive_type: 'spur_gear',
+      params: { teeth: 40, module_mm: 2.0, bore_radius: 0.006 },
+    }).nextState;
+
+    const { nextState: s3, response } = executeMcpToolOnEngineState(s2, 'create_joint', {
+      joint_type: 'gear',
+      part_a: 'pinion',
+      part_b: 'wheel',
+      ratio: -0.5,
+    });
+    assert.equal(response.status, 'created');
+    assert.equal(s3.joints.length, 1);
+
+    const meshVal = executeMcpToolOnEngineState(s3, 'validate_mesh', {
+      part_id: 'pinion',
+      expected_genus: 1,
+    }).response;
+    assert.equal(meshVal.status, 'PASS');
+  });
+
+  it('verifies BUG-016: revolve profile validation (r<0, angle>360, self-intersection) and tessellate_part schema', () => {
+    // 1. Negative radius r < 0 must throw
+    assert.throws(() =>
+      createRevolveMesh(
+        [
+          [-0.01, -0.02],
+          [0.03, -0.02],
+          [0.03, 0.02],
+        ],
+        360,
+        'standard',
+        7850
+      )
+    );
+
+    // 2. Angle > 360 must throw
+    assert.throws(() =>
+      createRevolveMesh(
+        [
+          [0.01, -0.02],
+          [0.03, -0.02],
+          [0.03, 0.02],
+        ],
+        720,
+        'standard',
+        7850
+      )
+    );
+
+    // 3. Self-intersecting figure-8 profile must throw
+    assert.throws(() =>
+      createRevolveMesh(
+        [
+          [0.01, -0.02],
+          [0.03, 0.02],
+          [0.01, 0.02],
+          [0.03, -0.02],
+        ],
+        360,
+        'standard',
+        7850
+      )
+    );
+
+    // 4. tessellate_part accepts 'coarse', 'medium', 'fine' and rejects invalid quality or chord_tolerance <= 0
+    const baseState: EngineStateSnapshot = {
+      parts: [
+        {
+          id: 'cyl_1',
+          name: 'Cylinder',
+          materialId: 'steel_1045',
+          dag: [
+            {
+              id: 'n1',
+              name: 'Cyl',
+              type: 'cylinder',
+              params: { radius: 0.02, height: 0.05 },
+              enabled: true,
+            },
+          ],
+          mesh: createCylinderMesh(0.02, 0.05, 'standard', 7850),
+          visible: true,
+          position: [0, 0, 0],
+          rotation: [0, 0, 0],
+          scale: [1, 1, 1],
+        },
+      ],
+      selectedPartId: 'cyl_1',
+      joints: [],
+      materials: [...DEFAULT_MATERIALS],
+      feaResult: null,
+      physicsFrames: [],
+      quality: 'standard',
+      renderMode: 'shaded',
+    };
+
+    const fineRes = executeMcpToolOnEngineState(baseState, 'tessellate_part', {
+      part_id: 'cyl_1',
+      quality: 'fine',
+      chord_tolerance: 0.0005,
+    });
+    assert.equal(fineRes.response.status, 'ok');
+    assert.equal(fineRes.nextState.quality, 'fine');
+
+    assert.throws(() =>
+      executeMcpToolOnEngineState(baseState, 'tessellate_part', {
+        part_id: 'cyl_1',
+        quality: 'ultra_invalid',
+      })
+    );
+    assert.throws(() =>
+      executeMcpToolOnEngineState(baseState, 'tessellate_part', {
+        part_id: 'cyl_1',
+        chord_tolerance: -0.001,
+      })
+    );
+  });
+
+  it('verifies BUG-017: FEA unconstrained model rejection, zero-load zero-response, and Axial Rod Tension benchmark', () => {
+    // 1. Axial Rod Tension benchmark: L = 1.0 m, A = 0.01 x 0.01 m^2 = 1e-4 m^2, E = 200 GPa, F = 2000 N along X
+    // Analytical: dL = F*L / (E*A) = 2000 * 1.0 / (200e9 * 1e-4) = 1e-4 m = 0.100 mm
+    // Analytical: sigma = F / A = 2000 / 1e-4 = 20e6 Pa = 20.0 MPa
+    const rodMesh = createBoxMesh(1.0, 0.01, 0.01, 7850);
+    const steel200GPa = {
+      ...DEFAULT_MATERIALS[0],
+      youngsModulus: 200e9,
+      yieldStrength: 250e6,
+    };
+    const rodPart = {
+      id: 'axial_rod',
+      name: 'Axial Rod 1m',
+      materialId: steel200GPa.id,
+      dag: [],
+      mesh: rodMesh,
+      visible: true,
+      position: [0, 0, 0] as [number, number, number],
+      rotation: [0, 0, 0] as [number, number, number],
+      scale: [1, 1, 1] as [number, number, number],
+    };
+
+    const axialOut = runLinearFeaSolver(rodPart, steel200GPa, [
+      { region: 'min_x', type: 'fixed' },
+      { region: 'max_x', type: 'force', forceVector: [2000, 0, 0] },
+    ]);
+    assert.ok(Math.abs(axialOut.result.maxDisplacementMm - 0.1) < 1e-4);
+    assert.ok(Math.abs(axialOut.result.maxVonMisesMPa - 20.0) < 1e-3);
+
+    // 2. Zero load [0, 0, 0] must yield exactly 0 displacement and 0 von Mises stress
+    const zeroOut = runLinearFeaSolver(rodPart, steel200GPa, [
+      { region: 'min_x', type: 'fixed' },
+      { region: 'max_x', type: 'force', forceVector: [0, 0, 0] },
+    ]);
+    assert.equal(zeroOut.result.maxDisplacementMm, 0);
+    assert.equal(zeroOut.result.maxVonMisesMPa, 0);
+
+    // 3. Unconstrained model (no fixed boundary condition) must throw
+    assert.throws(() =>
+      runLinearFeaSolver(rodPart, steel200GPa, [
+        { region: 'max_x', type: 'force', forceVector: [1000, 0, 0] },
+      ])
+    );
+  });
+
+  it('executes 50 deterministic seeded DAG fuzzing chains (2-6 ops each) with 0 panics and 100% watertight manifold output', () => {
+    let seed = 0x20261101;
+    const nextRand = () => {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      return seed / 0x100000000;
+    };
+
+    for (let chainIdx = 0; chainIdx < 50; chainIdx++) {
+      let state: EngineStateSnapshot = {
+        parts: [],
+        selectedPartId: '',
+        joints: [],
+        materials: [...DEFAULT_MATERIALS],
+        feaResult: null,
+        physicsFrames: [],
+        quality: 'standard',
+        renderMode: 'shaded',
+      };
+
+      const partId = `fuzz_part_${chainIdx}`;
+      const baseChoice = chainIdx % 5;
+      if (baseChoice === 0) {
+        state = executeMcpToolOnEngineState(state, 'add_feature_primitive', {
+          part_id: partId,
+          primitive_type: 'box',
+          params: {
+            width: 0.08 + nextRand() * 0.06,
+            height: 0.06 + nextRand() * 0.04,
+            depth: 0.08 + nextRand() * 0.06,
+          },
+        }).nextState;
+      } else if (baseChoice === 1) {
+        state = executeMcpToolOnEngineState(state, 'add_feature_primitive', {
+          part_id: partId,
+          primitive_type: 'cylinder',
+          params: {
+            radius: 0.03 + nextRand() * 0.02,
+            height: 0.06 + nextRand() * 0.04,
+          },
+        }).nextState;
+      } else if (baseChoice === 2) {
+        state = executeMcpToolOnEngineState(state, 'add_feature_primitive', {
+          part_id: partId,
+          primitive_type: 'polygon_prism',
+          params: {
+            sides: 6 + (chainIdx % 3) * 2,
+            outer_radius: 0.025 + nextRand() * 0.015,
+            height: 0.03 + nextRand() * 0.02,
+            chamfer_radius: 0.002,
+          },
+        }).nextState;
+      } else if (baseChoice === 3) {
+        state = executeMcpToolOnEngineState(state, 'add_feature_primitive', {
+          part_id: partId,
+          primitive_type: 'spur_gear',
+          params: {
+            teeth: 12 + (chainIdx % 12),
+            module_mm: 2.0,
+            face_width: 0.015,
+            bore_radius: 0.006,
+            hub_radius: 0.012,
+            hub_Length: 0.005,
+            keyway_width: 0.003,
+            keyway_depth: 0.0015,
+          },
+        }).nextState;
+      } else {
+        state = executeMcpToolOnEngineState(state, 'add_feature_primitive', {
+          part_id: partId,
+          primitive_type: 'wheel_rim',
+          params: {
+            outer_radius: 0.22,
+            rim_width: 0.12,
+            spokes: 5 + (chainIdx % 4),
+          },
+        }).nextState;
+      }
+
+      const extraOps = 1 + (chainIdx % 4);
+      for (let step = 0; step < extraOps; step++) {
+        if (step % 2 === 0 && baseChoice <= 2) {
+          state = executeMcpToolOnEngineState(state, 'cut_hole', {
+            part_id: partId,
+            radius: 0.004 + nextRand() * 0.003,
+            depth: 0.15,
+            offset_x: (nextRand() - 0.5) * 0.01,
+            offset_z: (nextRand() - 0.5) * 0.01,
+          }).nextState;
+        } else {
+          const sx = step === 1 && chainIdx % 7 === 0 ? -1 : 1;
+          state = executeMcpToolOnEngineState(state, 'transform_part', {
+            part_id: partId,
+            translation: [nextRand() * 0.01, nextRand() * 0.01, 0],
+            rotation_deg: [0, 0, Math.round(nextRand() * 45)],
+            scale: [sx, 1, 1],
+          }).nextState;
+        }
+      }
+
+      const mesh = state.parts[0].mesh;
+      assert.equal(mesh.isWatertight, true, `Chain ${chainIdx} must be watertight`);
+      assert.equal(mesh.boundaryEdgesCount, 0, `Chain ${chainIdx} must have 0 boundary edges`);
+      assert.equal(mesh.nonManifoldEdgesCount, 0, `Chain ${chainIdx} must have 0 non-manifold edges`);
+      assert.equal(mesh.degenerateTrianglesCount, 0, `Chain ${chainIdx} must have 0 degenerate triangles`);
+      assert.equal(mesh.isOutwardOriented, true, `Chain ${chainIdx} must have outward normals`);
+      assert.ok(mesh.volume > 0, `Chain ${chainIdx} must have positive volume`);
+    }
+  });
 });
+
 
