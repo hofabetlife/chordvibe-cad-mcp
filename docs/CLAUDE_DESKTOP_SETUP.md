@@ -13,12 +13,12 @@
    ```
 2. Сборка оптимизированного исполняемого файла сервера:
    ```powershell
-   cd c:\Users\voley\Documents\3D_MCP
+   cd c:\Users\<username>\Documents\chordvibe-cad-mcp
    cargo build --release -p mcp-cad-server
    ```
    После завершения сборки исполняемый файл будет доступен по пути:
    ```
-   c:\Users\voley\Documents\3D_MCP\target\release\mcp-cad-server.exe
+   c:\Users\<username>\Documents\chordvibe-cad-mcp\target\release\mcp-cad-server.exe
    ```
 
 ---
@@ -49,7 +49,7 @@ notepad "$env:APPDATA\Claude\claude_desktop_config.json"
 {
   "mcpServers": {
     "cad-engine": {
-      "command": "c:\\Users\\voley\\Documents\\3D_MCP\\target\\release\\mcp-cad-server.exe",
+      "command": "c:\\Users\\<username>\\Documents\\chordvibe-cad-mcp\\target\\release\\mcp-cad-server.exe",
       "args": [
         "--mode",
         "stdio"
@@ -124,9 +124,9 @@ Get-Content -Path "$env:APPDATA\Claude\logs\mcp-server-cad-engine.log" -Wait -Ta
 
 ### Ошибка 1: Сервер не запускается или иконка инструментов не появляется
 - **Причина**: Неверный путь к `mcp-cad-server.exe` или файл еще не скомпилирован.
-- **Решение**: Проверьте, что файл `c:\Users\voley\Documents\3D_MCP\target\release\mcp-cad-server.exe` существует. Запустите его вручную в консоли PowerShell:
+- **Решение**: Проверьте, что файл `c:\Users\<username>\Documents\chordvibe-cad-mcp\target\release\mcp-cad-server.exe` существует. Запустите его вручную в консоли PowerShell:
   ```powershell
-  c:\Users\voley\Documents\3D_MCP\target\release\mcp-cad-server.exe --mode stdio
+  c:\Users\<username>\Documents\chordvibe-cad-mcp\target\release\mcp-cad-server.exe --mode stdio
   ```
   Если он выводит лог `Initializing MCP-CAD Engine...` в консоль и ожидает ввода — бинарник исправен.
 

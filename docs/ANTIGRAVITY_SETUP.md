@@ -7,13 +7,13 @@
 ## 1. Автоматическая конфигурация (уже выполнена)
 
 Сервер зарегистрирован в глобальном конфигурационном файле Antigravity:
-`C:\Users\voley\.gemini\config\mcp_config.json`
+`C:\Users\<username>\.gemini\config\mcp_config.json`
 
 ```json
 {
   "mcpServers": {
     "mcp-cad": {
-      "command": "C:/Users/voley/Documents/3D_MCP/target/release/mcp-cad-server.exe",
+      "command": "C:/Users/<username>/Documents/chordvibe-cad-mcp/target/release/mcp-cad-server.exe",
       "args": ["--mode", "stdio"]
     }
   }

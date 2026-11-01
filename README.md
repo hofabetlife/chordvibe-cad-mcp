@@ -95,8 +95,8 @@ flowchart LR
 
 ### 1. Клонирование и сборка
 ```powershell
-git clone https://github.com/your-username/3D_MCP.git
-cd 3D_MCP
+git clone https://github.com/hofabetlife/chordvibe-cad-mcp.git
+cd chordvibe-cad-mcp
 cargo build --release -p mcp-cad-server
 ```
 *Исполняемый файл будет собран в `./target/release/mcp-cad-server.exe`.*
@@ -141,7 +141,7 @@ docker run --rm -p 8080:8080 mcp-cad-server
 {
   "mcpServers": {
     "cad-engine": {
-      "command": "c:\\Users\\voley\\Documents\\3D_MCP\\target\\release\\mcp-cad-server.exe",
+      "command": "C:\\Users\\<username>\\Documents\\chordvibe-cad-mcp\\target\\release\\mcp-cad-server.exe",
       "args": [
         "--mode",
         "stdio"
@@ -166,7 +166,7 @@ docker run --rm -p 8080:8080 mcp-cad-server
 3. Заполните поля:
    - **Name**: `cad-engine`
    - **Type**: `command`
-   - **Command**: `c:\Users\voley\Documents\3D_MCP\target\release\mcp-cad-server.exe --mode stdio`
+   - **Command**: `C:\Users\<username>\Documents\chordvibe-cad-mcp\target\release\mcp-cad-server.exe --mode stdio`
 4. Нажмите **Save**. Зеленый индикатор подтвердит доступность всех 28 инструментов.
 
 ---
@@ -317,7 +317,7 @@ cargo clippy --workspace -- -D warnings
 ## 📂 Структура репозитория
 
 ```
-3D_MCP/
+chordvibe-cad-mcp/
 ├── Cargo.toml                    # Корневой workspace-манифест
 ├── PRD.md                        # Документ требований к продукту
 ├── PROJECT_CONTEXT.md            # Контекст и соглашения разработки
