@@ -151,3 +151,38 @@
 - **Причина**: Несовпадение типов `NativeBridgeStatus`, свойства `titleRu`, расширение допустимых значений `QualityPreset` (`fine`), отсутствие `@types/node`.
 - **Исправление**: Экспортирован `NativeBridgeStatus`, добавлены типы, скорректированы вызовы, установлен `@types/node`.
 - **Верификация**: `tsc --noEmit` и `npm run build` завершаются с кодом 0 (0 ошибок).
+
+---
+
+## BUG-015 [S3][FIXED] server/tools: рассинхронизация JSON Schema в `create_joint` и `create_part`
+- **Компонент**: `crates/mcp-cad-server/src/tools/mod.rs`, `crates/mcp-cad-server/src/tools/physics.rs`
+- **Симптом**: `tools/list` объявлял `enum: ["revolute", "prismatic", "fixed", "spherical"]` для `create_joint` (без `"gear"`, хотя `physics::create_joint` поддерживает `"gear"` и `docs/MCP_API_REFERENCE.md` документирует его) и требовал обязательные `anchor_a`/`anchor_b` даже для зубчатой передачи (`gear`); `create_part` не содержал `is_fixed` в `input_schema`.
+- **Минимальный репродьюсер**: Вызов `tools/list` и валидация `create_joint` с `{"joint_type": "gear", "part_a": "g1", "part_b": "g2", "ratio": -0.5}` по JSON Schema.
+- **Корневая причина**: Устаревшее описание `input_schema` в `tools/mod.rs` и жесткое требование `extract_vec3(arguments, "anchor_a")` в `physics.rs`.
+- **План фикса**: Добавить `"gear"`, `axis_a`, `axis_b`, `ratio`, `teeth_a`, `teeth_b` в схему `create_joint`, сделать `anchor_a`/`anchor_b` опциональными (с дефолтом `[0.0, 0.0, 0.0]` и строгой проверкой конечности чисел при передаче), добавить `is_fixed` в схему `create_part`.
+- **Доказательство фикса**: Тест `test_bug015_create_joint_and_create_part_schema_contract` в `crates/mcp-cad-server/tests/mcp_contract_tests.rs` и тест `verifies BUG-015: 28 MCP tools catalog including validate_mesh and gear joint schema parity` в `src/cad/cad_engine.test.ts` (PASS, коммит `0d41f00`).
+
+---
+
+## BUG-016 [S2][FIXED] core/primitives: отсутствие валидации самопересечений и `r < 0` в `revolve`, инвертированный обход `wheel_rim` в TS-ядре и завышенный `weldTolerance`
+- **Компонент**: `crates/mcp-cad-server/src/tools/cad.rs`, `src/cad/primitives.ts`, `src/cad/mcp_dispatcher.ts`
+- **Симптом**:
+  1. Примитив `revolve` принимал отрицательные радиальные координаты `r < 0` (пересечение оси вращения), `angle_deg > 360` и самопересекающиеся 2D-профили («восьмерка»), порождая вывернутые самопересекающиеся сетки.
+  2. В TS-ядре `createWheelRimMesh` строил контур обода по часовой стрелке в плоскости $(r, z)$, из-за чего `signedVolume < 0` (`isOutwardOriented = false`), а `weldTolerance = 1e-5` в `analyzeMeshTopology` схлопывал соседние вершины отверстия шестерни ($Z=12$, $r_{\text{bore}}=6\text{ мм}$), создавая 16 ложных вырожденных треугольников.
+- **Минимальный репродьюсер**: `createRevolveMesh([[-0.01, -0.02], [0.03, -0.02], [0.03, 0.02]], 360)` и 50-цепочечный детерминированный DAG-фаззер (`Chain 4` и `Chain 48`).
+- **Корневая причина**: Отсутствие предвалидации координат $(r, z)$ и проверки пересечения отрезков контура в `revolve`; отсутствие автонормализации ориентации замкнутого многообразия в `MeshBuilder.build`; слишком грубый шаг квантования `1e-5` м вместо `1e-6` м при пространственной сварке вершин.
+- **План фикса**: Добавить проверку $r \ge 0$, $\text{angle\_deg} \in (0, 360]$ и детектор пересечения несмежных 2D-сегментов профиля в `crates/mcp-cad-server/src/tools/cad.rs` и `src/cad/primitives.ts`; нормализовать внешний обход в `MeshBuilder.build`; установить `weldTolerance = 1e-6` м; синхронизировать пресеты `coarse`/`medium`/`fine` в `tessellate_part`.
+- **Доказательство фикса**: Тесты `test_bug016_revolve_boundary_and_self_intersection_validation`, `verifies BUG-016` и `executes 50 deterministic seeded DAG fuzzing chains` (50/50 цепей: 100% watertight, 0 boundary edges, 0 degenerates, 100% outward normals; коммит `208cf2a`).
+
+---
+
+## BUG-017 [S2][FIXED] fea/solver: отсутствие проверки закрепления (Rigid Body Motion) и декомпозиции осевого растяжения Гука в TS FEA-решателе
+- **Компонент**: `src/cad/fea_solver.ts`, `src/cad/mcp_dispatcher.ts`
+- **Симптом**:
+  1. Вызов `runLinearFeaSolver` без граничного условия `'fixed'` не возвращал ошибку незакрепленного тела (Rigid Body Motion), а молча подставлял `fixedRegion = 'min_x'`.
+  2. При нулевой силе `[0, 0, 0]` возвращался ненулевой `minVonMisesMPa = Infinity`, а чисто осевая нагрузка вдоль оси закрепления рассчитывалась по изгибной формуле балки вместо закона Гука $\Delta L = \frac{F L}{E A}$, $\sigma = \frac{F}{A}$.
+- **Минимальный репродьюсер**: Бенчмарк `Axial Rod Tension` ($L = 1.0\text{ м}$, $A = 0.01 \times 0.01\text{ м}^2 = 10^{-4}\text{ м}^2$, $E = 200\text{ ГПа}$, $F_x = 2000\text{ Н}$ при закреплении `min_x`).
+- **Корневая причина**: В `runLinearFeaSolver` отсутствовала декомпозиция вектора силы на продольную (осевую) и поперечную (изгибную + сдвиговую Тимошенко) компоненты, а также отсутствовала проверка `hasFixedConstraint`.
+- **План фикса**: Выбрасывать явную ошибку при отсутствии `'fixed'`-ограничения; при $|F| \le 10^{-12}$ возвращать `0` перемещений и `0` напряжений; разложить силу на осевую ($\Delta L = \frac{|F_{\text{ax}}| L}{E A}$, $\sigma_{\text{ax}} = \frac{|F_{\text{ax}}|}{A}$) и поперечную ($\delta_{\text{EB}} + \delta_{\text{shear}}$).
+- **Доказательство фикса**: Тест `verifies BUG-017: FEA unconstrained model rejection, zero-load zero-response, and Axial Rod Tension benchmark` в `src/cad/cad_engine.test.ts` ($\Delta L = 0.1000\text{ мм}$, ошибка $0.00\%$; $\sigma_{\text{VM}} = 20.000\text{ МПа}$, ошибка $0.00\%$; коммит `02e932b`).
+

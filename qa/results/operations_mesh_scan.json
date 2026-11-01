@@ -52,33 +52,28 @@
       "watertight": true
     },
     {
-      "boundary_edges": 934,
-      "genus": 177.5,
-      "issues": [
-        "Mesh is not watertight: 934 boundary edges (holes), 0 non-manifold edges",
-        "Found 1 self-intersecting non-adjacent triangle pairs",
-        "Euler genus mismatch: computed 177.5 (round 178), expected 0"
-      ],
+      "boundary_edges": 0,
+      "genus": 0.0,
+      "issues": [],
       "operation": "cut_helical_groove_circular",
       "orientation_consistent": true,
-      "self_intersections": 1,
-      "status": "FAIL",
+      "self_intersections": 0,
+      "signed_volume": 0.000014852194028194,
+      "status": "PASS",
       "t_junctions": 0,
-      "watertight": false
+      "watertight": true
     },
     {
-      "boundary_edges": 96,
-      "genus": 16.0,
-      "issues": [
-        "Mesh is not watertight: 96 boundary edges (holes), 0 non-manifold edges",
-        "Euler genus mismatch: computed 16.0 (round 16), expected 0"
-      ],
+      "boundary_edges": 0,
+      "genus": 0.0,
+      "issues": [],
       "operation": "cut_helical_groove_metric_60",
       "orientation_consistent": true,
       "self_intersections": 0,
-      "status": "FAIL",
+      "signed_volume": 0.000015924018491024,
+      "status": "PASS",
       "t_junctions": 0,
-      "watertight": false
+      "watertight": true
     },
     {
       "boundary_edges": 0,

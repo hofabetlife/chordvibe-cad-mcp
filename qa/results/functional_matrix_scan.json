@@ -34,6 +34,37 @@
       "check": "capture_viewport_rejects_zero_dimensions",
       "pass": true,
       "rejected": true
+    },
+    {
+      "check": "create_joint_gear_and_create_part_is_fixed_schema_contract",
+      "gear_in_enum": true,
+      "is_fixed_in_schema": true,
+      "optional_anchors_accepted": true,
+      "pass": true
+    },
+    {
+      "check": "revolve_rejects_negative_r_angle_gt_360_and_self_intersection",
+      "pass": true,
+      "rejected_angle_720": true,
+      "rejected_figure8_profile": true,
+      "rejected_negative_radius": true
+    },
+    {
+      "check": "fea_rejects_unconstrained_and_returns_zero_on_zero_load",
+      "axial_rod_Benchmark_err_pct": 0.0,
+      "pass": true,
+      "rejected_unconstrained": true,
+      "zero_disp_on_zero_load": true
+    },
+    {
+      "chains_tested": 50,
+      "check": "deterministic_dag_fuzzing_50_chains",
+      "degenerates_count": 0,
+      "manifold_pass_rate": 1.0,
+      "outward_orientation_pass_rate": 1.0,
+      "panics_count": 0,
+      "pass": true,
+      "watertight_pass_rate": 1.0
     }
   ]
 }
