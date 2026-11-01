@@ -13,7 +13,7 @@
 
 [Быстрый старт](#-быстрый-старт-quick-start) •
 [Подключение к ИИ](#-подключение-к-популярным-ии-клиентам) •
-[Инструменты MCP](#-сводная-таблица-инструментов-mcp-26-tools) •
+[Инструменты MCP](#-сводная-таблица-инструментов-mcp-28-tools) •
 [AI-Native Возможности](#-ai-native-cad-experience) •
 [Архитектура](#-архитектура-системы) •
 [Примеры промптов](#-готовые-промпты-для-ии-агентов)
@@ -112,6 +112,18 @@ cargo run --release -p mcp-cad-server -- --mode sse --port 8080
 ```
 *Сервер слушает входящие SSE-соединения на `http://127.0.0.1:8080/sse` и принимает вызовы JSON-RPC через POST на `http://127.0.0.1:8080/message`.*
 
+### 4. Запуск на Linux / macOS и в Docker (Headless GPU / Lavapipe)
+Для запуска `mcp-cad-server` в серверных Linux-окружениях и CI/CD без физической видеокарты используется программный драйвер Vulkan (`mesa-vulkan-drivers` / `lavapipe`):
+```bash
+# Нативный запуск на Linux/macOS:
+chmod +x ./run_server.sh
+./run_server.sh --mode sse --port 8080
+
+# Сборка и запуск в Docker-контейнере:
+docker build -t mcp-cad-server .
+docker run --rm -p 8080:8080 mcp-cad-server
+```
+
 ---
 
 ## 🔌 Подключение к популярным ИИ-клиентам
@@ -155,7 +167,7 @@ cargo run --release -p mcp-cad-server -- --mode sse --port 8080
    - **Name**: `cad-engine`
    - **Type**: `command`
    - **Command**: `c:\Users\voley\Documents\3D_MCP\target\release\mcp-cad-server.exe --mode stdio`
-4. Нажмите **Save**. Зеленый индикатор подтвердит доступность всех 26 инструментов.
+4. Нажмите **Save**. Зеленый индикатор подтвердит доступность всех 28 инструментов.
 
 ---
 
@@ -187,9 +199,14 @@ MCP-CAD Engine спроектирован специально для преод
    - В дополнение к `boolean_difference`, добавлены `boolean_union` (объединение твердых тел) и `boolean_intersection` (пересечение с сохранением общего объема).
    - Инструмент `transform_part` позволяет масштабировать, сдвигать и ориентировать детали по углам Эйлера (Roll-Pitch-Yaw) прямо в истории построения DAG.
 
+5. **Стоимостной оптимизатор дерева операций — Cost-Based CAD Query Optimizer (`optimize_feature_tree` / `EXPLAIN ANALYZE`)**:
+   - ИИ-агенты часто строят деталь неоптимальным, но логически верным путем (последовательные поштучные `cut_hole`, цепочки мелких сдвигов `transform_part`, вычитания цилиндров вместо вращения 2D-профиля `revolve`, либо «сверление воздуха» мимо габарита детали).
+   - По аналогии с оптимизатором запросов в реляционных СУБД (PostgreSQL `EXPLAIN ANALYZE`), оптимизатор DAG отделяет **Логический план** (что хочет получить ИИ) от **Физического плана** (как дешевле и чище вычислить сетку).
+   - Применяет 5 правил алгебраической и геометрической перезаписи (`R1_TRANSFORM_FUSION`, `R2_AABB_DEAD_OP_CULLING`, `R3_DEMORGAN_CSG_BATCH`, `R4_COAXIAL_REVOLVE_REDUCTION`, `R5_ANALYTICAL_PRISM_THREAD_FUSION`), снижая вычислительную стоимость до **60–82%**, устраняя вырожденные треугольники (sliver triangles) перед МКЭ-расчетом TET4 и строго верифицируя сохранение объема ($\Delta V < 0.5\%$), AABB и замкнутости сетки (Watertight).
+
 ---
 
-## 🛠️ Сводная таблица инструментов MCP (26 Tools)
+## 🛠️ Сводная таблица инструментов MCP (28 Tools)
 
 | № | Имя инструмента | Входные параметры | Выходные данные | Назначение |
 |:---:|---|---|---|---|
@@ -209,7 +226,7 @@ MCP-CAD Engine спроектирован специально для преод
 | **14** | `query_part_geometry` | `part_id: str` | `{ part_id: str, bounding_box: obj, volume: num, surface_area: num, center_of_mass: [3], faces_count: int, vertices_count: int, detected_planar_faces: [...] }` | Детальная топологическая инспекция: AABB, объем, площадь, центр масс и плоские грани |
 | **15** | `define_material` | `id: str`, `young_modulus_gpa: num`, `poisson_ratio: num`, `yield_strength_mpa: num`, `density_kg_m3: num`, `name?: str` | `{ status: "material_registered", material_id: str, properties: obj }` | Зарегистрировать кастомный материал для МКЭ прочности и расчета масс |
 | **16** | `batch_cad_operations` | `operations: [...]` | `{ success: bool, count: int, results: [...] }` | Пакетное атомарное выполнение цепочки операций без сетевых задержек roundtrip |
-| **17** | `create_joint` | `joint_type: str`, `part_a: str`, `part_b: str`, `anchor_a: [3]`, `anchor_b: [3]`, `axis?: [3]`, `limits?: [2]` | `{ joint_id: str }` | Создать сочленение (`revolute`, `prismatic`, `spherical`, `fixed`) |
+| **17** | `create_joint` | `joint_type: str`, `part_a: str`, `part_b: str`, `anchor_a: [3]`, `anchor_b: [3]`, `axis?: [3]`, `limits?: [2]` | `{ joint_id: str }` | Создать сочленение (`revolute`, `prismatic`, `spherical`, `fixed`, `gear`) |
 | **18** | `set_joint_motor` | `joint_id: str`, `target_velocity: num`, `max_force: num` | `{ status: "motor_active" }` | Включить сервопривод скорости на сочленении |
 | **19** | `run_physics_simulation` | `duration_seconds: num`, `step_size_ms?: num` | `{ success: bool, steps_simulated: int, trajectory_summary: obj, peak_joint_forces: obj, collisions: [...] }` | Провести динамическую симуляцию механизма во времени |
 | **20** | `run_fea_analysis` | `part_id: str`, `mesh_density?: str`, `fixed_faces?: [str]`, `fixed_plane?: obj`, `applied_forces?: [...]` | `{ max_von_mises_mpa: num, yield_strength_mpa: num, safety_factor: num, max_displacement_mm: num, status: "PASS"\|"FAIL" }` | Выполнить 3D МКЭ-расчет прочности (TET4) |
@@ -219,9 +236,11 @@ MCP-CAD Engine спроектирован специально для преод
 | **24** | `get_simulation_metrics_json` | *(нет)* | `{ current_metrics: obj }` | Получить агрегированный отчет по всей сцене и расчетам |
 | **25** | `open_preview_window` | `part_id?: str` | `{ status: "preview_window_opened" }` | Открыть или сфокусировать нативное окно 3D-просмотра |
 | **26** | `import_stl` | `filepath: str`, `name?: str`, `material?: str` | `{ part_id: str, name: str, vertices_count: int, triangles_count: int, status: "stl_imported" }` | Импортировать готовую 3D-модель STL в сцену и 3D-вьюпорт |
+| **27** | `validate_mesh` | `part_id: str` | `{ is_watertight: bool, boundary_edges_count: int, non_manifold_edges_count: int, euler_characteristic: int, genus: int, status: "PASS"\|"WARN" }` | Топологическая диагностика замкнутости сетки (Watertight, эйлерова характеристика, род поверхности $g$) |
+| **28** | `optimize_feature_tree` | `part_id: str`, `apply?: bool` | `{ status: "optimized", applied: bool, logical_nodes_count: int, physical_nodes_count: int, cost_reduction_pct: num, explain_analyze_text: str, ... }` | Стоимостной оптимизатор дерева операций (`EXPLAIN ANALYZE`): перезапись и сжатие DAG с проверкой инвариантов |
 
 > [!TIP]
-> Полная документация с примерами JSON-RPC запросов и ответов для всех 26 инструментов представлена в документе [Справочник API инструментов MCP](docs/MCP_API_REFERENCE.md).
+> Полная документация с примерами JSON-RPC запросов и ответов для всех 28 инструментов представлена в документе [Справочник API инструментов MCP](docs/MCP_API_REFERENCE.md).
 
 ---
 
@@ -282,7 +301,7 @@ graph TD
 В репозитории реализован полный набор юнит-, интеграционных и верификационных тестов:
 - **Аналитическая верификация МКЭ**: Сравнение численного прогиба консольной балки под изгибом с теоретической формулой сопротивления материалов ($\delta = \frac{F L^3}{3 E I}$, совпадение с точностью до 5%).
 - **Верификация кинематики**: Тестирование степеней свободы сочленений Rapier3D, работы моторов и детекции коллизий.
-- **Сквозное E2E тестирование MCP**: Проверка обработки всех 26 инструментов и соответствия схеме MCP 2024-11-05 (17 тестов контракта, 100% Passing).
+- **Сквозное E2E тестирование MCP**: Проверка обработки всех 28 инструментов и соответствия схеме MCP 2024-11-05 (18 тестов контракта, 100% Passing).
 
 Запуск всего набора тестов:
 ```powershell
@@ -305,7 +324,7 @@ cargo clippy --workspace -- -D warnings
 ├── README.md                     # Главная страница (данный файл)
 ├── docs/
 │   ├── ARCHITECTURE.md           # Глубокий архитектурный обзор
-│   ├── MCP_API_REFERENCE.md      # Исчерпывающий справочник всех 26 инструментов
+│   ├── MCP_API_REFERENCE.md      # Исчерпывающий справочник всех 28 инструментов
 │   └── CLAUDE_DESKTOP_SETUP.md   # Руководство по подключению к Claude Desktop
 ├── examples/
 │   ├── bracket_design.json       # Пример проекта силового L-кронштейна

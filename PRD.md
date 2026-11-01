@@ -76,9 +76,9 @@ graph TD
     end
 
     subgraph Viewport & Presentation Windows
-        WINIT[Winit Window & Event Loop]
+        WINIT[Winit Native Window & Keyboard Controls]
         WGPU[WGPU Renderer: Mesh, Wireframe, Heatmaps]
-        EGUI[Egui HUD: Telemetry, Logs, Tree View]
+        WEB_HUD[MCP-CAD Studio Web HUD: Telemetry, DAG, CBO Optimizer]
         OFFSCREEN[Off-screen Framebuffer Reader PNG]
     end
 
@@ -100,7 +100,7 @@ graph TD
     FEA -->|Stress Heatmap| WGPU
     RAPIER -->|Transform Updates| WGPU
     WGPU --> WINIT
-    WGPU --> EGUI
+    DISPATCH <-->|JSON-RPC / Bridge| WEB_HUD
     WGPU --> OFFSCREEN
     OFFSCREEN -->|Base64 PNG Image| DISPATCH
     FEA -->|JSON Metrics| DISPATCH
@@ -117,14 +117,20 @@ graph TD
   - Каждая деталь имеет уникальный `part_id` и последовательность шагов-операций (`FeatureNode`).
   - Типы операций:
     - `AddBox(width, height, depth)`
-    - `AddCylinder(radius, height)`
-    - `AddSphere(radius)`
-    - `ExtrudeSketch(profile_2d, depth)`
-    - `CutHole(center, radius, depth)`
-    - `Fillet / Chamfer(edges, radius)`
-    - `BooleanUnion`, `BooleanDifference`, `BooleanIntersection`
-    - `Transform(translation, rotation, scale)`
+    - `AddCylinder(radius, height, segments)`
+    - `AddSphere(radius, sectors, stacks)`
+    - `AddCone(radius_bottom, radius_top, height, segments)`
+    - `AddPolygonPrism(sides, height, width_across_flats, radius, chamfer)` (включая коническую фаску по DIN 934)
+    - `AddSpurGear(module, teeth, pressure_angle_deg, face_width, bore_radius, keyway_width, keyway_depth, hub_diameter, hub_length)`
+    - `AddRevolve(profile_2d, angle_deg, segments)` (вращение 2D-профиля `[r, z]` вокруг оси Z)
+    - `AddWheelRim(rim_diameter, rim_width, ...)`
+    - `CutHole(center, normal, radius, depth, keyway_width, keyway_depth)`
+    - `CutHelicalGroove(helix_radius, groove_radius, pitch, height, start_z, starts, is_right_hand, profile_type)`
+    - `BooleanUnionMesh`, `BooleanDifferenceMesh`, `BooleanIntersectionMesh`
+    - `Transform(translation, rotation_deg, scale)`
+    - *Roadmap / Future Scope*: `ExtrudeSketch(profile_2d, depth)` и произвольный `Fillet(edges, radius)` на ребрах B-Rep.
   - **Редактирование параметров**: ИИ может вызвать `modify_feature(part_id, feature_id, params)`, что вызывает автоматический пересчет геометрии детали от измененного узла вниз по графу.
+  - **Стоимостной оптимизатор (`optimize_feature_tree`)**: Алгебраическая перезапись и сжатие дерева операций DAG (правила `R1`–`R5`) с верификацией топологической и объемной эквивалентности ($\Delta V < 0.5\%$).
 
 ### 4.2. Подсистема динамики механизмов (Rigid Body & Joints)
 - **Стек**: `rapier3d` (чистый Rust).
@@ -178,8 +184,8 @@ graph TD
 
 ИИ может добавлять собственные материалы через инструмент `define_material`.
 
-### 4.5. Визуализация и Окно на Windows
-- **Стек**: `wgpu`, `winit`, `egui`.
+### 4.5. Визуализация: Нативное окно WGPU и Веб-студия MCP-CAD Studio
+- **Стек**: Нативное окно `wgpu` + `winit` (без зависимости от `egui`) с управлением горячими клавишами (`Q` — пресеты тесселяции, `P` — пауза/воспроизведение анимации, `R` — сброс камеры) и полнофункциональный веб-интерфейс **MCP-CAD Studio** (React 19 + Three.js + Tailwind CSS) для интерактивной телеметрии, дерева операций DAG и панели Cost-Based Query Optimizer (`EXPLAIN ANALYZE`).
 - **Графический пайплайн**:
   - Рендеринг затененных твердых тел (PBR/Blinn-Phong) с контурными линиями граней (CAD-стиль).
   - Рендеринг сочленений: оси шарниров, векторы приводов, маркеры степеней свободы.
@@ -208,14 +214,26 @@ graph TD
 ### 5.2. Параметрическое моделирование (DAG-операции)
 - `add_feature_primitive(part_id: string, primitive_type: "box"|"cylinder"|"sphere"|"cone"|"polygon_prism"|"spur_gear"|"revolve"|"wheel_rim", params: object) -> { feature_id: string }`
   Добавляет базовый твердотельный объем.
-- `apply_boolean(part_id: string, target_feature_id: string, tool_feature_id: string, op: "union"|"difference"|"intersection") -> { feature_id: string }`
-  Выполняет булеву операцию между телами.
+- `boolean_difference(target_part_id: string, tool_part_id: string) -> { feature_id: string, status: "boolean_difference_applied" }`
+  Вычитает геометрию инструмента `tool_part_id` из целевой детали `target_part_id` (CSG Difference).
+- `boolean_union(target_part_id: string, tool_part_id: string) -> { target_part_id: string, feature_id: string, status: "union_applied", vertices_count: u32, triangles_count: u32 }`
+  Объединяет геометрию инструмента `tool_part_id` с целевой деталью `target_part_id` (CSG Union).
+- `boolean_intersection(target_part_id: string, tool_part_id: string) -> { target_part_id: string, feature_id: string, status: "intersection_applied", vertices_count: u32, triangles_count: u32 }`
+  Пересекает геометрию инструмента `tool_part_id` с целевой деталью `target_part_id` (CSG Intersection).
+- `transform_part(part_id: string, translation?: [f32; 3], rotation_deg?: [f32; 3], scale?: [f32; 3]) -> { part_id: string, feature_id: string, status: "transformed", bounding_box: object, volume: f64 }`
+  Пространственная трансформация детали в DAG.
 - `cut_hole(part_id: string, position: [f32; 3], normal: [f32; 3], radius: f32, depth: f32, keyway_width?: f32, keyway_depth?: f32) -> { feature_id: string }`
   Отверстие под вал, крепеж или ось со шпоночным пазом.
+- `cut_helical_groove(part_id: string, helix_radius: f32, groove_radius: f32, pitch: f32, height: f32, start_z?: f32, starts?: u32, is_right_hand?: bool, profile_type?: "circular"|"metric_60") -> { feature_id: string, status: "helical_groove_cut" }`
+  Нарезка спиральных канавок сверл или метрической резьбы 60° (ISO 68-1).
 - `modify_feature(part_id: string, feature_id: string, new_params: object) -> { status: "updated", updated_bounds: [...] }`
   Редактирование любого параметра в истории построения.
 - `get_feature_tree(part_id: string) -> { dag: [...] }`
   Получение полной структуры дерева операций детали.
+- `optimize_feature_tree(part_id: string, apply?: bool) -> { status: "optimized", cost_reduction_pct: f64, explain_analyze_text: string, ... }`
+  Стоимостной оптимизатор дерева операций (`EXPLAIN ANALYZE`) с алгебраической перезаписью DAG.
+- `validate_mesh(part_id: string, expected_genus?: i32) -> { status: "PASS"|"FAIL", topology: object, geometry: object }`
+  12-точечная топологическая и геометрическая диагностика сетки.
 
 ### 5.3. Механизмы и кинематика
 - `create_joint(joint_type: "revolute"|"prismatic"|"spherical"|"fixed"|"gear", part_a: string, part_b: string, anchor_a?: [f32; 3], anchor_b?: [f32; 3], axis?: [f32; 3], ratio?: f32, teeth_a?: u32, teeth_b?: u32, limits?: object) -> { joint_id: string }`

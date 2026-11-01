@@ -102,6 +102,18 @@ graph TD
   - `part`: Структура `Part` с ленивой тесселяцией: кэш сетки `cached_mesh`, настройки `tessellation_settings`, метод `tessellate(settings)` с автоинвалидацией при редактировании дерева операций, инспекция `inspect_geometry()`.
   - `export_stl`: Генератор стандартного STL формата (бинарный и ASCII), функция `export_part_stl_with_quality` для экспорта с заданным качеством (`Coarse`, `Medium`, `Fine`, `Custom`).
   - `import_stl`: Парсер бинарных и текстовых STL файлов с оптимизацией и сшивкой вершин.
+  - `query_optimizer`: **Cost-Based CAD Query Optimizer (CBO)** — подсистема оптимизации дерева операций Solid DAG по аналогии с планировщиком запросов СУБД (`EXPLAIN ANALYZE`):
+    - **Разделение планов**: ИИ-агент формирует декларативный *Логический план* (цепочку примитивов, отверстий, булевых вычитаний и трансформаций), а оптимизатор генерирует эквивалентные *Физические планы исполнения* и выбирает план с минимальной стоимостью $\min \text{Cost}(P)$.
+    - **Функция стоимости (Cost Model)**:
+      $$\text{Cost}(P) = w_{\text{csg}} \cdot N_{\text{3D\_CSG}} \cdot \log_2(T) + w_{\text{tri}} \cdot T_{\text{total}} + w_{\text{sliver}} \cdot P_{\text{sliver}} + w_{\text{nodes}} \cdot |V_{\text{DAG}}|$$
+      где учитываются вычислительная сложность 3D булевых пересечений, число треугольников $T$, риск вырожденных иглообразных граней (sliver triangles при касательных CSG), которые портят матрицу жесткости МКЭ TET4, и длина графа.
+    - **Алгебраические и геометрические правила перезаписи (Rewrite Rules)**:
+      1. `R1_TRANSFORM_FUSION` (Constant Folding матриц): свертка цепочек последовательных трансформаций $T_n \circ \dots \circ T_1$ в одну матрицу $\mathbf{M} \in SE(3)$ или проталкивание (Pushdown) смещения непосредственно в параметры примитива/отверстия, а также удаление нейтральных трансформаций ($T=[0,0,0], R=[0,0,0], S=[1,1,1]$).
+      2. `R2_AABB_DEAD_OP_CULLING` (Spatial Dead-Code Elimination & Deduplication): отсечение «мертвых» операций `cut_hole` / `boolean_difference`, чей ограничивающий объем $\text{AABB}_{\text{tool}} \cap \text{AABB}_{\text{target}} = \emptyset$ («сверление воздуха»), и дедупликация идентичных соосных отверстий.
+      3. `R3_DEMORGAN_CSG_BATCH` (Понижение размерности 3D CSG $\to$ 2D Profile Pattern): применение закона Де Моргана $A \setminus B_1 \setminus \dots \setminus B_k \equiv A \setminus \bigcup_{i=1}^k B_i$ для компланарных отверстий с одной нормалью $\mathbf{n}$ и пакетная перфорация за 1 проход триангуляции без промежуточных 3D перестроений сетки.
+      4. `R4_COAXIAL_REVOLVE_REDUCTION` (3D CSG $\to$ 2D Annular Profile Revolve): замена соосного цилиндра и сквозного центрального отверстия (`cylinder` + `cut_hole` вдоль оси Z) на однопроходное вращение 2D кольцевого профиля (`revolve` с `inner_radius`), исключающее 3D булево вычитание и гарантирующее 100% замкнутую сетку (Watertight, род поверхности $g=1$).
+      5. `R5_ANALYTICAL_PRISM_THREAD_FUSION`: слияние шестигранной/многогранной призмы (`polygon_prism`), центрального отверстия (`cut_hole`) и соосной метрической резьбы (`cut_helical_groove`) в единый аналитический проход генерации гайки/резьбовой втулки.
+    - **Верификация инвариантов эквивалентности**: перед фиксацией физического плана проверяется сохранение объема ($\Delta V / V < 0.5\%$), габаритного контейнера ($\Delta \text{AABB} < 10^{-3}$), замкнутости сетки ($\partial M = \emptyset$, 0 открытых граничных ребер) и характеристики Эйлера — Пуанкаре ($V - E + F = 2 - 2g$).
 
 ### 4.2. `crates/mcp-cad-physics`
 - **Назначение**: Симуляция кинематики и динамики твердых тел на базе `rapier3d`.
@@ -145,15 +157,15 @@ graph TD
   - `window`: Нативное интерактивное 3D-окно на `winit` + WGPU с управлением камерой мышь/клавиатура и динамическим переключением качества тесселяции (клавиша `'Q'`: Coarse $\to$ Medium $\to$ Fine) на лету.
 
 ### 4.5. `crates/mcp-cad-server`
-- **Назначение**: Запуск приложения, реализация протокола MCP (Model Context Protocol), маршрутизация запросов (всего 26 инженерных инструментов).
+- **Назначение**: Запуск приложения, реализация протокола MCP (Model Context Protocol), маршрутизация запросов (всего 28 инженерных инструментов).
 - **Основные компоненты**:
   - `main.rs`: Парсер аргументов CLI (`--mode stdio`, `--mode sse`, `--port 8080`, `--headless`, `--stl`, `--file`).
   - `mcp`: Сервер протокола MCP (JSON-RPC 2.0).
     - `stdio`: Чтение из `stdin`, ответ в `stdout`. **Внимание:** Все логи (`tracing`/`eprintln!`) пишутся строго в `stderr`.
     - `sse`: HTTP сервер (Axum) с поддержкой Server-Sent Events на указанном порту.
-  - `tool_handlers`: Реестр и обработчики 26 инструментов MCP:
-    - Детали, топология и тесселяция: `create_part`, `list_parts`, `delete_part`, `tessellate_part`, `query_part_geometry`, `transform_part`.
-    - Моделирование (Solid DAG): `add_feature_primitive`, `cut_hole`, `cut_helical_groove`, `boolean_difference`, `boolean_union`, `boolean_intersection`, `modify_feature`, `get_feature_tree`.
+  - `tool_handlers`: Реестр и обработчики 28 инструментов MCP:
+    - Детали, топология, тесселяция и валидация сетки: `create_part`, `list_parts`, `delete_part`, `tessellate_part`, `query_part_geometry`, `validate_mesh`, `transform_part`.
+    - Моделирование (Solid DAG) и стоимостная оптимизация: `add_feature_primitive`, `cut_hole`, `cut_helical_groove`, `boolean_difference`, `boolean_union`, `boolean_intersection`, `modify_feature`, `get_feature_tree`, `optimize_feature_tree`.
     - Библиотека материалов: `define_material`.
     - Пакетная автоматизация: `batch_cad_operations`.
     - Механизмы: `create_joint`, `set_joint_motor`, `run_physics_simulation`.
@@ -208,15 +220,15 @@ graph TD
 
 ### 6.4. Стандарты тестирования
 - Каждый модуль сопровождается исчерпывающими юнит- и интеграционными тестами (`#[cfg(test)]`).
-- **Актуальный статус тестов**: **99 тестов во всех 5 крейтах workspace (100% Passing)**:
-  - `mcp-cad-core`: 35 юнит-тестов + 14 тестов DAG + 6 тестов адаптивной тесселяции = **55 тестов**.
+- **Актуальный статус тестов**: **103 теста во всех 5 крейтах workspace (100% Passing)**:
+  - `mcp-cad-core`: 38 юнит-тестов (включая CBO Query Optimizer) + 14 тестов DAG + 6 тестов адаптивной тесселяции = **58 тестов**.
   - `mcp-cad-fea`: 5 юнит-тестов + 6 интеграционных тестов (включая аналитическую верификацию балки, осевое растяжение и адаптивный пайплайн) = **11 тестов**.
   - `mcp-cad-physics`: 6 интеграционных тестов кинематики и соударений = **6 тестов**.
   - `mcp-cad-viewer`: 9 интеграционных тестов рендеринга и тепловых карт = **9 тестов**.
-  - `mcp-cad-server`: 17 сквозных тестов MCP контрактов JSON-RPC + 1 интеграционный кинематический тест редуктора = **18 тестов**.
+  - `mcp-cad-server`: 18 сквозных тестов MCP контрактов JSON-RPC + 1 интеграционный кинематический тест редуктора = **19 тестов**.
 - **Верификационные тесты МКЭ (`mcp-cad-fea`)**: сравнение численных результатов расчета консольной балки под изгибом с теоретической формулой сопротивления материалов ($\delta = \frac{F L^3}{3 E I}$, погрешность не более 5-10% на средней сетке).
 - **Тесты кинематики (`mcp-cad-physics`)**: верификация сохранения степеней свободы шарниров и детекции коллизий.
-- Интеграционные тесты проверяют корректность выполнения всех 26 инструментов MCP через вызовы диспетчера.
+- Интеграционные тесты проверяют корректность выполнения всех 28 инструментов MCP через вызовы диспетчера.
 - Команда проверки:
   ```powershell
   cargo test --workspace
@@ -234,9 +246,9 @@ graph TD
 
 ---
 
-## 7. Спецификация контрактов инструментов MCP (Tools API, 26 инструментов)
+## 7. Спецификация контрактов инструментов MCP (Tools API, 28 инструментов)
 
-Ниже зафиксированы схемы всех 26 инструментов для обеспечения консистентности между субагентами:
+Ниже зафиксированы схемы всех 28 инструментов для обеспечения консистентности между субагентами:
 
 | Имя инструмента | Входные параметры | Выходные данные | Описание |
 |---|---|---|---|
@@ -252,8 +264,10 @@ graph TD
 | `transform_part` | `part_id: String`, `translation?: [f64; 3]`, `rotation_deg?: [f64; 3]`, `scale?: [f64; 3]` | `{ part_id: String, feature_id: String, status: "transformed", bounding_box: Object, volume: f64 }` | Пространственная трансформация (смещение, вращение RPY, масштаб) в DAG детали |
 | `modify_feature` | `part_id: String`, `feature_id: String`, `params: Object` | `{ status: "updated", dimensions: ... }` | Изменить шаг в истории |
 | `get_feature_tree` | `part_id: String` | `{ dag: Vec<FeatureNodeView> }` | Получить дерево операций |
+| `optimize_feature_tree` | `part_id: String`, `apply?: bool` | `{ status: "optimized", applied: bool, logical_nodes_count: usize, physical_nodes_count: usize, cost_reduction_pct: f64, explain_analyze_text: String, ... }` | Cost-Based CAD Query Optimizer (`EXPLAIN ANALYZE`): перезапись и оптимизация DAG дерева операций |
 | `tessellate_part` | `part_id: String`, `quality?: "coarse"\|"medium"\|"fine"`, `chord_tolerance?: f64`, `angular_tolerance_deg?: f64`, `max_edge_length?: f64` | `{ part_id: String, quality: String, vertices_count: usize, triangles_count: usize }` | Выполнить ленивую адаптивную тесселяцию детали с заданными допусками |
 | `query_part_geometry` | `part_id: String` | `{ part_id: String, bounding_box: Object, volume: f64, surface_area: f64, center_of_mass: [f64; 3], faces_count: usize, vertices_count: usize, detected_planar_faces: Vec<PlanarFaceInfo> }` | Инспекция топологии: AABB, объем, площадь, центр масс, полигоны и компланарные грани |
+| `validate_mesh` | `part_id: String` | `{ is_watertight: bool, boundary_edges_count: usize, non_manifold_edges_count: usize, euler_characteristic: i32, genus: i32, status: "PASS"\|"WARN" }` | Топологическая диагностика замкнутости сетки (Watertight, эйлерова характеристика, род поверхности $g$) |
 | `define_material` | `id: String`, `young_modulus_gpa: f64`, `poisson_ratio: f64`, `yield_strength_mpa: f64`, `density_kg_m3: f64`, `name?: String` | `{ status: "material_registered", material_id: String, properties: Object }` | Регистрация кастомного инженерного материала для МКЭ и расчета масс |
 | `batch_cad_operations` | `operations: Vec<{ tool: String, params: Object }>` | `{ success: bool, count: usize, results: Vec<Value> }` | Пакетное атомарное выполнение цепочки операций без задержек roundtrip |
 | `create_joint` | `joint_type`, `part_a`, `part_b`, `anchor_a?`, `anchor_b?`, `axis?`, `axis_a?`, `axis_b?`, `ratio?`, `teeth_a?`, `teeth_b?`, `limits?` | `{ joint_id: String }` | Создать сочленение (revolute, prismatic, spherical, fixed, gear; поддержка `"ground"`/`"world"`) |

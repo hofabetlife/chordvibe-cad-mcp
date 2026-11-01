@@ -12,6 +12,10 @@
 | BUG-008 | S2 | cad tools: failed rebuild leaves invalid FeatureNode in part DAG, poisoning subsequent operations | server/tools/cad | FIXED | `8a0e8bb` | 2026-10-30 |
 | BUG-009 | S2 | batch_cad_operations: partial failure does not roll back state mutations from earlier steps | server/tools/cad | FIXED | `13bc330` | 2026-10-30 |
 | BUG-010 | S3 | open_preview_window: does not validate part_id existence when running in headless mode | server/tools/render | FIXED | `66e8a81` | 2026-10-30 |
+| BUG-011 | S2 | optimize_feature_tree (CBO) is missing from Rust crates/mcp-cad-core & mcp-cad-server | core & server | FIXED | `current` | 2026-11-01 |
+| BUG-012 | S3 | list_tools() omits validate_mesh and optimize_feature_tree (26 vs 28 tools discrepancy) | server/tools/mod | FIXED | `current` | 2026-11-01 |
+| BUG-013 | S4 | Documentation inconsistency: references to 26 tools vs 28 tools across README and ARCHITECTURE | docs | FIXED | `current` | 2026-11-01 |
+| BUG-014 | S3 | TypeScript compilation errors in mcp-cad-studio (NativeBridgeStatus, titleRu, QualityPreset) | web/typescript | FIXED | `current` | 2026-10-31 |
 
 ---
 
@@ -116,3 +120,34 @@
   - `open_preview_window` проверяет наличие `part_id` в `state.parts` перед ветвлением по режиму работы (headless / GUI). Если деталь отсутствует — возвращается `ServerError::PartNotFound`.
   - `capture_viewport` валидирует `width > 0 && height > 0`, возвращая `ServerError::InvalidArgument` при нулевых габаритах.
 - **Верификация**: `test_bug_010_viewport_and_preview_validation` подтвердил возврат корректных ошибок.
+
+---
+
+## BUG-011 [S2][FIXED] core & server: `optimize_feature_tree` портирован в Rust-крейты
+- **Компонент**: `crates/mcp-cad-core/src/query_optimizer.rs`, `crates/mcp-cad-core/src/part.rs`, `crates/mcp-cad-server/src/tools/cad.rs`
+- **Причина**: Оптимизатор графа операций (Cost-Based Optimizer) с правилами R1–R5 и соответствующий инструмент MCP были реализованы на клиенте в TypeScript (`src/cad/query_optimizer.ts`, `src/cad/mcp_dispatcher.ts`), но не портированы в `crates/mcp-cad-core` и `crates/mcp-cad-server`.
+- **Исправление**: Реализован модуль `crates/mcp-cad-core/src/query_optimizer.rs` с правилами `R1_TRANSFORM_FUSION`, `R2_AABB_DEAD_OP_CULLING`, `R3_DEMORGAN_CSG_BATCH`, `R4_COAXIAL_REVOLVE_REDUCTION`, `R5_ANALYTICAL_PRISM_THREAD_FUSION`, методом `part.optimize_dag(apply)` и обработчиком `cad::optimize_feature_tree` в `crates/mcp-cad-server`.
+- **Верификация**: Юнит-тесты `test_r4_coaxial_bushing_cylinder_hole_to_revolve`, `test_r2_aabb_dead_op_culling_and_r1_transform_fusion`, `test_r5_prism_thread_fusion` и контрактный тест `test_mcp_optimize_feature_tree_cbo` подтверждают сохранение объема ($\Delta V < 0.5\%$) и топологических инвариантов.
+
+---
+
+## BUG-012 [S3][FIXED] server: `list_tools()` экспортирует все 28 инструментов (`validate_mesh` и `optimize_feature_tree`)
+- **Компонент**: `crates/mcp-cad-server/src/tools/mod.rs`
+- **Причина**: Функция `list_tools()` возвращала 26 инструментов, опуская инструмент №27 `validate_mesh` и инструмент №28 `optimize_feature_tree`.
+- **Исправление**: В `list_tools()` добавлены полные JSON-Schema определения для `validate_mesh` (Tool #27) и `optimize_feature_tree` (Tool #28), а в `dispatch_tool()` подключен маршрут `"optimize_feature_tree"`.
+- **Верификация**: `test_mcp_tools_list` проверяет `assert_eq!(tools.len(), 28)` и наличие всех 28 инструментов.
+
+---
+
+## BUG-013 [S4][FIXED] docs: синхронизировано количество инструментов (28 Tools)
+- **Компонент**: `README.md`, `docs/ARCHITECTURE.md`, `PROJECT_CONTEXT.md`, `qa/COVERAGE.md`
+- **Причина**: В разных разделах документации упоминалось 26 либо 28 инструментов.
+- **Исправление**: Все упоминания в `README.md`, `docs/ARCHITECTURE.md`, `PROJECT_CONTEXT.md` и `qa/COVERAGE.md` унифицированы на 28 инструментов.
+
+---
+
+## BUG-014 [S3][FIXED] web/typescript: ошибки типов tsc --noEmit в mcp-cad-studio
+- **Компонент**: `src/App.tsx`, `src/types/cad.ts`, `src/cad/native_bridge.ts`
+- **Причина**: Несовпадение типов `NativeBridgeStatus`, свойства `titleRu`, расширение допустимых значений `QualityPreset` (`fine`), отсутствие `@types/node`.
+- **Исправление**: Экспортирован `NativeBridgeStatus`, добавлены типы, скорректированы вызовы, установлен `@types/node`.
+- **Верификация**: `tsc --noEmit` и `npm run build` завершаются с кодом 0 (0 ошибок).

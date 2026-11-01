@@ -68,8 +68,8 @@ async fn test_mcp_tools_list() {
         .as_array()
         .expect("tools must be an array");
 
-    // Must declare exactly 26 tools
-    assert_eq!(tools.len(), 26, "Server must expose exactly 26 MCP tools");
+    // Must declare exactly 28 tools
+    assert_eq!(tools.len(), 28, "Server must expose exactly 28 MCP tools");
 
     let expected_tools = [
         "create_part",
@@ -98,6 +98,8 @@ async fn test_mcp_tools_list() {
         "transform_part",
         "define_material",
         "batch_cad_operations",
+        "validate_mesh",
+        "optimize_feature_tree",
     ];
 
     let mut found_names = HashSet::new();
@@ -2221,3 +2223,110 @@ async fn test_mcp_validate_mesh_and_debug_viewport_modes() {
         assert_eq!(&bytes[0..8], &PNG_MAGIC, "PNG signature mismatch for mode {}", mode);
     }
 }
+
+#[tokio::test]
+async fn test_mcp_optimize_feature_tree_cbo() {
+    let state = EngineState::new()
+        .expect("EngineState initialization failed")
+        .into_shared();
+
+    // 1. Create a coaxial bushing part (Cylinder + coaxial through CutHole + disjoint CutHole + sequential Transforms)
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 950,
+        "method": "tools/call",
+        "params": {
+            "name": "create_part",
+            "arguments": {
+                "name": "Precision Coaxial Bushing",
+                "material": "steel_structural_aisi1020"
+            }
+        }
+    })).await;
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let part_id = serde_json::from_str::<Value>(text).unwrap()["part_id"].as_str().unwrap().to_string();
+
+    // 2. Add cylinder primitive
+    rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 951,
+        "method": "tools/call",
+        "params": {
+            "name": "add_feature_primitive",
+            "arguments": {
+                "part_id": part_id,
+                "primitive_type": "cylinder",
+                "params": {
+                    "radius": 0.04,
+                    "height": 0.06,
+                    "segments": 32
+                }
+            }
+        }
+    })).await;
+
+    // 3. Cut coaxial central bore
+    rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 952,
+        "method": "tools/call",
+        "params": {
+            "name": "cut_hole",
+            "arguments": {
+                "part_id": part_id,
+                "position": [0.0, 0.0, 0.0],
+                "normal": [0.0, 0.0, 1.0],
+                "radius": 0.02,
+                "depth": 0.08
+            }
+        }
+    })).await;
+
+    // 4. Cut disjoint hole outside AABB (should be culled by R2)
+    rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 953,
+        "method": "tools/call",
+        "params": {
+            "name": "cut_hole",
+            "arguments": {
+                "part_id": part_id,
+                "position": [2.0, 2.0, 0.0],
+                "normal": [0.0, 0.0, 1.0],
+                "radius": 0.01,
+                "depth": 0.05
+            }
+        }
+    })).await;
+
+    // 5. Call optimize_feature_tree with apply: true
+    let opt_resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 954,
+        "method": "tools/call",
+        "params": {
+            "name": "optimize_feature_tree",
+            "arguments": {
+                "part_id": part_id,
+                "apply": true
+            }
+        }
+    })).await;
+    assert_eq!(opt_resp["id"], 954);
+    let opt_text = opt_resp["result"]["content"][0]["text"].as_str().unwrap();
+    let opt_data: Value = serde_json::from_str(opt_text).unwrap();
+
+    assert_eq!(opt_data["status"], "optimized");
+    assert_eq!(opt_data["applied"], true);
+    assert_eq!(opt_data["logical_nodes_count"], 3);
+    assert_eq!(opt_data["physical_nodes_count"], 1);
+    assert!(opt_data["cost_reduction_pct"].as_f64().unwrap() > 0.0);
+    assert!(opt_data["explain_analyze_text"].as_str().unwrap().contains("EXPLAIN (ANALYZE, COSTS, TOPOLOGY)"));
+    assert_eq!(opt_data["equivalence_verification"]["passed"], true);
+    assert!(opt_data["equivalence_verification"]["volume_delta_pct"].as_f64().unwrap() < 0.5);
+
+    let rules = opt_data["applied_rules"].as_array().unwrap();
+    assert!(rules.iter().any(|r| r.as_str() == Some("R2_AABB_DEAD_OP_CULLING")));
+    assert!(rules.iter().any(|r| r.as_str() == Some("R4_COAXIAL_REVOLVE_REDUCTION")));
+}
+

@@ -85,6 +85,28 @@ impl Part {
         self.cached_settings = None;
     }
 
+    /// Runs the Cost-Based CAD Query Optimizer on this part's parametric FeatureTree (DAG).
+    /// If `apply` is true, replaces `self.dag` with the optimized physical execution plan and rebuilds the mesh.
+    pub fn optimize_dag(
+        &mut self,
+        apply: bool,
+    ) -> Result<crate::query_optimizer::CadOptimizationReport, CadError> {
+        let settings = self.cached_settings.clone().unwrap_or_default();
+        let (report, optimized_tree) = crate::query_optimizer::optimize_feature_tree_dag(
+            &self.id,
+            &self.name,
+            &self.dag,
+            &settings,
+            apply,
+        )?;
+        if apply {
+            self.dag = optimized_tree;
+            self.invalidate_cache();
+            self.rebuild()?;
+        }
+        Ok(report)
+    }
+
     /// Reference to the current evaluated triangle mesh.
     #[inline]
     pub fn mesh(&self) -> &TriangleMesh {

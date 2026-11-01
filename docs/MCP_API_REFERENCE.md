@@ -33,13 +33,15 @@
    - [18. `import_stl`](#18-import_stl)
    - [19. `export_stl`](#19-export_stl)
    - [20. `get_simulation_metrics_json`](#20-get_simulation_metrics_json)
-7. [Группа 6: Топология, CSG операции, кастомные материалы и пакетная оптимизация](#группа-6-топология-csg-операции-кастомные-материалы-и-пакетная-оптимизация)
+7. [Группа 6: Топология, CSG операции, кастомные материалы и стоимостная оптимизация DAG](#группа-6-топология-csg-операции-кастомные-материалы-и-пакетная-оптимизация)
    - [21. `query_part_geometry`](#21-query_part_geometry)
    - [22. `boolean_union`](#22-boolean_union)
    - [23. `boolean_intersection`](#23-boolean_intersection)
    - [24. `transform_part`](#24-transform_part)
    - [25. `define_material`](#25-define_material)
    - [26. `batch_cad_operations`](#26-batch_cad_operations)
+   - [27. `validate_mesh`](#27-validate_mesh)
+   - [28. `optimize_feature_tree`](#28-optimize_feature_tree)
 
 ---
 
@@ -1341,6 +1343,99 @@
       {
         "type": "text",
         "text": "{\n  \"success\": true,\n  \"count\": 3,\n  \"results\": [\n    {\n      \"part_id\": \"part-shaft-01\"\n    },\n    {\n      \"feature_id\": \"8a9c3f2b-1a2d-4e5f-b6a7-c8d9e0f1a2b3\"\n    },\n    {\n      \"feature_id\": \"4c5d6e7f-8a9b-0c1d-2e3f-4a5b6c7d8e9f\"\n    }\n  ]\n}"
+      }
+    ]
+  }
+}
+```
+
+---
+
+### 27. `validate_mesh`
+
+Выполняет строгую топологическую диагностику полигональной сетки детали на замкнутость (**Watertight**), наличие открытых граничных ребер ($\partial M = \emptyset$), не-многообразных (non-manifold) ребер, вырожденных треугольников нулевой площади, а также вычисляет характеристику Эйлера — Пуанкаре ($\chi = V - E + F$) и топологический род поверхности ($g = 1 - \chi / 2$).
+
+#### Входные параметры
+| Параметр | Тип | Обязательный | Описание |
+|---|---|:---:|---|
+| `part_id` | `string` | **Да** | Идентификатор инспектируемой детали |
+
+#### Пример запроса
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 27,
+  "method": "tools/call",
+  "params": {
+    "name": "validate_mesh",
+    "arguments": {
+      "part_id": "part-bushing-opt"
+    }
+  }
+}
+```
+
+#### Пример ответа
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 27,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"part_id\": \"part-bushing-opt\",\n  \"is_watertight\": true,\n  \"is_manifold\": true,\n  \"boundary_edges_count\": 0,\n  \"non_manifold_edges_count\": 0,\n  \"degenerate_triangles_count\": 0,\n  \"euler_characteristic\": 0,\n  \"genus\": 1,\n  \"vertices_count\": 256,\n  \"triangles_count\": 512,\n  \"status\": \"PASS\"\n}"
+      }
+    ]
+  }
+}
+```
+
+---
+
+### 28. `optimize_feature_tree`
+
+Запускает **Cost-Based CAD Query Optimizer (`EXPLAIN ANALYZE`)** над деревом операций Solid DAG детали. Оптимизатор анализирует построенную ИИ-агентом логическую цепочку шагов, применяет правила алгебраической и геометрической эквивалентной перезаписи, оценивает кандидатов по функции стоимости (Cost Model) и проверяет сохранение топологических инвариантов (объем $\Delta V < 0.5\%$, AABB и замкнутость сетки Watertight).
+
+Поддерживаемые правила перезаписи:
+- `R1_TRANSFORM_FUSION`: Свертка цепочки матриц трансформаций $T_n \circ \dots \circ T_1 \to \mathbf{M} \in SE(3)$, удаление нейтральных сдвигов и проталкивание (Pushdown) смещения в примитив/отверстие.
+- `R2_AABB_DEAD_OP_CULLING`: Отсечение «мертвых» булевых операций и отверстий вне габарита детали ($\text{AABB}_{\text{tool}} \cap \text{AABB}_{\text{target}} = \emptyset$) и дедупликация совпадающих отверстий.
+- `R3_DEMORGAN_CSG_BATCH`: Группировка серии компланарных `cut_hole` по закону Де Моргана $A \setminus B_1 \setminus \dots \setminus B_k \equiv A \setminus \bigcup B_i$ в единый проход перфорации профиля.
+- `R4_COAXIAL_REVOLVE_REDUCTION`: Понижение размерности соосного цилиндра и центрального отверстия (`cylinder` + `cut_hole`) до однопроходного вращения 2D кольцевого профиля (`revolve` с `inner_radius`), гарантирующее 100% замкнутую сетку без 3D CSG.
+- `R5_ANALYTICAL_PRISM_THREAD_FUSION`: Слияние шестигранной призмы (`polygon_prism`), отверстия (`cut_hole`) и метрической резьбы (`cut_helical_groove`) в единый аналитический проход генерации резьбовой детали.
+
+#### Входные параметры
+| Параметр | Тип | Обязательный | Описание |
+|---|---|:---:|---|
+| `part_id` | `string` | **Да** | Идентификатор оптимизируемой детали |
+| `apply` | `boolean` | Нет | Применить ли скомпилированный физический план к детали и перестроить 3D-сетку (по умолчанию `true`; при `false` работает в режиме инспекции `EXPLAIN ANALYZE` без мутации DAG) |
+
+#### Пример запроса
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 28,
+  "method": "tools/call",
+  "params": {
+    "name": "optimize_feature_tree",
+    "arguments": {
+      "part_id": "part-bushing-opt",
+      "apply": true
+    }
+  }
+}
+```
+
+#### Пример ответа
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 28,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"part_id\": \"part-bushing-opt\",\n  \"status\": \"optimized\",\n  \"applied\": true,\n  \"logical_nodes_count\": 5,\n  \"physical_nodes_count\": 1,\n  \"logical_cost\": 562.4,\n  \"physical_cost\": 98.2,\n  \"cost_reduction_pct\": 82.5,\n  \"estimated_speedup_x\": 5.73,\n  \"applied_rules\": [\n    \"R2_AABB_DEAD_OP_CULLING\",\n    \"R1_TRANSFORM_FUSION\",\n    \"R4_COAXIAL_REVOLVE_REDUCTION\"\n  ],\n  \"equivalence_verification\": {\n    \"passed\": true,\n    \"volume_before_cm3\": 79.42,\n    \"volume_after_cm3\": 79.42,\n    \"volume_delta_pct\": 0.0,\n    \"watertight_before\": false,\n    \"watertight_after\": true\n  },\n  \"explain_analyze_text\": \"EXPLAIN (ANALYZE, COSTS, TOPOLOGY) FOR PART 'AI_Coaxial_Bushing_Unoptimized' ...\"\n}"
       }
     ]
   }

@@ -13,7 +13,7 @@ use crate::error::ServerError;
 use crate::protocol::{ToolCallResult, ToolDefinition};
 use crate::state::EngineState;
 
-/// Returns the complete registry of all 26 MCP engineering tools with strict input schemas.
+/// Returns the complete registry of all 28 MCP engineering tools with strict input schemas.
 pub fn list_tools() -> Vec<ToolDefinition> {
     vec![
         // 1. create_part
@@ -787,6 +787,44 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "required": ["operations"]
             }),
         },
+        // 27. validate_mesh
+        ToolDefinition {
+            name: "validate_mesh".to_string(),
+            description: "Performs a 12-point topological and geometric mesh diagnostic (watertightness, manifoldness, winding consistency, Euler characteristic, genus, sliver triangles, T-junctions, and Möller 3D self-intersections)".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "part_id": {
+                        "type": "string",
+                        "description": "Identifier of the part to validate"
+                    },
+                    "expected_genus": {
+                        "type": "integer",
+                        "description": "Optional expected topological genus g = (2 - chi) / 2 (e.g. 0 for sphere/box, 1 for torus/through-hole)"
+                    }
+                },
+                "required": ["part_id"]
+            }),
+        },
+        // 28. optimize_feature_tree
+        ToolDefinition {
+            name: "optimize_feature_tree".to_string(),
+            description: "Runs the Cost-Based CAD Query Optimizer (CBO) on a part's parametric FeatureTree (DAG), applying algebraic CSG rewrite rules (R1-R5), AABB dead-operation culling, and coaxial revolve reduction while verifying volumetric and topological equivalence".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "part_id": {
+                        "type": "string",
+                        "description": "Identifier of the part whose FeatureTree (DAG) should be optimized"
+                    },
+                    "apply": {
+                        "type": "boolean",
+                        "description": "Whether to apply the optimal physical execution plan to the part's DAG and rebuild its mesh (default: true)"
+                    }
+                },
+                "required": ["part_id"]
+            }),
+        },
     ]
 }
 
@@ -905,6 +943,10 @@ pub fn dispatch_tool(
         }
         "validate_mesh" => {
             let res = cad::validate_mesh_tool(args, state)?;
+            ToolCallResult::json(&res).map_err(ServerError::Json)
+        }
+        "optimize_feature_tree" => {
+            let res = cad::optimize_feature_tree(args, state)?;
             ToolCallResult::json(&res).map_err(ServerError::Json)
         }
         other => Err(ServerError::ToolNotFound(other.to_string())),

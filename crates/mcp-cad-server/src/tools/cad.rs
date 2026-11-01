@@ -1718,3 +1718,45 @@ pub fn batch_cad_operations(args: &Value, state: &mut EngineState) -> Result<Val
         "results": results,
     }))
 }
+
+/// 28. `optimize_feature_tree`: Runs the Cost-Based CAD Query Optimizer (CBO) on a part's parametric FeatureTree (DAG).
+pub fn optimize_feature_tree(args: &Value, state: &mut EngineState) -> Result<Value, ServerError> {
+    let part_id = args
+        .get("part_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'part_id'".to_string()))?;
+
+    let apply = args
+        .get("apply")
+        .or_else(|| args.get("apply_best_plan"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let (report, mesh_opt) = {
+        let part = state
+            .parts
+            .get_mut(part_id)
+            .ok_or_else(|| ServerError::PartNotFound(part_id.to_string()))?;
+
+        let report = part.optimize_dag(apply)?;
+        let mesh = if apply {
+            Some(part.mesh().clone())
+        } else {
+            None
+        };
+        (report, mesh)
+    };
+
+    if let Some(mesh_clone) = mesh_opt {
+        state.send_gui_mesh(&mesh_clone);
+        let _ = state.physics_world.remove_part(part_id);
+        if let Some(part) = state.parts.get(part_id) {
+            if !part.mesh().vertices.is_empty() {
+                let _ = state.physics_world.add_part(part, true);
+            }
+        }
+    }
+
+    serde_json::to_value(&report).map_err(ServerError::Json)
+}
+

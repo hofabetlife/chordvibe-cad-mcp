@@ -1,6 +1,6 @@
 # MCP-CAD Engine: Coverage Matrix
 
-Матрица инструментов (26 шт.) по сценариям тестирования:
+Матрица инструментов (28 шт.) по сценариям тестирования:
 - **HP**: Happy path (корректные параметры, штатное выполнение)
 - **BND**: Boundary values (ноль, отрицательные, малые $10^{-6}$, большие $10^3$, NaN/inf)
 - **INV**: Invalid IDs / missing parameters / wrong types
@@ -35,16 +35,18 @@
 | 24 | `transform_part` | PASS | PASS | PASS | PASS | PASS | 100% VERIFIED |
 | 25 | `define_material` | PASS | PASS | PASS | PASS | PASS | 100% VERIFIED |
 | 26 | `batch_cad_operations` | PASS | PASS | PASS | PASS | PASS | 100% VERIFIED |
+| 27 | `validate_mesh` | PASS | PASS | PASS | PASS | PASS | 100% VERIFIED |
+| 28 | `optimize_feature_tree` | PASS | PASS | PASS | PASS | PASS | 100% VERIFIED |
 
 ---
 
 ## Тестовое покрытие по крейтам (Rust Workspace)
 
 1. **`mcp-cad-core`**:
-   - `src/lib.rs` unit tests: 41/41 PASS
+   - `src/lib.rs` unit tests (включая `query_optimizer`): 44/44 PASS
    - `tests/dag_tests.rs`: 14/14 PASS
    - `tests/tessellation_tests.rs`: 6/6 PASS
-   - Итого: **61 тест (100% PASS)**
+   - Итого: **64 теста (100% PASS)**
 
 2. **`mcp-cad-physics`**:
    - `tests/physics_tests.rs`: 6/6 PASS
@@ -61,8 +63,8 @@
 
 5. **`mcp-cad-server`**:
    - `tests/gear_kinematic_test.rs`: 1/1 PASS
-   - `tests/mcp_contract_tests.rs`: 18/18 PASS
+   - `tests/mcp_contract_tests.rs`: 19/19 PASS
    - `tests/qa_wide_scan.rs`: 13/13 PASS
-   - Итого: **32 теста (100% PASS)**
+   - Итого: **33 теста (100% PASS)**
 
-**Всего по проекту: 120 тестов, 0 падений, 0 регрессий, 0 предупреждений Clippy.**
+**Всего по проекту: 124 Rust-теста + 16 TypeScript-тестов = 140 тестов, 0 падений, 0 регрессий, 0 предупреждений Clippy.**
