@@ -212,8 +212,15 @@ export function runPhysicsSimulationTrajectory(
   finalParts: CadPart[];
   finalJoints: KinematicJoint[];
 } {
+  if (!Number.isFinite(durationSec) || durationSec <= 0) {
+    throw new Error('Simulation duration must be a positive finite number (> 0)');
+  }
+  if (!Number.isFinite(dtSec) || dtSec <= 0) {
+    throw new Error('Simulation time step dt must be positive (> 0)');
+  }
+
   const safeDt = Math.max(0.001, Math.min(0.1, dtSec));
-  const steps = Math.max(1, Math.min(600, Math.round(durationSec / safeDt)));
+  const steps = Math.max(1, Math.min(2000, Math.round(durationSec / safeDt)));
 
   let currentParts = initialParts.map((p) => ({
     ...p,

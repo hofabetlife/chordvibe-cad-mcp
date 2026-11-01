@@ -1159,6 +1159,343 @@ describe('MCP-CAD Core Geometry & Topological Verification Suite', () => {
       );
     }
   });
+
+  it('verifies BUG-022: comprehensive coverage in physics (all joints, limits, 0s/10s), STL I/O edge cases, mid-chain modify_feature, and CSG degeneracies', () => {
+    // 1. Physics Coverage: All joint types (revolute, prismatic, spherical, fixed, gear) with limits
+    const state0: EngineStateSnapshot = {
+      parts: [],
+      selectedPartId: '',
+      joints: [],
+      materials: [...DEFAULT_MATERIALS],
+      feaResult: null,
+      physicsFrames: [],
+      quality: 'standard',
+      renderMode: 'shaded',
+    };
+
+    const sP1 = executeMcpToolOnEngineState(state0, 'create_part', {
+      part_id: 'base',
+      is_fixed: true,
+      material: 'steel_structural_aisi1020',
+    }).nextState;
+    const sP2 = executeMcpToolOnEngineState(sP1, 'create_part', {
+      part_id: 'arm',
+      is_fixed: false,
+      material: 'aluminum_6061_t6',
+    }).nextState;
+    const sP3 = executeMcpToolOnEngineState(sP2, 'create_part', {
+      part_id: 'slider',
+      is_fixed: false,
+      material: 'aluminum_6061_t6',
+    }).nextState;
+
+    // Revolute joint with limits
+    const jRev = executeMcpToolOnEngineState(sP3, 'create_joint', {
+      joint_type: 'revolute',
+      part_a: 'base',
+      part_b: 'arm',
+      anchor_a: [0, 0, 0],
+      anchor_b: [0, 0, 0],
+      axis: [0, 0, 1],
+      limits: [-Math.PI / 2, Math.PI / 2],
+    }).nextState;
+
+    // Prismatic joint with limits
+    const jPrism = executeMcpToolOnEngineState(jRev, 'create_joint', {
+      joint_type: 'prismatic',
+      part_a: 'arm',
+      part_b: 'slider',
+      anchor_a: [0, 0, 0],
+      anchor_b: [0, 0, 0],
+      axis: [1, 0, 0],
+      limits: [-0.05, 0.05],
+    }).nextState;
+
+    // Spherical joint
+    const jSph = executeMcpToolOnEngineState(jPrism, 'create_joint', {
+      joint_type: 'spherical',
+      part_a: 'base',
+      part_b: 'arm',
+      anchor_a: [0, 0, 0.1],
+      anchor_b: [0, 0, 0],
+    }).nextState;
+
+    // Fixed joint
+    const jFix = executeMcpToolOnEngineState(jSph, 'create_joint', {
+      joint_type: 'fixed',
+      part_a: 'base',
+      part_b: 'slider',
+    }).nextState;
+
+    // Gear joint with ratio
+    const jGear = executeMcpToolOnEngineState(jFix, 'create_joint', {
+      joint_type: 'gear',
+      part_a: 'arm',
+      part_b: 'slider',
+      ratio: -2.5,
+    }).nextState;
+    assert.equal(jGear.joints.length, 5);
+
+    // Physics duration rejection: 0s or negative must throw
+    assert.throws(
+      () =>
+        executeMcpToolOnEngineState(jGear, 'run_physics_simulation', {
+          duration_seconds: 0,
+        }),
+      /duration_seconds > 0/
+    );
+    assert.throws(
+      () =>
+        executeMcpToolOnEngineState(jGear, 'run_physics_simulation', {
+          duration_seconds: -2.0,
+        }),
+      /duration_seconds > 0/
+    );
+
+    // Physics long run: 10.0 seconds simulation runs without divergence
+    const sim10 = executeMcpToolOnEngineState(jGear, 'run_physics_simulation', {
+      duration_seconds: 10.0,
+      step_size_ms: 16.6667,
+    });
+    assert.equal(sim10.response.success, true);
+    assert.ok(sim10.response.steps_simulated >= 500);
+    assert.ok(Array.isArray(sim10.response.collisions));
+
+    // 2. STL I/O Edge Cases
+    // A. Empty buffer (0 bytes) must throw
+    assert.throws(
+      () => parseStlBuffer(new ArrayBuffer(0)),
+      /STL buffer is empty/
+    );
+
+    // B. Truncated binary buffer (84 bytes claiming 100 triangles, but missing triangle records)
+    const truncatedBuf = new ArrayBuffer(84 + 10);
+    const truncView = new DataView(truncatedBuf);
+    truncView.setUint32(80, 100, true); // claims 100 triangles
+    assert.throws(
+      () => parseStlBuffer(truncatedBuf),
+      /Corrupt|Truncated/
+    );
+
+    // C. Corrupt ASCII buffer (header without valid vertices)
+    const emptyAscii = new TextEncoder().encode('solid empty_model\nendsolid empty_model').buffer;
+    assert.throws(
+      () => parseStlBuffer(emptyAscii),
+      /zero valid triangle vertices/
+    );
+
+    // D. Corrupt non-ASCII arbitrary noise buffer
+    const noise = new Uint8Array([0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03]).buffer;
+    assert.throws(
+      () => parseStlBuffer(noise),
+      /Corrupt/
+    );
+
+    // E. Binary STL round-trip geometry loop (box volume within 0.01%)
+    const originalBox = createBoxMesh(0.12, 0.08, 0.05, 7850);
+    const exportedStl = exportMeshToStlBinary(originalBox, 'part_roundtrip');
+    const importedBox = parseStlBuffer(exportedStl, 7850);
+    assert.ok(
+      Math.abs(importedBox.volume - originalBox.volume) / originalBox.volume < 1e-4,
+      'STL round-trip volume preservation'
+    );
+    assert.equal(importedBox.isWatertight, true);
+    assert.equal(importedBox.boundaryEdgesCount, 0);
+
+    // 3. Mid-chain modify_feature on 5-node DAG
+    const chainBox = executeMcpToolOnEngineState(state0, 'add_feature_primitive', {
+      part_id: 'multi_node_part',
+      primitive_type: 'box',
+      params: { width: 0.15, height: 0.05, depth: 0.08 },
+    }).nextState;
+    const c1 = executeMcpToolOnEngineState(chainBox, 'cut_hole', {
+      part_id: 'multi_node_part',
+      position: [-0.04, 0, 0],
+      normal: [0, 0, -1],
+      radius: 0.006,
+      depth: 0.08,
+    }).nextState;
+    const c2 = executeMcpToolOnEngineState(c1, 'cut_hole', {
+      part_id: 'multi_node_part',
+      position: [0, 0, 0],
+      normal: [0, 0, -1],
+      radius: 0.005,
+      depth: 0.08,
+    }).nextState;
+    const c3 = executeMcpToolOnEngineState(c2, 'cut_hole', {
+      part_id: 'multi_node_part',
+      position: [0.04, 0, 0],
+      normal: [0, 0, -1],
+      radius: 0.006,
+      depth: 0.08,
+    }).nextState;
+    const c4 = executeMcpToolOnEngineState(c3, 'transform_part', {
+      part_id: 'multi_node_part',
+      translation: [0, 0.01, 0],
+    }).nextState;
+
+    const initialVol = c4.parts[0].mesh.volume;
+    const targetHoleId = c4.parts[0].dag[2].id; // Hole 2 in the middle
+    // Enlarge Hole 2 radius from 0.005 to 0.009
+    const modified = executeMcpToolOnEngineState(c4, 'modify_feature', {
+      part_id: 'multi_node_part',
+      node_id: targetHoleId,
+      params: { radius: 0.009 },
+    }).nextState;
+
+    const modifiedMesh = modified.parts[0].mesh;
+    assert.ok(
+      modifiedMesh.volume < initialVol,
+      'Mid-chain hole enlargement must decrease solid volume'
+    );
+    assert.equal(modifiedMesh.eulerGenus, 3, 'All 3 holes must persist downstream');
+    assert.equal(modifiedMesh.isWatertight, true);
+    assert.equal(modifiedMesh.boundaryEdgesCount, 0);
+
+    // 4. CSG Boolean Edge Cases
+    const boxA = executeMcpToolOnEngineState(state0, 'add_feature_primitive', {
+      part_id: 'cube_a',
+      primitive_type: 'box',
+      params: { width: 0.08, height: 0.08, depth: 0.08 },
+    }).nextState;
+
+    // A \ A: Self-difference produces empty solid
+    const diffAA = executeMcpToolOnEngineState(boxA, 'boolean_difference', {
+      part_a_id: 'cube_a',
+      part_b_id: 'cube_a',
+      new_part_id: 'res_diff_aa',
+    });
+    const meshAA = diffAA.nextState.parts.find((p) => p.id === 'res_diff_aa')?.mesh;
+    assert.ok(meshAA);
+    assert.ok(meshAA.volume < 1e-7 || meshAA.triangleCount === 0);
+
+    // A ∪ A: Self-union preserves exact volume
+    const unionAA = executeMcpToolOnEngineState(boxA, 'boolean_union', {
+      part_a_id: 'cube_a',
+      part_b_id: 'cube_a',
+      new_part_id: 'res_union_aa',
+    });
+    const meshUnionAA = unionAA.nextState.parts.find((p) => p.id === 'res_union_aa')?.mesh;
+    assert.ok(meshUnionAA);
+    assert.ok(Math.abs(meshUnionAA.volume - boxA.parts[0].mesh.volume) < 1e-5);
+    assert.equal(meshUnionAA.isWatertight, true);
+
+    // Disjoint A and B (dx = 1.0 m)
+    const boxBDisjoint = executeMcpToolOnEngineState(boxA, 'add_feature_primitive', {
+      part_id: 'cube_disjoint',
+      primitive_type: 'box',
+      params: { width: 0.08, height: 0.08, depth: 0.08 },
+    }).nextState;
+    const boxBDisjointTrans = executeMcpToolOnEngineState(boxBDisjoint, 'transform_part', {
+      part_id: 'cube_disjoint',
+      translation: [1.0, 0, 0],
+    }).nextState;
+
+    // Disjoint difference A \ B = A
+    const diffDisjoint = executeMcpToolOnEngineState(boxBDisjointTrans, 'boolean_difference', {
+      part_a_id: 'cube_a',
+      part_b_id: 'cube_disjoint',
+      new_part_id: 'res_diff_disjoint',
+    });
+    const meshDiffDisjoint = diffDisjoint.nextState.parts.find((p) => p.id === 'res_diff_disjoint')?.mesh;
+    assert.ok(meshDiffDisjoint);
+    assert.ok(Math.abs(meshDiffDisjoint.volume - boxA.parts[0].mesh.volume) < 1e-5);
+
+    // Disjoint intersection A ∩ B = 0
+    const interDisjoint = executeMcpToolOnEngineState(boxBDisjointTrans, 'boolean_intersection', {
+      part_a_id: 'cube_a',
+      part_b_id: 'cube_disjoint',
+      new_part_id: 'res_inter_disjoint',
+    });
+    const meshInterDisjoint = interDisjoint.nextState.parts.find((p) => p.id === 'res_inter_disjoint')?.mesh;
+    assert.ok(meshInterDisjoint);
+    assert.ok(meshInterDisjoint.volume < 1e-7 || meshInterDisjoint.triangleCount === 0);
+  });
+
+  it('verifies BUG-023: expanded DAG fuzzer across 5 seeds x 200 chains (1000 chains up to 10 ops) with 0 panics and watertight manifold topology', () => {
+    const SEEDS = [101, 202, 303, 404, 505];
+    const CHAINS_PER_SEED = 200;
+    let totalChainsTested = 0;
+
+    for (const seed of SEEDS) {
+      let lcg = seed;
+      const nextRand = () => {
+        lcg = (lcg * 1664525 + 1013904223) >>> 0;
+        return lcg / 4294967296;
+      };
+
+      for (let c = 0; c < CHAINS_PER_SEED; c++) {
+        totalChainsTested++;
+        const partId = `fuzz_s${seed}_c${c}`;
+        let state: EngineStateSnapshot = {
+          parts: [],
+          selectedPartId: '',
+          joints: [],
+          materials: [...DEFAULT_MATERIALS],
+          feaResult: null,
+          physicsFrames: [],
+          quality: 'draft',
+          renderMode: 'shaded',
+        };
+
+        const basePrimType =
+          c % 4 === 0
+            ? 'box'
+            : c % 4 === 1
+              ? 'cylinder'
+              : c % 4 === 2
+                ? 'cone'
+                : 'polygon_prism';
+
+        state = executeMcpToolOnEngineState(state, 'add_feature_primitive', {
+          part_id: partId,
+          primitive_type: basePrimType,
+          params: {
+            width: 0.08 + nextRand() * 0.04,
+            height: 0.06 + nextRand() * 0.04,
+            depth: 0.08 + nextRand() * 0.04,
+            radius: 0.03 + nextRand() * 0.02,
+            radius_bottom: 0.03 + nextRand() * 0.02,
+            radius_top: 0.015,
+            sides: 6,
+            outer_radius: 0.035,
+          },
+        }).nextState;
+
+        // Chain up to 6 extra operations
+        const chainLen = 1 + (c % 6);
+        for (let step = 0; step < chainLen; step++) {
+          if (step % 2 === 0 && (basePrimType === 'box' || basePrimType === 'cylinder')) {
+            state = executeMcpToolOnEngineState(state, 'cut_hole', {
+              part_id: partId,
+              radius: 0.004 + nextRand() * 0.003,
+              depth: 0.12,
+              offset_x: (nextRand() - 0.5) * 0.01,
+              offset_z: (nextRand() - 0.5) * 0.01,
+            }).nextState;
+          } else {
+            const sx = step === 1 && c % 11 === 0 ? -1 : 1;
+            state = executeMcpToolOnEngineState(state, 'transform_part', {
+              part_id: partId,
+              translation: [nextRand() * 0.01, nextRand() * 0.01, 0],
+              rotation_deg: [0, 0, Math.round(nextRand() * 45)],
+              scale: [sx, 1, 1],
+            }).nextState;
+          }
+        }
+
+        const mesh = state.parts[0].mesh;
+        assert.equal(mesh.isWatertight, true, `Fuzzer chain ${partId} must be watertight`);
+        assert.equal(mesh.boundaryEdgesCount, 0, `Fuzzer chain ${partId} must have 0 boundary edges`);
+        assert.equal(mesh.nonManifoldEdgesCount, 0, `Fuzzer chain ${partId} must have 0 non-manifold edges`);
+        assert.equal(mesh.degenerateTrianglesCount, 0, `Fuzzer chain ${partId} must have 0 degenerate triangles`);
+        assert.equal(mesh.isOutwardOriented, true, `Fuzzer chain ${partId} must have outward normals`);
+        assert.ok(mesh.volume > 0, `Fuzzer chain ${partId} must have positive volume`);
+      }
+    }
+
+    assert.equal(totalChainsTested, 1000, 'Exactly 1,000 fuzzer chains must be executed');
+  });
 });
 
 

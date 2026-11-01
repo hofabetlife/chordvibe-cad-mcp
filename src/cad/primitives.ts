@@ -3500,6 +3500,10 @@ export function evaluateFeatureTree(
         break;
       }
       case 'transform': {
+        if (currentMesh && pendingHoles.length > 0) {
+          currentMesh = applyHolesToMesh(currentMesh, pendingHoles, density);
+          pendingHoles.length = 0;
+        }
         if (currentMesh) {
           const tr: [number, number, number] = Array.isArray(p.translation)
             ? [Number(p.translation[0]), Number(p.translation[1]), Number(p.translation[2])]
@@ -3611,12 +3615,17 @@ export function parseStlBuffer(
   density: number = 7850,
   scaleFactor: number = 1.0
 ): MeshGeometryData {
-  const view = new DataView(buffer);
   const byteLength = buffer.byteLength;
+  if (byteLength === 0) {
+    throw new Error('STL buffer is empty (0 bytes)');
+  }
+
+  const view = new DataView(buffer);
 
   if (byteLength >= 84) {
     const triCount = view.getUint32(80, true);
-    if (84 + triCount * 50 === byteLength && triCount > 0) {
+    const expectedBinaryLen = 84 + triCount * 50;
+    if (expectedBinaryLen === byteLength && triCount > 0) {
       const vertices = new Float32Array(triCount * 9);
       const normals = new Float32Array(triCount * 9);
       const indices = new Uint32Array(triCount * 3);
@@ -3689,7 +3698,17 @@ export function parseStlBuffer(
   }
 
   // Fallback: ASCII STL parser
-  const text = new TextDecoder().decode(buffer);
+  let text: string;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true }).decode(buffer);
+  } catch {
+    throw new Error('Corrupt binary/non-ASCII STL file: invalid encoding');
+  }
+
+  if (!text.toLowerCase().includes('solid')) {
+    throw new Error('Corrupt STL file: neither valid binary STL nor ASCII solid header');
+  }
+
   const vertexRegex =
     /vertex\s+([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)\s+([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)\s+([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)/g;
   const coords: number[] = [];
@@ -3700,6 +3719,10 @@ export function parseStlBuffer(
       parseFloat(match[2]) * scaleFactor,
       parseFloat(match[3]) * scaleFactor
     );
+  }
+
+  if (coords.length < 9) {
+    throw new Error('Corrupt ASCII STL: zero valid triangle vertices found');
   }
 
   const builder = new MeshBuilder();
