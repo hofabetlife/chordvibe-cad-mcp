@@ -34,6 +34,10 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     "part_id": {
                         "type": "string",
                         "description": "Optional custom part ID (default: auto-generated UUID)"
+                    },
+                    "is_fixed": {
+                        "type": "boolean",
+                        "description": "If true, fixes the part in 3D space during physics simulations (default: false)"
                     }
                 },
                 "required": ["name", "material"]
@@ -314,43 +318,69 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         // 10. create_joint
         ToolDefinition {
             name: "create_joint".to_string(),
-            description: "Establishes a kinematic or dynamic constraint between two parts in Rapier3D (revolute, prismatic, spherical, fixed)".to_string(),
+            description: "Establishes a kinematic or dynamic constraint between two parts in Rapier3D (revolute, prismatic, spherical, fixed, gear)".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "joint_type": {
                         "type": "string",
-                        "enum": ["revolute", "prismatic", "spherical", "fixed"],
+                        "enum": ["revolute", "prismatic", "spherical", "fixed", "gear"],
                         "description": "Kinematic joint type"
                     },
                     "part_a": {
                         "type": "string",
-                        "description": "ID of first connected part"
+                        "description": "ID of first connected part (or 'ground' / 'world')"
                     },
                     "part_b": {
                         "type": "string",
-                        "description": "ID of second connected part"
+                        "description": "ID of second connected part (or 'ground' / 'world')"
                     },
                     "anchor_a": {
                         "type": "array",
                         "items": { "type": "number" },
                         "minItems": 3,
                         "maxItems": 3,
-                        "description": "Anchor point [x, y, z] on part A"
+                        "description": "Anchor point [x, y, z] on part A (default: [0, 0, 0])"
                     },
                     "anchor_b": {
                         "type": "array",
                         "items": { "type": "number" },
                         "minItems": 3,
                         "maxItems": 3,
-                        "description": "Anchor point [x, y, z] on part B"
+                        "description": "Anchor point [x, y, z] on part B (default: [0, 0, 0])"
                     },
                     "axis": {
                         "type": "array",
                         "items": { "type": "number" },
                         "minItems": 3,
                         "maxItems": 3,
-                        "description": "Joint rotation or sliding axis [x, y, z] (required for revolute/prismatic)"
+                        "description": "Joint rotation or sliding axis [x, y, z] (for revolute/prismatic/gear)"
+                    },
+                    "axis_a": {
+                        "type": "array",
+                        "items": { "type": "number" },
+                        "minItems": 3,
+                        "maxItems": 3,
+                        "description": "Rotation axis [x, y, z] for gear A in a gear joint"
+                    },
+                    "axis_b": {
+                        "type": "array",
+                        "items": { "type": "number" },
+                        "minItems": 3,
+                        "maxItems": 3,
+                        "description": "Rotation axis [x, y, z] for gear B in a gear joint"
+                    },
+                    "ratio": {
+                        "type": "number",
+                        "description": "Gear transmission ratio (omega_a / omega_b) for gear joints"
+                    },
+                    "teeth_a": {
+                        "type": "number",
+                        "description": "Tooth count of gear A (used to compute ratio = teeth_a / teeth_b if ratio is omitted)"
+                    },
+                    "teeth_b": {
+                        "type": "number",
+                        "description": "Tooth count of gear B (used to compute ratio = teeth_a / teeth_b if ratio is omitted)"
                     },
                     "limits": {
                         "type": "array",
@@ -360,7 +390,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                         "description": "Lower and upper motion limits [min, max]"
                     }
                 },
-                "required": ["joint_type", "part_a", "part_b", "anchor_a", "anchor_b"]
+                "required": ["joint_type", "part_a", "part_b"]
             }),
         },
         // 11. set_joint_motor

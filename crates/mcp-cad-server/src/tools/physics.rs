@@ -148,19 +148,26 @@ pub fn create_joint(args: &Value, state: &mut EngineState) -> Result<Value, Serv
         }
     }
 
-    let parse_vec3 = |key: &str| -> Result<[f64; 3], ServerError> {
-        let arr = args
-            .get(key)
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| ServerError::InvalidArgument(format!("Missing required array '{key}' [x, y, z]")))?;
+    let parse_opt_vec3 = |key: &str, default: [f64; 3]| -> Result<[f64; 3], ServerError> {
+        let Some(val) = args.get(key) else {
+            return Ok(default);
+        };
+        if val.is_null() {
+            return Ok(default);
+        }
+        let arr = val
+            .as_array()
+            .ok_or_else(|| ServerError::InvalidArgument(format!("'{key}' must be an array [x, y, z]")))?;
         if arr.len() != 3 {
             return Err(ServerError::InvalidArgument(format!("'{key}' must contain 3 elements")));
         }
-        Ok([
-            arr[0].as_f64().unwrap_or(0.0),
-            arr[1].as_f64().unwrap_or(0.0),
-            arr[2].as_f64().unwrap_or(0.0),
-        ])
+        let x = arr[0].as_f64().ok_or_else(|| ServerError::InvalidArgument(format!("'{key}[0]' must be a finite number")))?;
+        let y = arr[1].as_f64().ok_or_else(|| ServerError::InvalidArgument(format!("'{key}[1]' must be a finite number")))?;
+        let z = arr[2].as_f64().ok_or_else(|| ServerError::InvalidArgument(format!("'{key}[2]' must be a finite number")))?;
+        if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+            return Err(ServerError::InvalidArgument(format!("'{key}' components must be finite numbers")));
+        }
+        Ok([x, y, z])
     };
 
     let limits = args.get("limits").and_then(|v| v.as_array()).and_then(|arr| {
@@ -173,9 +180,9 @@ pub fn create_joint(args: &Value, state: &mut EngineState) -> Result<Value, Serv
 
     let cad_joint = match joint_type_str.to_lowercase().as_str() {
         "revolute" => {
-            let anchor_a = parse_vec3("anchor_a")?;
-            let anchor_b = parse_vec3("anchor_b")?;
-            let axis = parse_vec3("axis").unwrap_or([0.0, 0.0, 1.0]);
+            let anchor_a = parse_opt_vec3("anchor_a", [0.0, 0.0, 0.0])?;
+            let anchor_b = parse_opt_vec3("anchor_b", [0.0, 0.0, 0.0])?;
+            let axis = parse_opt_vec3("axis", [0.0, 0.0, 1.0])?;
             CadJointType::Revolute {
                 anchor_a,
                 anchor_b,
@@ -184,9 +191,9 @@ pub fn create_joint(args: &Value, state: &mut EngineState) -> Result<Value, Serv
             }
         }
         "prismatic" => {
-            let anchor_a = parse_vec3("anchor_a")?;
-            let anchor_b = parse_vec3("anchor_b")?;
-            let axis = parse_vec3("axis").unwrap_or([1.0, 0.0, 0.0]);
+            let anchor_a = parse_opt_vec3("anchor_a", [0.0, 0.0, 0.0])?;
+            let anchor_b = parse_opt_vec3("anchor_b", [0.0, 0.0, 0.0])?;
+            let axis = parse_opt_vec3("axis", [1.0, 0.0, 0.0])?;
             CadJointType::Prismatic {
                 anchor_a,
                 anchor_b,
@@ -195,17 +202,20 @@ pub fn create_joint(args: &Value, state: &mut EngineState) -> Result<Value, Serv
             }
         }
         "spherical" => {
-            let anchor_a = parse_vec3("anchor_a")?;
-            let anchor_b = parse_vec3("anchor_b")?;
+            let anchor_a = parse_opt_vec3("anchor_a", [0.0, 0.0, 0.0])?;
+            let anchor_b = parse_opt_vec3("anchor_b", [0.0, 0.0, 0.0])?;
             CadJointType::Spherical { anchor_a, anchor_b }
         }
         "fixed" => {
-            let anchor_a = parse_vec3("anchor_a")?;
-            let anchor_b = parse_vec3("anchor_b")?;
+            let anchor_a = parse_opt_vec3("anchor_a", [0.0, 0.0, 0.0])?;
+            let anchor_b = parse_opt_vec3("anchor_b", [0.0, 0.0, 0.0])?;
             CadJointType::Fixed { anchor_a, anchor_b }
         }
         "gear" => {
             let ratio = if let Some(r) = args.get("ratio").and_then(|v| v.as_f64()) {
+                if !r.is_finite() || r.abs() < 1e-9 {
+                    return Err(ServerError::InvalidArgument("Gear ratio must be a non-zero finite number".into()));
+                }
                 r
             } else if let (Some(ta), Some(tb)) = (
                 args.get("teeth_a").and_then(|v| v.as_f64()),
@@ -219,8 +229,9 @@ pub fn create_joint(args: &Value, state: &mut EngineState) -> Result<Value, Serv
                 1.0
             };
 
-            let axis_a = parse_vec3("axis_a").or_else(|_| parse_vec3("axis")).unwrap_or([0.0, 0.0, 1.0]);
-            let axis_b = parse_vec3("axis_b").or_else(|_| parse_vec3("axis")).unwrap_or([0.0, 0.0, 1.0]);
+            let default_axis = parse_opt_vec3("axis", [0.0, 0.0, 1.0])?;
+            let axis_a = parse_opt_vec3("axis_a", default_axis)?;
+            let axis_b = parse_opt_vec3("axis_b", default_axis)?;
 
             CadJointType::Gear {
                 ratio,
