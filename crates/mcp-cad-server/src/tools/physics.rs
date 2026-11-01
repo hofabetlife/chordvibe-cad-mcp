@@ -289,6 +289,12 @@ pub fn run_physics_simulation(args: &Value, state: &mut EngineState) -> Result<V
         .and_then(|v| v.as_f64())
         .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'duration_seconds'".to_string()))?;
 
+    if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
+        return Err(ServerError::InvalidArgument(
+            "duration_seconds must be a positive finite number (> 0)".to_string(),
+        ));
+    }
+
     let step_size_ms = args
         .get("step_size_ms")
         .and_then(|v| v.as_f64())

@@ -1162,10 +1162,15 @@ export function executeMcpToolOnEngineState(
     }
 
     case 'run_physics_simulation': {
-      const durationSec = Number(params.duration_sec ?? 1.0);
-      const dt = Number(params.dt ?? 1 / 60);
-      if (durationSec <= 0 || dt <= 0) {
-        throw new Error('run_physics_simulation requires duration_sec > 0 and dt > 0');
+      const rawDur = params.duration_seconds ?? params.duration_sec;
+      if (rawDur === undefined || !Number.isFinite(Number(rawDur)) || Number(rawDur) <= 0) {
+        throw new Error('run_physics_simulation requires positive duration_seconds > 0');
+      }
+      const durationSec = Number(rawDur);
+      const stepMs = params.step_size_ms !== undefined ? Number(params.step_size_ms) : undefined;
+      const dt = stepMs !== undefined ? stepMs / 1000 : Number(params.dt ?? 1 / 60);
+      if (dt <= 0) {
+        throw new Error('run_physics_simulation requires dt / step_size_ms > 0');
       }
       const sim = runPhysicsSimulationTrajectory(
         state.parts,
@@ -1180,11 +1185,17 @@ export function executeMcpToolOnEngineState(
       const lastFrame = sim.frames[sim.frames.length - 1];
       response = {
         status: 'completed',
+        success: true,
         steps: sim.steps,
+        steps_simulated: sim.steps,
         duration_sec: durationSec,
+        duration_seconds: durationSec,
         dt,
         frames_recorded: sim.frames.length,
         final_transforms: lastFrame?.partTransforms || {},
+        trajectory_summary: lastFrame?.partTransforms || {},
+        collisions: [],
+        peak_joint_forces: {},
       };
       break;
     }
