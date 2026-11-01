@@ -54,6 +54,22 @@ pub struct TopologyMetrics {
     pub non_manifold_vertices_count: usize,
 }
 
+/// Maximum permitted fraction of triangles with minimum interior angle < 5° for `status = "PASS"`.
+/// Justified by FEM stiffness matrix conditioning (Shewchuk 2002): sin(5°) ≈ 0.0872, keeping element
+/// conditioning bounded and preventing inverted/sliver TET4 Jacobians during volume meshing.
+pub const MAX_ALLOWED_SLIVER_RATIO: f64 = 0.01;
+
+/// Histogram buckets for minimum triangle interior angles (in degrees).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AngleHistogramBuckets {
+    pub lt_1_deg: usize,
+    pub deg_1_to_5: usize,
+    pub deg_5_to_15: usize,
+    pub deg_15_to_30: usize,
+    pub deg_30_to_45: usize,
+    pub deg_45_to_60: usize,
+}
+
 /// Geometry quality metrics covering degeneracies, slivers, T-junctions, and self-intersections.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GeometryMetrics {
@@ -67,6 +83,20 @@ pub struct GeometryMetrics {
     pub duplicate_vertices_count: usize,
     /// Number of sliver triangles (min angle < 5 deg or aspect ratio > 100)
     pub sliver_triangles_count: usize,
+    /// Number of triangles with minimum interior angle < 5 deg
+    pub lt_5_deg_count: usize,
+    /// Fraction of valid triangles with minimum interior angle < 5 deg (0.0 .. 1.0)
+    pub lt_5_deg_ratio: f64,
+    /// Number of extreme needle triangles with minimum interior angle < 1 deg
+    pub lt_1_deg_count: usize,
+    /// Fraction of valid triangles with minimum interior angle < 1 deg (0.0 .. 1.0)
+    pub lt_1_deg_ratio: f64,
+    /// Minimum aspect ratio observed across all triangles (1.0 for equilateral under R/(2r))
+    pub min_aspect_ratio: f64,
+    /// 5th-percentile aspect ratio across all triangles
+    pub p5_aspect_ratio: f64,
+    /// Median aspect ratio across all triangles
+    pub median_aspect_ratio: f64,
     /// Maximum aspect ratio observed across all triangles
     pub max_aspect_ratio: f64,
     /// Number of T-junctions (vertex lies on edge of another triangle without sharing it)
@@ -88,6 +118,8 @@ pub struct AngleStatistics {
     pub median_angle_deg: f64,
     /// 5th percentile interior angle in degrees
     pub p5_angle_deg: f64,
+    /// Histogram of minimum interior angles across 6 degree buckets
+    pub histogram: AngleHistogramBuckets,
 }
 
 /// Key representing a quantized 3D point for fast vertex welding and duplicate detection.
@@ -132,6 +164,7 @@ struct DirectedEdge(u32, u32);
 /// - `signed_volume > 0.0`
 /// - `degenerate_triangles == 0`
 /// - `self_intersections == 0`
+/// - `lt_5_deg_ratio <= MAX_ALLOWED_SLIVER_RATIO` (1.0%) and `lt_1_deg_count == 0`
 /// - `expected_genus` matches if provided
 pub fn validate_mesh(mesh: &TriangleMesh, expected_genus: Option<i32>) -> MeshValidationReport {
     let mut issues = Vec::new();
@@ -161,6 +194,13 @@ pub fn validate_mesh(mesh: &TriangleMesh, expected_genus: Option<i32>) -> MeshVa
                 degenerate_triangles_count: 0,
                 duplicate_vertices_count: 0,
                 sliver_triangles_count: 0,
+                lt_5_deg_count: 0,
+                lt_5_deg_ratio: 0.0,
+                lt_1_deg_count: 0,
+                lt_1_deg_ratio: 0.0,
+                min_aspect_ratio: 0.0,
+                p5_aspect_ratio: 0.0,
+                median_aspect_ratio: 0.0,
                 max_aspect_ratio: 0.0,
                 t_junctions_count: 0,
                 normals_vs_winding_mismatches: 0,
@@ -171,6 +211,7 @@ pub fn validate_mesh(mesh: &TriangleMesh, expected_genus: Option<i32>) -> MeshVa
                 min_angle_deg: 0.0,
                 median_angle_deg: 0.0,
                 p5_angle_deg: 0.0,
+                histogram: AngleHistogramBuckets::default(),
             },
         };
     }
@@ -233,8 +274,12 @@ pub fn validate_mesh(mesh: &TriangleMesh, expected_genus: Option<i32>) -> MeshVa
 
     let mut degenerate_triangles_count = 0usize;
     let mut sliver_triangles_count = 0usize;
+    let mut lt_5_deg_count = 0usize;
+    let mut lt_1_deg_count = 0usize;
+    let mut angle_histogram = AngleHistogramBuckets::default();
     let mut max_aspect_ratio = 1.0f64;
     let mut all_min_angles: Vec<f64> = Vec::with_capacity(mesh.indices.len());
+    let mut all_aspect_ratios: Vec<f64> = Vec::with_capacity(mesh.indices.len());
     let mut normals_vs_winding_mismatches = 0usize;
 
     for tri in &mesh.indices {
@@ -284,7 +329,24 @@ pub fn validate_mesh(mesh: &TriangleMesh, expected_genus: Option<i32>) -> MeshVa
             let min_angle = angle_a_deg.min(angle_b_deg).min(angle_c_deg);
             all_min_angles.push(min_angle);
 
-            // Aspect ratio = longest edge * perimeter / (4 * sqrt(3) * area)
+            if min_angle < 1.0 {
+                lt_1_deg_count += 1;
+                lt_5_deg_count += 1;
+                angle_histogram.lt_1_deg += 1;
+            } else if min_angle < 5.0 {
+                lt_5_deg_count += 1;
+                angle_histogram.deg_1_to_5 += 1;
+            } else if min_angle < 15.0 {
+                angle_histogram.deg_5_to_15 += 1;
+            } else if min_angle < 30.0 {
+                angle_histogram.deg_15_to_30 += 1;
+            } else if min_angle < 45.0 {
+                angle_histogram.deg_30_to_45 += 1;
+            } else {
+                angle_histogram.deg_45_to_60 += 1;
+            }
+
+            // Aspect ratio = R_circ / (2 * r_in)
             let semi = 0.5 * (a + b + c);
             let r_in = area / semi;
             let r_circ = (a * b * c) / (4.0 * area);
@@ -292,6 +354,7 @@ pub fn validate_mesh(mesh: &TriangleMesh, expected_genus: Option<i32>) -> MeshVa
             if aspect > max_aspect_ratio {
                 max_aspect_ratio = aspect;
             }
+            all_aspect_ratios.push(aspect);
 
             if min_angle < 5.0 || aspect > 100.0 {
                 sliver_triangles_count += 1;
@@ -430,7 +493,11 @@ pub fn validate_mesh(mesh: &TriangleMesh, expected_genus: Option<i32>) -> MeshVa
     let signed_volume = mesh.signed_volume();
     let is_positive_volume = signed_volume > 1e-12;
 
-    // Angle statistics
+    // Angle & Aspect Ratio statistics
+    let valid_tris = all_min_angles.len().max(1);
+    let lt_5_deg_ratio = (lt_5_deg_count as f64) / (valid_tris as f64);
+    let lt_1_deg_ratio = (lt_1_deg_count as f64) / (valid_tris as f64);
+
     all_min_angles.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let (min_angle_deg, median_angle_deg, p5_angle_deg) = if all_min_angles.is_empty() {
         (0.0, 0.0, 0.0)
@@ -441,6 +508,17 @@ pub fn validate_mesh(mesh: &TriangleMesh, expected_genus: Option<i32>) -> MeshVa
         let p5_idx = ((n as f64 * 0.05).floor() as usize).min(n - 1);
         let p5_val = all_min_angles[p5_idx];
         (min_val, med_val, p5_val)
+    };
+
+    all_aspect_ratios.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let (min_aspect_ratio, p5_aspect_ratio, median_aspect_ratio) = if all_aspect_ratios.is_empty() {
+        (1.0, 1.0, 1.0)
+    } else {
+        let n = all_aspect_ratios.len();
+        let min_ar = all_aspect_ratios[0];
+        let p5_ar = all_aspect_ratios[((n as f64 * 0.05).floor() as usize).min(n - 1)];
+        let med_ar = all_aspect_ratios[n / 2];
+        (min_ar, p5_ar, med_ar)
     };
 
     // T-junctions detection:
@@ -502,7 +580,7 @@ pub fn validate_mesh(mesh: &TriangleMesh, expected_genus: Option<i32>) -> MeshVa
     let (self_intersections_count, coplanar_overlaps_count) =
         check_self_intersections(&welded_positions, &welded_indices);
 
-    // Evaluate issues and final status
+    // Evaluate issues and final status (including strict Sliver Quality Gate)
     if !is_watertight {
         issues.push(format!(
             "Mesh is not watertight: {} boundary edges (holes), {} non-manifold edges",
@@ -531,6 +609,21 @@ pub fn validate_mesh(mesh: &TriangleMesh, expected_genus: Option<i32>) -> MeshVa
         issues.push(format!(
             "Found {} self-intersecting non-adjacent triangle pairs",
             self_intersections_count
+        ));
+    }
+    if lt_1_deg_count > 0 {
+        issues.push(format!(
+            "Sliver quality gate failed: {} needle triangles with min angle < 1° (min_angle={:.4}°)",
+            lt_1_deg_count, min_angle_deg
+        ));
+    }
+    if lt_5_deg_ratio > MAX_ALLOWED_SLIVER_RATIO {
+        issues.push(format!(
+            "Sliver quality gate failed: {:.2}% of triangles ({}/{}) have min angle < 5° (threshold {:.2}%)",
+            lt_5_deg_ratio * 100.0,
+            lt_5_deg_count,
+            valid_tris,
+            MAX_ALLOWED_SLIVER_RATIO * 100.0
         ));
     }
     if let Some(exp_g) = expected_genus {
@@ -605,6 +698,13 @@ pub fn validate_mesh(mesh: &TriangleMesh, expected_genus: Option<i32>) -> MeshVa
             degenerate_triangles_count,
             duplicate_vertices_count,
             sliver_triangles_count,
+            lt_5_deg_count,
+            lt_5_deg_ratio,
+            lt_1_deg_count,
+            lt_1_deg_ratio,
+            min_aspect_ratio,
+            p5_aspect_ratio,
+            median_aspect_ratio,
             max_aspect_ratio,
             t_junctions_count,
             normals_vs_winding_mismatches,
@@ -615,6 +715,7 @@ pub fn validate_mesh(mesh: &TriangleMesh, expected_genus: Option<i32>) -> MeshVa
             min_angle_deg,
             median_angle_deg,
             p5_angle_deg,
+            histogram: angle_histogram,
         },
     }
 }

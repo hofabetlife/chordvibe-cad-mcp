@@ -88,6 +88,234 @@ pub fn create_box(width: f64, height: f64, depth: f64) -> TriangleMesh {
     TriangleMesh::new(vertices, indices)
 }
 
+/// Splits a quad `(p0, p1, p2, p3)` along its shorter diagonal to maximize minimum interior angle.
+#[inline]
+fn push_quad_shortest_diag(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<[u32; 3]>,
+    p0: [f64; 3],
+    p1: [f64; 3],
+    p2: [f64; 3],
+    p3: [f64; 3],
+    normal: [f64; 3],
+) {
+    let base = vertices.len() as u32;
+    vertices.push(Vertex::new(p0, normal));
+    vertices.push(Vertex::new(p1, normal));
+    vertices.push(Vertex::new(p2, normal));
+    vertices.push(Vertex::new(p3, normal));
+
+    let d02_sq = (p0[0] - p2[0]).powi(2) + (p0[1] - p2[1]).powi(2) + (p0[2] - p2[2]).powi(2);
+    let d13_sq = (p1[0] - p3[0]).powi(2) + (p1[1] - p3[1]).powi(2) + (p1[2] - p3[2]).powi(2);
+    if d02_sq <= d13_sq * 1.000001 {
+        indices.push([base, base + 1, base + 2]);
+        indices.push([base, base + 2, base + 3]);
+    } else {
+        indices.push([base, base + 1, base + 3]);
+        indices.push([base + 1, base + 2, base + 3]);
+    }
+}
+
+/// Connects two equal-count planar 2D rings `ring_a` and `ring_b` at height `z_val` using intermediate
+/// concentric rings so radial step size matches circumferential chord length (eliminating cap slivers).
+fn add_bridged_ring_strip_2d(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<[u32; 3]>,
+    ring_a: &[[f64; 2]],
+    ring_b: &[[f64; 2]],
+    z_val: f64,
+    is_top: bool,
+) {
+    let m = ring_a.len().min(ring_b.len());
+    if m < 3 {
+        return;
+    }
+    let nz = if is_top { 1.0 } else { -1.0 };
+    let normal = [0.0, 0.0, nz];
+
+    let mut total_radial = 0.0;
+    let mut total_chord = 0.0;
+    for i in 0..m {
+        let next = (i + 1) % m;
+        let a0 = ring_a[i];
+        let a1 = ring_a[next];
+        let b0 = ring_b[i];
+        let b1 = ring_b[next];
+        total_radial += (a0[0] - b0[0]).hypot(a0[1] - b0[1]);
+        total_chord +=
+            0.5 * ((a1[0] - a0[0]).hypot(a1[1] - a0[1]) + (b1[0] - b0[0]).hypot(b1[1] - b0[1]));
+    }
+    let avg_radial = total_radial / (m as f64);
+    let avg_chord = (total_chord / (m as f64)).max(1e-6);
+    let n_steps = ((avg_radial / (avg_chord * 1.15)).ceil() as usize).clamp(1, 14);
+
+    let mut prev_ring: Vec<[f64; 2]> = ring_a[..m].to_vec();
+    for s in 1..=n_steps {
+        let t = (s as f64) / (n_steps as f64);
+        let curr_ring: Vec<[f64; 2]> = if s == n_steps {
+            ring_b[..m].to_vec()
+        } else {
+            (0..m)
+                .map(|i| {
+                    [
+                        ring_a[i][0] + (ring_b[i][0] - ring_a[i][0]) * t,
+                        ring_a[i][1] + (ring_b[i][1] - ring_a[i][1]) * t,
+                    ]
+                })
+                .collect()
+        };
+
+        for i in 0..m {
+            let next = (i + 1) % m;
+            let p0 = [prev_ring[i][0], prev_ring[i][1], z_val];
+            let p1 = [prev_ring[next][0], prev_ring[next][1], z_val];
+            let p2 = [curr_ring[next][0], curr_ring[next][1], z_val];
+            let p3 = [curr_ring[i][0], curr_ring[i][1], z_val];
+            if is_top {
+                // ring_a is outer, ring_b is inner: [a_i, a_next, b_next, b_i] has -Z cross, so reverse for +Z
+                push_quad_shortest_diag(vertices, indices, p0, p3, p2, p1, normal);
+            } else {
+                push_quad_shortest_diag(vertices, indices, p0, p1, p2, p3, normal);
+            }
+        }
+        prev_ring = curr_ring;
+    }
+}
+
+/// 2-to-1 vertex halving transition between an `outer_ring` of `2*k` vertices and an `inner_ring` of `k` vertices.
+/// Emits 3 well-shaped triangles per pair of outer segments.
+fn add_halving_ring_transition_2d(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<[u32; 3]>,
+    outer_ring: &[[f64; 2]],
+    inner_ring: &[[f64; 2]],
+    z_val: f64,
+    is_top: bool,
+) {
+    let k = inner_ring.len();
+    if outer_ring.len() != 2 * k || k < 3 {
+        return;
+    }
+    let nz = if is_top { 1.0 } else { -1.0 };
+    let normal = [0.0, 0.0, nz];
+
+    let mut push_tri = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| {
+        let base = vertices.len() as u32;
+        vertices.push(Vertex::new([a[0], a[1], z_val], normal));
+        vertices.push(Vertex::new([b[0], b[1], z_val], normal));
+        vertices.push(Vertex::new([c[0], c[1], z_val], normal));
+        if is_top {
+            indices.push([base, base + 2, base + 1]);
+        } else {
+            indices.push([base, base + 1, base + 2]);
+        }
+    };
+
+    for j in 0..k {
+        let j_next = (j + 1) % k;
+        let o0 = outer_ring[2 * j];
+        let o1 = outer_ring[2 * j + 1];
+        let o2 = outer_ring[2 * j_next];
+        let i0 = inner_ring[j];
+        let i1 = inner_ring[j_next];
+        push_tri(o0, o1, i0);
+        push_tri(o1, i1, i0);
+        push_tri(o1, o2, i1);
+    }
+}
+
+/// Triangulates a planar disk cap bounded by `outer_ring` around `center` at height `z_val`
+/// using concentric rings and 2-to-1 vertex halving so the central fan has at most 8–16 segments.
+fn add_subdivided_disk_cap_2d(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<[u32; 3]>,
+    outer_ring: &[[f64; 2]],
+    center: [f64; 2],
+    z_val: f64,
+    is_top: bool,
+) {
+    let mut curr_ring: Vec<[f64; 2]> = outer_ring.to_vec();
+    if curr_ring.len() < 3 {
+        return;
+    }
+    let nz = if is_top { 1.0 } else { -1.0 };
+    let normal = [0.0, 0.0, nz];
+
+    let mut init_chord_sum = 0.0;
+    for i in 0..curr_ring.len() {
+        let next = (i + 1) % curr_ring.len();
+        init_chord_sum +=
+            (curr_ring[next][0] - curr_ring[i][0]).hypot(curr_ring[next][1] - curr_ring[i][1]);
+    }
+    let initial_chord = (init_chord_sum / (curr_ring.len() as f64)).max(1e-6);
+
+    for _iter in 0..24 {
+        let m = curr_ring.len();
+        let mut r_sum = 0.0;
+        let mut c_sum = 0.0;
+        for i in 0..m {
+            let next = (i + 1) % m;
+            r_sum += (curr_ring[i][0] - center[0]).hypot(curr_ring[i][1] - center[1]);
+            c_sum += (curr_ring[next][0] - curr_ring[i][0])
+                .hypot(curr_ring[next][1] - curr_ring[i][1]);
+        }
+        let avg_r = r_sum / (m as f64);
+        let avg_c = (c_sum / (m as f64)).max(1e-6);
+        let target_step = initial_chord.max(avg_c);
+
+        if m <= 16 && avg_r <= target_step * 1.45 {
+            break;
+        }
+
+        if m >= 16 && m % 2 == 0 && avg_c < avg_r * 0.38 {
+            let next_scale = ((avg_r - avg_c * 1.15) / avg_r).clamp(0.45, 0.78);
+            let half_m = m / 2;
+            let halved_ring: Vec<[f64; 2]> = (0..half_m)
+                .map(|j| {
+                    let p = curr_ring[2 * j];
+                    [
+                        center[0] + (p[0] - center[0]) * next_scale,
+                        center[1] + (p[1] - center[1]) * next_scale,
+                    ]
+                })
+                .collect();
+            add_halving_ring_transition_2d(vertices, indices, &curr_ring, &halved_ring, z_val, is_top);
+            curr_ring = halved_ring;
+        } else if avg_r > target_step * 1.45 {
+            let next_scale = ((avg_r - target_step * 0.95) / avg_r).clamp(0.38, 0.78);
+            let next_ring: Vec<[f64; 2]> = curr_ring
+                .iter()
+                .map(|p| {
+                    [
+                        center[0] + (p[0] - center[0]) * next_scale,
+                        center[1] + (p[1] - center[1]) * next_scale,
+                    ]
+                })
+                .collect();
+            add_bridged_ring_strip_2d(vertices, indices, &curr_ring, &next_ring, z_val, is_top);
+            curr_ring = next_ring;
+        } else {
+            break;
+        }
+    }
+
+    let m = curr_ring.len();
+    let center_idx = vertices.len() as u32;
+    vertices.push(Vertex::new([center[0], center[1], z_val], normal));
+    let rim_start = vertices.len() as u32;
+    for p in &curr_ring {
+        vertices.push(Vertex::new([p[0], p[1], z_val], normal));
+    }
+    for i in 0..m {
+        let next = (i + 1) % m;
+        if is_top {
+            indices.push([center_idx, rim_start + (i as u32), rim_start + (next as u32)]);
+        } else {
+            indices.push([center_idx, rim_start + (next as u32), rim_start + (i as u32)]);
+        }
+    }
+}
+
 /// Generates a solid 3D cylinder centered at the origin along the Z axis.
 ///
 /// Coordinates span: `radius` in XY plane, `z in [-height/2, height/2]`.
@@ -102,76 +330,40 @@ pub fn create_cylinder(radius: f64, height: f64, segments: usize) -> TriangleMes
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
 
-    // 1. Top cap (z = +h2, normal = [0, 0, 1])
-    let top_center_idx = vertices.len() as u32;
-    vertices.push(Vertex::new([0.0, 0.0, h2], [0.0, 0.0, 1.0]));
+    let rim_ring: Vec<[f64; 2]> = (0..segs)
+        .map(|i| {
+            let theta = (i as f64) * 2.0 * PI / (segs as f64);
+            [radius * theta.cos(), radius * theta.sin()]
+        })
+        .collect();
 
-    let top_rim_start = vertices.len() as u32;
-    for i in 0..segs {
-        let theta = (i as f64) * 2.0 * PI / (segs as f64);
-        let x = radius * theta.cos();
-        let y = radius * theta.sin();
-        vertices.push(Vertex::new([x, y, h2], [0.0, 0.0, 1.0]));
-    }
+    // 1. Top and bottom caps with concentric ring subdivision + 2-to-1 halving
+    add_subdivided_disk_cap_2d(&mut vertices, &mut indices, &rim_ring, [0.0, 0.0], h2, true);
+    add_subdivided_disk_cap_2d(&mut vertices, &mut indices, &rim_ring, [0.0, 0.0], -h2, false);
 
-    for i in 0..segs {
-        let next = (i + 1) % segs;
-        indices.push([
-            top_center_idx,
-            top_rim_start + (i as u32),
-            top_rim_start + (next as u32),
-        ]);
-    }
+    // 2. Side wall subdivided axially so height steps match circumferential chord length
+    let chord = (2.0 * radius * (PI / (segs as f64)).sin()).max(1e-6);
+    let n_z = ((height / (chord * 1.25)).ceil() as usize).clamp(1, 64);
 
-    // 2. Bottom cap (z = -h2, normal = [0, 0, -1])
-    let bot_center_idx = vertices.len() as u32;
-    vertices.push(Vertex::new([0.0, 0.0, -h2], [0.0, 0.0, -1.0]));
-
-    let bot_rim_start = vertices.len() as u32;
-    for i in 0..segs {
-        let theta = (i as f64) * 2.0 * PI / (segs as f64);
-        let x = radius * theta.cos();
-        let y = radius * theta.sin();
-        vertices.push(Vertex::new([x, y, -h2], [0.0, 0.0, -1.0]));
-    }
-
-    for i in 0..segs {
-        let next = (i + 1) % segs;
-        // Winding reversed so normal points down (-Z)
-        indices.push([
-            bot_center_idx,
-            bot_rim_start + (next as u32),
-            bot_rim_start + (i as u32),
-        ]);
-    }
-
-    // 3. Side wall quads (split into 2 triangles each)
-    let side_start = vertices.len() as u32;
-    for i in 0..segs {
-        let theta = (i as f64) * 2.0 * PI / (segs as f64);
-        let cos_t = theta.cos();
-        let sin_t = theta.sin();
-        let x = radius * cos_t;
-        let y = radius * sin_t;
-        let normal = [cos_t, sin_t, 0.0];
-
-        // Top vertex
-        vertices.push(Vertex::new([x, y, h2], normal));
-        // Bottom vertex
-        vertices.push(Vertex::new([x, y, -h2], normal));
-    }
-
-    for i in 0..segs {
-        let next = (i + 1) % segs;
-        let curr_top = side_start + (i as u32) * 2;
-        let curr_bot = curr_top + 1;
-        let next_top = side_start + (next as u32) * 2;
-        let next_bot = next_top + 1;
-
-        // Tri 1: curr_top -> curr_bot -> next_top (CCW outward)
-        indices.push([curr_top, curr_bot, next_top]);
-        // Tri 2: curr_bot -> next_bot -> next_top (CCW outward)
-        indices.push([curr_bot, next_bot, next_top]);
+    for k in 0..n_z {
+        let z_top = h2 - (k as f64) * (height / (n_z as f64));
+        let z_bot = h2 - ((k + 1) as f64) * (height / (n_z as f64));
+        for i in 0..segs {
+            let next = (i + 1) % segs;
+            let p0 = rim_ring[i];
+            let p1 = rim_ring[next];
+            let mid_ang = ((i as f64) + 0.5) * 2.0 * PI / (segs as f64);
+            let normal = [mid_ang.cos(), mid_ang.sin(), 0.0];
+            push_quad_shortest_diag(
+                &mut vertices,
+                &mut indices,
+                [p0[0], p0[1], z_top],
+                [p0[0], p0[1], z_bot],
+                [p1[0], p1[1], z_bot],
+                [p1[0], p1[1], z_top],
+                normal,
+            );
+        }
     }
 
     TriangleMesh::new(vertices, indices)
@@ -187,42 +379,118 @@ pub fn create_cylinder_with_settings(
     create_cylinder(radius, height, segments)
 }
 
-/// Generates a solid 3D UV sphere centered at the origin.
+/// Generates a solid 3D UV sphere centered at the origin with polar ring halving to prevent pole slivers.
 pub fn create_sphere(radius: f64, sectors: usize, stacks: usize) -> TriangleMesh {
     let (def_sec, def_stk) = TessellationSettings::default().calculate_sphere_resolution(radius);
-    let sectors = if sectors == 0 { def_sec } else { sectors.max(6) };
-    let stacks = if stacks == 0 { def_stk } else { stacks.max(4) };
+    let base_sectors = if sectors == 0 { def_sec } else { sectors.max(8) };
+    let stacks = if stacks == 0 { def_stk } else { stacks.max(8) };
 
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
 
-    for i in 0..=stacks {
-        let phi = PI * 0.5 - (i as f64) * PI / (stacks as f64);
+    // Build latitude rings from south pole (-h2) to north pole (+h2) with adaptive sector count
+    // (halving sectors near poles so circumferential chord never drops below 1/5 of meridional step)
+    let mut rings: Vec<Vec<[f64; 3]>> = Vec::with_capacity(stacks - 1);
+    for i in 1..stacks {
+        let phi = -PI * 0.5 + (i as f64) * PI / (stacks as f64);
         let z = radius * phi.sin();
-        let xy = radius * phi.cos();
+        let r_xy = radius * phi.cos();
+        let mut ring_segs = base_sectors;
+        while ring_segs > 8 && (2.0 * PI * r_xy / (ring_segs as f64)) < (PI * radius / (stacks as f64)) * 0.42 && ring_segs % 2 == 0 {
+            ring_segs /= 2;
+        }
+        let ring: Vec<[f64; 3]> = (0..ring_segs)
+            .map(|j| {
+                let theta = (j as f64) * 2.0 * PI / (ring_segs as f64);
+                [r_xy * theta.cos(), r_xy * theta.sin(), z]
+            })
+            .collect();
+        rings.push(ring);
+    }
 
-        for j in 0..=sectors {
-            let theta = (j as f64) * 2.0 * PI / (sectors as f64);
-            let x = xy * theta.cos();
-            let y = xy * theta.sin();
+    // South pole fan (z = -radius)
+    let south_pole = [0.0, 0.0, -radius];
+    let south_ring = &rings[0];
+    for j in 0..south_ring.len() {
+        let next = (j + 1) % south_ring.len();
+        let a = south_pole;
+        let b = south_ring[next];
+        let c = south_ring[j];
+        let base = vertices.len() as u32;
+        vertices.push(Vertex::new(a, [0.0, 0.0, -1.0]));
+        vertices.push(Vertex::new(b, [b[0] / radius, b[1] / radius, b[2] / radius]));
+        vertices.push(Vertex::new(c, [c[0] / radius, c[1] / radius, c[2] / radius]));
+        indices.push([base, base + 1, base + 2]);
+    }
 
-            let norm = [x / radius, y / radius, z / radius];
-            vertices.push(Vertex::new([x, y, z], norm));
+    // Intermediate latitude bands
+    for r_idx in 0..(rings.len() - 1) {
+        let r0 = &rings[r_idx];
+        let r1 = &rings[r_idx + 1];
+        let n0 = r0.len();
+        let n1 = r1.len();
+        if n0 == n1 {
+            for j in 0..n0 {
+                let next = (j + 1) % n0;
+                let p0 = r0[j];
+                let p1 = r0[next];
+                let p2 = r1[next];
+                let p3 = r1[j];
+                let n = [
+                    (p0[0] + p2[0]) * 0.5 / radius,
+                    (p0[1] + p2[1]) * 0.5 / radius,
+                    (p0[2] + p2[2]) * 0.5 / radius,
+                ];
+                push_quad_shortest_diag(&mut vertices, &mut indices, p0, p1, p2, p3, n);
+            }
+        } else if n1 == 2 * n0 {
+            for j in 0..n0 {
+                let next = (j + 1) % n0;
+                let i0 = r0[j];
+                let i1 = r0[next];
+                let o0 = r1[2 * j];
+                let o1 = r1[2 * j + 1];
+                let o2 = r1[2 * next];
+                for (a, b, c) in [(i0, o1, o0), (i0, i1, o1), (i1, o2, o1)] {
+                    let base = vertices.len() as u32;
+                    vertices.push(Vertex::new(a, [a[0] / radius, a[1] / radius, a[2] / radius]));
+                    vertices.push(Vertex::new(b, [b[0] / radius, b[1] / radius, b[2] / radius]));
+                    vertices.push(Vertex::new(c, [c[0] / radius, c[1] / radius, c[2] / radius]));
+                    indices.push([base, base + 1, base + 2]);
+                }
+            }
+        } else if n0 == 2 * n1 {
+            for j in 0..n1 {
+                let next = (j + 1) % n1;
+                let o0 = r0[2 * j];
+                let o1 = r0[2 * j + 1];
+                let o2 = r0[2 * next];
+                let i0 = r1[j];
+                let i1 = r1[next];
+                for (a, b, c) in [(o0, o1, i0), (o1, i1, i0), (o1, o2, i1)] {
+                    let base = vertices.len() as u32;
+                    vertices.push(Vertex::new(a, [a[0] / radius, a[1] / radius, a[2] / radius]));
+                    vertices.push(Vertex::new(b, [b[0] / radius, b[1] / radius, b[2] / radius]));
+                    vertices.push(Vertex::new(c, [c[0] / radius, c[1] / radius, c[2] / radius]));
+                    indices.push([base, base + 1, base + 2]);
+                }
+            }
         }
     }
 
-    for i in 0..stacks {
-        for j in 0..sectors {
-            let k1 = (i * (sectors + 1) + j) as u32;
-            let k2 = k1 + (sectors + 1) as u32;
-
-            if i != 0 {
-                indices.push([k1, k2, k1 + 1]);
-            }
-            if i != (stacks - 1) {
-                indices.push([k1 + 1, k2, k2 + 1]);
-            }
-        }
+    // North pole fan (z = +radius)
+    let north_pole = [0.0, 0.0, radius];
+    let north_ring = rings.last().unwrap();
+    for j in 0..north_ring.len() {
+        let next = (j + 1) % north_ring.len();
+        let a = north_pole;
+        let b = north_ring[j];
+        let c = north_ring[next];
+        let base = vertices.len() as u32;
+        vertices.push(Vertex::new(a, [0.0, 0.0, 1.0]));
+        vertices.push(Vertex::new(b, [b[0] / radius, b[1] / radius, b[2] / radius]));
+        vertices.push(Vertex::new(c, [c[0] / radius, c[1] / radius, c[2] / radius]));
+        indices.push([base, base + 1, base + 2]);
     }
 
     TriangleMesh::new(vertices, indices)
@@ -546,53 +814,27 @@ pub fn create_cone(radius_bottom: f64, radius_top: f64, height: f64, segments: u
 
     // 1. Bottom cap (z = -h2, normal = [0, 0, -1])
     if has_bot_cap {
-        let bot_center_idx = vertices.len() as u32;
-        vertices.push(Vertex::new([0.0, 0.0, -h2], [0.0, 0.0, -1.0]));
-
-        let bot_rim_start = vertices.len() as u32;
-        for i in 0..segs {
-            let theta = (i as f64) * 2.0 * PI / (segs as f64);
-            let x = radius_bottom * theta.cos();
-            let y = radius_bottom * theta.sin();
-            vertices.push(Vertex::new([x, y, -h2], [0.0, 0.0, -1.0]));
-        }
-
-        for i in 0..segs {
-            let next = (i + 1) % segs;
-            // CCW when viewed from outside (-Z): [center, next, curr]
-            indices.push([
-                bot_center_idx,
-                bot_rim_start + (next as u32),
-                bot_rim_start + (i as u32),
-            ]);
-        }
+        let bot_ring: Vec<[f64; 2]> = (0..segs)
+            .map(|i| {
+                let theta = (i as f64) * 2.0 * PI / (segs as f64);
+                [radius_bottom * theta.cos(), radius_bottom * theta.sin()]
+            })
+            .collect();
+        add_subdivided_disk_cap_2d(&mut vertices, &mut indices, &bot_ring, [0.0, 0.0], -h2, false);
     }
 
     // 2. Top cap (z = +h2, normal = [0, 0, 1]) if truncated cone
     if has_top_cap {
-        let top_center_idx = vertices.len() as u32;
-        vertices.push(Vertex::new([0.0, 0.0, h2], [0.0, 0.0, 1.0]));
-
-        let top_rim_start = vertices.len() as u32;
-        for i in 0..segs {
-            let theta = (i as f64) * 2.0 * PI / (segs as f64);
-            let x = radius_top * theta.cos();
-            let y = radius_top * theta.sin();
-            vertices.push(Vertex::new([x, y, h2], [0.0, 0.0, 1.0]));
-        }
-
-        for i in 0..segs {
-            let next = (i + 1) % segs;
-            // CCW when viewed from outside (+Z): [center, curr, next]
-            indices.push([
-                top_center_idx,
-                top_rim_start + (i as u32),
-                top_rim_start + (next as u32),
-            ]);
-        }
+        let top_ring: Vec<[f64; 2]> = (0..segs)
+            .map(|i| {
+                let theta = (i as f64) * 2.0 * PI / (segs as f64);
+                [radius_top * theta.cos(), radius_top * theta.sin()]
+            })
+            .collect();
+        add_subdivided_disk_cap_2d(&mut vertices, &mut indices, &top_ring, [0.0, 0.0], h2, true);
     }
 
-    // 3. Side wall
+    // 3. Side wall with axial subdivision and 2-to-1 halving near sharp cone apexes
     let dr = radius_bottom - radius_top;
     let slant = (height * height + dr * dr).sqrt();
     let (nz, n_radial) = if slant > 1e-12 {
@@ -600,86 +842,168 @@ pub fn create_cone(radius_bottom: f64, radius_top: f64, height: f64, segments: u
     } else {
         (0.0, 1.0)
     };
+    let base_chord = (2.0 * max_r * (PI / (segs as f64)).sin()).max(1e-6);
+    let n_z = ((slant / (base_chord * 1.25)).ceil() as usize).clamp(4, 48);
 
     if !has_top_cap {
         // Sharp cone: apex at [0, 0, h2]
-        let side_start = vertices.len() as u32;
-        for i in 0..segs {
-            let theta = (i as f64) * 2.0 * PI / (segs as f64);
-            let cos_t = theta.cos();
-            let sin_t = theta.sin();
-            let x = radius_bottom * cos_t;
-            let y = radius_bottom * sin_t;
-            let norm = [n_radial * cos_t, n_radial * sin_t, nz];
-            vertices.push(Vertex::new([x, y, -h2], norm));
+        let mut curr_segs = segs;
+        let mut prev_ring: Vec<[f64; 3]> = (0..curr_segs)
+            .map(|i| {
+                let theta = (i as f64) * 2.0 * PI / (curr_segs as f64);
+                [radius_bottom * theta.cos(), radius_bottom * theta.sin(), -h2]
+            })
+            .collect();
+
+        for k in 1..n_z {
+            let t = (k as f64) / (n_z as f64);
+            let r_curr = radius_bottom * (1.0 - t);
+            let z_curr = -h2 + t * height;
+            let chord_curr = 2.0 * PI * r_curr / (curr_segs as f64);
+            let step_len = slant / (n_z as f64);
+
+            if curr_segs >= 16 && curr_segs % 2 == 0 && chord_curr < step_len * 0.55 {
+                let half_segs = curr_segs / 2;
+                let next_ring: Vec<[f64; 3]> = (0..half_segs)
+                    .map(|j| {
+                        let theta = (j as f64) * 2.0 * PI / (half_segs as f64);
+                        [r_curr * theta.cos(), r_curr * theta.sin(), z_curr]
+                    })
+                    .collect();
+                for j in 0..half_segs {
+                    let j_next = (j + 1) % half_segs;
+                    let o0 = prev_ring[2 * j];
+                    let o1 = prev_ring[2 * j + 1];
+                    let o2 = prev_ring[2 * j_next];
+                    let i0 = next_ring[j];
+                    let i1 = next_ring[j_next];
+                    let ang = ((2 * j + 1) as f64) * 2.0 * PI / (curr_segs as f64);
+                    let norm = [n_radial * ang.cos(), n_radial * ang.sin(), nz];
+                    for (a, b, c) in [(o0, o1, i0), (o1, i1, i0), (o1, o2, i1)] {
+                        let base = vertices.len() as u32;
+                        vertices.push(Vertex::new(a, norm));
+                        vertices.push(Vertex::new(b, norm));
+                        vertices.push(Vertex::new(c, norm));
+                        indices.push([base, base + 1, base + 2]);
+                    }
+                }
+                curr_segs = half_segs;
+                prev_ring = next_ring;
+            } else {
+                let next_ring: Vec<[f64; 3]> = (0..curr_segs)
+                    .map(|i| {
+                        let theta = (i as f64) * 2.0 * PI / (curr_segs as f64);
+                        [r_curr * theta.cos(), r_curr * theta.sin(), z_curr]
+                    })
+                    .collect();
+                for i in 0..curr_segs {
+                    let next = (i + 1) % curr_segs;
+                    let ang = ((i as f64) + 0.5) * 2.0 * PI / (curr_segs as f64);
+                    let norm = [n_radial * ang.cos(), n_radial * ang.sin(), nz];
+                    push_quad_shortest_diag(
+                        &mut vertices,
+                        &mut indices,
+                        prev_ring[i],
+                        prev_ring[next],
+                        next_ring[next],
+                        next_ring[i],
+                        norm,
+                    );
+                }
+                prev_ring = next_ring;
+            }
         }
 
-        let apex_idx = vertices.len() as u32;
-        vertices.push(Vertex::new([0.0, 0.0, h2], [0.0, 0.0, 1.0]));
-
-        for i in 0..segs {
-            let next = (i + 1) % segs;
-            let curr_bot = side_start + (i as u32);
-            let next_bot = side_start + (next as u32);
-
-            // CCW outward: [curr_bot, next_bot, apex]
-            indices.push([curr_bot, next_bot, apex_idx]);
+        let apex = [0.0, 0.0, h2];
+        for i in 0..curr_segs {
+            let next = (i + 1) % curr_segs;
+            let ang = ((i as f64) + 0.5) * 2.0 * PI / (curr_segs as f64);
+            let norm = [n_radial * ang.cos(), n_radial * ang.sin(), nz];
+            let base = vertices.len() as u32;
+            vertices.push(Vertex::new(prev_ring[i], norm));
+            vertices.push(Vertex::new(prev_ring[next], norm));
+            vertices.push(Vertex::new(apex, norm));
+            indices.push([base, base + 1, base + 2]);
         }
     } else if !has_bot_cap {
         // Inverted sharp cone: apex at [0, 0, -h2]
-        let side_start = vertices.len() as u32;
-        for i in 0..segs {
-            let theta = (i as f64) * 2.0 * PI / (segs as f64);
-            let cos_t = theta.cos();
-            let sin_t = theta.sin();
-            let x = radius_top * cos_t;
-            let y = radius_top * sin_t;
-            let norm = [n_radial * cos_t, n_radial * sin_t, nz];
-            vertices.push(Vertex::new([x, y, h2], norm));
+        let mut curr_segs = segs;
+        let mut prev_ring: Vec<[f64; 3]> = (0..curr_segs)
+            .map(|i| {
+                let theta = (i as f64) * 2.0 * PI / (curr_segs as f64);
+                [radius_top * theta.cos(), radius_top * theta.sin(), h2]
+            })
+            .collect();
+
+        for k in 1..n_z {
+            let t = (k as f64) / (n_z as f64);
+            let r_curr = radius_top * (1.0 - t);
+            let z_curr = h2 - t * height;
+            let next_ring: Vec<[f64; 3]> = (0..curr_segs)
+                .map(|i| {
+                    let theta = (i as f64) * 2.0 * PI / (curr_segs as f64);
+                    [r_curr * theta.cos(), r_curr * theta.sin(), z_curr]
+                })
+                .collect();
+            for i in 0..curr_segs {
+                let next = (i + 1) % curr_segs;
+                let ang = ((i as f64) + 0.5) * 2.0 * PI / (curr_segs as f64);
+                let norm = [n_radial * ang.cos(), n_radial * ang.sin(), nz];
+                push_quad_shortest_diag(
+                    &mut vertices,
+                    &mut indices,
+                    prev_ring[i],
+                    next_ring[i],
+                    next_ring[next],
+                    prev_ring[next],
+                    norm,
+                );
+            }
+            prev_ring = next_ring;
         }
 
-        let apex_idx = vertices.len() as u32;
-        vertices.push(Vertex::new([0.0, 0.0, -h2], [0.0, 0.0, -1.0]));
-
-        for i in 0..segs {
-            let next = (i + 1) % segs;
-            let curr_top = side_start + (i as u32);
-            let next_top = side_start + (next as u32);
-
-            // CCW outward: [curr_top, apex, next_top]
-            indices.push([curr_top, apex_idx, next_top]);
+        let apex = [0.0, 0.0, -h2];
+        for i in 0..curr_segs {
+            let next = (i + 1) % curr_segs;
+            let ang = ((i as f64) + 0.5) * 2.0 * PI / (curr_segs as f64);
+            let norm = [n_radial * ang.cos(), n_radial * ang.sin(), nz];
+            let base = vertices.len() as u32;
+            vertices.push(Vertex::new(prev_ring[i], norm));
+            vertices.push(Vertex::new(apex, norm));
+            vertices.push(Vertex::new(prev_ring[next], norm));
+            indices.push([base, base + 1, base + 2]);
         }
     } else {
-        // Truncated cone (frustum)
-        let side_start = vertices.len() as u32;
-        for i in 0..segs {
-            let theta = (i as f64) * 2.0 * PI / (segs as f64);
-            let cos_t = theta.cos();
-            let sin_t = theta.sin();
-            let norm = [n_radial * cos_t, n_radial * sin_t, nz];
+        // Truncated cone (frustum) subdivided into n_z axial bands
+        for k in 0..n_z {
+            let t0 = (k as f64) / (n_z as f64);
+            let t1 = ((k + 1) as f64) / (n_z as f64);
+            let r0 = radius_bottom + (radius_top - radius_bottom) * t0;
+            let r1 = radius_bottom + (radius_top - radius_bottom) * t1;
+            let z0 = -h2 + t0 * height;
+            let z1 = -h2 + t1 * height;
 
-            // Top vertex
-            let xt = radius_top * cos_t;
-            let yt = radius_top * sin_t;
-            vertices.push(Vertex::new([xt, yt, h2], norm));
+            for i in 0..segs {
+                let next = (i + 1) % segs;
+                let a0 = (i as f64) * 2.0 * PI / (segs as f64);
+                let a1 = (next as f64) * 2.0 * PI / (segs as f64);
+                let mid_a = ((i as f64) + 0.5) * 2.0 * PI / (segs as f64);
+                let norm = [n_radial * mid_a.cos(), n_radial * mid_a.sin(), nz];
 
-            // Bottom vertex
-            let xb = radius_bottom * cos_t;
-            let yb = radius_bottom * sin_t;
-            vertices.push(Vertex::new([xb, yb, -h2], norm));
-        }
-
-        for i in 0..segs {
-            let next = (i + 1) % segs;
-            let curr_top = side_start + (i as u32) * 2;
-            let curr_bot = curr_top + 1;
-            let next_top = side_start + (next as u32) * 2;
-            let next_bot = next_top + 1;
-
-            // Tri 1: curr_top -> curr_bot -> next_top (CCW outward)
-            indices.push([curr_top, curr_bot, next_top]);
-            // Tri 2: curr_bot -> next_bot -> next_top (CCW outward)
-            indices.push([curr_bot, next_bot, next_top]);
+                let p_bot_curr = [r0 * a0.cos(), r0 * a0.sin(), z0];
+                let p_bot_next = [r0 * a1.cos(), r0 * a1.sin(), z0];
+                let p_top_next = [r1 * a1.cos(), r1 * a1.sin(), z1];
+                let p_top_curr = [r1 * a0.cos(), r1 * a0.sin(), z1];
+                push_quad_shortest_diag(
+                    &mut vertices,
+                    &mut indices,
+                    p_top_curr,
+                    p_bot_curr,
+                    p_bot_next,
+                    p_top_next,
+                    norm,
+                );
+            }
         }
     }
 
@@ -1343,61 +1667,23 @@ pub fn create_spur_gear_with_settings(
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
 
-    // Helper: add planar fan cap around [0, 0, z]
+    // Helper: add planar subdivided disk cap around [0, 0, z]
     let add_fan_cap = |verts: &mut Vec<Vertex>,
                        idxs: &mut Vec<[u32; 3]>,
                        ring: &[[f64; 2]],
                        z_val: f64,
                        is_top: bool| {
-        let n_z = if is_top { 1.0 } else { -1.0 };
-        let center_idx = verts.len() as u32;
-        verts.push(Vertex::new([0.0, 0.0, z_val], [0.0, 0.0, n_z]));
-        let start_idx = verts.len() as u32;
-        for p in ring {
-            verts.push(Vertex::new([p[0], p[1], z_val], [0.0, 0.0, n_z]));
-        }
-        let n = ring.len();
-        for i in 0..n {
-            let next = (i + 1) % n;
-            if is_top {
-                idxs.push([center_idx, start_idx + (i as u32), start_idx + (next as u32)]);
-            } else {
-                idxs.push([center_idx, start_idx + (next as u32), start_idx + (i as u32)]);
-            }
-        }
+        add_subdivided_disk_cap_2d(verts, idxs, ring, [0.0, 0.0], z_val, is_top);
     };
 
-    // Helper: add planar annular cap between inner_ring and outer_ring at z_val
+    // Helper: add planar bridged annular cap between inner_ring and outer_ring at z_val
     let add_annulus_cap = |verts: &mut Vec<Vertex>,
                            idxs: &mut Vec<[u32; 3]>,
                            in_ring: &[[f64; 2]],
                            out_ring: &[[f64; 2]],
                            z_val: f64,
                            is_top: bool| {
-        let n_z = if is_top { 1.0 } else { -1.0 };
-        let in_start = verts.len() as u32;
-        for p in in_ring {
-            verts.push(Vertex::new([p[0], p[1], z_val], [0.0, 0.0, n_z]));
-        }
-        let out_start = verts.len() as u32;
-        for p in out_ring {
-            verts.push(Vertex::new([p[0], p[1], z_val], [0.0, 0.0, n_z]));
-        }
-        let n = in_ring.len();
-        for i in 0..n {
-            let next = (i + 1) % n;
-            let in_c = in_start + (i as u32);
-            let in_n = in_start + (next as u32);
-            let out_c = out_start + (i as u32);
-            let out_n = out_start + (next as u32);
-            if is_top {
-                idxs.push([in_c, out_c, out_n]);
-                idxs.push([in_c, out_n, in_n]);
-            } else {
-                idxs.push([in_c, out_n, out_c]);
-                idxs.push([in_c, in_n, out_n]);
-            }
-        }
+        add_bridged_ring_strip_2d(verts, idxs, out_ring, in_ring, z_val, is_top);
     };
 
     // Helper: add tooth-ladder caps at z_val for all teeth, stitched to root_poly
@@ -1508,7 +1794,7 @@ pub fn create_spur_gear_with_settings(
         }
     }
 
-    // Helper: add vertical side wall between z_bot and z_top
+    // Helper: add vertical side wall between z_bot and z_top with axial subdivision
     let add_vertical_wall = |verts: &mut Vec<Vertex>,
                              idxs: &mut Vec<[u32; 3]>,
                              ring: &[[f64; 2]],
@@ -1516,32 +1802,56 @@ pub fn create_spur_gear_with_settings(
                              z_top: f64,
                              is_outer: bool| {
         let n = ring.len();
+        if n < 3 {
+            return;
+        }
+        let mut chord_sum = 0.0;
         for i in 0..n {
             let next = (i + 1) % n;
-            let p1 = ring[i];
-            let p2 = ring[next];
-            let dx = p2[0] - p1[0];
-            let dy = p2[1] - p1[1];
-            let edge_len = dx.hypot(dy);
-            let sign = if is_outer { 1.0 } else { -1.0 };
-            let normal = if edge_len > 1e-12 {
-                [sign * dy / edge_len, -sign * dx / edge_len, 0.0]
-            } else {
-                [sign, 0.0, 0.0]
-            };
+            chord_sum += (ring[next][0] - ring[i][0]).hypot(ring[next][1] - ring[i][1]);
+        }
+        let avg_chord = (chord_sum / (n as f64)).max(1e-6);
+        let dz_span = (z_top - z_bot).abs();
+        let n_z = ((dz_span / (avg_chord * 1.4)).ceil() as usize).clamp(1, 24);
 
-            let base = verts.len() as u32;
-            verts.push(Vertex::new([p1[0], p1[1], z_top], normal)); // 0: top curr
-            verts.push(Vertex::new([p1[0], p1[1], z_bot], normal)); // 1: bot curr
-            verts.push(Vertex::new([p2[0], p2[1], z_bot], normal)); // 2: bot next
-            verts.push(Vertex::new([p2[0], p2[1], z_top], normal)); // 3: top next
+        for kz in 0..n_z {
+            let z0 = z_bot + (kz as f64) * (z_top - z_bot) / (n_z as f64);
+            let z1 = z_bot + ((kz + 1) as f64) * (z_top - z_bot) / (n_z as f64);
+            for i in 0..n {
+                let next = (i + 1) % n;
+                let p1 = ring[i];
+                let p2 = ring[next];
+                let dx = p2[0] - p1[0];
+                let dy = p2[1] - p1[1];
+                let edge_len = dx.hypot(dy);
+                let sign = if is_outer { 1.0 } else { -1.0 };
+                let normal = if edge_len > 1e-12 {
+                    [sign * dy / edge_len, -sign * dx / edge_len, 0.0]
+                } else {
+                    [sign, 0.0, 0.0]
+                };
 
-            if is_outer {
-                idxs.push([base, base + 1, base + 3]);
-                idxs.push([base + 1, base + 2, base + 3]);
-            } else {
-                idxs.push([base, base + 3, base + 1]);
-                idxs.push([base + 1, base + 3, base + 2]);
+                if is_outer {
+                    push_quad_shortest_diag(
+                        verts,
+                        idxs,
+                        [p1[0], p1[1], z1],
+                        [p1[0], p1[1], z0],
+                        [p2[0], p2[1], z0],
+                        [p2[0], p2[1], z1],
+                        normal,
+                    );
+                } else {
+                    push_quad_shortest_diag(
+                        verts,
+                        idxs,
+                        [p1[0], p1[1], z1],
+                        [p2[0], p2[1], z1],
+                        [p2[0], p2[1], z0],
+                        [p1[0], p1[1], z0],
+                        normal,
+                    );
+                }
             }
         }
     };
@@ -1682,41 +1992,55 @@ pub fn create_revolve(profile: &[[f64; 2]], angle_deg: f64, segments: usize) -> 
     let sweep_angle_rad = sweep_angle_deg * PI / 180.0;
 
     // 1. Clean profile: ensure r >= 0 and remove duplicate consecutive points
-    let mut pts: Vec<[f64; 2]> = Vec::with_capacity(profile.len());
+    let mut raw_pts: Vec<[f64; 2]> = Vec::with_capacity(profile.len());
     for p in profile {
         let r = p[0].max(0.0);
         let z = p[1];
-        if let Some(last) = pts.last() {
+        if let Some(last) = raw_pts.last() {
             let d2 = (r - last[0]).powi(2) + (z - last[1]).powi(2);
             if d2 > 1e-12 {
-                pts.push([r, z]);
+                raw_pts.push([r, z]);
             }
         } else {
-            pts.push([r, z]);
+            raw_pts.push([r, z]);
         }
     }
-    if pts.len() > 2 {
-        let first = pts[0];
-        let last = *pts.last().unwrap();
+    if raw_pts.len() > 2 {
+        let first = raw_pts[0];
+        let last = *raw_pts.last().unwrap();
         let d2 = (first[0] - last[0]).powi(2) + (first[1] - last[1]).powi(2);
         if d2 <= 1e-12 {
-            pts.pop();
+            raw_pts.pop();
         }
     }
-    let m = pts.len();
-    if m < 3 {
+    if raw_pts.len() < 3 {
         return TriangleMesh::empty();
     }
 
     // 2. Ensure CCW orientation in the (r, z) half-plane (r as X, z as Y)
     let mut area2d = 0.0;
-    for i in 0..m {
-        let next = (i + 1) % m;
-        area2d += pts[i][0] * pts[next][1] - pts[next][0] * pts[i][1];
+    for i in 0..raw_pts.len() {
+        let next = (i + 1) % raw_pts.len();
+        area2d += raw_pts[i][0] * raw_pts[next][1] - raw_pts[next][0] * raw_pts[i][1];
     }
     if area2d < 0.0 {
-        pts.reverse();
+        raw_pts.reverse();
     }
+
+    // Subdivide long profile segments so revolved quads and partial-angle end caps have balanced aspect ratios
+    let target_seg_len = ((max_r * sweep_angle_rad) / (segs as f64) * 1.35).max(max_r * 0.15).max(1e-5);
+    let mut pts: Vec<[f64; 2]> = Vec::with_capacity(raw_pts.len() * 2);
+    for i in 0..raw_pts.len() {
+        let p0 = raw_pts[i];
+        let p1 = raw_pts[(i + 1) % raw_pts.len()];
+        let seg_len = (p1[0] - p0[0]).hypot(p1[1] - p0[1]);
+        let n_sub = ((seg_len / target_seg_len).ceil() as usize).clamp(1, 16);
+        for s in 0..n_sub {
+            let t = (s as f64) / (n_sub as f64);
+            pts.push([p0[0] + (p1[0] - p0[0]) * t, p0[1] + (p1[1] - p0[1]) * t]);
+        }
+    }
+    let m = pts.len();
 
     // 3. Generate side-wall quad strips per profile segment with exact analytical normals
     let n_steps = if is_full_circle { segs } else { segs + 1 };
@@ -2032,19 +2356,13 @@ pub fn create_wheel_rim_with_settings(
     let mut vertices: Vec<Vertex> = Vec::new();
     let mut indices: Vec<[u32; 3]> = Vec::new();
 
-    // Helper: emit a single quad (2 triangles) with explicit normal
+    // Helper: emit a single quad (2 triangles) split along its shorter diagonal
     let mut push_quad = |p0: [f64; 3], p1: [f64; 3], p2: [f64; 3], p3: [f64; 3], n: [f64; 3]| {
-        let base = vertices.len() as u32;
-        vertices.push(Vertex::new(p0, n));
-        vertices.push(Vertex::new(p1, n));
-        vertices.push(Vertex::new(p2, n));
-        vertices.push(Vertex::new(p3, n));
-        indices.push([base, base + 1, base + 2]);
-        indices.push([base, base + 2, base + 3]);
+        push_quad_shortest_diag(&mut vertices, &mut indices, p0, p1, p2, p3, n);
     };
 
     // 3. Build stepped rim barrel profile in CCW (r, z) order
-    // Segment 14 ([r_inner_barrel, z_front] -> [r_inner_barrel, z_back]) is the spoke/window attachment band.
+    // Segment 15 ([r_inner_barrel, z_front] -> [r_inner_barrel, z_back]) is the spoke/window attachment band.
     let barrel_pts: Vec<[f64; 2]> = vec![
         [r_flange, -h_w],                           // 0
         [r_flange, -h_w + 0.05 * w_rim],            // 1
@@ -2107,10 +2425,11 @@ pub fn create_wheel_rim_with_settings(
     }
 
     // 4. Spokes and Ventilation Window Walls between r_hub_eff and r_inner_barrel (z in [z_back, z_front])
+    let n_r_spoke = (((r_inner_barrel - r_hub_eff) / (w_spoke / (k_s as f64) * 1.4)).ceil() as usize).clamp(3, 8);
     for s in 0..n_spokes {
         let sec_start = s * k_sec;
 
-        // 4a. Spoke top (+Z) and bottom (-Z) faces across k_s segments
+        // 4a. Spoke top (+Z) and bottom (-Z) faces across k_s segments and n_r_spoke radial steps
         for m in 0..k_s {
             let j0 = sec_start + m;
             let j1 = (j0 + 1) % n_theta;
@@ -2119,22 +2438,31 @@ pub fn create_wheel_rim_with_settings(
             let b0 = barrel_inner_ring[j0];
             let b1 = barrel_inner_ring[j1];
 
-            // Front face at z_front (normal [0, 0, 1])
-            push_quad(
-                [h0[0], h0[1], z_front],
-                [b0[0], b0[1], z_front],
-                [b1[0], b1[1], z_front],
-                [h1[0], h1[1], z_front],
-                [0.0, 0.0, 1.0],
-            );
-            // Back face at z_back (normal [0, 0, -1])
-            push_quad(
-                [h0[0], h0[1], z_back],
-                [h1[0], h1[1], z_back],
-                [b1[0], b1[1], z_back],
-                [b0[0], b0[1], z_back],
-                [0.0, 0.0, -1.0],
-            );
+            for kr in 0..n_r_spoke {
+                let t0 = (kr as f64) / (n_r_spoke as f64);
+                let t1 = ((kr + 1) as f64) / (n_r_spoke as f64);
+                let r0_a = [h0[0] + (b0[0] - h0[0]) * t0, h0[1] + (b0[1] - h0[1]) * t0];
+                let r1_a = [h0[0] + (b0[0] - h0[0]) * t1, h0[1] + (b0[1] - h0[1]) * t1];
+                let r1_b = [h1[0] + (b1[0] - h1[0]) * t1, h1[1] + (b1[1] - h1[1]) * t1];
+                let r0_b = [h1[0] + (b1[0] - h1[0]) * t0, h1[1] + (b1[1] - h1[1]) * t0];
+
+                // Front face at z_front (normal [0, 0, 1])
+                push_quad(
+                    [r0_a[0], r0_a[1], z_front],
+                    [r1_a[0], r1_a[1], z_front],
+                    [r1_b[0], r1_b[1], z_front],
+                    [r0_b[0], r0_b[1], z_front],
+                    [0.0, 0.0, 1.0],
+                );
+                // Back face at z_back (normal [0, 0, -1])
+                push_quad(
+                    [r0_a[0], r0_a[1], z_back],
+                    [r0_b[0], r0_b[1], z_back],
+                    [r1_b[0], r1_b[1], z_back],
+                    [r1_a[0], r1_a[1], z_back],
+                    [0.0, 0.0, -1.0],
+                );
+            }
         }
 
         // 4b. Leading side wall of spoke s at j_lead = sec_start (from barrel to hub, facing -theta)
@@ -2145,13 +2473,19 @@ pub fn create_wheel_rim_with_settings(
         let dyl = bl[1] - hl[1];
         let len_l = dxl.hypot(dyl).max(1e-12);
         let nl = [dyl / len_l, -dxl / len_l, 0.0];
-        push_quad(
-            [hl[0], hl[1], z_front],
-            [hl[0], hl[1], z_back],
-            [bl[0], bl[1], z_back],
-            [bl[0], bl[1], z_front],
-            nl,
-        );
+        for kr in 0..n_r_spoke {
+            let t0 = (kr as f64) / (n_r_spoke as f64);
+            let t1 = ((kr + 1) as f64) / (n_r_spoke as f64);
+            let p0 = [hl[0] + dxl * t0, hl[1] + dyl * t0];
+            let p1 = [hl[0] + dxl * t1, hl[1] + dyl * t1];
+            push_quad(
+                [p0[0], p0[1], z_front],
+                [p0[0], p0[1], z_back],
+                [p1[0], p1[1], z_back],
+                [p1[0], p1[1], z_front],
+                nl,
+            );
+        }
 
         // 4c. Trailing side wall of spoke s at j_trail = sec_start + k_s (facing +theta)
         let j_trail = sec_start + k_s;
@@ -2161,13 +2495,19 @@ pub fn create_wheel_rim_with_settings(
         let dyt = bt[1] - ht[1];
         let len_t = dxt.hypot(dyt).max(1e-12);
         let nt = [-dyt / len_t, dxt / len_t, 0.0];
-        push_quad(
-            [bt[0], bt[1], z_front],
-            [bt[0], bt[1], z_back],
-            [ht[0], ht[1], z_back],
-            [ht[0], ht[1], z_front],
-            nt,
-        );
+        for kr in 0..n_r_spoke {
+            let t0 = (kr as f64) / (n_r_spoke as f64);
+            let t1 = ((kr + 1) as f64) / (n_r_spoke as f64);
+            let p0 = [ht[0] + dxt * t0, ht[1] + dyt * t0];
+            let p1 = [ht[0] + dxt * t1, ht[1] + dyt * t1];
+            push_quad(
+                [p1[0], p1[1], z_front],
+                [p1[0], p1[1], z_back],
+                [p0[0], p0[1], z_back],
+                [p0[0], p0[1], z_front],
+                nt,
+            );
+        }
 
         // 4d. Hub outer cylindrical wall along the ventilation window (k_s .. k_sec)
         for m in k_s..k_sec {
@@ -2239,53 +2579,55 @@ pub fn create_wheel_rim_with_settings(
             perim_loop.push([r_bore_eff * ang.cos(), r_bore_eff * ang.sin()]);
         }
 
-        // Build 4 * k_b bolt hole points in matching CCW order around bolt_center
-        let mut hole_loop: Vec<[f64; 2]> = Vec::with_capacity(n_loop);
-        for idx in 0..n_loop {
-            let psi = -0.75 * PI + (idx as f64) * 2.0 * PI / (n_loop as f64);
+        // Build 2 * k_b bolt hole points and 2 * k_b midpoint ring points in matching CCW order around bolt_center
+        let n_bolt = 2 * k_b;
+        let mut hole_loop: Vec<[f64; 2]> = Vec::with_capacity(n_bolt);
+        let mut mid_loop: Vec<[f64; 2]> = Vec::with_capacity(n_bolt);
+        for j in 0..n_bolt {
+            let ox = perim_loop[2 * j][0];
+            let oy = perim_loop[2 * j][1];
+            let psi = -0.75 * PI + (j as f64) * 2.0 * PI / (n_bolt as f64);
             let c_p = psi.cos();
             let s_p = psi.sin();
-            let px = bolt_center[0] + r_bolt_eff * (c_p * er[0] + s_p * et_vec[0]);
-            let py = bolt_center[1] + r_bolt_eff * (c_p * er[1] + s_p * et_vec[1]);
-            hole_loop.push([px, py]);
+            let ix = bolt_center[0] + r_bolt_eff * (c_p * er[0] + s_p * et_vec[0]);
+            let iy = bolt_center[1] + r_bolt_eff * (c_p * er[1] + s_p * et_vec[1]);
+            hole_loop.push([ix, iy]);
+            mid_loop.push([0.5 * ix + 0.5 * ox, 0.5 * iy + 0.5 * oy]);
         }
 
-        // Emit front (+Z), back (-Z), and inner bolt-hole cylindrical wall for sector b
-        for idx in 0..n_loop {
-            let next_idx = (idx + 1) % n_loop;
+        // Emit front (+Z) and back (-Z) hub annular sector caps using 2-to-1 halving transition
+        // Note: perim_loop and mid_loop are CCW around bolt_center, so for +Z outward normal we pass Winding::Cw
+        // to add_halving_ring_transition_2d (where Winding::Cw emits (O_{2i}, M_i, O_{2i+1}) -> CCW in XY!).
+        add_halving_ring_transition_2d(&mut vertices, &mut indices, &perim_loop, &mid_loop, z_front, [0.0, 0.0, 1.0], Winding::Cw);
+        add_bridged_ring_strip_2d(&mut vertices, &mut indices, &hole_loop, &mid_loop, z_front, [0.0, 0.0, 1.0], Winding::Ccw, 1);
+
+        add_halving_ring_transition_2d(&mut vertices, &mut indices, &perim_loop, &mid_loop, z_back, [0.0, 0.0, -1.0], Winding::Ccw);
+        add_bridged_ring_strip_2d(&mut vertices, &mut indices, &hole_loop, &mid_loop, z_back, [0.0, 0.0, -1.0], Winding::Cw, 1);
+
+        // Bolt hole inner vertical wall with axial subdivision (normal pointing inward toward bolt_center)
+        let bolt_chord = (2.0 * PI * r_bolt_eff / (n_bolt as f64)).max(1e-6);
+        let bolt_z_steps = (((z_front - z_back) / bolt_chord).round() as usize).clamp(2, 8);
+        for idx in 0..n_bolt {
+            let next_idx = (idx + 1) % n_bolt;
             let h0 = hole_loop[idx];
             let h1 = hole_loop[next_idx];
-            let p0 = perim_loop[idx];
-            let p1 = perim_loop[next_idx];
-
-            // Front cap quad at z_front
-            push_quad(
-                [h0[0], h0[1], z_front],
-                [p0[0], p0[1], z_front],
-                [p1[0], p1[1], z_front],
-                [h1[0], h1[1], z_front],
-                [0.0, 0.0, 1.0],
-            );
-            // Back cap quad at z_back
-            push_quad(
-                [h0[0], h0[1], z_back],
-                [h1[0], h1[1], z_back],
-                [p1[0], p1[1], z_back],
-                [p0[0], p0[1], z_back],
-                [0.0, 0.0, -1.0],
-            );
-            // Bolt hole inner vertical wall (normal pointing inward toward bolt_center)
             let dx = h1[0] - h0[0];
             let dy = h1[1] - h0[1];
             let len = dx.hypot(dy).max(1e-12);
             let n_in = [-dy / len, dx / len, 0.0];
-            push_quad(
-                [h1[0], h1[1], z_front],
-                [h1[0], h1[1], z_back],
-                [h0[0], h0[1], z_back],
-                [h0[0], h0[1], z_front],
-                n_in,
-            );
+            for iz in 0..bolt_z_steps {
+                let tz0 = (iz as f64) / (bolt_z_steps as f64);
+                let tz1 = ((iz + 1) as f64) / (bolt_z_steps as f64);
+                let za = z_front + (z_back - z_front) * tz0;
+                let zb = z_front + (z_back - z_front) * tz1;
+                push_quad(
+                    [h1[0], h1[1], za],
+                    [h1[0], h1[1], zb],
+                    [h0[0], h0[1], zb],
+                    [h0[0], h0[1], za],
+                    n_in,
+                );
+            }
         }
     }
 

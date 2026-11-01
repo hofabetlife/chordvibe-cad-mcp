@@ -540,6 +540,9 @@ pub fn polygons_to_mesh(polygons: &[CsgPolygon]) -> TriangleMesh {
     // 4. Post-triangulation manifold stitching & residual T-junction / slit resolution
     repair_manifold_triangles(&mut tris, &canon_pos, diag);
 
+    // 4b. Lawson Delaunay edge-flipping across internal coplanar edges to eliminate BSP fan slivers
+    optimize_coplanar_delaunay_edges(&mut tris, &canon_pos);
+
     // 5. Emit TriangleMesh with crisp per-face normals
     let mut vertices = Vec::with_capacity(tris.len() * 3);
     let mut indices = Vec::with_capacity(tris.len());
@@ -567,6 +570,123 @@ pub fn polygons_to_mesh(polygons: &[CsgPolygon]) -> TriangleMesh {
     }
 
     TriangleMesh::new(vertices, indices)
+}
+
+#[inline]
+fn min_triangle_angle_rad(p0: Vector3<f64>, p1: Vector3<f64>, p2: Vector3<f64>) -> f64 {
+    let a = (p1 - p0).norm();
+    let b = (p2 - p1).norm();
+    let c = (p0 - p2).norm();
+    if a <= 1e-13 || b <= 1e-13 || c <= 1e-13 {
+        return 0.0;
+    }
+    let cos_a = ((b * b + c * c - a * a) / (2.0 * b * c)).clamp(-1.0, 1.0);
+    let cos_b = ((a * a + c * c - b * b) / (2.0 * a * c)).clamp(-1.0, 1.0);
+    let cos_c = ((a * a + b * b - c * c) / (2.0 * a * b)).clamp(-1.0, 1.0);
+    let max_cos = cos_a.max(cos_b).max(cos_c);
+    max_cos.acos()
+}
+
+/// Performs iterative Lawson Delaunay diagonal flips on adjacent coplanar triangles
+/// whenever flipping the shared interior edge strictly increases the minimum interior angle.
+fn optimize_coplanar_delaunay_edges(
+    tris: &mut [([u32; 3], Vector3<f64>)],
+    canon_pos: &[Vector3<f64>],
+) {
+    let n_tris = tris.len();
+    if n_tris < 2 || n_tris > 25000 {
+        return;
+    }
+
+    for _pass in 0..4 {
+        let mut flipped_in_pass = 0usize;
+        // Map directed half-edge (u, v) -> (tri_idx, local_edge_idx 0..3)
+        let mut half_edge_map: HashMap<(u32, u32), (usize, usize)> =
+            HashMap::with_capacity(n_tris * 3);
+        let mut edge_total_count: HashMap<(u32, u32), u8> = HashMap::with_capacity(n_tris * 2);
+
+        for (t_idx, (t, _)) in tris.iter().enumerate() {
+            for e in 0..3 {
+                let u = t[e];
+                let v = t[(e + 1) % 3];
+                half_edge_map.insert((u, v), (t_idx, e));
+                let key = if u < v { (u, v) } else { (v, u) };
+                *edge_total_count.entry(key).or_insert(0) += 1;
+            }
+        }
+
+        let mut locked_tris = vec![false; n_tris];
+
+        for t1_idx in 0..n_tris {
+            if locked_tris[t1_idx] {
+                continue;
+            }
+            let (t1, n1) = tris[t1_idx];
+            for e1 in 0..3 {
+                let u = t1[e1];
+                let v = t1[(e1 + 1) % 3];
+                let w = t1[(e1 + 2) % 3];
+                let key = if u < v { (u, v) } else { (v, u) };
+                if edge_total_count.get(&key).copied().unwrap_or(0) != 2 {
+                    continue;
+                }
+                let Some(&(t2_idx, e2)) = half_edge_map.get(&(v, u)) else {
+                    continue;
+                };
+                if t2_idx <= t1_idx || locked_tris[t2_idx] {
+                    continue;
+                }
+                let (t2, n2) = tris[t2_idx];
+                if n1.dot(&n2) < 0.9998 {
+                    continue;
+                }
+                let x = t2[(e2 + 2) % 3];
+                if x == w || x == u || x == v {
+                    continue;
+                }
+                // Never flip if the new diagonal (w, x) already exists as an edge
+                let new_key = if w < x { (w, x) } else { (x, w) };
+                if edge_total_count.contains_key(&new_key) {
+                    continue;
+                }
+
+                let pu = canon_pos[u as usize];
+                let pv = canon_pos[v as usize];
+                let pw = canon_pos[w as usize];
+                let px = canon_pos[x as usize];
+
+                // Check strict convexity of quad (u, x, v, w) in plane n1
+                let c_new1 = (px - pw).cross(&(pu - pw));
+                let c_new2 = (pw - px).cross(&(pv - px));
+                let a_new1 = c_new1.dot(&n1);
+                let a_new2 = c_new2.dot(&n1);
+                if a_new1 <= 1e-12 || a_new2 <= 1e-12 {
+                    continue;
+                }
+                if (c_new1.normalize()).dot(&n1) < 0.999 || (c_new2.normalize()).dot(&n1) < 0.999 {
+                    continue;
+                }
+
+                let min_before =
+                    min_triangle_angle_rad(pu, pv, pw).min(min_triangle_angle_rad(pv, pu, px));
+                let min_after =
+                    min_triangle_angle_rad(pw, px, pu).min(min_triangle_angle_rad(px, pw, pv));
+
+                if min_after > min_before + 1e-3 {
+                    tris[t1_idx].0 = [w, x, u];
+                    tris[t2_idx].0 = [x, w, v];
+                    locked_tris[t1_idx] = true;
+                    locked_tris[t2_idx] = true;
+                    flipped_in_pass += 1;
+                    break;
+                }
+            }
+        }
+
+        if flipped_in_pass == 0 {
+            break;
+        }
+    }
 }
 
 fn clean_index_loop(loop_ids: &mut Vec<u32>) {
@@ -661,7 +781,8 @@ fn triangulate_subdivided_convex_loop(
                 continue;
             }
 
-            let quality = signed_area2 / perim_sq;
+            let min_ang = min_triangle_angle_rad(p_prev, p_curr, p_next);
+            let quality = min_ang + 0.15 * (signed_area2 / perim_sq);
             if quality > best_quality {
                 best_quality = quality;
                 best_idx = Some(i);
