@@ -308,6 +308,12 @@ pub fn add_feature_primitive(args: &Value, state: &mut EngineState) -> Result<Va
                 .and_then(|v| v.as_array())
                 .ok_or_else(|| ServerError::InvalidArgument("Revolve requires 'profile' array of [r, z] points".to_string()))?;
 
+            if profile_val.len() < 3 {
+                return Err(ServerError::InvalidArgument(
+                    "Revolve 'profile' must contain at least 3 [r, z] points".to_string(),
+                ));
+            }
+
             let mut profile = Vec::with_capacity(profile_val.len());
             for item in profile_val {
                 let arr = item.as_array().ok_or_else(|| {
@@ -318,7 +324,43 @@ pub fn add_feature_primitive(args: &Value, state: &mut EngineState) -> Result<Va
                 }
                 let r = arr[0].as_f64().ok_or_else(|| ServerError::InvalidArgument("Invalid r coordinate in profile".to_string()))?;
                 let z = arr[1].as_f64().ok_or_else(|| ServerError::InvalidArgument("Invalid z coordinate in profile".to_string()))?;
-                profile.push([r, z]);
+                if !r.is_finite() || !z.is_finite() {
+                    return Err(ServerError::InvalidArgument("Profile coordinates [r, z] must be finite numbers".to_string()));
+                }
+                if r < -1e-9 {
+                    return Err(ServerError::InvalidArgument(format!(
+                        "Profile coordinate r ({r}) cannot be negative (crosses rotation axis)"
+                    )));
+                }
+                profile.push([r.max(0.0), z]);
+            }
+
+            // Reject self-intersecting 2D contour segments in the (r, z) plane
+            let n_pts = profile.len();
+            let segments_intersect_2d = |a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]| -> bool {
+                let ccw = |p1: [f64; 2], p2: [f64; 2], p3: [f64; 2]| -> f64 {
+                    (p2[0] - p1[0]) * (p3[1] - p1[1]) - (p2[1] - p1[1]) * (p3[0] - p1[0])
+                };
+                let d1 = ccw(a, b, c);
+                let d2 = ccw(a, b, d);
+                let d3 = ccw(c, d, a);
+                let d4 = ccw(c, d, b);
+                ((d1 > 1e-9 && d2 < -1e-9) || (d1 < -1e-9 && d2 > 1e-9))
+                    && ((d3 > 1e-9 && d4 < -1e-9) || (d3 < -1e-9 && d4 > 1e-9))
+            };
+            for i in 0..n_pts {
+                let i_next = (i + 1) % n_pts;
+                for j in (i + 2)..n_pts {
+                    let j_next = (j + 1) % n_pts;
+                    if i == 0 && j_next == 0 {
+                        continue;
+                    }
+                    if segments_intersect_2d(profile[i], profile[i_next], profile[j], profile[j_next]) {
+                        return Err(ServerError::InvalidArgument(
+                            "Revolve 2D profile is self-intersecting in the (r, z) plane".to_string(),
+                        ));
+                    }
+                }
             }
 
             let angle_deg = params
@@ -327,10 +369,22 @@ pub fn add_feature_primitive(args: &Value, state: &mut EngineState) -> Result<Va
                 .and_then(|v| v.as_f64())
                 .unwrap_or(360.0);
 
+            if !angle_deg.is_finite() || angle_deg <= 0.0 || angle_deg > 360.0 {
+                return Err(ServerError::InvalidArgument(format!(
+                    "Revolve 'angle_deg' must be in (0, 360], got {angle_deg}"
+                )));
+            }
+
             let segments = params
                 .get("segments")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(32) as usize;
+
+            if segments < 3 {
+                return Err(ServerError::InvalidArgument(
+                    "Revolve 'segments' must be >= 3".to_string(),
+                ));
+            }
 
             FeatureOp::AddRevolve {
                 profile,
