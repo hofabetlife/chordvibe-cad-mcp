@@ -917,6 +917,158 @@ describe('MCP-CAD Core Geometry & Topological Verification Suite', () => {
     assert.ok(squashedReport.lt5DegRatio > 0.01 || squashedReport.lt1DegCount > 0);
     assert.equal(squashedReport.status, 'FAIL', 'Sliver-contaminated mesh must fail validation gate');
   });
+
+  it('verifies BUG-020: Rust vs TS parity for 3D CSG booleans, transactional modify_feature rollback, and validate_mesh nested fields', () => {
+    const initialState: EngineStateSnapshot = {
+      parts: [],
+      selectedPartId: '',
+      joints: [],
+      materials: [...DEFAULT_MATERIALS],
+      feaResult: null,
+      physicsFrames: [],
+      quality: 'standard',
+      renderMode: 'shaded',
+    };
+
+    // 1. Create Part A (Box 0.1 x 0.1 x 0.1 at origin, volume = 0.001 m^3)
+    const s1 = executeMcpToolOnEngineState(initialState, 'add_feature_primitive', {
+      part_id: 'box_a',
+      primitive_type: 'box',
+      params: { width: 0.1, height: 0.1, depth: 0.1 },
+    }).nextState;
+
+    // 2. Create Part B (Box 0.1 x 0.1 x 0.1 shifted by dx=0.05)
+    const s2 = executeMcpToolOnEngineState(s1, 'add_feature_primitive', {
+      part_id: 'box_b',
+      primitive_type: 'box',
+      params: { width: 0.1, height: 0.1, depth: 0.1 },
+    }).nextState;
+    const s3 = executeMcpToolOnEngineState(s2, 'transform_part', {
+      part_id: 'box_b',
+      translation: [0.05, 0, 0],
+    }).nextState;
+
+    // 3. Test 3D CSG Boolean Difference (A \ B)
+    const diffRes = executeMcpToolOnEngineState(s3, 'boolean_difference', {
+      part_a_id: 'box_a',
+      part_b_id: 'box_b',
+      new_part_id: 'part_diff',
+    });
+    assert.equal(diffRes.response.status, 'ok');
+    const partDiff = diffRes.nextState.parts.find((p) => p.id === 'part_diff');
+    assert.ok(partDiff, 'part_diff must be created in engine state');
+    // Volume: Part A is 0.001 m^3, overlap is 0.05 * 0.1 * 0.1 = 0.0005 m^3. Result = 0.0005 m^3
+    assert.ok(
+      Math.abs(partDiff.mesh.volume - 0.0005) < 1e-5,
+      `Expected difference volume 0.0005, got ${partDiff.mesh.volume}`
+    );
+    assert.equal(partDiff.mesh.isWatertight, true, 'CSG difference must be watertight');
+    assert.equal(partDiff.mesh.boundaryEdgesCount, 0, 'CSG difference must have 0 boundary edges');
+
+    // 4. Test 3D CSG Boolean Intersection (A ∩ B)
+    const interRes = executeMcpToolOnEngineState(s3, 'boolean_intersection', {
+      part_a_id: 'box_a',
+      part_b_id: 'box_b',
+      new_part_id: 'part_inter',
+    });
+    assert.equal(interRes.response.status, 'ok');
+    const partInter = interRes.nextState.parts.find((p) => p.id === 'part_inter');
+    assert.ok(partInter, 'part_inter must be created');
+    assert.ok(
+      Math.abs(partInter.mesh.volume - 0.0005) < 1e-5,
+      `Expected intersection volume 0.0005, got ${partInter.mesh.volume}`
+    );
+    assert.equal(partInter.mesh.isWatertight, true, 'CSG intersection must be watertight');
+    assert.equal(partInter.mesh.boundaryEdgesCount, 0, 'CSG intersection must have 0 boundary edges');
+
+    // 5. Test 3D CSG Boolean Union (A ∪ B)
+    const unionRes = executeMcpToolOnEngineState(s3, 'boolean_union', {
+      part_a_id: 'box_a',
+      part_b_id: 'box_b',
+      new_part_id: 'part_union',
+    });
+    assert.equal(unionRes.response.status, 'ok');
+    const partUnion = unionRes.nextState.parts.find((p) => p.id === 'part_union');
+    assert.ok(partUnion, 'part_union must be created');
+    // Union volume: 0.001 + 0.001 - 0.0005 = 0.0015 m^3
+    assert.ok(
+      Math.abs(partUnion.mesh.volume - 0.0015) < 1e-5,
+      `Expected union volume 0.0015, got ${partUnion.mesh.volume}`
+    );
+    assert.equal(partUnion.mesh.isWatertight, true, 'CSG union must be watertight');
+    assert.equal(partUnion.mesh.boundaryEdgesCount, 0, 'CSG union must have 0 boundary edges');
+
+    // 6. Test modify_feature transactional rollback on invalid params
+    const boxBefore = JSON.stringify(s1.parts[0]);
+    assert.throws(() =>
+      executeMcpToolOnEngineState(s1, 'modify_feature', {
+        part_id: 'box_a',
+        node_id: s1.parts[0].dag[0].id,
+        params: { width: -0.05 }, // invalid negative dimension
+      })
+    );
+    const boxAfter = JSON.stringify(s1.parts[0]);
+    assert.equal(boxBefore, boxAfter, 'Original part state must remain unchanged after failed modify_feature');
+
+    // 7. Test unified validate_mesh nested fields parity
+    const valRes = executeMcpToolOnEngineState(diffRes.nextState, 'validate_mesh', {
+      part_id: 'part_diff',
+    }).response;
+    assert.equal(valRes.status, 'PASS');
+    // Top level
+    assert.equal(valRes.is_watertight, true);
+    assert.equal(valRes.boundary_edges_count, 0);
+    assert.equal(valRes.non_manifold_edges_count, 0);
+    // Nested topology
+    assert.ok(valRes.topology, 'Must contain nested topology');
+    assert.equal(valRes.topology.is_watertight, true);
+    assert.equal(valRes.topology.boundary_edges_count, 0);
+    // Nested geometry
+    assert.ok(valRes.geometry, 'Must contain nested geometry');
+    assert.ok(Math.abs(valRes.geometry.volume - 0.0005) < 1e-5);
+    assert.ok(Array.isArray(valRes.geometry.centroid));
+    assert.ok(valRes.geometry.bounding_box);
+    // Nested angle stats
+    assert.ok(valRes.angle_stats, 'Must contain nested angle_stats');
+    assert.equal(valRes.angle_stats.lt1_deg_count, 0);
+    assert.ok(valRes.angle_stats.angle_histogram);
+
+    // 8. SKEPTIC challenges:
+    // SKEPTIC 1: Boolean operation with non-existent part must fail cleanly
+    assert.throws(() =>
+      executeMcpToolOnEngineState(s3, 'boolean_difference', {
+        part_a_id: 'box_a',
+        part_b_id: 'ghost_part_404',
+      })
+    );
+    // SKEPTIC 2: Mid-chain modification rollback on part with multiple nodes
+    const chained = executeMcpToolOnEngineState(s1, 'cut_hole', {
+      part_id: 'box_a',
+      position: [0, 0, 0],
+      normal: [0, 0, -1],
+      radius: 0.01,
+      depth: 0.1,
+    }).nextState;
+    const chainedSnap = JSON.stringify(chained.parts[0]);
+    assert.throws(() =>
+      executeMcpToolOnEngineState(chained, 'modify_feature', {
+        part_id: 'box_a',
+        node_id: chained.parts[0].dag[1].id,
+        params: { radius: -0.02 },
+      })
+    );
+    assert.equal(JSON.stringify(chained.parts[0]), chainedSnap);
+    // SKEPTIC 3: Slicing identical overlapping meshes in boolean difference (A \ A)
+    const selfDiff = executeMcpToolOnEngineState(s1, 'boolean_difference', {
+      part_a_id: 'box_a',
+      part_b_id: 'box_a',
+      new_part_id: 'empty_solid',
+    });
+    // Self difference produces empty geometry or 0 volume
+    const emptyMesh = selfDiff.nextState.parts.find((p) => p.id === 'empty_solid')?.mesh;
+    assert.ok(emptyMesh);
+    assert.ok(emptyMesh.volume < 1e-7 || emptyMesh.triangleCount === 0);
+  });
 });
 
 

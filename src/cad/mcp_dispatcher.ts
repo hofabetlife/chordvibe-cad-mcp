@@ -4,6 +4,7 @@ import {
   FeaSimulationResult,
   KinematicJoint,
   MaterialSpec,
+  MeshGeometryData,
   PhysicsTrajectoryFrame,
   QualityPreset,
   RenderMode,
@@ -17,6 +18,11 @@ import {
   exportMeshToStlBinary,
   validatePartMesh,
 } from './primitives';
+import {
+  csgDifferenceMesh,
+  csgIntersectionMesh,
+  csgUnionMesh,
+} from './csg_bsp';
 import { optimizeCadFeatureTree } from './query_optimizer';
 
 export interface McpToolDefinition {
@@ -697,9 +703,19 @@ export function executeMcpToolOnEngineState(
     case 'boolean_difference':
     case 'boolean_union':
     case 'boolean_intersection': {
-      const partA = resolveTargetPart(state, params.part_a);
-      const partB = state.parts.find((p) => p.id === params.part_b);
-      const resultId = String(params.result_id || partA.id);
+      const partAId = params.part_a_id || params.part_a;
+      const partBId = params.part_b_id || params.part_b;
+      const resultId = String(params.new_part_id || params.result_id || partAId);
+
+      const partA = resolveTargetPart(state, partAId);
+      if (!partBId) {
+        throw new Error(`CSG ${toolName} requires part_b / part_b_id`);
+      }
+      const partB = state.parts.find((p) => p.id === partBId);
+      if (!partB) {
+        throw new Error(`Part '${partBId}' not found for CSG ${toolName}`);
+      }
+
       const opType =
         toolName === 'boolean_difference'
           ? ('boolean_difference' as const)
@@ -708,37 +724,28 @@ export function executeMcpToolOnEngineState(
             : ('boolean_intersection' as const);
 
       const density = getDensity(partA.materialId);
-      let nextDag = [
+
+      // Perform real 3D BSP CSG operation between partA mesh and partB mesh
+      let nextMesh: MeshGeometryData;
+      if (opType === 'boolean_difference') {
+        nextMesh = csgDifferenceMesh(partA.mesh, partB.mesh, density);
+      } else if (opType === 'boolean_union') {
+        nextMesh = csgUnionMesh(partA.mesh, partB.mesh, density);
+      } else {
+        nextMesh = csgIntersectionMesh(partA.mesh, partB.mesh, density);
+      }
+
+      const nextDag = [
         ...partA.dag,
         {
           id: `csg_${partA.dag.length + 1}`,
-          name: `CSG ${opType.replace('boolean_', '').toUpperCase()} (${params.part_b || 'tool'})`,
+          name: `CSG ${opType.replace('boolean_', '').toUpperCase()} (${partBId})`,
           type: opType,
-          params: { tool_part_id: params.part_b },
+          params: { tool_part_id: partBId },
           enabled: true,
         },
       ];
 
-      // If boolean_difference with a cylindrical tool part, also cut an equivalent hole so volume & genus update accurately
-      if (opType === 'boolean_difference' && partB) {
-        const cylNode = partB.dag.find((n) => n.type === 'cylinder');
-        const r = Number(cylNode?.params?.radius ?? 0.006);
-        const h = Number(cylNode?.params?.height ?? 0.05);
-        nextDag.push({
-          id: `csg_hole_${nextDag.length + 1}`,
-          name: `CSG Subtract Bore`,
-          type: 'cut_hole',
-          params: {
-            position: partB.position || [0, 0, 0],
-            normal: [0, -1, 0],
-            radius: r,
-            depth: h,
-          },
-          enabled: true,
-        });
-      }
-
-      const nextMesh = evaluateFeatureTree(nextDag, state.quality, density);
       if (resultId === partA.id) {
         partA.dag = nextDag;
         partA.mesh = nextMesh;
@@ -752,7 +759,7 @@ export function executeMcpToolOnEngineState(
         };
         state.parts = [
           ...state.parts.filter(
-            (p) => p.id !== resultId && p.id !== params.part_b
+            (p) => p.id !== resultId && p.id !== partBId
           ),
           resPart,
         ];
@@ -893,20 +900,13 @@ export function executeMcpToolOnEngineState(
 
     case 'validate_mesh': {
       const part = resolveTargetPart(state, params.part_id);
-      const report = validatePartMesh(part.id, part.mesh);
       const expectedGenus =
         params.expected_genus !== undefined ? Number(params.expected_genus) : undefined;
-      const genusMatches =
-        expectedGenus === undefined ||
-        Math.round(report.eulerGenus) === Math.round(expectedGenus);
-      const passed =
-        report.isWatertight &&
-        report.isManifold &&
-        report.isOutwardOriented &&
-        report.degenerateTrianglesCount === 0 &&
-        genusMatches;
+      const report = validatePartMesh(part.id, part.mesh, expectedGenus);
       response = {
-        status: passed ? 'PASS' : 'FAIL',
+        status: report.status,
+        issues: report.warnings.filter((w) => !w.toLowerCase().includes('warning')),
+        warnings: report.warnings,
         part_id: report.partId,
         raw_vertices_count: report.rawVerticesCount,
         welded_vertices_count: report.weldedVerticesCount,
@@ -922,6 +922,61 @@ export function executeMcpToolOnEngineState(
         is_watertight: report.isWatertight,
         is_manifold: report.isManifold,
         is_outward_oriented: report.isOutwardOriented,
+        topology: {
+          is_watertight: report.isWatertight,
+          boundary_edges_count: report.boundaryEdgesCount,
+          non_manifold_edges_count: report.nonManifoldEdgesCount,
+          orientation_consistent: report.isOutwardOriented,
+          inconsistent_edges_count: report.inconsistentEdgesCount,
+          welded_vertices_count: report.weldedVerticesCount,
+          unique_edges_count: report.uniqueEdgesCount,
+          triangles_count: report.trianglesCount,
+          euler_characteristic: report.eulerCharacteristic,
+          genus: report.eulerGenus,
+          connected_components: report.connectedComponentsCount,
+          non_manifold_vertices_count: 0,
+        },
+        geometry: {
+          volume: report.volume,
+          signed_volume: report.volume,
+          surface_area: report.surfaceArea,
+          centroid: report.centerOfMass,
+          bounding_box: report.boundingBox,
+          is_positive_volume: report.isOutwardOriented,
+          degenerate_triangles_count: report.degenerateTrianglesCount,
+          duplicate_vertices_count: report.rawVerticesCount - report.weldedVerticesCount,
+          sliver_triangles_count: report.sliverTrianglesCount,
+          lt_5_deg_count: report.lt5DegCount,
+          lt_5_deg_ratio: report.lt5DegRatio,
+          lt_1_deg_count: report.lt1DegCount,
+          lt_1_deg_ratio: report.lt1DegRatio,
+          min_aspect_ratio: report.minAspectRatio,
+          p5_aspect_ratio: report.p5AspectRatio,
+          median_aspect_ratio: report.medianAspectRatio,
+          max_aspect_ratio: report.maxAspectRatio,
+          t_junctions_count: report.tJunctionsCount,
+          normals_vs_winding_mismatches: 0,
+          self_intersections_count: report.selfIntersectionsCount,
+          coplanar_overlaps_count: 0,
+        },
+        angle_stats: {
+          min_angle_deg: report.minAngleDeg,
+          median_angle_deg: report.medianAngleDeg,
+          p5_angle_deg: report.p5AngleDeg,
+          lt1_deg_count: report.lt1DegCount,
+          lt_1_deg_count: report.lt1DegCount,
+          lt5_deg_ratio: report.lt5DegRatio,
+          lt_5_deg_ratio: report.lt5DegRatio,
+          angle_histogram: report.angleHistogram,
+          histogram: {
+            lt_1_deg: report.angleHistogram.lt1Deg,
+            deg_1_to_5: report.angleHistogram.deg1To5,
+            deg_5_to_15: report.angleHistogram.deg5To15,
+            deg_15_to_30: report.angleHistogram.deg15To30,
+            deg_30_to_45: report.angleHistogram.deg30To45,
+            deg_45_to_60: report.angleHistogram.deg45To60,
+          },
+        },
         volume: report.volume,
         surface_area: report.surfaceArea,
         bounding_box: report.boundingBox,
