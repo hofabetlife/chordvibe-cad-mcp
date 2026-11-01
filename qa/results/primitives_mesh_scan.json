@@ -391,20 +391,18 @@
       "watertight": true
     },
     {
-      "euler_chi": 2,
-      "genus": 0.0,
-      "issues": [
-        "Euler genus mismatch: computed 0.0 (round 0), expected 1"
-      ],
+      "euler_chi": 0,
+      "genus": 1.0,
+      "issues": [],
       "orientation_consistent": true,
-      "signed_volume": 2.8881900853978277e-6,
-      "status": "FAIL",
+      "signed_volume": 3.041825419284512e-6,
+      "status": "PASS",
       "target": "spur_gear_teeth_8_with_hub_bore_keyway",
       "teeth": 8,
-      "triangles": 448,
+      "triangles": 640,
       "warnings": [
-        "Notice: 192 sliver triangles detected (min angle < 5° or aspect ratio > 100)",
-        "Notice: 480 un-welded duplicate vertices found (CAD split normals)"
+        "Notice: 214 sliver triangles detected (min angle < 5° or aspect ratio > 100)",
+        "Notice: 668 un-welded duplicate vertices found (CAD split normals)"
       ],
       "watertight": true
     },

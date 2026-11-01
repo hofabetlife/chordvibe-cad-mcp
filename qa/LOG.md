@@ -87,3 +87,47 @@
   - Обновлены и согласованы все отчеты QA: `STATE.json`, `BUGS.md`, `COVERAGE.md`, `MESH_REPORT.md`, `LOG.md`, `FINAL_REPORT.md`.
 - **Итог**: Открытых багов S1/S2/S3/S4 нет (0). Все критерии остановки достигнуты. Релиз готов к эксплуатации.
 
+---
+
+## Итерация 11–14 — Фаза 3: Расширение до 28 инструментов (`validate_mesh`, `optimize_feature_tree`) и закрытие BUG-011..BUG-014
+- **Дата/время**: 2026-11-01T10:10:00Z
+- **Коммит**: `38d6683 chore(qa): baseline snapshot before iteration 15`
+- **Суть**:
+  - **BUG-011 [S2]**: Исправлен эйлеров род `spur_gear` при $Z=8$ со ступицей и шпоночным пазом ($g=1$, $\chi=0$) и полярная O-сетка болтовых отверстий PCD в `wheel_rim` ($g=11, 12, 16$).
+  - **BUG-012 [S3]**: Устранены открытые граничные ребра (`boundary_edges = 0`) в `cut_helical_groove` для круглого и метрического ($60^\circ$) профилей резьбы.
+  - **BUG-013 [S4]**: Унифицирована документация по всем 28 инструментам MCP (включая `validate_mesh` и `optimize_feature_tree`).
+  - **BUG-014 [S3]**: Исправлены типы TypeScript в веб-студии `mcp-cad-studio` (`tsc --noEmit` = 0 ошибок).
+
+---
+
+## Итерация 15 — Фаза 2: Глубокий аудит контрактов API, 27 PNG-рендеров и граничных условий
+- **Дата/время**: 2026-11-01T16:15:00Z
+- **Выполнено**:
+  - Просмотрены и описаны по 11-пунктному чек-листу (Раздел 8 ТЗ, Правила R1/R2) все 27 диагностических рендеров в `qa/artifacts/*.png` (`spur_gear_hub_keyway_*`, `wheel_rim_5spoke_*`, `revolve_partial_180_*`, `polygon_prism_hex_chamfer_*`, `csg_chain_two_holes_*`, `neg_scale_cyl_*`).
+  - Обнаружены и задокументированы 3 новых дефекта:
+    - **BUG-015 [S3]**: В `tools/list` (`crates/mcp-cad-server/src/tools/mod.rs`) для `create_joint` отсутствовал тип `"gear"` в `enum` и требовались обязательные `anchor_a`/`anchor_b`, а в `create_part` отсутствовало свойство `is_fixed`.
+    - **BUG-016 [S2]**: В `revolve` (`crates/mcp-cad-server/src/tools/cad.rs` и `src/cad/primitives.ts`) отсутствовала проверка пересечения оси вращения ($r < 0$), угла $\notin (0, 360]$ и самопересечения 2D-профиля («восьмерка»); в TS-ядре `createWheelRimMesh` строил контур с отрицательным знаковым объемом, а `weldTolerance = 1e-5` м схлопывал соседние вершины мелких отверстий.
+    - **BUG-017 [S2]**: В TS FEA-решателе (`src/cad/fea_solver.ts`) отсутствовала проверка незакрепленного тела (Rigid Body Motion при 0 `'fixed'`-ограничений) и декомпозиция силы на осевое растяжение/сжатие Гука ($\Delta L = \frac{FL}{EA}$) и поперечный изгиб.
+
+---
+
+## Итерация 16–17 — Фаза 3: Атомарное исправление BUG-015, BUG-016, BUG-017 и 50-цепочечный DAG-фаззинг
+- **Дата/время**: 2026-11-01T16:45:00Z
+- **Коммиты**:
+  - `0d41f00 fix(server): align create_joint gear schema and create_part is_fixed schema [BUG-015]`
+  - `208cf2a fix(core): enforce revolve profile boundary and self-intersection validation and outward MeshBuilder orientation [BUG-016]`
+  - `02e932b fix(fea): reject unconstrained FEA models and decompose axial Hooke vs transverse bending [BUG-017]`
+- **Верификация**:
+  - Написаны и пройдены регрессионные тесты `test_bug015_create_joint_and_create_part_schema_contract`, `test_bug016_revolve_boundary_and_self_intersection_validation` в `mcp_contract_tests.rs` и тесты 18–21 в `src/cad/cad_engine.test.ts`.
+  - Выполнен детерминированный фаззинг 50 случайных цепочек DAG (по 2–6 операций: примитивы + `cut_hole` + `transform_part` с отражением): **50/50 PASS** (0 паник, 100% watertight, 0 boundary edges, 0 non-manifold edges, 0 degenerate triangles, 100% outward normals).
+
+---
+
+## Итерация 18 — Фаза 4: Финальный контрольный прогон и аудит UI в браузере
+- **Дата/время**: 2026-11-01T16:50:00Z
+- **Выполнено**:
+  - Пройдены 2 последовательных чистых прогона всех тестов (`npx --yes tsx --test src/cad/cad_engine.test.ts`: 21/21 PASS; Rust workspace: 126/126 PASS).
+  - Сборка `compile_applet` и проверка `lint_applet`: 0 ошибок.
+  - Актуализированы все отчеты и JSON-метрики в `qa/`. Открытых багов S1/S2/S3/S4: **0**.
+
+

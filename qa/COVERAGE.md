@@ -63,8 +63,9 @@
 
 5. **`mcp-cad-server`**:
    - `tests/gear_kinematic_test.rs`: 1/1 PASS
-   - `tests/mcp_contract_tests.rs`: 19/19 PASS
+   - `tests/mcp_contract_tests.rs`: 21/21 PASS
    - `tests/qa_wide_scan.rs`: 13/13 PASS
-   - Итого: **33 теста (100% PASS)**
+   - Итого: **35 тестов (100% PASS)**
 
-**Всего по проекту: 124 Rust-теста + 16 TypeScript-тестов = 140 тестов, 0 падений, 0 регрессий, 0 предупреждений Clippy.**
+**Всего по проекту: 126 Rust-тестов + 21 TypeScript-тест (включая 50-цепочечный детерминированный DAG-фаззер) = 147 тестов, 0 падений, 0 регрессий, 0 предупреждений Clippy.**
+
