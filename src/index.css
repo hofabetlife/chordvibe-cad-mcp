@@ -1,0 +1,39 @@
+@import "tailwindcss";
+@source "./";
+@source "../index.html";
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  color-scheme: dark;
+}
+
+code, kbd, samp, pre, .font-mono {
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+/* Custom CAD scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #181b20;
+}
+::-webkit-scrollbar-thumb {
+  background: #2b303b;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3b4252;
+}
+
+/* Custom engineering slider inputs */
+input[type="range"] {
+  accent-color: #0284c7;
+}
+
+/* Canvas styling */
+canvas {
+  outline: none;
+}

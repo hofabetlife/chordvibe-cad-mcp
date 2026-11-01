@@ -1,0 +1,2746 @@
+//! 3D solid primitive generators: Box, Cylinder, Sphere, and CutHole.
+
+use std::f64::consts::PI;
+use nalgebra::{Rotation3, Vector3};
+use crate::csg::csg_difference;
+use crate::tessellation::{TessellationQuality, TessellationSettings};
+use crate::topology::{TriangleMesh, Vertex};
+
+/// Generates a solid 3D box (cuboid) centered at the origin.
+///
+/// Dimensions: `width` along X, `height` along Y, `depth` along Z.
+/// Coordinates span: `[-width/2, width/2] x [-height/2, height/2] x [-depth/2, depth/2]`.
+pub fn create_box(width: f64, height: f64, depth: f64) -> TriangleMesh {
+    let w2 = width * 0.5;
+    let h2 = height * 0.5;
+    let d2 = depth * 0.5;
+
+    let mut vertices = Vec::with_capacity(24);
+    let mut indices = Vec::with_capacity(12);
+
+    // Helper macro to append a rectangular face (4 vertices, 2 triangles)
+    let mut add_face = |p0: [f64; 3], p1: [f64; 3], p2: [f64; 3], p3: [f64; 3], normal: [f64; 3]| {
+        let base = vertices.len() as u32;
+        vertices.push(Vertex::new(p0, normal));
+        vertices.push(Vertex::new(p1, normal));
+        vertices.push(Vertex::new(p2, normal));
+        vertices.push(Vertex::new(p3, normal));
+
+        // CCW when viewed from outside
+        indices.push([base, base + 1, base + 2]);
+        indices.push([base, base + 2, base + 3]);
+    };
+
+    // Front face (+Z)
+    add_face(
+        [-w2, -h2,  d2],
+        [ w2, -h2,  d2],
+        [ w2,  h2,  d2],
+        [-w2,  h2,  d2],
+        [0.0, 0.0, 1.0],
+    );
+
+    // Back face (-Z)
+    add_face(
+        [ w2, -h2, -d2],
+        [-w2, -h2, -d2],
+        [-w2,  h2, -d2],
+        [ w2,  h2, -d2],
+        [0.0, 0.0, -1.0],
+    );
+
+    // Right face (+X)
+    add_face(
+        [ w2, -h2,  d2],
+        [ w2, -h2, -d2],
+        [ w2,  h2, -d2],
+        [ w2,  h2,  d2],
+        [1.0, 0.0, 0.0],
+    );
+
+    // Left face (-X)
+    add_face(
+        [-w2, -h2, -d2],
+        [-w2, -h2,  d2],
+        [-w2,  h2,  d2],
+        [-w2,  h2, -d2],
+        [-1.0, 0.0, 0.0],
+    );
+
+    // Top face (+Y)
+    add_face(
+        [-w2,  h2,  d2],
+        [ w2,  h2,  d2],
+        [ w2,  h2, -d2],
+        [-w2,  h2, -d2],
+        [0.0, 1.0, 0.0],
+    );
+
+    // Bottom face (-Y)
+    add_face(
+        [-w2, -h2, -d2],
+        [ w2, -h2, -d2],
+        [ w2, -h2,  d2],
+        [-w2, -h2,  d2],
+        [0.0, -1.0, 0.0],
+    );
+
+    TriangleMesh::new(vertices, indices)
+}
+
+/// Generates a solid 3D cylinder centered at the origin along the Z axis.
+///
+/// Coordinates span: `radius` in XY plane, `z in [-height/2, height/2]`.
+pub fn create_cylinder(radius: f64, height: f64, segments: usize) -> TriangleMesh {
+    let segs = if segments == 0 {
+        TessellationSettings::default().calculate_segments(radius)
+    } else {
+        segments.max(8)
+    };
+    let h2 = height * 0.5;
+
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+
+    // 1. Top cap (z = +h2, normal = [0, 0, 1])
+    let top_center_idx = vertices.len() as u32;
+    vertices.push(Vertex::new([0.0, 0.0, h2], [0.0, 0.0, 1.0]));
+
+    let top_rim_start = vertices.len() as u32;
+    for i in 0..segs {
+        let theta = (i as f64) * 2.0 * PI / (segs as f64);
+        let x = radius * theta.cos();
+        let y = radius * theta.sin();
+        vertices.push(Vertex::new([x, y, h2], [0.0, 0.0, 1.0]));
+    }
+
+    for i in 0..segs {
+        let next = (i + 1) % segs;
+        indices.push([
+            top_center_idx,
+            top_rim_start + (i as u32),
+            top_rim_start + (next as u32),
+        ]);
+    }
+
+    // 2. Bottom cap (z = -h2, normal = [0, 0, -1])
+    let bot_center_idx = vertices.len() as u32;
+    vertices.push(Vertex::new([0.0, 0.0, -h2], [0.0, 0.0, -1.0]));
+
+    let bot_rim_start = vertices.len() as u32;
+    for i in 0..segs {
+        let theta = (i as f64) * 2.0 * PI / (segs as f64);
+        let x = radius * theta.cos();
+        let y = radius * theta.sin();
+        vertices.push(Vertex::new([x, y, -h2], [0.0, 0.0, -1.0]));
+    }
+
+    for i in 0..segs {
+        let next = (i + 1) % segs;
+        // Winding reversed so normal points down (-Z)
+        indices.push([
+            bot_center_idx,
+            bot_rim_start + (next as u32),
+            bot_rim_start + (i as u32),
+        ]);
+    }
+
+    // 3. Side wall quads (split into 2 triangles each)
+    let side_start = vertices.len() as u32;
+    for i in 0..segs {
+        let theta = (i as f64) * 2.0 * PI / (segs as f64);
+        let cos_t = theta.cos();
+        let sin_t = theta.sin();
+        let x = radius * cos_t;
+        let y = radius * sin_t;
+        let normal = [cos_t, sin_t, 0.0];
+
+        // Top vertex
+        vertices.push(Vertex::new([x, y, h2], normal));
+        // Bottom vertex
+        vertices.push(Vertex::new([x, y, -h2], normal));
+    }
+
+    for i in 0..segs {
+        let next = (i + 1) % segs;
+        let curr_top = side_start + (i as u32) * 2;
+        let curr_bot = curr_top + 1;
+        let next_top = side_start + (next as u32) * 2;
+        let next_bot = next_top + 1;
+
+        // Tri 1: curr_top -> curr_bot -> next_top (CCW outward)
+        indices.push([curr_top, curr_bot, next_top]);
+        // Tri 2: curr_bot -> next_bot -> next_top (CCW outward)
+        indices.push([curr_bot, next_bot, next_top]);
+    }
+
+    TriangleMesh::new(vertices, indices)
+}
+
+/// Generates a solid 3D cylinder with adaptive tessellation based on `TessellationSettings`.
+pub fn create_cylinder_with_settings(
+    radius: f64,
+    height: f64,
+    settings: &TessellationSettings,
+) -> TriangleMesh {
+    let segments = settings.calculate_segments(radius);
+    create_cylinder(radius, height, segments)
+}
+
+/// Generates a solid 3D UV sphere centered at the origin.
+pub fn create_sphere(radius: f64, sectors: usize, stacks: usize) -> TriangleMesh {
+    let (def_sec, def_stk) = TessellationSettings::default().calculate_sphere_resolution(radius);
+    let sectors = if sectors == 0 { def_sec } else { sectors.max(6) };
+    let stacks = if stacks == 0 { def_stk } else { stacks.max(4) };
+
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+
+    for i in 0..=stacks {
+        let phi = PI * 0.5 - (i as f64) * PI / (stacks as f64);
+        let z = radius * phi.sin();
+        let xy = radius * phi.cos();
+
+        for j in 0..=sectors {
+            let theta = (j as f64) * 2.0 * PI / (sectors as f64);
+            let x = xy * theta.cos();
+            let y = xy * theta.sin();
+
+            let norm = [x / radius, y / radius, z / radius];
+            vertices.push(Vertex::new([x, y, z], norm));
+        }
+    }
+
+    for i in 0..stacks {
+        for j in 0..sectors {
+            let k1 = (i * (sectors + 1) + j) as u32;
+            let k2 = k1 + (sectors + 1) as u32;
+
+            if i != 0 {
+                indices.push([k1, k2, k1 + 1]);
+            }
+            if i != (stacks - 1) {
+                indices.push([k1 + 1, k2, k2 + 1]);
+            }
+        }
+    }
+
+    TriangleMesh::new(vertices, indices)
+}
+
+/// Generates a solid 3D UV sphere with adaptive tessellation based on `TessellationSettings`.
+pub fn create_sphere_with_settings(
+    radius: f64,
+    settings: &TessellationSettings,
+) -> TriangleMesh {
+    let (sectors, stacks) = settings.calculate_sphere_resolution(radius);
+    create_sphere(radius, sectors, stacks)
+}
+
+/// Generates an oriented cylinder with specified center, axis direction vector, radius, and height.
+pub fn create_cylinder_oriented(
+    center: [f64; 3],
+    axis: [f64; 3],
+    radius: f64,
+    height: f64,
+    segments: usize,
+) -> TriangleMesh {
+    let mut mesh = create_cylinder(radius, height, segments);
+
+    let ax_vec = Vector3::new(axis[0], axis[1], axis[2]);
+    let ax_len = ax_vec.norm();
+    let unit_axis = if ax_len > 1e-12 {
+        ax_vec / ax_len
+    } else {
+        Vector3::new(0.0, 0.0, 1.0)
+    };
+
+    let z_unit = Vector3::new(0.0, 0.0, 1.0);
+    let rot = if let Some(r) = Rotation3::rotation_between(&z_unit, &unit_axis) {
+        r
+    } else {
+        // Opposite direction (180 deg rotation around X)
+        Rotation3::from_axis_angle(&Vector3::x_axis(), PI)
+    };
+
+    for v in &mut mesh.vertices {
+        let pos = rot * v.pos_vec();
+        let n = rot * v.normal_vec();
+        v.position = [
+            pos.x + center[0],
+            pos.y + center[1],
+            pos.z + center[2],
+        ];
+        v.normal = [n.x, n.y, n.z];
+    }
+
+    mesh
+}
+
+/// Generates an oriented cylinder with adaptive tessellation based on `TessellationSettings`.
+pub fn create_cylinder_oriented_with_settings(
+    center: [f64; 3],
+    axis: [f64; 3],
+    radius: f64,
+    height: f64,
+    settings: &TessellationSettings,
+) -> TriangleMesh {
+    let segments = settings.calculate_segments(radius);
+    create_cylinder_oriented(center, axis, radius, height, segments)
+}
+
+/// Cuts a cylindrical hole in `mesh` at the specified `center` location,
+/// oriented along `normal` with radius `radius` and depth `depth`.
+/// Optionally cuts a DIN 6885 keyway slot of specified `keyway_width` and `keyway_depth`.
+///
+/// Uses Boolean difference (CSG subtraction).
+pub fn cut_hole(
+    mesh: &TriangleMesh,
+    center: [f64; 3],
+    normal: [f64; 3],
+    radius: f64,
+    depth: f64,
+    keyway_width: Option<f64>,
+    keyway_depth: Option<f64>,
+) -> TriangleMesh {
+    cut_hole_with_settings(
+        mesh,
+        center,
+        normal,
+        radius,
+        depth,
+        keyway_width,
+        keyway_depth,
+        &TessellationSettings::default(),
+    )
+}
+
+/// Cuts a cylindrical hole in `mesh` with adaptive tessellation based on `TessellationSettings`.
+#[allow(clippy::too_many_arguments)]
+pub fn cut_hole_with_settings(
+    mesh: &TriangleMesh,
+    center: [f64; 3],
+    normal: [f64; 3],
+    radius: f64,
+    depth: f64,
+    keyway_width: Option<f64>,
+    keyway_depth: Option<f64>,
+    settings: &TessellationSettings,
+) -> TriangleMesh {
+    if radius <= 1e-12 || depth <= 1e-12 || mesh.indices.is_empty() {
+        return mesh.clone();
+    }
+
+    let norm_v = Vector3::new(normal[0], normal[1], normal[2]);
+    let norm_len = norm_v.norm();
+    let unit_norm = if norm_len > 1e-12 {
+        norm_v / norm_len
+    } else {
+        Vector3::new(0.0, 0.0, 1.0)
+    };
+
+    let center_vec = Vector3::new(center[0], center[1], center[2]);
+    let mut t_min = f64::INFINITY;
+    let mut t_max = f64::NEG_INFINITY;
+    for v in &mesh.vertices {
+        let t = (v.pos_vec() - center_vec).dot(&unit_norm);
+        if t < t_min {
+            t_min = t;
+        }
+        if t > t_max {
+            t_max = t;
+        }
+    }
+    let span = (t_max - t_min).max(0.0);
+    let margin = (depth * 0.05).clamp(1e-3, 0.05);
+
+    // Determine axial start/end along +unit_norm relative to center_vec:
+    // If depth covers the part span along unit_norm, treat as a through-hole spanning [t_min - margin, t_max + margin].
+    // Otherwise drill from the entry side (t_entry) inward by depth along -unit_norm.
+    let (t_high, t_low) = if span > 1e-9 && depth >= span - 1e-4 {
+        (t_max + margin, t_min - margin)
+    } else {
+        let t_entry = if t_max.abs() <= 1e-4 { 0.0 } else { t_max };
+        let mut t_bottom = t_entry - depth;
+        if span > 1e-9 && (t_bottom - t_min).abs() < 5e-4 {
+            if depth >= span * 0.95 {
+                t_bottom = t_min - margin;
+            } else {
+                t_bottom = t_min + 1e-3;
+            }
+        }
+        (t_entry + margin, t_bottom)
+    };
+
+    let tool_height = (t_high - t_low).max(1e-5);
+    let drill_dir = -unit_norm;
+    let tool_center = center_vec + unit_norm * (0.5 * (t_high + t_low));
+
+    let final_tool = if let (Some(kw), Some(kd)) = (keyway_width, keyway_depth) {
+        if kw > 1e-6 && kd > 1e-6 {
+            build_keyway_cutter_prism(
+                tool_center,
+                drill_dir,
+                radius,
+                tool_height,
+                kw,
+                kd,
+                settings.calculate_segments(radius).max(24),
+            )
+        } else {
+            create_cylinder_oriented_with_settings(
+                [tool_center.x, tool_center.y, tool_center.z],
+                [drill_dir.x, drill_dir.y, drill_dir.z],
+                radius,
+                tool_height,
+                settings,
+            )
+        }
+    } else {
+        create_cylinder_oriented_with_settings(
+            [tool_center.x, tool_center.y, tool_center.z],
+            [drill_dir.x, drill_dir.y, drill_dir.z],
+            radius,
+            tool_height,
+            settings,
+        )
+    };
+
+    csg_difference(mesh, &final_tool)
+}
+
+/// Builds a single watertight manifold cutter prism consisting of a cylinder of `radius`
+/// with a rectangular keyway slot (`kw` wide, `kd` deep beyond `radius`) extruded along `axis`.
+fn build_keyway_cutter_prism(
+    center: Vector3<f64>,
+    axis: Vector3<f64>,
+    radius: f64,
+    height: f64,
+    keyway_width: f64,
+    keyway_depth: f64,
+    segments: usize,
+) -> TriangleMesh {
+    let w = axis.normalize();
+    let up = if w.y.abs() < 0.9 {
+        Vector3::new(0.0, 1.0, 0.0)
+    } else {
+        Vector3::new(0.0, 0.0, 1.0)
+    };
+    let u = w.cross(&up).normalize();
+    let v = w.cross(&u).normalize();
+
+    let half_kw = (keyway_width * 0.5).clamp(radius * 0.02, radius * 0.92);
+    let alpha = (half_kw / radius).clamp(0.02, 0.95).asin();
+    let y_shoulder = (radius * radius - half_kw * half_kw).max(0.0).sqrt();
+    let y_top = radius + keyway_depth;
+
+    let mut profile: Vec<[f64; 2]> = Vec::with_capacity(segments + 4);
+    profile.push([half_kw, y_shoulder]);
+    profile.push([half_kw, y_top]);
+    profile.push([-half_kw, y_top]);
+    profile.push([-half_kw, y_shoulder]);
+
+    let start_ang = std::f64::consts::FRAC_PI_2 + alpha;
+    let end_ang = 2.5 * std::f64::consts::PI - alpha;
+    let arc_steps = segments.max(16);
+    for i in 1..arc_steps {
+        let t = i as f64 / arc_steps as f64;
+        let ang = start_ang + t * (end_ang - start_ang);
+        profile.push([radius * ang.cos(), radius * ang.sin()]);
+    }
+
+    let n = profile.len();
+    let half_h = height * 0.5;
+    let to_world = |px: f64, py: f64, pz: f64| -> [f64; 3] {
+        let p = center + u * px + v * py + w * pz;
+        [p.x, p.y, p.z]
+    };
+    let norm_world = |nx: f64, ny: f64, nz: f64| -> [f64; 3] {
+        let d = (u * nx + v * ny + w * nz).normalize();
+        [d.x, d.y, d.z]
+    };
+
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+
+    // Bottom cap at z = -half_h (normal -w)
+    let n_bot = norm_world(0.0, 0.0, -1.0);
+    let bot_center_idx = vertices.len() as u32;
+    vertices.push(Vertex::new(to_world(0.0, 0.0, -half_h), n_bot));
+    let bot_ring_start = vertices.len() as u32;
+    for &[px, py] in &profile {
+        vertices.push(Vertex::new(to_world(px, py, -half_h), n_bot));
+    }
+    for i in 0..n {
+        let next = (i + 1) % n;
+        indices.push([
+            bot_center_idx,
+            bot_ring_start + next as u32,
+            bot_ring_start + i as u32,
+        ]);
+    }
+
+    // Top cap at z = +half_h (normal +w)
+    let n_top = norm_world(0.0, 0.0, 1.0);
+    let top_center_idx = vertices.len() as u32;
+    vertices.push(Vertex::new(to_world(0.0, 0.0, half_h), n_top));
+    let top_ring_start = vertices.len() as u32;
+    for &[px, py] in &profile {
+        vertices.push(Vertex::new(to_world(px, py, half_h), n_top));
+    }
+    for i in 0..n {
+        let next = (i + 1) % n;
+        indices.push([
+            top_center_idx,
+            top_ring_start + i as u32,
+            top_ring_start + next as u32,
+        ]);
+    }
+
+    // Side walls connecting bottom ring to top ring
+    for i in 0..n {
+        let next = (i + 1) % n;
+        let p0 = profile[i];
+        let p1 = profile[next];
+        let dx = p1[0] - p0[0];
+        let dy = p1[1] - p0[1];
+        let len = (dx * dx + dy * dy).sqrt().max(1e-12);
+        let n_side = norm_world(dy / len, -dx / len, 0.0);
+
+        let base = vertices.len() as u32;
+        vertices.push(Vertex::new(to_world(p0[0], p0[1], -half_h), n_side));
+        vertices.push(Vertex::new(to_world(p1[0], p1[1], -half_h), n_side));
+        vertices.push(Vertex::new(to_world(p1[0], p1[1], half_h), n_side));
+        vertices.push(Vertex::new(to_world(p0[0], p0[1], half_h), n_side));
+
+        indices.push([base, base + 1, base + 2]);
+        indices.push([base, base + 2, base + 3]);
+    }
+
+    TriangleMesh::new(vertices, indices)
+}
+
+/// Generates a solid 3D cone or truncated cone (frustum) centered at the origin along the Z axis.
+///
+/// If `radius_top == 0.0`, a sharp cone with its apex at `z = +height/2` is created.
+/// If `radius_top > 0.0`, a frustum with flat top cap at `z = +height/2` is created.
+/// Coordinates span: `[-height/2, +height/2]` along Z axis.
+pub fn create_cone(radius_bottom: f64, radius_top: f64, height: f64, segments: usize) -> TriangleMesh {
+    if height <= 1e-12 || (radius_bottom <= 1e-12 && radius_top <= 1e-12) {
+        return TriangleMesh::empty();
+    }
+
+    let max_r = radius_bottom.max(radius_top);
+    let segs = if segments == 0 {
+        TessellationSettings::default().calculate_segments(max_r)
+    } else {
+        segments.max(8)
+    };
+    let h2 = height * 0.5;
+
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+
+    let has_bot_cap = radius_bottom > 1e-12;
+    let has_top_cap = radius_top > 1e-12;
+
+    // 1. Bottom cap (z = -h2, normal = [0, 0, -1])
+    if has_bot_cap {
+        let bot_center_idx = vertices.len() as u32;
+        vertices.push(Vertex::new([0.0, 0.0, -h2], [0.0, 0.0, -1.0]));
+
+        let bot_rim_start = vertices.len() as u32;
+        for i in 0..segs {
+            let theta = (i as f64) * 2.0 * PI / (segs as f64);
+            let x = radius_bottom * theta.cos();
+            let y = radius_bottom * theta.sin();
+            vertices.push(Vertex::new([x, y, -h2], [0.0, 0.0, -1.0]));
+        }
+
+        for i in 0..segs {
+            let next = (i + 1) % segs;
+            // CCW when viewed from outside (-Z): [center, next, curr]
+            indices.push([
+                bot_center_idx,
+                bot_rim_start + (next as u32),
+                bot_rim_start + (i as u32),
+            ]);
+        }
+    }
+
+    // 2. Top cap (z = +h2, normal = [0, 0, 1]) if truncated cone
+    if has_top_cap {
+        let top_center_idx = vertices.len() as u32;
+        vertices.push(Vertex::new([0.0, 0.0, h2], [0.0, 0.0, 1.0]));
+
+        let top_rim_start = vertices.len() as u32;
+        for i in 0..segs {
+            let theta = (i as f64) * 2.0 * PI / (segs as f64);
+            let x = radius_top * theta.cos();
+            let y = radius_top * theta.sin();
+            vertices.push(Vertex::new([x, y, h2], [0.0, 0.0, 1.0]));
+        }
+
+        for i in 0..segs {
+            let next = (i + 1) % segs;
+            // CCW when viewed from outside (+Z): [center, curr, next]
+            indices.push([
+                top_center_idx,
+                top_rim_start + (i as u32),
+                top_rim_start + (next as u32),
+            ]);
+        }
+    }
+
+    // 3. Side wall
+    let dr = radius_bottom - radius_top;
+    let slant = (height * height + dr * dr).sqrt();
+    let (nz, n_radial) = if slant > 1e-12 {
+        (dr / slant, height / slant)
+    } else {
+        (0.0, 1.0)
+    };
+
+    if !has_top_cap {
+        // Sharp cone: apex at [0, 0, h2]
+        let side_start = vertices.len() as u32;
+        for i in 0..segs {
+            let theta = (i as f64) * 2.0 * PI / (segs as f64);
+            let cos_t = theta.cos();
+            let sin_t = theta.sin();
+            let x = radius_bottom * cos_t;
+            let y = radius_bottom * sin_t;
+            let norm = [n_radial * cos_t, n_radial * sin_t, nz];
+            vertices.push(Vertex::new([x, y, -h2], norm));
+        }
+
+        let apex_idx = vertices.len() as u32;
+        vertices.push(Vertex::new([0.0, 0.0, h2], [0.0, 0.0, 1.0]));
+
+        for i in 0..segs {
+            let next = (i + 1) % segs;
+            let curr_bot = side_start + (i as u32);
+            let next_bot = side_start + (next as u32);
+
+            // CCW outward: [curr_bot, next_bot, apex]
+            indices.push([curr_bot, next_bot, apex_idx]);
+        }
+    } else if !has_bot_cap {
+        // Inverted sharp cone: apex at [0, 0, -h2]
+        let side_start = vertices.len() as u32;
+        for i in 0..segs {
+            let theta = (i as f64) * 2.0 * PI / (segs as f64);
+            let cos_t = theta.cos();
+            let sin_t = theta.sin();
+            let x = radius_top * cos_t;
+            let y = radius_top * sin_t;
+            let norm = [n_radial * cos_t, n_radial * sin_t, nz];
+            vertices.push(Vertex::new([x, y, h2], norm));
+        }
+
+        let apex_idx = vertices.len() as u32;
+        vertices.push(Vertex::new([0.0, 0.0, -h2], [0.0, 0.0, -1.0]));
+
+        for i in 0..segs {
+            let next = (i + 1) % segs;
+            let curr_top = side_start + (i as u32);
+            let next_top = side_start + (next as u32);
+
+            // CCW outward: [curr_top, apex, next_top]
+            indices.push([curr_top, apex_idx, next_top]);
+        }
+    } else {
+        // Truncated cone (frustum)
+        let side_start = vertices.len() as u32;
+        for i in 0..segs {
+            let theta = (i as f64) * 2.0 * PI / (segs as f64);
+            let cos_t = theta.cos();
+            let sin_t = theta.sin();
+            let norm = [n_radial * cos_t, n_radial * sin_t, nz];
+
+            // Top vertex
+            let xt = radius_top * cos_t;
+            let yt = radius_top * sin_t;
+            vertices.push(Vertex::new([xt, yt, h2], norm));
+
+            // Bottom vertex
+            let xb = radius_bottom * cos_t;
+            let yb = radius_bottom * sin_t;
+            vertices.push(Vertex::new([xb, yb, -h2], norm));
+        }
+
+        for i in 0..segs {
+            let next = (i + 1) % segs;
+            let curr_top = side_start + (i as u32) * 2;
+            let curr_bot = curr_top + 1;
+            let next_top = side_start + (next as u32) * 2;
+            let next_bot = next_top + 1;
+
+            // Tri 1: curr_top -> curr_bot -> next_top (CCW outward)
+            indices.push([curr_top, curr_bot, next_top]);
+            // Tri 2: curr_bot -> next_bot -> next_top (CCW outward)
+            indices.push([curr_bot, next_bot, next_top]);
+        }
+    }
+
+    TriangleMesh::new(vertices, indices)
+}
+
+/// Generates a solid 3D cone or frustum with adaptive tessellation based on `TessellationSettings`.
+pub fn create_cone_with_settings(
+    radius_bottom: f64,
+    radius_top: f64,
+    height: f64,
+    settings: &TessellationSettings,
+) -> TriangleMesh {
+    let max_r = radius_bottom.max(radius_top);
+    let segments = settings.calculate_segments(max_r);
+    create_cone(radius_bottom, radius_top, height, segments)
+}
+
+/// Generates a solid regular polygonal prism centered at origin along Z axis.
+///
+/// Parameters:
+/// - `sides`: number of facets (minimum 3, default 6 for standard hexagon)
+/// - `height`: prism height along Z axis
+/// - `width_across_flats`: optional flat-to-flat distance (S, e.g. wrench size for nuts/bolts)
+/// - `radius`: optional circumscribed circle radius (distance from center to vertices)
+/// - `chamfer`: optional chamfer size at top and bottom faces (30-degree bevel per DIN 934)
+///
+/// Features sharp edges, flat facet normals, and 100% watertight manifold topology.
+pub fn create_polygon_prism(
+    sides: usize,
+    height: f64,
+    width_across_flats: Option<f64>,
+    radius: Option<f64>,
+    chamfer: Option<f64>,
+) -> TriangleMesh {
+    if sides < 3 || height <= 1e-12 {
+        return TriangleMesh::empty();
+    }
+    let n = sides;
+
+    let angle_step = 2.0 * PI / (n as f64);
+    let half_angle = PI / (n as f64);
+
+    let circumradius = if let Some(waf) = width_across_flats {
+        if waf > 1e-12 {
+            waf / (2.0 * half_angle.cos())
+        } else if let Some(r) = radius {
+            r
+        } else {
+            return TriangleMesh::empty();
+        }
+    } else if let Some(r) = radius {
+        if r > 1e-12 {
+            r
+        } else {
+            return TriangleMesh::empty();
+        }
+    } else {
+        return TriangleMesh::empty();
+    };
+
+    if circumradius <= 1e-12 {
+        return TriangleMesh::empty();
+    }
+
+    let h2 = height * 0.5;
+    let c_val = chamfer.unwrap_or(0.0);
+    let has_chamfer = c_val > 1e-6;
+
+    let (r_cap, z_bot_mid, z_top_mid) = if has_chamfer {
+        let tan_alpha = (PI / 6.0).tan(); // 30-degree DIN 934 chamfer angle
+        let mut c_r = c_val.min(circumradius * 0.45);
+        let mut c_z = c_r * tan_alpha;
+        if c_z > height * 0.40 {
+            c_z = height * 0.40;
+            c_r = c_z / tan_alpha;
+        }
+        let r_c = (circumradius - c_r).max(circumradius * 0.20);
+        (r_c, -h2 + c_z, h2 - c_z)
+    } else {
+        (circumradius, -h2, h2)
+    };
+
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+
+    // 1. Top cap (z = +h2, flat normal = [0, 0, 1])
+    let top_center_idx = vertices.len() as u32;
+    vertices.push(Vertex::new([0.0, 0.0, h2], [0.0, 0.0, 1.0]));
+
+    let top_rim_start = vertices.len() as u32;
+    for i in 0..n {
+        let theta = (i as f64) * angle_step;
+        let x = r_cap * theta.cos();
+        let y = r_cap * theta.sin();
+        vertices.push(Vertex::new([x, y, h2], [0.0, 0.0, 1.0]));
+    }
+
+    for i in 0..n {
+        let next = (i + 1) % n;
+        indices.push([
+            top_center_idx,
+            top_rim_start + (i as u32),
+            top_rim_start + (next as u32),
+        ]);
+    }
+
+    // 2. Bottom cap (z = -h2, flat normal = [0, 0, -1])
+    let bot_center_idx = vertices.len() as u32;
+    vertices.push(Vertex::new([0.0, 0.0, -h2], [0.0, 0.0, -1.0]));
+
+    let bot_rim_start = vertices.len() as u32;
+    for i in 0..n {
+        let theta = (i as f64) * angle_step;
+        let x = r_cap * theta.cos();
+        let y = r_cap * theta.sin();
+        vertices.push(Vertex::new([x, y, -h2], [0.0, 0.0, -1.0]));
+    }
+
+    for i in 0..n {
+        let next = (i + 1) % n;
+        indices.push([
+            bot_center_idx,
+            bot_rim_start + (next as u32),
+            bot_rim_start + (i as u32),
+        ]);
+    }
+
+    // Helper closure to add a quad facet (p0_top, p1_bot, p2_bot_next, p3_top_next) with exact outward normal
+    let mut add_quad_facet = |p0: [f64; 3], p1: [f64; 3], p2: [f64; 3], p3: [f64; 3]| {
+        let v0 = Vector3::new(p0[0], p0[1], p0[2]);
+        let v1 = Vector3::new(p1[0], p1[1], p1[2]);
+        let v2 = Vector3::new(p2[0], p2[1], p2[2]);
+        let v3 = Vector3::new(p3[0], p3[1], p3[2]);
+        let n_vec = (v1 - v0).cross(&(v3 - v0)) + (v2 - v1).cross(&(v3 - v1));
+        let n_len = n_vec.norm();
+        let normal = if n_len > 1e-12 {
+            [n_vec.x / n_len, n_vec.y / n_len, n_vec.z / n_len]
+        } else {
+            [1.0, 0.0, 0.0]
+        };
+
+        let base = vertices.len() as u32;
+        vertices.push(Vertex::new(p0, normal));
+        vertices.push(Vertex::new(p1, normal));
+        vertices.push(Vertex::new(p2, normal));
+        vertices.push(Vertex::new(p3, normal));
+
+        indices.push([base, base + 1, base + 3]);
+        indices.push([base + 1, base + 2, base + 3]);
+    };
+
+    // 3. Side wall quads (and optional top/bottom chamfer bevel bands)
+    for i in 0..n {
+        let next = (i + 1) % n;
+        let t1 = (i as f64) * angle_step;
+        let t2 = (next as f64) * angle_step;
+        let c1 = t1.cos();
+        let s1 = t1.sin();
+        let c2 = t2.cos();
+        let s2 = t2.sin();
+
+        let x1_mid = circumradius * c1;
+        let y1_mid = circumradius * s1;
+        let x2_mid = circumradius * c2;
+        let y2_mid = circumradius * s2;
+
+        if has_chamfer {
+            let x1_cap = r_cap * c1;
+            let y1_cap = r_cap * s1;
+            let x2_cap = r_cap * c2;
+            let y2_cap = r_cap * s2;
+
+            // Top bevel band: from z = h2 (r_cap) down to z = z_top_mid (circumradius)
+            add_quad_facet(
+                [x1_cap, y1_cap, h2],
+                [x1_mid, y1_mid, z_top_mid],
+                [x2_mid, y2_mid, z_top_mid],
+                [x2_cap, y2_cap, h2],
+            );
+
+            // Middle vertical band: from z = z_top_mid down to z = z_bot_mid
+            add_quad_facet(
+                [x1_mid, y1_mid, z_top_mid],
+                [x1_mid, y1_mid, z_bot_mid],
+                [x2_mid, y2_mid, z_bot_mid],
+                [x2_mid, y2_mid, z_top_mid],
+            );
+
+            // Bottom bevel band: from z = z_bot_mid (circumradius) down to z = -h2 (r_cap)
+            add_quad_facet(
+                [x1_mid, y1_mid, z_bot_mid],
+                [x1_cap, y1_cap, -h2],
+                [x2_cap, y2_cap, -h2],
+                [x2_mid, y2_mid, z_bot_mid],
+            );
+        } else {
+            add_quad_facet(
+                [x1_mid, y1_mid, h2],
+                [x1_mid, y1_mid, -h2],
+                [x2_mid, y2_mid, -h2],
+                [x2_mid, y2_mid, h2],
+            );
+        }
+    }
+
+    TriangleMesh::new(vertices, indices)
+}
+
+/// Generates a closed, watertight (manifold) 3D mesh for a helical cutting tool
+/// (sweeping a circular or 60-degree metric triangular cross section of radius/depth `groove_radius` along a helix).
+///
+/// Supports multi-start flutes (`starts`), right/left handedness, end caps for clean CSG,
+/// and profile_type ("circular" or "metric_60" per ISO 68-1).
+#[allow(clippy::too_many_arguments)]
+pub fn create_helical_cutter(
+    helix_radius: f64,
+    groove_radius: f64,
+    pitch: f64,
+    height: f64,
+    start_z: f64,
+    starts: usize,
+    is_right_hand: bool,
+    turns: f64,
+    profile_type: &str,
+) -> TriangleMesh {
+    create_helical_cutter_with_settings(
+        helix_radius,
+        groove_radius,
+        pitch,
+        height,
+        start_z,
+        starts,
+        is_right_hand,
+        turns,
+        profile_type,
+        &TessellationSettings::default(),
+    )
+}
+
+/// Generates a helical cutter mesh with adaptive tessellation based on `TessellationSettings`.
+#[allow(clippy::too_many_arguments)]
+pub fn create_helical_cutter_with_settings(
+    helix_radius: f64,
+    groove_radius: f64,
+    pitch: f64,
+    height: f64,
+    start_z: f64,
+    starts: usize,
+    is_right_hand: bool,
+    turns: f64,
+    profile_type: &str,
+    settings: &TessellationSettings,
+) -> TriangleMesh {
+    if pitch <= 1e-9 || groove_radius <= 1e-9 {
+        return TriangleMesh::empty();
+    }
+
+    let effective_turns = if turns > 0.0 {
+        turns
+    } else if height > 0.0 {
+        height / pitch
+    } else {
+        1.0
+    };
+
+    if effective_turns <= 0.0 {
+        return TriangleMesh::empty();
+    }
+
+    let num_starts = starts.max(1);
+    let cross_segments: usize = match settings.quality {
+        TessellationQuality::Coarse => 12,
+        TessellationQuality::Medium => 16,
+        TessellationQuality::Fine => 24,
+        TessellationQuality::Custom { .. } => settings.calculate_segments(groove_radius).clamp(12, 32),
+    };
+    let steps_per_turn: usize = match settings.quality {
+        TessellationQuality::Coarse => 16,
+        TessellationQuality::Medium => 24,
+        TessellationQuality::Fine => 36,
+        TessellationQuality::Custom { .. } => settings.calculate_segments(helix_radius).clamp(16, 64),
+    };
+    let k_steps = ((effective_turns * steps_per_turn as f64).round() as usize).max(8);
+
+    let mut all_vertices = Vec::new();
+    let mut all_indices = Vec::new();
+
+    let s = if is_right_hand { 1.0 } else { -1.0 };
+    let c = pitch / (2.0 * PI);
+    let h_len = (helix_radius * helix_radius + c * c).sqrt();
+    let total_sweep_angle = 2.0 * PI * effective_turns;
+
+    for start_idx in 0..num_starts {
+        let phi_0 = (start_idx as f64) * 2.0 * PI / (num_starts as f64);
+        let start_vertex_offset = all_vertices.len() as u32;
+
+        let is_metric = profile_type.eq_ignore_ascii_case("metric_60");
+        let m = if is_metric { 4 } else { cross_segments };
+
+        // Generate ring vertices at each step j along the helix
+        for j in 0..=k_steps {
+            let u = (j as f64) / (k_steps as f64);
+            let t = u * total_sweep_angle;
+            let theta = phi_0 + s * t;
+            let z = start_z + (t / (2.0 * PI)) * pitch;
+
+            let cos_t = theta.cos();
+            let sin_t = theta.sin();
+
+            let center = Vector3::new(helix_radius * cos_t, helix_radius * sin_t, z);
+            let e_r = Vector3::new(cos_t, sin_t, 0.0);
+            let e_b = if h_len > 1e-12 {
+                Vector3::new(-c * sin_t / h_len, c * cos_t / h_len, -s * helix_radius / h_len)
+            } else {
+                Vector3::new(0.0, 0.0, 1.0)
+            };
+
+            if is_metric {
+                // ISO 68-1 60-degree triangular metric thread profile (symmetric rhombus cutter
+                // supporting both external shaft threads and internal nut threads).
+                // Flank angle is 30 deg to radial axis: tan(30) = 1 / sqrt(3).
+                let tan30 = (PI / 6.0).tan();
+                let w = (groove_radius * tan30).min(0.48 * pitch);
+                let h_eff = w / tan30;
+
+                let corners = [
+                    (Vector3::new(h_eff, 0.0, 0.0), Vector3::new(1.0, 0.0, 0.0)),
+                    (
+                        Vector3::new(1e-3 * h_eff, w, 0.0),
+                        Vector3::new(0.0, 1.0, 0.0),
+                    ),
+                    (Vector3::new(-h_eff, 0.0, 0.0), Vector3::new(-1.0, 0.0, 0.0)),
+                    (
+                        Vector3::new(1e-3 * h_eff, -w, 0.0),
+                        Vector3::new(0.0, -1.0, 0.0),
+                    ),
+                ];
+                for (p_c, n_c) in corners {
+                    let pos = center + e_r * p_c.x + e_b * p_c.y;
+                    let n = (e_r * n_c.x + e_b * n_c.y).normalize();
+                    all_vertices.push(Vertex::new([pos.x, pos.y, pos.z], [n.x, n.y, n.z]));
+                }
+            } else {
+                // Half-step angular offset ensures no longitudinal edge lies at cos(alpha) == 0 (r_coord == 0)
+                for i in 0..cross_segments {
+                    let alpha = ((i as f64) + 0.5) * 2.0 * PI / (cross_segments as f64);
+                    let cos_a = alpha.cos();
+                    let sin_a = alpha.sin();
+
+                    let n = e_r * cos_a + e_b * sin_a;
+                    let pos = center + n * groove_radius;
+
+                    all_vertices.push(Vertex::new([pos.x, pos.y, pos.z], [n.x, n.y, n.z]));
+                }
+            }
+        }
+
+        // Quads along the helical tube
+        for j in 0..k_steps {
+            for i in 0..m {
+                let next_i = (i + 1) % m;
+                let v00 = start_vertex_offset + (j * m + i) as u32;
+                let v01 = start_vertex_offset + (j * m + next_i) as u32;
+                let v10 = start_vertex_offset + ((j + 1) * m + i) as u32;
+                let v11 = start_vertex_offset + ((j + 1) * m + next_i) as u32;
+
+                all_indices.push([v00, v01, v11]);
+                all_indices.push([v00, v11, v10]);
+            }
+        }
+
+        // 1. Start cap at j = 0 (outward normal: -T_unit)
+        let theta0 = phi_0;
+        let z0 = start_z;
+        let c0 = Vector3::new(helix_radius * theta0.cos(), helix_radius * theta0.sin(), z0);
+        let tan0 = Vector3::new(-s * helix_radius * theta0.sin(), s * helix_radius * theta0.cos(), c);
+        let n_start = if h_len > 1e-12 { -tan0 / h_len } else { Vector3::new(0.0, 0.0, -1.0) };
+
+        let start_cap_center_idx = all_vertices.len() as u32;
+        all_vertices.push(Vertex::new([c0.x, c0.y, c0.z], [n_start.x, n_start.y, n_start.z]));
+
+        for i in 0..m {
+            let next_i = (i + 1) % m;
+            let vi = start_vertex_offset + i as u32;
+            let v_next = start_vertex_offset + next_i as u32;
+            all_indices.push([start_cap_center_idx, v_next, vi]);
+        }
+
+        // 2. End cap at j = k_steps (outward normal: +T_unit)
+        let tk = total_sweep_angle;
+        let thetak = phi_0 + s * tk;
+        let zk = start_z + (tk / (2.0 * PI)) * pitch;
+        let ck = Vector3::new(helix_radius * thetak.cos(), helix_radius * thetak.sin(), zk);
+        let tank = Vector3::new(-s * helix_radius * thetak.sin(), s * helix_radius * thetak.cos(), c);
+        let n_end = if h_len > 1e-12 { tank / h_len } else { Vector3::new(0.0, 0.0, 1.0) };
+
+        let end_cap_center_idx = all_vertices.len() as u32;
+        all_vertices.push(Vertex::new([ck.x, ck.y, ck.z], [n_end.x, n_end.y, n_end.z]));
+
+        for i in 0..m {
+            let next_i = (i + 1) % m;
+            let vi = start_vertex_offset + (k_steps * m + i) as u32;
+            let v_next = start_vertex_offset + (k_steps * m + next_i) as u32;
+            all_indices.push([end_cap_center_idx, vi, v_next]);
+        }
+    }
+
+    TriangleMesh::new(all_vertices, all_indices)
+}
+
+/// Generates a solid 3D parametric spur gear centered at origin along the Z axis.
+///
+/// Features:
+/// - True involute flank profile according to DIN 867 / ISO 53 standards.
+/// - Module `module` ($m$), tooth count `teeth` ($z$).
+/// - Pitch diameter $d = m \cdot z$, pitch radius $r = m \cdot z / 2$.
+/// - Tip (addendum) radius $r_a = r + m$, root (dedendum) radius $r_f = r - 1.25 \cdot m$.
+/// - Base radius $r_b = r \cdot \cos(\alpha)$ with pressure angle $\alpha$ (default 20 deg).
+/// - Radial dedendum flank connecting smoothly below base circle if $r_f < r_b$.
+/// - Face width `face_width` ($b$) along Z axis.
+/// - Optional cylindrical mounting hub (`hub_diameter`, `hub_length`).
+/// - Optional central shaft bore hole (`bore_radius`).
+/// - Optional DIN 6885 parallel keyway slot (`keyway_width`, `keyway_depth`).
+#[allow(clippy::too_many_arguments)]
+pub fn create_spur_gear(
+    module: f64,
+    teeth: usize,
+    pressure_angle_deg: f64,
+    face_width: f64,
+    bore_radius: Option<f64>,
+    keyway_width: Option<f64>,
+    keyway_depth: Option<f64>,
+    hub_diameter: Option<f64>,
+    hub_length: Option<f64>,
+) -> TriangleMesh {
+    create_spur_gear_with_settings(
+        module,
+        teeth,
+        pressure_angle_deg,
+        face_width,
+        bore_radius,
+        keyway_width,
+        keyway_depth,
+        hub_diameter,
+        hub_length,
+        &TessellationSettings::default(),
+    )
+}
+
+/// Generates a solid 3D parametric spur gear with adaptive tessellation based on `TessellationSettings`.
+#[allow(clippy::too_many_arguments)]
+pub fn create_spur_gear_with_settings(
+    module: f64,
+    teeth: usize,
+    pressure_angle_deg: f64,
+    face_width: f64,
+    bore_radius: Option<f64>,
+    keyway_width: Option<f64>,
+    keyway_depth: Option<f64>,
+    hub_diameter: Option<f64>,
+    hub_length: Option<f64>,
+    settings: &TessellationSettings,
+) -> TriangleMesh {
+    if module <= 1e-9 || teeth < 3 || face_width <= 1e-9 {
+        return TriangleMesh::empty();
+    }
+
+    let alpha_deg = if pressure_angle_deg > 0.0 && pressure_angle_deg < 89.0 {
+        pressure_angle_deg
+    } else {
+        20.0
+    };
+    let alpha = alpha_deg * PI / 180.0;
+
+    let z = teeth as f64;
+    let r = module * z * 0.5;
+    let r_a = r + module;
+    let r_f = (r - 1.25 * module).max(0.1 * module);
+    let r_b = r * alpha.cos();
+    let h2 = face_width * 0.5;
+
+    // Pitch circle tooth thickness half-angle: psi = pi / (2 * z)
+    let psi = PI / (2.0 * z);
+    let trough_half_angle = PI / z;
+    // Involute function at pressure angle alpha: inv(alpha) = tan(alpha) - alpha
+    let inv_alpha = alpha.tan() - alpha;
+
+    // Angle theta from tooth centerline at radius R >= r_b
+    let min_tip_half_angle = (trough_half_angle * 0.15).max(1e-4);
+    let theta_at_r = |radius: f64| -> f64 {
+        let raw = if radius < r_b {
+            psi + inv_alpha
+        } else {
+            let cos_ar = (r_b / radius).clamp(0.0, 1.0);
+            let alpha_r = cos_ar.acos();
+            let inv_alpha_r = alpha_r.tan() - alpha_r;
+            (psi + inv_alpha - inv_alpha_r).max(min_tip_half_angle)
+        };
+        raw.min(trough_half_angle * 0.70)
+    };
+
+    let theta_base = theta_at_r(r_b);
+    // Root fillet angle widens slightly past theta_base when r_f < r_b so that polar angle
+    // increases strictly monotonically and radial steps never create collinear cap triangles.
+    let theta_root = if r_f < r_b - 1e-9 {
+        (theta_base + 0.25 * (trough_half_angle - theta_base).max(1e-4)).min(trough_half_angle * 0.75)
+    } else {
+        theta_at_r(r_f)
+    };
+
+    // 1. Build structured per-tooth levels and root-circle ring
+    let n_flank_steps = match settings.quality {
+        TessellationQuality::Coarse => 2,
+        TessellationQuality::Medium => 4,
+        TessellationQuality::Fine => 8,
+        TessellationQuality::Custom { .. } => (settings.calculate_segments(r_a) / teeth).clamp(2, 16),
+    };
+    let r_inv_start = r_b.max(r_f);
+
+    // Build radial levels for each tooth from level 0 (r_f) up to level M (r_a)
+    let mut radial_levels: Vec<(f64, f64)> = Vec::new(); // (radius, half_angle_from_tooth_center)
+    radial_levels.push((r_f, theta_root));
+    if r_f < r_b - 1e-9 {
+        radial_levels.push((r_b, theta_base));
+    }
+    for s_idx in 1..=n_flank_steps {
+        let s = (s_idx as f64) / (n_flank_steps as f64);
+        let r_curr = r_inv_start + s * (r_a - r_inv_start);
+        radial_levels.push((r_curr, theta_at_r(r_curr)));
+    }
+    let m_levels = radial_levels.len() - 1; // index of top level at r_a
+
+    // Root circle ring has L_{k,0} and R_{k,0} per tooth, plus trough midpoint T_k when trough arc is wide
+    let include_trough_mid = (trough_half_angle - theta_root) > 0.12;
+    let mut root_angles: Vec<f64> = Vec::with_capacity(teeth * 3 + 4);
+    for k in 0..teeth {
+        let phi_k = (k as f64) * 2.0 * PI / z;
+        root_angles.push((phi_k - theta_root).rem_euclid(2.0 * PI));
+        root_angles.push((phi_k + theta_root).rem_euclid(2.0 * PI));
+        if include_trough_mid {
+            root_angles.push((phi_k + trough_half_angle).rem_euclid(2.0 * PI));
+        }
+    }
+    root_angles.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Determine optional bore, keyway, and hub parameters
+    let bore_r = bore_radius.unwrap_or(0.0);
+    let has_bore = bore_r > 1e-6 && bore_r < r_f * 0.96;
+
+    let kw_w = keyway_width.unwrap_or(0.0);
+    let kw_d = keyway_depth.unwrap_or(0.0);
+    let has_keyway = has_bore && kw_w > 1e-6 && kw_d > 1e-6 && (bore_r + kw_d) < r_f * 0.96;
+
+    let hub_r = hub_diameter.map(|d| d * 0.5).unwrap_or(0.0);
+    let hub_l = hub_length.unwrap_or(0.0);
+    let max_inner_r = if has_keyway {
+        ((bore_r + kw_d).hypot(kw_w * 0.5)).max(bore_r)
+    } else {
+        bore_r
+    };
+    let has_hub = hub_r > 1e-6
+        && hub_l > 1e-6
+        && hub_r < r_f * 0.98
+        && (!has_bore || hub_r > max_inner_r * 1.02);
+
+    let total_hub_len = if has_hub {
+        if hub_l > face_width {
+            hub_l
+        } else {
+            face_width + hub_l
+        }
+    } else {
+        face_width
+    };
+    let z_hub_top = -h2 + total_hub_len;
+
+    // If a keyway is present, ensure exact keyway corner angles are in root_angles
+    let (kw_half, kw_y_top, kw_corners) = if has_keyway {
+        let w_half = (kw_w * 0.5).min(bore_r * 0.85);
+        let y_shoulder = (bore_r * bore_r - w_half * w_half).max(0.0).sqrt();
+        let y_top = bore_r + kw_d;
+        let c1 = y_shoulder.atan2(w_half).rem_euclid(2.0 * PI);
+        let c2 = y_top.atan2(w_half).rem_euclid(2.0 * PI);
+        let c3 = y_top.atan2(-w_half).rem_euclid(2.0 * PI);
+        let c4 = y_shoulder.atan2(-w_half).rem_euclid(2.0 * PI);
+        (w_half, y_top, Some([c1, c2, c3, c4]))
+    } else {
+        (0.0, 0.0, None)
+    };
+
+    if let Some(corners) = kw_corners {
+        for &c_ang in &corners {
+            let exists = root_angles.iter().any(|&a| (a - c_ang).abs() < 1e-4);
+            if !exists {
+                root_angles.push(c_ang);
+            }
+        }
+        root_angles.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
+    // Helper to find index of angle in root_angles
+    let find_root_angle_idx = |target_ang: f64| -> usize {
+        let norm = target_ang.rem_euclid(2.0 * PI);
+        let mut best_i = 0;
+        let mut best_d = f64::INFINITY;
+        for (i, &a) in root_angles.iter().enumerate() {
+            let diff = (a - norm)
+                .abs()
+                .min((a - norm + 2.0 * PI).abs())
+                .min((a - norm - 2.0 * PI).abs());
+            if diff < best_d {
+                best_d = diff;
+                best_i = i;
+            }
+        }
+        best_i
+    };
+
+    let root_poly: Vec<[f64; 2]> = root_angles
+        .iter()
+        .map(|&a| [r_f * a.cos(), r_f * a.sin()])
+        .collect();
+
+    // Build inner bore/keyway ring and hub ring matching root_angles
+    let inner_poly: Vec<[f64; 2]> = if has_bore {
+        root_angles
+            .iter()
+            .map(|&ang| {
+                if let Some([c1, c2, c3, c4]) = kw_corners {
+                    if ang >= c1 - 1e-4 && ang <= c2 + 1e-4 {
+                        let r_in = kw_half / ang.cos();
+                        [r_in * ang.cos(), r_in * ang.sin()]
+                    } else if ang > c2 + 1e-4 && ang < c3 - 1e-4 {
+                        let r_in = kw_y_top / ang.sin();
+                        [r_in * ang.cos(), r_in * ang.sin()]
+                    } else if ang >= c3 - 1e-4 && ang <= c4 + 1e-4 {
+                        let r_in = -kw_half / ang.cos();
+                        [r_in * ang.cos(), r_in * ang.sin()]
+                    } else {
+                        [bore_r * ang.cos(), bore_r * ang.sin()]
+                    }
+                } else {
+                    [bore_r * ang.cos(), bore_r * ang.sin()]
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let hub_poly: Vec<[f64; 2]> = if has_hub {
+        root_angles
+            .iter()
+            .map(|&ang| [hub_r * ang.cos(), hub_r * ang.sin()])
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+
+    // Helper: add planar fan cap around [0, 0, z]
+    let add_fan_cap = |verts: &mut Vec<Vertex>,
+                       idxs: &mut Vec<[u32; 3]>,
+                       ring: &[[f64; 2]],
+                       z_val: f64,
+                       is_top: bool| {
+        let n_z = if is_top { 1.0 } else { -1.0 };
+        let center_idx = verts.len() as u32;
+        verts.push(Vertex::new([0.0, 0.0, z_val], [0.0, 0.0, n_z]));
+        let start_idx = verts.len() as u32;
+        for p in ring {
+            verts.push(Vertex::new([p[0], p[1], z_val], [0.0, 0.0, n_z]));
+        }
+        let n = ring.len();
+        for i in 0..n {
+            let next = (i + 1) % n;
+            if is_top {
+                idxs.push([center_idx, start_idx + (i as u32), start_idx + (next as u32)]);
+            } else {
+                idxs.push([center_idx, start_idx + (next as u32), start_idx + (i as u32)]);
+            }
+        }
+    };
+
+    // Helper: add planar annular cap between inner_ring and outer_ring at z_val
+    let add_annulus_cap = |verts: &mut Vec<Vertex>,
+                           idxs: &mut Vec<[u32; 3]>,
+                           in_ring: &[[f64; 2]],
+                           out_ring: &[[f64; 2]],
+                           z_val: f64,
+                           is_top: bool| {
+        let n_z = if is_top { 1.0 } else { -1.0 };
+        let in_start = verts.len() as u32;
+        for p in in_ring {
+            verts.push(Vertex::new([p[0], p[1], z_val], [0.0, 0.0, n_z]));
+        }
+        let out_start = verts.len() as u32;
+        for p in out_ring {
+            verts.push(Vertex::new([p[0], p[1], z_val], [0.0, 0.0, n_z]));
+        }
+        let n = in_ring.len();
+        for i in 0..n {
+            let next = (i + 1) % n;
+            let in_c = in_start + (i as u32);
+            let in_n = in_start + (next as u32);
+            let out_c = out_start + (i as u32);
+            let out_n = out_start + (next as u32);
+            if is_top {
+                idxs.push([in_c, out_c, out_n]);
+                idxs.push([in_c, out_n, in_n]);
+            } else {
+                idxs.push([in_c, out_n, out_c]);
+                idxs.push([in_c, in_n, out_n]);
+            }
+        }
+    };
+
+    // Helper: add tooth-ladder caps at z_val for all teeth, stitched to root_poly
+    let add_teeth_caps = |verts: &mut Vec<Vertex>,
+                          idxs: &mut Vec<[u32; 3]>,
+                          z_val: f64,
+                          is_top: bool| {
+        let n_z = if is_top { 1.0 } else { -1.0 };
+        let mut push_tri = |a: u32, b: u32, c: u32| {
+            if is_top {
+                idxs.push([a, b, c]);
+            } else {
+                idxs.push([a, c, b]);
+            }
+        };
+
+        let n_r = root_poly.len();
+        for k in 0..teeth {
+            let phi_k = (k as f64) * 2.0 * PI / z;
+            let idx_l = find_root_angle_idx(phi_k - theta_root);
+            let idx_r = find_root_angle_idx(phi_k + theta_root);
+
+            // Create level >= 1 flank vertices for tooth k
+            let mut l_idxs: Vec<u32> = Vec::with_capacity(m_levels + 1);
+            let mut r_idxs: Vec<u32> = Vec::with_capacity(m_levels + 1);
+            l_idxs.push(0); // placeholder for level 0
+            r_idxs.push(0);
+
+            for &(r_lvl, th_lvl) in radial_levels.iter().skip(1) {
+                let p_l = [r_lvl * (phi_k - th_lvl).cos(), r_lvl * (phi_k - th_lvl).sin()];
+                let p_r = [r_lvl * (phi_k + th_lvl).cos(), r_lvl * (phi_k + th_lvl).sin()];
+                let il = verts.len() as u32;
+                verts.push(Vertex::new([p_l[0], p_l[1], z_val], [0.0, 0.0, n_z]));
+                let ir = verts.len() as u32;
+                verts.push(Vertex::new([p_r[0], p_r[1], z_val], [0.0, 0.0, n_z]));
+                l_idxs.push(il);
+                r_idxs.push(ir);
+            }
+
+            // Connect root vertices between idx_l and idx_r to level 1 (l_idxs[1], r_idxs[1])
+            let steps_lr = (idx_r + n_r - idx_l) % n_r;
+            let mut base_verts: Vec<u32> = Vec::with_capacity(steps_lr + 1);
+            for s in 0..=steps_lr {
+                let rp = root_poly[(idx_l + s) % n_r];
+                let vi = verts.len() as u32;
+                verts.push(Vertex::new([rp[0], rp[1], z_val], [0.0, 0.0, n_z]));
+                base_verts.push(vi);
+            }
+            if steps_lr == 1 {
+                push_tri(base_verts[0], l_idxs[1], r_idxs[1]);
+                push_tri(base_verts[0], r_idxs[1], base_verts[1]);
+            } else {
+                let mid = steps_lr / 2;
+                for s in 0..mid {
+                    push_tri(base_verts[s], l_idxs[1], base_verts[s + 1]);
+                }
+                push_tri(base_verts[mid], l_idxs[1], r_idxs[1]);
+                for s in mid..steps_lr {
+                    push_tri(base_verts[s], r_idxs[1], base_verts[s + 1]);
+                }
+            }
+
+            // Quad ladder across tooth for levels 1..(m_levels - 1)
+            for j in 1..(m_levels - 1) {
+                push_tri(l_idxs[j], l_idxs[j + 1], r_idxs[j + 1]);
+                push_tri(l_idxs[j], r_idxs[j + 1], r_idxs[j]);
+            }
+
+            // Top band (m_levels - 1) -> m_levels including tip crest point Tip_k at r_a
+            // Connecting Tip_k to level (m_levels - 1) avoids 3 nearly-collinear points on r_a!
+            let p_tip = [r_a * phi_k.cos(), r_a * phi_k.sin()];
+            let tip_idx = verts.len() as u32;
+            verts.push(Vertex::new([p_tip[0], p_tip[1], z_val], [0.0, 0.0, n_z]));
+            let prev_lvl = m_levels - 1;
+            push_tri(l_idxs[prev_lvl], l_idxs[m_levels], tip_idx);
+            push_tri(l_idxs[prev_lvl], tip_idx, r_idxs[prev_lvl]);
+            push_tri(r_idxs[prev_lvl], tip_idx, r_idxs[m_levels]);
+        }
+    };
+
+    // Build outer gear perimeter polygon matching the exact cap boundary edges
+    let mut outer_perimeter: Vec<[f64; 2]> = Vec::new();
+    let n_r = root_poly.len();
+    for k in 0..teeth {
+        let phi_k = (k as f64) * 2.0 * PI / z;
+        let idx_l = find_root_angle_idx(phi_k - theta_root);
+        let idx_r = find_root_angle_idx(phi_k + theta_root);
+        let next_k = (k + 1) % teeth;
+        let phi_next = (next_k as f64) * 2.0 * PI / z;
+        let idx_next_l = find_root_angle_idx(phi_next - theta_root);
+
+        // Leading root corner L_{k,0}
+        outer_perimeter.push(root_poly[idx_l]);
+        // Leading flank levels 1..=m_levels
+        for &(r_lvl, th_lvl) in radial_levels.iter().skip(1) {
+            outer_perimeter.push([r_lvl * (phi_k - th_lvl).cos(), r_lvl * (phi_k - th_lvl).sin()]);
+        }
+        // Tip crest center
+        outer_perimeter.push([r_a * phi_k.cos(), r_a * phi_k.sin()]);
+        // Trailing flank levels m_levels..=1
+        for &(r_lvl, th_lvl) in radial_levels.iter().skip(1).rev() {
+            outer_perimeter.push([r_lvl * (phi_k + th_lvl).cos(), r_lvl * (phi_k + th_lvl).sin()]);
+        }
+        // Trailing root corner R_{k,0} and all root trough vertices up to (excluding) L_{k+1,0}
+        let trough_steps = (idx_next_l + n_r - idx_r) % n_r;
+        for s in 0..trough_steps {
+            outer_perimeter.push(root_poly[(idx_r + s) % n_r]);
+        }
+    }
+
+    // Helper: add vertical side wall between z_bot and z_top
+    let add_vertical_wall = |verts: &mut Vec<Vertex>,
+                             idxs: &mut Vec<[u32; 3]>,
+                             ring: &[[f64; 2]],
+                             z_bot: f64,
+                             z_top: f64,
+                             is_outer: bool| {
+        let n = ring.len();
+        for i in 0..n {
+            let next = (i + 1) % n;
+            let p1 = ring[i];
+            let p2 = ring[next];
+            let dx = p2[0] - p1[0];
+            let dy = p2[1] - p1[1];
+            let edge_len = dx.hypot(dy);
+            let sign = if is_outer { 1.0 } else { -1.0 };
+            let normal = if edge_len > 1e-12 {
+                [sign * dy / edge_len, -sign * dx / edge_len, 0.0]
+            } else {
+                [sign, 0.0, 0.0]
+            };
+
+            let base = verts.len() as u32;
+            verts.push(Vertex::new([p1[0], p1[1], z_top], normal)); // 0: top curr
+            verts.push(Vertex::new([p1[0], p1[1], z_bot], normal)); // 1: bot curr
+            verts.push(Vertex::new([p2[0], p2[1], z_bot], normal)); // 2: bot next
+            verts.push(Vertex::new([p2[0], p2[1], z_top], normal)); // 3: top next
+
+            if is_outer {
+                idxs.push([base, base + 1, base + 3]);
+                idxs.push([base + 1, base + 2, base + 3]);
+            } else {
+                idxs.push([base, base + 3, base + 1]);
+                idxs.push([base + 1, base + 3, base + 2]);
+            }
+        }
+    };
+
+    // Outer gear tooth wall from -h2 to +h2
+    add_vertical_wall(&mut vertices, &mut indices, &outer_perimeter, -h2, h2, true);
+    // Top and bottom tooth caps (outside r_f)
+    add_teeth_caps(&mut vertices, &mut indices, h2, true);
+    add_teeth_caps(&mut vertices, &mut indices, -h2, false);
+
+    // Inner disk/annulus inside r_f
+    match (has_hub, has_bore) {
+        (false, false) => {
+            add_fan_cap(&mut vertices, &mut indices, &root_poly, h2, true);
+            add_fan_cap(&mut vertices, &mut indices, &root_poly, -h2, false);
+        }
+        (true, false) => {
+            add_annulus_cap(&mut vertices, &mut indices, &hub_poly, &root_poly, h2, true);
+            add_vertical_wall(&mut vertices, &mut indices, &hub_poly, h2, z_hub_top, true);
+            add_fan_cap(&mut vertices, &mut indices, &hub_poly, z_hub_top, true);
+            add_fan_cap(&mut vertices, &mut indices, &root_poly, -h2, false);
+        }
+        (false, true) => {
+            add_annulus_cap(&mut vertices, &mut indices, &inner_poly, &root_poly, h2, true);
+            add_annulus_cap(&mut vertices, &mut indices, &inner_poly, &root_poly, -h2, false);
+            add_vertical_wall(&mut vertices, &mut indices, &inner_poly, -h2, h2, false);
+        }
+        (true, true) => {
+            add_annulus_cap(&mut vertices, &mut indices, &hub_poly, &root_poly, h2, true);
+            add_vertical_wall(&mut vertices, &mut indices, &hub_poly, h2, z_hub_top, true);
+            add_annulus_cap(&mut vertices, &mut indices, &inner_poly, &hub_poly, z_hub_top, true);
+            add_annulus_cap(&mut vertices, &mut indices, &inner_poly, &root_poly, -h2, false);
+            add_vertical_wall(&mut vertices, &mut indices, &inner_poly, -h2, z_hub_top, false);
+        }
+    }
+
+    TriangleMesh::new(vertices, indices)
+}
+
+/// Helper: 2D polygon ear-clipping triangulation for simple polygons.
+/// Returns a list of triangle index triples indexing into `pts`.
+fn triangulate_simple_polygon_2d(pts: &[[f64; 2]]) -> Vec<[u32; 3]> {
+    let n = pts.len();
+    if n < 3 {
+        return Vec::new();
+    }
+    if n == 3 {
+        return vec![[0, 1, 2]];
+    }
+
+    let mut indices: Vec<u32> = (0..n as u32).collect();
+    let mut triangles = Vec::with_capacity(n - 2);
+
+    let is_point_in_tri = |p: [f64; 2], a: [f64; 2], b: [f64; 2], c: [f64; 2]| -> bool {
+        let cross = |p1: [f64; 2], p2: [f64; 2], p3: [f64; 2]| {
+            (p2[0] - p1[0]) * (p3[1] - p1[1]) - (p2[1] - p1[1]) * (p3[0] - p1[0])
+        };
+        let c1 = cross(a, b, p);
+        let c2 = cross(b, c, p);
+        let c3 = cross(c, a, p);
+        let has_neg = (c1 < -1e-9) || (c2 < -1e-9) || (c3 < -1e-9);
+        let has_pos = (c1 > 1e-9) || (c2 > 1e-9) || (c3 > 1e-9);
+        !(has_neg && has_pos)
+    };
+
+    let is_ear = |prev: usize, curr: usize, next: usize, idxs: &[u32]| -> bool {
+        let a = pts[idxs[prev] as usize];
+        let b = pts[idxs[curr] as usize];
+        let c = pts[idxs[next] as usize];
+        // Convex check (CCW interior angle)
+        let cross = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]);
+        if cross <= 1e-12 {
+            return false;
+        }
+        for (i, &idx) in idxs.iter().enumerate() {
+            if i == prev || i == curr || i == next {
+                continue;
+            }
+            let p = pts[idx as usize];
+            if is_point_in_tri(p, a, b, c) {
+                return false;
+            }
+        }
+        true
+    };
+
+    let mut stuck_count = 0;
+    while indices.len() > 3 && stuck_count < indices.len() * 2 {
+        let len = indices.len();
+        let mut ear_found = false;
+        for i in 0..len {
+            let prev = (i + len - 1) % len;
+            let next = (i + 1) % len;
+            if is_ear(prev, i, next, &indices) {
+                triangles.push([indices[prev], indices[i], indices[next]]);
+                indices.remove(i);
+                ear_found = true;
+                break;
+            }
+        }
+        if !ear_found {
+            stuck_count += 1;
+            if stuck_count >= len {
+                triangles.push([indices[0], indices[1], indices[2]]);
+                indices.remove(1);
+            }
+        } else {
+            stuck_count = 0;
+        }
+    }
+    if indices.len() == 3 {
+        triangles.push([indices[0], indices[1], indices[2]]);
+    }
+    triangles
+}
+
+/// Generates a solid 3D body of revolution by rotating a 2D profile `[r, z]` around the Z axis.
+///
+/// Features:
+/// - 2D profile coordinates: `r` (distance from rotation axis Z, r >= 0) and `z` (axial position).
+/// - Complete 360-degree rotation or partial angle `angle_deg` (0 < angle_deg <= 360).
+/// - Radial resolution controlled by `segments` (minimum 3).
+/// - Manifold watertight topology with seam stitching at 360 degrees and planar end-caps for partial angles.
+/// - Surface normal computation with outward orientation.
+pub fn create_revolve(profile: &[[f64; 2]], angle_deg: f64, segments: usize) -> TriangleMesh {
+    if profile.len() < 3 || angle_deg <= 1e-6 {
+        return TriangleMesh::empty();
+    }
+
+    let max_r = profile.iter().map(|p| p[0].abs()).fold(0.0, f64::max);
+    let segs = if segments == 0 {
+        TessellationSettings::default().calculate_segments_arc(max_r, angle_deg * PI / 180.0)
+    } else {
+        segments.max(3)
+    };
+    let sweep_angle_deg = angle_deg.clamp(1e-4, 360.0);
+    let is_full_circle = (sweep_angle_deg - 360.0).abs() < 1e-5;
+    let sweep_angle_rad = sweep_angle_deg * PI / 180.0;
+
+    // 1. Clean profile: ensure r >= 0 and remove duplicate consecutive points
+    let mut pts: Vec<[f64; 2]> = Vec::with_capacity(profile.len());
+    for p in profile {
+        let r = p[0].max(0.0);
+        let z = p[1];
+        if let Some(last) = pts.last() {
+            let d2 = (r - last[0]).powi(2) + (z - last[1]).powi(2);
+            if d2 > 1e-12 {
+                pts.push([r, z]);
+            }
+        } else {
+            pts.push([r, z]);
+        }
+    }
+    if pts.len() > 2 {
+        let first = pts[0];
+        let last = *pts.last().unwrap();
+        let d2 = (first[0] - last[0]).powi(2) + (first[1] - last[1]).powi(2);
+        if d2 <= 1e-12 {
+            pts.pop();
+        }
+    }
+    let m = pts.len();
+    if m < 3 {
+        return TriangleMesh::empty();
+    }
+
+    // 2. Ensure CCW orientation in the (r, z) half-plane (r as X, z as Y)
+    let mut area2d = 0.0;
+    for i in 0..m {
+        let next = (i + 1) % m;
+        area2d += pts[i][0] * pts[next][1] - pts[next][0] * pts[i][1];
+    }
+    if area2d < 0.0 {
+        pts.reverse();
+    }
+
+    // 3. Generate side-wall quad strips per profile segment with exact analytical normals
+    let n_steps = if is_full_circle { segs } else { segs + 1 };
+    let mut vertices = Vec::with_capacity(n_steps * m * 2);
+    let mut indices = Vec::new();
+
+    let thetas: Vec<(f64, f64)> = (0..n_steps)
+        .map(|j| {
+            let theta = if is_full_circle {
+                (j as f64) * 2.0 * PI / (segs as f64)
+            } else {
+                (j as f64) * sweep_angle_rad / (segs as f64)
+            };
+            (theta.cos(), theta.sin())
+        })
+        .collect();
+
+    for i in 0..m {
+        let next_i = (i + 1) % m;
+        let r_a = if pts[i][0] < 1e-9 { 0.0 } else { pts[i][0] };
+        let z_a = pts[i][1];
+        let r_b = if pts[next_i][0] < 1e-9 { 0.0 } else { pts[next_i][0] };
+        let z_b = pts[next_i][1];
+
+        // Edge lying on rotation axis has zero surface area
+        if r_a < 1e-9 && r_b < 1e-9 {
+            continue;
+        }
+
+        // Outward 2D normal for CCW profile in (r, z): (dz, -dr) / len
+        let dr = r_b - r_a;
+        let dz = z_b - z_a;
+        let seg_len = (dr * dr + dz * dz).sqrt().max(1e-12);
+        let nr = dz / seg_len;
+        let nz = -dr / seg_len;
+
+        let base_v = vertices.len() as u32;
+        for &(cos_t, sin_t) in &thetas {
+            let xa = if r_a == 0.0 { 0.0 } else { r_a * cos_t };
+            let ya = if r_a == 0.0 { 0.0 } else { r_a * sin_t };
+            let xb = if r_b == 0.0 { 0.0 } else { r_b * cos_t };
+            let yb = if r_b == 0.0 { 0.0 } else { r_b * sin_t };
+            let n3 = [nr * cos_t, nr * sin_t, nz];
+            vertices.push(Vertex::new([xa, ya, z_a], n3));
+            vertices.push(Vertex::new([xb, yb, z_b], n3));
+        }
+
+        for j in 0..segs {
+            let next_j = if is_full_circle {
+                (j + 1) % segs
+            } else {
+                j + 1
+            };
+
+            let v_curr_a = base_v + (j as u32) * 2;
+            let v_curr_b = v_curr_a + 1;
+            let v_next_a = base_v + (next_j as u32) * 2;
+            let v_next_b = v_next_a + 1;
+
+            if r_a < 1e-9 {
+                // Triangle fan around axis point at a
+                indices.push([v_curr_a, v_next_b, v_curr_b]);
+            } else if r_b < 1e-9 {
+                // Triangle fan around axis point at b
+                indices.push([v_curr_a, v_next_a, v_next_b]);
+            } else {
+                // Regular quad split into 2 triangles
+                indices.push([v_curr_a, v_next_a, v_next_b]);
+                indices.push([v_curr_a, v_next_b, v_curr_b]);
+            }
+        }
+    }
+
+    // 4. If partial angle, cap the planar start and end faces with dedicated flat-normal vertices
+    if !is_full_circle {
+        let cap_triangles = triangulate_simple_polygon_2d(&pts);
+
+        // Start cap at theta = 0: outward normal points towards -Y (e_r x e_z = [0, -1, 0])
+        let start_cap_base = vertices.len() as u32;
+        let start_normal = [0.0, -1.0, 0.0];
+        for p in &pts {
+            let r = if p[0] < 1e-9 { 0.0 } else { p[0] };
+            vertices.push(Vertex::new([r, 0.0, p[1]], start_normal));
+        }
+        for tri in &cap_triangles {
+            indices.push([
+                start_cap_base + tri[0],
+                start_cap_base + tri[1],
+                start_cap_base + tri[2],
+            ]);
+        }
+
+        // End cap at theta = sweep_angle: outward normal points towards +e_theta = [-sin, cos, 0]
+        let end_cap_base = vertices.len() as u32;
+        let (cos_end, sin_end) = thetas[segs];
+        let end_normal = [-sin_end, cos_end, 0.0];
+        for p in &pts {
+            let r = if p[0] < 1e-9 { 0.0 } else { p[0] };
+            let x = if r == 0.0 { 0.0 } else { r * cos_end };
+            let y = if r == 0.0 { 0.0 } else { r * sin_end };
+            vertices.push(Vertex::new([x, y, p[1]], end_normal));
+        }
+        for tri in &cap_triangles {
+            indices.push([
+                end_cap_base + tri[0],
+                end_cap_base + tri[2],
+                end_cap_base + tri[1],
+            ]);
+        }
+    }
+
+    let mut mesh = TriangleMesh::new(vertices, indices);
+
+    // 5. Enforce outward orientation
+    if mesh.signed_volume() < 0.0 {
+        for tri in &mut mesh.indices {
+            tri.swap(1, 2);
+        }
+        for v in &mut mesh.vertices {
+            v.normal = [-v.normal[0], -v.normal[1], -v.normal[2]];
+        }
+    }
+
+    mesh
+}
+
+/// Generates a solid 3D body of revolution with adaptive tessellation based on `TessellationSettings`.
+pub fn create_revolve_with_settings(
+    profile: &[[f64; 2]],
+    angle_deg: f64,
+    settings: &TessellationSettings,
+) -> TriangleMesh {
+    let max_r = profile.iter().map(|p| p[0].abs()).fold(0.0, f64::max);
+    let segments = settings.calculate_segments_arc(max_r, angle_deg * PI / 180.0);
+    create_revolve(profile, angle_deg, segments)
+}
+
+/// Generates a solid 3D parametric automotive wheel rim according to tire & wheel engineering standards.
+///
+/// Features:
+/// - Stepped rim barrel with inner/outer flanges, bead seat shelves, and drop center mounting well (монтажный ручей).
+/// - Central mounting hub with central bore hole (`hub_bore_diameter`).
+/// - Standard PCD (Pitch Circle Diameter) bolt pattern with `bolt_holes_count` holes (`bolt_hole_diameter`).
+/// - Structural spokes (`spokes_count`, `spoke_width`, `spoke_thickness`) connecting hub and rim barrel.
+/// - Open brake cooling windows between spokes for caliper and rotor ventilation.
+/// - Wheel offset ET (`offset_et`) setting hub mounting pad position relative to rim barrel centerline.
+#[allow(clippy::too_many_arguments)]
+pub fn create_wheel_rim(
+    rim_diameter: f64,
+    rim_width: f64,
+    flange_diameter: Option<f64>,
+    hub_diameter: Option<f64>,
+    hub_bore_diameter: Option<f64>,
+    pcd_diameter: Option<f64>,
+    bolt_holes_count: Option<usize>,
+    bolt_hole_diameter: Option<f64>,
+    spokes_count: Option<usize>,
+    spoke_width: Option<f64>,
+    spoke_thickness: Option<f64>,
+    offset_et: Option<f64>,
+) -> TriangleMesh {
+    create_wheel_rim_with_settings(
+        rim_diameter,
+        rim_width,
+        flange_diameter,
+        hub_diameter,
+        hub_bore_diameter,
+        pcd_diameter,
+        bolt_holes_count,
+        bolt_hole_diameter,
+        spokes_count,
+        spoke_width,
+        spoke_thickness,
+        offset_et,
+        &TessellationSettings::default(),
+    )
+}
+
+/// Generates a solid 3D parametric automotive wheel rim with adaptive tessellation based on `TessellationSettings`.
+#[allow(clippy::too_many_arguments)]
+pub fn create_wheel_rim_with_settings(
+    rim_diameter: f64,
+    rim_width: f64,
+    flange_diameter: Option<f64>,
+    hub_diameter: Option<f64>,
+    hub_bore_diameter: Option<f64>,
+    pcd_diameter: Option<f64>,
+    bolt_holes_count: Option<usize>,
+    bolt_hole_diameter: Option<f64>,
+    spokes_count: Option<usize>,
+    spoke_width: Option<f64>,
+    spoke_thickness: Option<f64>,
+    offset_et: Option<f64>,
+    settings: &TessellationSettings,
+) -> TriangleMesh {
+    if rim_diameter <= 1e-4 || rim_width <= 1e-4 {
+        return TriangleMesh::empty();
+    }
+
+    let d_rim = rim_diameter;
+    let w_rim = rim_width;
+    let r_bead = d_rim * 0.5;
+
+    let d_flange = flange_diameter.unwrap_or(d_rim * 1.08).max(d_rim * 1.02);
+    let r_flange = d_flange * 0.5;
+
+    let d_hub = hub_diameter.unwrap_or(d_rim * 0.35).clamp(d_rim * 0.15, d_rim * 0.65);
+    let r_hub = d_hub * 0.5;
+
+    let d_bore = hub_bore_diameter.unwrap_or(d_hub * 0.45).clamp(d_hub * 0.15, d_hub * 0.70);
+    let r_bore = d_bore * 0.5;
+
+    let d_pcd = pcd_diameter.unwrap_or((d_hub + d_bore) * 0.5).clamp(d_bore + 0.015, d_hub - 0.012);
+    let r_pcd = d_pcd * 0.5;
+
+    let n_bolts = bolt_holes_count.unwrap_or(5).clamp(3, 12);
+    let d_bolt = bolt_hole_diameter.unwrap_or(0.014).clamp(0.005, (r_hub - r_pcd).min(r_pcd - r_bore).max(0.008) * 1.6);
+    let r_bolt = d_bolt * 0.5;
+
+    let n_spokes = spokes_count.unwrap_or(5).max(3);
+
+    let max_spoke_w = (2.0 * PI * r_hub / (n_spokes as f64)) * 0.75;
+    let w_spoke = spoke_width.unwrap_or(d_rim * 0.055).clamp(0.010, max_spoke_w);
+
+    let t_spoke = spoke_thickness.unwrap_or(w_spoke * 0.65).clamp(0.008, w_rim * 0.4);
+
+    let et = offset_et.unwrap_or(0.035).clamp(-w_rim * 0.4, w_rim * 0.4);
+
+    // 1. Key radial & axial dimensions with safe geometric clearances
+    let t_w = (r_bead * 0.045).clamp(0.006, 0.012);
+    let drop_depth = (r_bead * 0.08).clamp(0.015, 0.035);
+    let r_well = (r_bead - drop_depth).max(r_hub + t_w + 0.015);
+    let r_inner_barrel = r_well - t_w;
+    let r_hump = r_bead + (r_bead * 0.012).clamp(0.002, 0.005);
+
+    let r_hub_eff = r_hub.min(r_inner_barrel * 0.78).max(r_bore + 0.018);
+    let r_bore_eff = r_bore.min(r_hub_eff * 0.65);
+    let r_bolt_ring = (r_hub_eff - (r_hub_eff - r_bore_eff) * 0.15).max(r_bore_eff + 0.012);
+    let radial_band = r_bolt_ring - r_bore_eff;
+    let r_pcd_eff = r_pcd.clamp(
+        r_bore_eff + radial_band * 0.28,
+        r_bolt_ring - radial_band * 0.28,
+    );
+    let max_r_bolt = (r_pcd_eff - r_bore_eff)
+        .min(r_bolt_ring - r_pcd_eff)
+        .min(r_pcd_eff * (PI / (n_bolts as f64)).sin())
+        * 0.55;
+    let r_bolt_eff = r_bolt.clamp(0.002, max_r_bolt.max(0.0025));
+
+    let h_w = w_rim * 0.5;
+    let z_well_bot = -h_w + 0.30 * w_rim;
+    let z_well_top = h_w - 0.30 * w_rim;
+    let max_disc_t = (z_well_top - z_well_bot) * 0.55;
+    let t_disc = t_spoke.clamp(0.010, max_disc_t.max(0.012));
+    let z_disc_center = (et - t_disc * 0.5).clamp(
+        z_well_bot + t_disc * 0.65,
+        z_well_top - t_disc * 0.65,
+    );
+    let z_back = z_disc_center - t_disc * 0.5;
+    let z_front = z_disc_center + t_disc * 0.5;
+
+    let q_mult = match settings.quality {
+        TessellationQuality::Coarse => 1,
+        TessellationQuality::Medium => 2,
+        TessellationQuality::Fine => 3,
+        TessellationQuality::Custom { .. } => 2,
+    };
+
+    // 2. Angular discretization of the spoke + window sectors (N_theta stations around 360 deg)
+    let k_s = 2 * q_mult; // segments across each spoke
+    let k_w = 4 * q_mult; // segments across each ventilation window
+    let k_sec = k_s + k_w;
+    let n_theta = n_spokes * k_sec;
+    let d_theta_sec = 2.0 * PI / (n_spokes as f64);
+
+    let delta_hub = (w_spoke / (2.0 * r_hub_eff)).clamp(0.12 * d_theta_sec, 0.34 * d_theta_sec);
+    let delta_barrel =
+        (w_spoke / (2.0 * r_inner_barrel)).clamp(0.08 * d_theta_sec, 0.34 * d_theta_sec);
+
+    let mut phi_hub = Vec::with_capacity(n_theta);
+    let mut phi_barrel = Vec::with_capacity(n_theta);
+    for s in 0..n_spokes {
+        let base_ang = (s as f64) * d_theta_sec;
+        // Spoke indices: 0..k_s covers [-delta, +delta] around base_ang + 0.5 * d_theta_sec?
+        // Place spoke centered at base_ang + delta_max so phi starts >= 0 and increases strictly in [0, 2*PI)
+        let spoke_center = base_ang + 0.25 * d_theta_sec;
+        let next_spoke_center = base_ang + 1.25 * d_theta_sec;
+        for m in 0..k_s {
+            let t = (m as f64) / (k_s as f64);
+            phi_hub.push(spoke_center - delta_hub + t * (2.0 * delta_hub));
+            phi_barrel.push(spoke_center - delta_barrel + t * (2.0 * delta_barrel));
+        }
+        for m in 0..k_w {
+            let t = (m as f64) / (k_w as f64);
+            let h_start = spoke_center + delta_hub;
+            let h_end = next_spoke_center - delta_hub;
+            let b_start = spoke_center + delta_barrel;
+            let b_end = next_spoke_center - delta_barrel;
+            phi_hub.push(h_start + t * (h_end - h_start));
+            phi_barrel.push(b_start + t * (b_end - b_start));
+        }
+    }
+
+    let hub_outer_ring: Vec<[f64; 2]> = phi_hub
+        .iter()
+        .map(|&a| [r_hub_eff * a.cos(), r_hub_eff * a.sin()])
+        .collect();
+    let barrel_inner_ring: Vec<[f64; 2]> = phi_barrel
+        .iter()
+        .map(|&a| [r_inner_barrel * a.cos(), r_inner_barrel * a.sin()])
+        .collect();
+
+    let mut vertices: Vec<Vertex> = Vec::new();
+    let mut indices: Vec<[u32; 3]> = Vec::new();
+
+    // Helper: emit a single quad (2 triangles) with explicit normal
+    let mut push_quad = |p0: [f64; 3], p1: [f64; 3], p2: [f64; 3], p3: [f64; 3], n: [f64; 3]| {
+        let base = vertices.len() as u32;
+        vertices.push(Vertex::new(p0, n));
+        vertices.push(Vertex::new(p1, n));
+        vertices.push(Vertex::new(p2, n));
+        vertices.push(Vertex::new(p3, n));
+        indices.push([base, base + 1, base + 2]);
+        indices.push([base, base + 2, base + 3]);
+    };
+
+    // 3. Build stepped rim barrel profile in CCW (r, z) order
+    // Segment 14 ([r_inner_barrel, z_front] -> [r_inner_barrel, z_back]) is the spoke/window attachment band.
+    let barrel_pts: Vec<[f64; 2]> = vec![
+        [r_flange, -h_w],                           // 0
+        [r_flange, -h_w + 0.05 * w_rim],            // 1
+        [r_bead + 0.004, -h_w + 0.08 * w_rim],      // 2
+        [r_bead, -h_w + 0.12 * w_rim],              // 3
+        [r_bead, -h_w + 0.22 * w_rim],              // 4
+        [r_well, z_well_bot],                       // 5
+        [r_well, z_well_top],                       // 6
+        [r_hump, h_w - 0.22 * w_rim],               // 7
+        [r_bead, h_w - 0.18 * w_rim],               // 8
+        [r_bead, h_w - 0.08 * w_rim],               // 9
+        [r_flange, h_w - 0.04 * w_rim],             // 10
+        [r_flange, h_w],                            // 11
+        [r_flange - t_w, h_w],                      // 12
+        [r_bead - t_w, h_w - 0.08 * w_rim],         // 13
+        [r_inner_barrel, z_well_top],               // 14
+        [r_inner_barrel, z_front],                  // 15 (top of spoke/window band)
+        [r_inner_barrel, z_back],                   // 16 (bottom of spoke/window band)
+        [r_inner_barrel, z_well_bot],               // 17
+        [r_bead - t_w, -h_w + 0.22 * w_rim],        // 18
+        [r_flange - t_w, -h_w],                     // 19
+    ];
+
+    let n_b_pts = barrel_pts.len();
+    for seg_i in 0..n_b_pts {
+        let next_i = (seg_i + 1) % n_b_pts;
+        let ra = barrel_pts[seg_i][0];
+        let za = barrel_pts[seg_i][1];
+        let rb = barrel_pts[next_i][0];
+        let zb = barrel_pts[next_i][1];
+
+        let dr = rb - ra;
+        let dz = zb - za;
+        let len = dr.hypot(dz).max(1e-12);
+        let nr = dz / len;
+        let nz = -dr / len;
+
+        let is_spoke_band = seg_i == 15; // [r_inner_barrel, z_front] -> [r_inner_barrel, z_back]
+
+        for j in 0..n_theta {
+            if is_spoke_band {
+                let in_sec = j % k_sec;
+                if in_sec < k_s {
+                    // Spoke attaches here; no barrel wall across the spoke cross-section
+                    continue;
+                }
+            }
+            let next_j = (j + 1) % n_theta;
+            let a0 = phi_barrel[j];
+            let a1 = phi_barrel[next_j];
+            let mid_a = 0.5 * (a0 + if next_j == 0 { a1 + 2.0 * PI } else { a1 });
+            let n3 = [nr * mid_a.cos(), nr * mid_a.sin(), nz];
+
+            let p0 = [ra * a0.cos(), ra * a0.sin(), za];
+            let p1 = [ra * a1.cos(), ra * a1.sin(), za];
+            let p2 = [rb * a1.cos(), rb * a1.sin(), zb];
+            let p3 = [rb * a0.cos(), rb * a0.sin(), zb];
+            push_quad(p0, p1, p2, p3, n3);
+        }
+    }
+
+    // 4. Spokes and Ventilation Window Walls between r_hub_eff and r_inner_barrel (z in [z_back, z_front])
+    for s in 0..n_spokes {
+        let sec_start = s * k_sec;
+
+        // 4a. Spoke top (+Z) and bottom (-Z) faces across k_s segments
+        for m in 0..k_s {
+            let j0 = sec_start + m;
+            let j1 = (j0 + 1) % n_theta;
+            let h0 = hub_outer_ring[j0];
+            let h1 = hub_outer_ring[j1];
+            let b0 = barrel_inner_ring[j0];
+            let b1 = barrel_inner_ring[j1];
+
+            // Front face at z_front (normal [0, 0, 1])
+            push_quad(
+                [h0[0], h0[1], z_front],
+                [b0[0], b0[1], z_front],
+                [b1[0], b1[1], z_front],
+                [h1[0], h1[1], z_front],
+                [0.0, 0.0, 1.0],
+            );
+            // Back face at z_back (normal [0, 0, -1])
+            push_quad(
+                [h0[0], h0[1], z_back],
+                [h1[0], h1[1], z_back],
+                [b1[0], b1[1], z_back],
+                [b0[0], b0[1], z_back],
+                [0.0, 0.0, -1.0],
+            );
+        }
+
+        // 4b. Leading side wall of spoke s at j_lead = sec_start (from barrel to hub, facing -theta)
+        let j_lead = sec_start;
+        let hl = hub_outer_ring[j_lead];
+        let bl = barrel_inner_ring[j_lead];
+        let dxl = bl[0] - hl[0];
+        let dyl = bl[1] - hl[1];
+        let len_l = dxl.hypot(dyl).max(1e-12);
+        let nl = [dyl / len_l, -dxl / len_l, 0.0];
+        push_quad(
+            [hl[0], hl[1], z_front],
+            [hl[0], hl[1], z_back],
+            [bl[0], bl[1], z_back],
+            [bl[0], bl[1], z_front],
+            nl,
+        );
+
+        // 4c. Trailing side wall of spoke s at j_trail = sec_start + k_s (facing +theta)
+        let j_trail = sec_start + k_s;
+        let ht = hub_outer_ring[j_trail];
+        let bt = barrel_inner_ring[j_trail];
+        let dxt = bt[0] - ht[0];
+        let dyt = bt[1] - ht[1];
+        let len_t = dxt.hypot(dyt).max(1e-12);
+        let nt = [-dyt / len_t, dxt / len_t, 0.0];
+        push_quad(
+            [bt[0], bt[1], z_front],
+            [bt[0], bt[1], z_back],
+            [ht[0], ht[1], z_back],
+            [ht[0], ht[1], z_front],
+            nt,
+        );
+
+        // 4d. Hub outer cylindrical wall along the ventilation window (k_s .. k_sec)
+        for m in k_s..k_sec {
+            let j0 = sec_start + m;
+            let j1 = (j0 + 1) % n_theta;
+            let h0 = hub_outer_ring[j0];
+            let h1 = hub_outer_ring[j1];
+            let dxh = h1[0] - h0[0];
+            let dyh = h1[1] - h0[1];
+            let len_h = dxh.hypot(dyh).max(1e-12);
+            let nh = [dyh / len_h, -dxh / len_h, 0.0];
+            push_quad(
+                [h0[0], h0[1], z_front],
+                [h0[0], h0[1], z_back],
+                [h1[0], h1[1], z_back],
+                [h1[0], h1[1], z_front],
+                nh,
+            );
+        }
+    }
+
+    // 5. Bolt Sector O-Grids inside [r_bore_eff, r_bolt_ring] for each of the n_bolts PCD holes
+    let k_b = 2 * q_mult; // segments per side of each bolt sector
+    let d_beta = 2.0 * PI / (n_bolts as f64);
+    let mut bolt_outer_ring: Vec<[f64; 2]> = Vec::with_capacity(n_bolts * k_b);
+    let mut bore_ring: Vec<[f64; 2]> = Vec::with_capacity(n_bolts * k_b);
+
+    for b in 0..n_bolts {
+        let beta_min = (b as f64) * d_beta;
+        let beta_max = ((b + 1) as f64) * d_beta;
+        let beta_mid = 0.5 * (beta_min + beta_max);
+        let er = [beta_mid.cos(), beta_mid.sin()];
+        let et_vec = [-beta_mid.sin(), beta_mid.cos()];
+        let bolt_center = [r_pcd_eff * er[0], r_pcd_eff * er[1]];
+
+        // Record global CCW rings at r_bore_eff and r_bolt_ring
+        for m in 0..k_b {
+            let t = (m as f64) / (k_b as f64);
+            let ang = beta_min + t * d_beta;
+            bore_ring.push([r_bore_eff * ang.cos(), r_bore_eff * ang.sin()]);
+            bolt_outer_ring.push([r_bolt_ring * ang.cos(), r_bolt_ring * ang.sin()]);
+        }
+
+        // Build 4 * k_b perimeter points in CCW order around bolt_center:
+        // Side 0: theta = beta_min, r from r_bore_eff to r_bolt_ring
+        // Side 1: r = r_bolt_ring, theta from beta_min to beta_max
+        // Side 2: theta = beta_max, r from r_bolt_ring to r_bore_eff
+        // Side 3: r = r_bore_eff, theta from beta_max to beta_min
+        let n_loop = 4 * k_b;
+        let mut perim_loop: Vec<[f64; 2]> = Vec::with_capacity(n_loop);
+        for m in 0..k_b {
+            let t = (m as f64) / (k_b as f64);
+            let r = r_bore_eff + t * (r_bolt_ring - r_bore_eff);
+            perim_loop.push([r * beta_min.cos(), r * beta_min.sin()]);
+        }
+        for m in 0..k_b {
+            let t = (m as f64) / (k_b as f64);
+            let ang = beta_min + t * d_beta;
+            perim_loop.push([r_bolt_ring * ang.cos(), r_bolt_ring * ang.sin()]);
+        }
+        for m in 0..k_b {
+            let t = (m as f64) / (k_b as f64);
+            let r = r_bolt_ring - t * (r_bolt_ring - r_bore_eff);
+            perim_loop.push([r * beta_max.cos(), r * beta_max.sin()]);
+        }
+        for m in 0..k_b {
+            let t = (m as f64) / (k_b as f64);
+            let ang = beta_max - t * d_beta;
+            perim_loop.push([r_bore_eff * ang.cos(), r_bore_eff * ang.sin()]);
+        }
+
+        // Build 4 * k_b bolt hole points in matching CCW order around bolt_center
+        let mut hole_loop: Vec<[f64; 2]> = Vec::with_capacity(n_loop);
+        for idx in 0..n_loop {
+            let psi = -0.75 * PI + (idx as f64) * 2.0 * PI / (n_loop as f64);
+            let c_p = psi.cos();
+            let s_p = psi.sin();
+            let px = bolt_center[0] + r_bolt_eff * (c_p * er[0] + s_p * et_vec[0]);
+            let py = bolt_center[1] + r_bolt_eff * (c_p * er[1] + s_p * et_vec[1]);
+            hole_loop.push([px, py]);
+        }
+
+        // Emit front (+Z), back (-Z), and inner bolt-hole cylindrical wall for sector b
+        for idx in 0..n_loop {
+            let next_idx = (idx + 1) % n_loop;
+            let h0 = hole_loop[idx];
+            let h1 = hole_loop[next_idx];
+            let p0 = perim_loop[idx];
+            let p1 = perim_loop[next_idx];
+
+            // Front cap quad at z_front
+            push_quad(
+                [h0[0], h0[1], z_front],
+                [p0[0], p0[1], z_front],
+                [p1[0], p1[1], z_front],
+                [h1[0], h1[1], z_front],
+                [0.0, 0.0, 1.0],
+            );
+            // Back cap quad at z_back
+            push_quad(
+                [h0[0], h0[1], z_back],
+                [h1[0], h1[1], z_back],
+                [p1[0], p1[1], z_back],
+                [p0[0], p0[1], z_back],
+                [0.0, 0.0, -1.0],
+            );
+            // Bolt hole inner vertical wall (normal pointing inward toward bolt_center)
+            let dx = h1[0] - h0[0];
+            let dy = h1[1] - h0[1];
+            let len = dx.hypot(dy).max(1e-12);
+            let n_in = [-dy / len, dx / len, 0.0];
+            push_quad(
+                [h1[0], h1[1], z_front],
+                [h1[0], h1[1], z_back],
+                [h0[0], h0[1], z_back],
+                [h0[0], h0[1], z_front],
+                n_in,
+            );
+        }
+    }
+
+    // 6. Central bore inner cylindrical wall at r = r_bore_eff
+    let n_bore = bore_ring.len();
+    for i in 0..n_bore {
+        let next_i = (i + 1) % n_bore;
+        let b0 = bore_ring[i];
+        let b1 = bore_ring[next_i];
+        let dx = b1[0] - b0[0];
+        let dy = b1[1] - b0[1];
+        let len = dx.hypot(dy).max(1e-12);
+        let n_in = [-dy / len, dx / len, 0.0];
+        push_quad(
+            [b1[0], b1[1], z_front],
+            [b1[0], b1[1], z_back],
+            [b0[0], b0[1], z_back],
+            [b0[0], b0[1], z_front],
+            n_in,
+        );
+    }
+
+    // 7. Zipper-stitch the hub annulus between bolt_outer_ring (at r_bolt_ring) and hub_outer_ring (at r_hub_eff)
+    // Align starting index of hub_outer_ring closest to bolt_outer_ring[0] angle (0.0)
+    let n1 = bolt_outer_ring.len();
+    let n2 = hub_outer_ring.len();
+    let ang1 = |idx: usize| -> f64 {
+        let wraps = idx / n1;
+        let rem = idx % n1;
+        let p = bolt_outer_ring[rem];
+        p[1].atan2(p[0]).rem_euclid(2.0 * PI) + (wraps as f64) * 2.0 * PI
+    };
+    let ang2 = |idx: usize| -> f64 {
+        let wraps = idx / n2;
+        let rem = idx % n2;
+        phi_hub[rem] + (wraps as f64) * 2.0 * PI
+    };
+
+    let mut i1 = 0usize;
+    let mut i2 = 0usize;
+    while i1 < n1 || i2 < n2 {
+        let advance_1 = if i1 >= n1 {
+            false
+        } else if i2 >= n2 {
+            true
+        } else {
+            ang1(i1 + 1) <= ang2(i2 + 1)
+        };
+
+        let a_curr = bolt_outer_ring[i1 % n1];
+        let b_curr = hub_outer_ring[i2 % n2];
+
+        if advance_1 {
+            let a_next = bolt_outer_ring[(i1 + 1) % n1];
+            // Front cap (+Z): [a_curr, b_curr, a_next]
+            let bf = vertices.len() as u32;
+            vertices.push(Vertex::new([a_curr[0], a_curr[1], z_front], [0.0, 0.0, 1.0]));
+            vertices.push(Vertex::new([b_curr[0], b_curr[1], z_front], [0.0, 0.0, 1.0]));
+            vertices.push(Vertex::new([a_next[0], a_next[1], z_front], [0.0, 0.0, 1.0]));
+            indices.push([bf, bf + 1, bf + 2]);
+
+            // Back cap (-Z): [a_curr, a_next, b_curr]
+            let bb = vertices.len() as u32;
+            vertices.push(Vertex::new([a_curr[0], a_curr[1], z_back], [0.0, 0.0, -1.0]));
+            vertices.push(Vertex::new([a_next[0], a_next[1], z_back], [0.0, 0.0, -1.0]));
+            vertices.push(Vertex::new([b_curr[0], b_curr[1], z_back], [0.0, 0.0, -1.0]));
+            indices.push([bb, bb + 1, bb + 2]);
+
+            i1 += 1;
+        } else {
+            let b_next = hub_outer_ring[(i2 + 1) % n2];
+            // Front cap (+Z): [a_curr, b_curr, b_next]
+            let bf = vertices.len() as u32;
+            vertices.push(Vertex::new([a_curr[0], a_curr[1], z_front], [0.0, 0.0, 1.0]));
+            vertices.push(Vertex::new([b_curr[0], b_curr[1], z_front], [0.0, 0.0, 1.0]));
+            vertices.push(Vertex::new([b_next[0], b_next[1], z_front], [0.0, 0.0, 1.0]));
+            indices.push([bf, bf + 1, bf + 2]);
+
+            // Back cap (-Z): [a_curr, b_next, b_curr]
+            let bb = vertices.len() as u32;
+            vertices.push(Vertex::new([a_curr[0], a_curr[1], z_back], [0.0, 0.0, -1.0]));
+            vertices.push(Vertex::new([b_next[0], b_next[1], z_back], [0.0, 0.0, -1.0]));
+            vertices.push(Vertex::new([b_curr[0], b_curr[1], z_back], [0.0, 0.0, -1.0]));
+            indices.push([bb, bb + 1, bb + 2]);
+
+            i2 += 1;
+        }
+    }
+
+    TriangleMesh::new(vertices, indices)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_box_volume() {
+        let b = create_box(2.0, 3.0, 4.0);
+        let vol = b.volume();
+        assert!((vol - 24.0).abs() < 1e-6, "Box volume should be 24.0, got {}", vol);
+        assert_eq!(b.triangle_count(), 12);
+        assert_eq!(b.vertex_count(), 24);
+    }
+
+    #[test]
+    fn test_sphere_volume() {
+        let r = 2.0;
+        let s = create_sphere(r, 48, 24);
+        let expected = (4.0 / 3.0) * PI * r.powi(3);
+        let actual = s.volume();
+        // Discretized sphere volume is slightly less than smooth sphere (~1-2%)
+        let diff_ratio = (actual - expected).abs() / expected;
+        assert!(
+            diff_ratio < 0.03,
+            "Sphere volume {} should be close to {}, diff: {}",
+            actual,
+            expected,
+            diff_ratio
+        );
+    }
+
+    #[test]
+    fn test_cylinder_volume() {
+        let r = 1.5;
+        let h = 5.0;
+        let c = create_cylinder(r, h, 64);
+        let expected = PI * r * r * h;
+        let actual = c.volume();
+        let diff_ratio = (actual - expected).abs() / expected;
+        assert!(
+            diff_ratio < 0.01,
+            "Cylinder volume {} should be within 1% of {}, diff: {}",
+            actual,
+            expected,
+            diff_ratio
+        );
+    }
+
+    #[test]
+    fn test_cone_sharp_volume() {
+        let r = 3.0;
+        let h = 6.0;
+        let cone = create_cone(r, 0.0, h, 64);
+        let expected = (1.0 / 3.0) * PI * r * r * h;
+        let actual = cone.volume();
+        let diff_ratio = (actual - expected).abs() / expected;
+        assert!(
+            diff_ratio < 0.01,
+            "Sharp cone volume {} should be within 1% of {}, diff: {}",
+            actual,
+            expected,
+            diff_ratio
+        );
+    }
+
+    #[test]
+    fn test_cone_frustum_volume() {
+        let r_bot = 4.0;
+        let r_top = 2.0;
+        let h = 5.0;
+        let frustum = create_cone(r_bot, r_top, h, 64);
+        let expected = (1.0 / 3.0) * PI * h * (r_bot * r_bot + r_bot * r_top + r_top * r_top);
+        let actual = frustum.volume();
+        let diff_ratio = (actual - expected).abs() / expected;
+        assert!(
+            diff_ratio < 0.01,
+            "Frustum volume {} should be within 1% of {}, diff: {}",
+            actual,
+            expected,
+            diff_ratio
+        );
+    }
+
+    #[test]
+    fn test_helical_cutter_volume_and_manifold() {
+        let cutter = create_helical_cutter(4.0, 1.5, 20.0, 40.0, 0.0, 2, true, 2.0, "circular");
+        assert!(cutter.triangle_count() > 0);
+        assert!(cutter.vertex_count() > 0);
+        let vol = cutter.volume();
+        assert!(vol > 0.0, "Helical cutter volume should be positive, got {}", vol);
+
+        // Check AABB spans expected Z range ~ [0.0 - r_g, 40.0 + r_g]
+        let aabb = cutter.bounding_box();
+        assert!(aabb.min[2] < 1.0);
+        assert!(aabb.max[2] > 39.0);
+    }
+
+    #[test]
+    fn test_helical_cutter_metric_60() {
+        let cutter = create_helical_cutter(4.0, 1.0, 2.0, 10.0, 0.0, 1, true, 5.0, "metric_60");
+        assert!(cutter.triangle_count() > 0);
+        let vol = cutter.volume();
+        assert!(vol > 0.0, "Metric 60 cutter volume must be positive: got {}", vol);
+    }
+
+    #[test]
+    fn test_polygon_prism_volume_and_flat_normals() {
+        // Hexagon: width across flats S = 10.0, height H = 5.0
+        // Exact volume = (sqrt(3) / 2) * S^2 * H = (sqrt(3) / 2) * 100 * 5 = 250 * sqrt(3) ~ 433.01270189
+        let prism = create_polygon_prism(6, 5.0, Some(10.0), None, None);
+        let vol = prism.volume();
+        let expected_vol = (3.0_f64.sqrt() / 2.0) * 100.0 * 5.0;
+        let diff = (vol - expected_vol).abs();
+        assert!(
+            diff < 1e-4,
+            "Hexagonal prism volume should be {}, got {}",
+            expected_vol,
+            vol
+        );
+        assert_eq!(prism.triangle_count(), 24); // 6 top + 6 bot + 12 sides
+
+        // Test with DIN 934 conical chamfer
+        let chamfered = create_polygon_prism(6, 5.0, Some(10.0), None, Some(0.5));
+        let vol_chamfered = chamfered.volume();
+        assert!(
+            vol_chamfered < vol,
+            "Chamfered prism volume ({}) must be less than unchamfered ({})",
+            vol_chamfered,
+            vol
+        );
+        assert!(
+            vol_chamfered > vol * 0.8,
+            "Chamfered prism volume should retain most of original body: got {}",
+            vol_chamfered
+        );
+    }
+
+    #[test]
+    fn test_spur_gear_solid_volume_and_dimensions() {
+        let m = 0.002;
+        let z = 20;
+        let b = 0.015;
+        let gear = create_spur_gear(m, z, 20.0, b, None, None, None, None, None);
+        assert!(gear.triangle_count() > 0);
+        let vol = gear.volume();
+        assert!(vol > 0.0, "Spur gear volume should be positive: got {}", vol);
+
+        // Approximate reference volume: pitch cylinder V = pi * r^2 * b
+        let r_pitch = m * (z as f64) * 0.5; // 0.020 m
+        let v_pitch_cyl = PI * r_pitch * r_pitch * b;
+        let diff_ratio = (vol - v_pitch_cyl).abs() / v_pitch_cyl;
+        assert!(
+            diff_ratio < 0.12,
+            "Gear volume ({}) should be close to pitch cylinder volume ({}), diff: {}",
+            vol,
+            v_pitch_cyl,
+            diff_ratio
+        );
+
+        // AABB dimensions: Z dimension should match face width, X and Y ~ tip diameter 2 * (r + m) = 0.044 m
+        let aabb = gear.bounding_box();
+        let dims = aabb.dimensions();
+        assert!((dims[2] - b).abs() < 1e-6, "Z dimension must match face width");
+        let d_tip = 2.0 * (r_pitch + m);
+        assert!(
+            (dims[0] - d_tip).abs() < 0.002,
+            "X diameter should be close to tip diameter {}, got {}",
+            d_tip,
+            dims[0]
+        );
+        assert!(
+            (dims[1] - d_tip).abs() < 0.002,
+            "Y diameter should be close to tip diameter {}, got {}",
+            d_tip,
+            dims[1]
+        );
+    }
+
+    #[test]
+    fn test_spur_gear_with_hub_bore_and_keyway() {
+        let m = 0.002;
+        let z = 20;
+        let b = 0.015;
+        let gear_plain = create_spur_gear(m, z, 20.0, b, None, None, None, None, None);
+        let _vol_plain = gear_plain.volume();
+
+        // Gear with hub (dia 25mm, length 10mm -> total length 25mm), bore 12mm (r=6mm), keyway 4x1.8mm
+        let gear_with_hub_and_keyway = create_spur_gear(
+            m,
+            z,
+            20.0,
+            b,
+            Some(0.006),
+            Some(0.004),
+            Some(0.0018),
+            Some(0.025),
+            Some(0.010),
+        );
+        assert!(gear_with_hub_and_keyway.triangle_count() > 0);
+        let vol_hub_gear = gear_with_hub_and_keyway.volume();
+        assert!(vol_hub_gear > 0.0, "Hub gear volume must be positive: got {}", vol_hub_gear);
+
+        // Check AABB spans total hub length 0.025m
+        let aabb = gear_with_hub_and_keyway.bounding_box();
+        assert!((aabb.dimensions()[2] - 0.025).abs() < 1e-4);
+
+        // Test without keyway vs with keyway: keyway should reduce volume
+        let gear_without_keyway = create_spur_gear(
+            m,
+            z,
+            20.0,
+            b,
+            Some(0.006),
+            None,
+            None,
+            Some(0.025),
+            Some(0.010),
+        );
+        let vol_no_key = gear_without_keyway.volume();
+        assert!(
+            vol_hub_gear < vol_no_key,
+            "Keyway must reduce volume: with_key={}, without_key={}",
+            vol_hub_gear,
+            vol_no_key
+        );
+    }
+
+    #[test]
+    fn test_cut_hole_with_keyway_reduces_volume() {
+        let block = create_box(10.0, 10.0, 10.0);
+        let hole_plain = cut_hole(&block, [0.0, 5.0, 0.0], [0.0, 1.0, 0.0], 2.0, 10.0, None, None);
+        let hole_keyway = cut_hole(
+            &block,
+            [0.0, 5.0, 0.0],
+            [0.0, 1.0, 0.0],
+            2.0,
+            10.0,
+            Some(1.0),
+            Some(1.0),
+        );
+
+        let v_plain = hole_plain.volume();
+        let v_keyway = hole_keyway.volume();
+        assert!(
+            v_keyway < v_plain,
+            "Hole with keyway volume ({}) must be less than plain hole ({})",
+            v_keyway,
+            v_plain
+        );
+    }
+
+    #[test]
+    fn test_revolve_cylinder_volume_and_aabb() {
+        let r = 2.0;
+        let h = 2.0;
+        let profile = vec![
+            [0.0, -1.0],
+            [r, -1.0],
+            [r, 1.0],
+            [0.0, 1.0],
+        ];
+        let cyl_revolve = create_revolve(&profile, 360.0, 32);
+        assert!(cyl_revolve.triangle_count() > 0);
+        let vol = cyl_revolve.volume();
+        let expected_vol = PI * r * r * h;
+        let diff_ratio = (vol - expected_vol).abs() / expected_vol;
+        assert!(
+            diff_ratio < 0.03,
+            "Revolved cylinder volume {} should be close to analytical {}, diff: {}",
+            vol,
+            expected_vol,
+            diff_ratio
+        );
+
+        let aabb = cyl_revolve.bounding_box();
+        let dims = aabb.dimensions();
+        assert!((dims[0] - 2.0 * r).abs() < 0.1);
+        assert!((dims[1] - 2.0 * r).abs() < 0.1);
+        assert!((dims[2] - h).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_revolve_partial_angle_and_hollow_ring() {
+        // 180-degree half cylinder
+        let profile = vec![
+            [0.0, -1.0],
+            [2.0, -1.0],
+            [2.0, 1.0],
+            [0.0, 1.0],
+        ];
+        let half_cyl = create_revolve(&profile, 180.0, 32);
+        let vol_half = half_cyl.volume();
+        let expected_half = 0.5 * PI * 4.0 * 2.0;
+        let diff_ratio = (vol_half - expected_half).abs() / expected_half;
+        assert!(
+            diff_ratio < 0.03,
+            "Half revolved cylinder volume {} should be close to {}, diff: {}",
+            vol_half,
+            expected_half,
+            diff_ratio
+        );
+
+        // Hollow ring/pipe: r in [1, 2], h = 2
+        let ring_profile = vec![
+            [1.0, -1.0],
+            [2.0, -1.0],
+            [2.0, 1.0],
+            [1.0, 1.0],
+        ];
+        let ring = create_revolve(&ring_profile, 360.0, 32);
+        let vol_ring = ring.volume();
+        let expected_ring = PI * (4.0 - 1.0) * 2.0;
+        let ring_diff_ratio = (vol_ring - expected_ring).abs() / expected_ring;
+        assert!(
+            ring_diff_ratio < 0.03,
+            "Hollow ring volume {} should be close to {}, diff: {}",
+            vol_ring,
+            expected_ring,
+            ring_diff_ratio
+        );
+    }
+
+    #[test]
+    fn test_wheel_rim_parametric_solid_and_dimensions() {
+        let rim_d = 0.4572; // 18 inches
+        let rim_w = 0.2032; // 8 inches
+        let wheel = create_wheel_rim(
+            rim_d,
+            rim_w,
+            Some(0.490),
+            Some(0.160),
+            Some(0.066),
+            Some(0.1143),
+            Some(5),
+            Some(0.014),
+            Some(5),
+            Some(0.028),
+            Some(0.018),
+            Some(0.035),
+        );
+
+        assert!(wheel.triangle_count() > 0, "Wheel rim should have triangles");
+        let vol = wheel.volume();
+        assert!(vol > 0.001, "Wheel rim volume should be positive: got {}", vol);
+
+        let aabb = wheel.bounding_box();
+        let dims = aabb.dimensions();
+        // Z dimension should match rim width
+        assert!(
+            (dims[2] - rim_w).abs() < 0.01,
+            "Wheel Z span {} should be close to rim width {}",
+            dims[2],
+            rim_w
+        );
+        // X and Y dimensions should be close to flange diameter (0.490m)
+        assert!(
+            (dims[0] - 0.490).abs() < 0.02,
+            "Wheel X diameter {} should be close to flange diameter 0.490",
+            dims[0]
+        );
+        assert!(
+            (dims[1] - 0.490).abs() < 0.02,
+            "Wheel Y diameter {} should be close to flange diameter 0.490",
+            dims[1]
+        );
+    }
+}
