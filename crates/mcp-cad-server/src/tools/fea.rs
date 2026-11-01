@@ -100,13 +100,16 @@ pub fn run_fea_analysis(args: &Value, state: &mut EngineState) -> Result<Value, 
         }
     }
 
-    // Default constraint: fix MinX boundary if nothing specified
+    // Reject unconstrained FEA models instead of silently injecting MinX (BUG-017 / BUG-019)
     if !dirichlet_added {
-        boundary.fix_aabb_face(AabbFace::MinX, 1e-4);
+        return Err(ServerError::InvalidArgument(
+            "Unconstrained FEA model: at least one fixed boundary constraint ('fixed_faces' or 'fixed_plane') is required to prevent rigid body motion".to_string(),
+        ));
     }
 
     // Applied loads
     let mut loads_added = false;
+    let explicit_loads_key = args.get("applied_forces").is_some() || args.get("applied_force").is_some();
 
     // Check applied_forces array
     let forces_list: Vec<&Value> = if let Some(arr) = args.get("applied_forces").and_then(|v| v.as_array()) {
@@ -164,8 +167,8 @@ pub fn run_fea_analysis(args: &Value, state: &mut EngineState) -> Result<Value, 
         }
     }
 
-    // Default load: 1000 N downward load (-Y) on MaxX face if none specified
-    if !loads_added {
+    // Only apply default load if neither applied_forces nor applied_force was passed in args
+    if !loads_added && !explicit_loads_key {
         boundary.add_aabb_face_force(AabbFace::MaxX, 1e-4, [0.0, -1000.0, 0.0]);
     }
 
