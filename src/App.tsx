@@ -1708,7 +1708,7 @@ export function App() {
         {/* Native-Style Minimalist Windows Preview Header */}
         <header className="h-10 bg-[#181c24] border-b border-[#29303d] px-3 flex items-center justify-between gap-2 shrink-0 z-20 whitespace-nowrap">
           {/* Left: Window Title, Unified Bridge Status & Model Selector */}
-          <div className="flex items-center gap-2 min-w-0">
+          <div className="flex items-center gap-2 min-w-0 overflow-hidden">
             <div className="flex items-center gap-1.5 text-xs font-semibold tracking-tight text-[#e2e8f0] shrink-0">
               <Box className="w-4 h-4 text-[#38bdf8]" />
               <span>MCP-CAD 3D Preview (WGPU)</span>
@@ -1720,7 +1720,7 @@ export function App() {
                   ? `Прямое соединение с Windows демоном ${bridgeStatus.endpointUrl} (${bridgeStatus.latencyMs}ms)`
                   : 'Единое ядро Z-Axis WGPU + бинарные сетки /output/*.stl (100% паритет с Windows EXE)'
               }
-              className={`hidden xl:inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono border ${
+              className={`hidden 2xl:inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono border shrink-0 ${
                 bridgeStatus.mode === 'windows_exe_connected'
                   ? 'bg-[#10b981]/15 border-[#10b981]/50 text-[#34d399]'
                   : 'bg-[#38bdf8]/15 border-[#38bdf8]/40 text-[#38bdf8]'
@@ -1735,13 +1735,13 @@ export function App() {
 
             <div className="h-4 w-[1px] bg-[#29303d] shrink-0" />
 
-            <label className="flex items-center gap-1.5 text-[11px] text-[#94a3b8]">
-              <span className="hidden lg:inline">Модель:</span>
+            <label className="flex items-center gap-1.5 text-[11px] text-[#94a3b8] min-w-0">
+              <span className="hidden xl:inline shrink-0">Модель:</span>
               <select
                 aria-label="Выбор 3D модели предпросмотра"
                 value={activePreset}
                 onChange={(e) => loadScenePreset(e.target.value, quality)}
-                className="w-56 bg-[#222730] hover:bg-[#282e3a] text-[#f1f5f9] text-xs font-mono px-2 py-1 rounded border border-[#333b4a] focus:outline-none focus:border-[#38bdf8] cursor-pointer"
+                className="w-36 xl:w-44 shrink bg-[#222730] hover:bg-[#282e3a] text-[#f1f5f9] text-xs font-mono px-2 py-1 rounded border border-[#333b4a] focus:outline-none focus:border-[#38bdf8] cursor-pointer truncate"
               >
                 <optgroup label="Параметрические модели (WGPU Golden)">
                   <option value="spur_gear">
@@ -1817,13 +1817,13 @@ export function App() {
               <button
                 onClick={handleToggleRustStlSource}
                 title="Переключить источник геометрии между параметрическим ядром WGPU и скомпилированным бинарным файлом Rust /output/*.stl"
-                className={`px-2 py-1 rounded border text-[11px] font-mono cursor-pointer transition-colors ${
+                className={`px-2 py-1 rounded border text-[11px] font-mono cursor-pointer transition-colors shrink-0 ${
                   useCompiledRustStl
                     ? 'bg-[#f59e0b]/20 border-[#f59e0b] text-[#fbbf24] font-semibold'
                     : 'bg-[#222730] hover:bg-[#2b313d] border-[#323946] text-[#cbd5e1]'
                 }`}
               >
-                {useCompiledRustStl ? 'Источник: Rust STL' : 'Источник: Ядро WGPU'}
+                {useCompiledRustStl ? 'Rust STL' : 'WGPU Ядро'}
               </button>
             )}
           </div>
