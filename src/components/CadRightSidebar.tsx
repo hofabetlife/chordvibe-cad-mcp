@@ -195,7 +195,7 @@ export const CadRightSidebar: React.FC<CadRightSidebarProps> = ({
         <div className="px-3 py-2.5 border-b border-[#262b36] bg-[#10131a] flex items-center justify-between">
           <div className="flex items-center gap-2 text-xs font-semibold text-[#f1f5f9]">
             <Ruler className="w-3.5 h-3.5 text-[#38bdf8]" />
-            <span>Геометрия и Топология (B-Rep)</span>
+            <span>Геометрия и Топология (Mesh)</span>
           </div>
           <span className="text-[10px] font-mono text-[#38bdf8]">
             Half-Edge
@@ -672,6 +672,70 @@ export const CadRightSidebar: React.FC<CadRightSidebarProps> = ({
                     {feaResult.solveTimeMs.toFixed(1)} мс
                   </span>
                 </div>
+
+                {feaResult.kirschMetrics && (
+                  <div className="bg-[#12151c] border border-[#38bdf8]/40 rounded p-2.5 space-y-2 text-[10px] mt-2 font-mono">
+                    <div className="flex items-center justify-between border-b border-[#222734] pb-1">
+                      <span className="text-[#38bdf8] font-bold text-xs">
+                        Концентратор Кирсча (Kirsch Solution)
+                      </span>
+                      <span className="text-[9px] bg-[#38bdf8]/15 text-[#38bdf8] px-1.5 py-0.5 rounded font-bold">
+                        Kt ≈ {feaResult.kirschMetrics.theoreticalKtGross}
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-1.5 text-[10px] pt-0.5">
+                      <div className="bg-[#181c24] p-1.5 rounded border border-[#222734]">
+                        <span className="text-[#64748b] block text-[9px]">
+                          Брутто напряжение σ₀:
+                        </span>
+                        <span className="text-[#f1f5f9] font-bold">
+                          {feaResult.kirschMetrics.grossNominalStressMPa.toFixed(1)} МПа
+                        </span>
+                      </div>
+
+                      <div className="bg-[#181c24] p-1.5 rounded border border-[#222734]">
+                        <span className="text-[#64748b] block text-[9px]">
+                          Нетто напряжение σ_net:
+                        </span>
+                        <span className="text-[#38bdf8] font-bold">
+                          {feaResult.kirschMetrics.netNominalStressMPa.toFixed(1)} МПа
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="space-y-1 text-[10px] pt-1 border-t border-[#222734] text-[#cbd5e1]">
+                      <div className="flex justify-between">
+                        <span className="text-[#64748b]">Теоретич. Kt (Бескон. пласт.):</span>
+                        <span className="text-[#f59e0b] font-bold">3.000</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-[#64748b]">Howland Kt брутто (d/W=0.2):</span>
+                        <span className="text-[#38bdf8] font-bold">
+                          {feaResult.kirschMetrics.theoreticalKtGross}
+                        </span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-[#64748b]">Howland Kt нетто:</span>
+                        <span className="text-[#10b981] font-bold">
+                          {feaResult.kirschMetrics.theoreticalKtNet}
+                        </span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-[#64748b]">Теоретич. пик (Howland):</span>
+                        <span className="text-[#f1f5f9] font-bold">
+                          {feaResult.kirschMetrics.theoreticalPeakStressMPa.toFixed(1)} МПа
+                        </span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-[#64748b]">МКЭ Kt брутто (FEA):</span>
+                        <span className="text-[#f87171] font-bold">
+                          {feaResult.kirschMetrics.feaKtGross.toFixed(3)}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
             ) : (
               <div className="bg-[#181c24] border border-[#242936] rounded p-3 text-xs text-[#94a3b8]">
@@ -1058,7 +1122,7 @@ export const CadRightSidebar: React.FC<CadRightSidebarProps> = ({
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-1.5 text-xs font-semibold text-[#10b981]">
                       <CheckCircle2 className="w-4 h-4" />
-                      <span>QA Аудит: 100% PASS</span>
+                      <span>Инспекция сетки (validate_mesh)</span>
                     </div>
                     <button
                       onClick={() =>

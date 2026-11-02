@@ -164,6 +164,7 @@ export interface CadPart {
   name: string;
   materialId: string;
   dag: DagNode[];
+  featureIdMap?: Record<string, string>;
   mesh: MeshGeometryData;
   visible: boolean;
   isFixed?: boolean;
@@ -191,9 +192,10 @@ export interface KinematicJoint {
 }
 
 export interface FeaBoundaryCondition {
-  region: 'min_x' | 'max_x' | 'min_y' | 'max_y' | 'min_z' | 'max_z';
+  region: 'min_x' | 'max_x' | 'min_y' | 'max_y' | 'min_z' | 'max_z' | 'point' | 'edge';
   type: 'fixed' | 'force';
   forceVector?: [number, number, number]; // N
+  position?: [number, number, number]; // m (for concentrated point load / constraint)
 }
 
 export interface FeaTetraQualityMetrics {
@@ -202,6 +204,31 @@ export interface FeaTetraQualityMetrics {
   medianAspectRatio: number;
   maxAspectRatio: number;
   minDihedralAngleDeg: number;
+  degenerateElementCount?: number;
+  qualityStatus?: 'PASS' | 'WARN' | 'REJECT';
+}
+
+export interface KirschAnalysisMetrics {
+  plateWidthMm: number;
+  plateHeightMm: number;
+  plateThicknessMm: number;
+  holeRadiusMm: number;
+  holeDiameterMm: number;
+  tensileForceKN: number;
+  grossAreaM2: number;
+  netAreaM2: number;
+  grossNominalStressMPa: number;
+  netNominalStressMPa: number;
+  theoreticalKtInfinite: number;
+  theoreticalKtGross: number;
+  theoreticalKtNet: number;
+  theoreticalPeakStressMPa: number;
+  feaPeakStressMPa: number;
+  holeEdgeMaxStressMPa?: number;
+  globalMaxStressMPa?: number;
+  feaKtGross: number;
+  feaKtNet: number;
+  howlandErrorPct: number;
 }
 
 export interface FeaSimulationResult {
@@ -214,15 +241,22 @@ export interface FeaSimulationResult {
   meshDensity?: 'coarse' | 'medium' | 'fine';
   tetQuality?: FeaTetraQualityMetrics;
   discretizationWarning?: string;
+  certificationDisclaimer?: string;
   maxDisplacementMm: number;
   maxVonMisesMPa: number;
   minVonMisesMPa: number;
+  holeEdgeMaxStressMPa?: number;
+  globalMaxStressMPa?: number;
   yieldStrengthMPa: number;
   safetyFactor: number;
   status: 'SAFE' | 'WARNING_HIGH_STRESS' | 'FAILURE_YIELD_EXCEEDED';
   solveTimeMs: number;
   conditions: FeaBoundaryCondition[];
   analyticalBenchmarkErrorPct?: number;
+  warnings?: string[];
+  singularityDetected?: boolean;
+  elementOrder?: 'TET4' | 'TET10';
+  kirschMetrics?: KirschAnalysisMetrics;
 }
 
 export interface PhysicsTrajectoryFrame {

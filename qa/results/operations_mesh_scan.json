@@ -1,0 +1,204 @@
+{
+  "phase": "phase_2_operations_and_chains_scan",
+  "results": [
+    {
+      "boundary_edges": 0,
+      "expected_genus": 1,
+      "genus": 1.0,
+      "issues": [],
+      "operation": "cut_hole_through_box",
+      "orientation_consistent": true,
+      "self_intersections": 0,
+      "signed_volume": 0.00037244679286971413,
+      "status": "PASS",
+      "t_junctions": 0,
+      "watertight": true
+    },
+    {
+      "boundary_edges": 6,
+      "expected_genus": 0,
+      "genus": 1.0,
+      "issues": [
+        "Mesh is not watertight: 6 boundary edges (holes), 0 non-manifold edges",
+        "Euler genus mismatch: computed 1.0 (round 1), expected 0"
+      ],
+      "operation": "cut_hole_blind_box",
+      "orientation_consistent": true,
+      "self_intersections": 0,
+      "signed_volume": 0.0003793124257814897,
+      "status": "FAIL",
+      "t_junctions": 0,
+      "watertight": false
+    },
+    {
+      "boundary_edges": 0,
+      "expected_genus": 1,
+      "genus": 1.0,
+      "issues": [],
+      "operation": "cut_hole_with_keyway",
+      "orientation_consistent": true,
+      "self_intersections": 0,
+      "status": "PASS",
+      "t_junctions": 0,
+      "watertight": true
+    },
+    {
+      "boundary_edges": 8,
+      "expected_genus": 1,
+      "genus": 2.0,
+      "issues": [
+        "Mesh is not watertight: 8 boundary edges (holes), 0 non-manifold edges",
+        "Sliver quality gate failed: 45.07% of triangles (64/142) have min angle < 5° (threshold 20.00%)",
+        "Euler genus mismatch: computed 2.0 (round 2), expected 1"
+      ],
+      "operation": "cut_hole_angled",
+      "orientation_consistent": true,
+      "self_intersections": 0,
+      "status": "FAIL",
+      "t_junctions": 0,
+      "watertight": false
+    },
+    {
+      "boundary_edges": 11873,
+      "genus": 94.5,
+      "issues": [
+        "Mesh is not watertight: 11873 boundary edges (holes), 0 non-manifold edges",
+        "Orientation is inconsistent: 37 inverted directed edges detected",
+        "Euler genus mismatch: computed 94.5 (round 95), expected 0"
+      ],
+      "operation": "cut_helical_groove_circular",
+      "orientation_consistent": false,
+      "self_intersections": 0,
+      "status": "FAIL",
+      "t_junctions": 0,
+      "watertight": false
+    },
+    {
+      "boundary_edges": 6749,
+      "genus": 15.0,
+      "issues": [
+        "Mesh is not watertight: 6749 boundary edges (holes), 1 non-manifold edges",
+        "Orientation is inconsistent: 25 inverted directed edges detected",
+        "Euler genus mismatch: computed 15.0 (round 15), expected 0"
+      ],
+      "operation": "cut_helical_groove_metric_60",
+      "orientation_consistent": false,
+      "self_intersections": 0,
+      "status": "FAIL",
+      "t_junctions": 0,
+      "watertight": false
+    },
+    {
+      "boundary_edges": 0,
+      "expected_volume": 0.0015,
+      "genus": 0.0,
+      "issues": [],
+      "operation": "boolean_union_coplanar_boxes",
+      "orientation_consistent": true,
+      "self_intersections": 0,
+      "signed_volume": 0.0015000000000000007,
+      "status": "PASS",
+      "t_junctions": 0,
+      "watertight": true
+    },
+    {
+      "boundary_edges": 0,
+      "expected_volume": 0.0005,
+      "genus": 0.0,
+      "issues": [],
+      "operation": "boolean_difference_coplanar_boxes",
+      "orientation_consistent": true,
+      "self_intersections": 0,
+      "signed_volume": 0.0005000000000000002,
+      "status": "PASS",
+      "t_junctions": 0,
+      "watertight": true
+    },
+    {
+      "boundary_edges": 0,
+      "expected_volume": 0.0005,
+      "genus": 0.0,
+      "issues": [],
+      "operation": "boolean_intersection_coplanar_boxes",
+      "orientation_consistent": true,
+      "self_intersections": 0,
+      "signed_volume": 0.0005000000000000002,
+      "status": "PASS",
+      "t_junctions": 0,
+      "watertight": true
+    },
+    {
+      "issues": [],
+      "operation": "transform_negative_scale",
+      "orientation_consistent": true,
+      "signed_volume": 0.005999999999999999,
+      "status": "PASS",
+      "watertight": true
+    },
+    {
+      "operation": "chain_box_two_holes_genus2",
+      "validation": {
+        "angle_stats": {
+          "histogram": {
+            "deg_15_to_30": 42,
+            "deg_1_to_5": 88,
+            "deg_30_to_45": 29,
+            "deg_45_to_60": 13,
+            "deg_5_to_15": 58,
+            "lt_1_deg": 0
+          },
+          "median_angle_deg": 11.249999999999842,
+          "min_angle_deg": 0.2084789082868999,
+          "p5_angle_deg": 2.0767327317180104
+        },
+        "geometry": {
+          "coplanar_overlaps_count": 45,
+          "degenerate_triangles_count": 0,
+          "duplicate_vertices_count": 571,
+          "is_positive_volume": true,
+          "lt_1_deg_count": 0,
+          "lt_1_deg_ratio": 0.0,
+          "lt_5_deg_count": 88,
+          "lt_5_deg_ratio": 0.3826086956521739,
+          "max_aspect_ratio": 29920.344027402683,
+          "median_aspect_ratio": 6.113389712173076,
+          "min_aspect_ratio": 1.0038689250051906,
+          "normals_vs_winding_mismatches": 0,
+          "p5_aspect_ratio": 1.0895381620176556,
+          "self_intersections_count": 36,
+          "signed_volume": 0.0009705922067392366,
+          "sliver_triangles_count": 88,
+          "t_junctions_count": 0
+        },
+        "issues": [
+          "Mesh is not watertight: 6 boundary edges (holes), 0 non-manifold edges",
+          "Orientation is inconsistent: 35 inverted directed edges detected",
+          "Found 36 self-intersecting non-adjacent triangle pairs",
+          "Sliver quality gate failed: 38.26% of triangles (88/230) have min angle < 5° (threshold 20.00%)",
+          "Euler genus mismatch: computed 0.5 (round 1), expected 2"
+        ],
+        "status": "FAIL",
+        "topology": {
+          "boundary_edges_count": 6,
+          "connected_components": 2,
+          "euler_characteristic": 1,
+          "genus": 0.5,
+          "inconsistent_edges_count": 35,
+          "is_watertight": false,
+          "non_manifold_edges_count": 0,
+          "non_manifold_vertices_count": 0,
+          "orientation_consistent": false,
+          "triangles_count": 230,
+          "unique_edges_count": 348,
+          "welded_vertices_count": 119
+        },
+        "warnings": [
+          "Notice: 88 sliver triangles detected (min angle < 5° or aspect ratio > 100)",
+          "Notice: 571 un-welded duplicate vertices found (CAD split normals)",
+          "Notice: 45 coplanar overlapping triangle pairs detected"
+        ]
+      }
+    }
+  ],
+  "total_operations_tested": 11
+}
