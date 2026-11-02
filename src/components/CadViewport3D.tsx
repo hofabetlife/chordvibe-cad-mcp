@@ -1079,7 +1079,7 @@ export const CadViewport3D: React.FC<CadViewport3DProps> = ({
                   fitCameraToParts(parts);
                 }
               }}
-              title="Наложить эталонный рендер Windows WGPU (/qa/artifacts/*.png) поверх WebGL для проверки 100% совпадения"
+              title="Наложить эталонный рендер Windows WGPU (/qa/artifacts/*.png) поверх WebGL для визуального сравнения"
               className={`px-2 py-0.5 rounded text-[10px] font-mono flex items-center gap-1 cursor-pointer transition-colors ${
                 compareOverlayActive
                   ? 'bg-[#f59e0b] text-[#0c0e12] font-semibold'

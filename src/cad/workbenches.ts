@@ -15,10 +15,10 @@ export const ENGINEERING_WORKBENCHES: WorkbenchMetadata[] = [
     id: 'modeling',
     label: 'Моделирование',
     shortLabel: '1. Моделирование',
-    subtitle: 'Параметрические тела, булевы операции CSG, дерево DAG и топология B-Rep',
+    subtitle: 'Параметрические тела, булевы операции CSG, дерево DAG и топология TriangleMesh',
     accentColor: '#38bdf8',
     leftPanelTitle: 'Дерево построения и Материалы',
-    rightPanelTitle: 'Геометрия и Топология (B-Rep)',
+    rightPanelTitle: 'Геометрия и Топология (Mesh)',
   },
   {
     id: 'fea',
@@ -59,6 +59,14 @@ export interface FeaQuickLoadPreset {
 }
 
 export const FEA_QUICK_LOAD_PRESETS: FeaQuickLoadPreset[] = [
+  {
+    id: 'kirsch_tension',
+    label: 'Пластина Кирсча 100 кН',
+    description: 'Заделка min_x, продольное растяжение max_x Fx = +100 кН (Пластина 200x200x10 мм с отверстием R=20мм)',
+    fixedRegion: 'min_x',
+    loadRegion: 'max_x',
+    forceVector: [100000, 0, 0],
+  },
   {
     id: 'cantilever_bending',
     label: 'Изгиб 1.2 кН',
