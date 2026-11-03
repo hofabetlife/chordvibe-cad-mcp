@@ -2357,9 +2357,11 @@ pub fn create_wheel_rim_with_settings(
     let mut indices: Vec<[u32; 3]> = Vec::new();
 
     // Helper: emit a single quad (2 triangles) split along its shorter diagonal
-    let mut push_quad = |p0: [f64; 3], p1: [f64; 3], p2: [f64; 3], p3: [f64; 3], n: [f64; 3]| {
-        push_quad_shortest_diag(&mut vertices, &mut indices, p0, p1, p2, p3, n);
-    };
+    macro_rules! push_quad {
+        ($p0:expr, $p1:expr, $p2:expr, $p3:expr, $n:expr $(,)?) => {
+            push_quad_shortest_diag(&mut vertices, &mut indices, $p0, $p1, $p2, $p3, $n);
+        };
+    }
 
     // 3. Build stepped rim barrel profile in CCW (r, z) order
     // Segment 15 ([r_inner_barrel, z_front] -> [r_inner_barrel, z_back]) is the spoke/window attachment band.
@@ -2420,7 +2422,7 @@ pub fn create_wheel_rim_with_settings(
             let p1 = [ra * a1.cos(), ra * a1.sin(), za];
             let p2 = [rb * a1.cos(), rb * a1.sin(), zb];
             let p3 = [rb * a0.cos(), rb * a0.sin(), zb];
-            push_quad(p0, p1, p2, p3, n3);
+            push_quad!(p0, p1, p2, p3, n3);
         }
     }
 
@@ -2447,7 +2449,7 @@ pub fn create_wheel_rim_with_settings(
                 let r0_b = [h1[0] + (b1[0] - h1[0]) * t0, h1[1] + (b1[1] - h1[1]) * t0];
 
                 // Front face at z_front (normal [0, 0, 1])
-                push_quad(
+                push_quad!(
                     [r0_a[0], r0_a[1], z_front],
                     [r1_a[0], r1_a[1], z_front],
                     [r1_b[0], r1_b[1], z_front],
@@ -2455,7 +2457,7 @@ pub fn create_wheel_rim_with_settings(
                     [0.0, 0.0, 1.0],
                 );
                 // Back face at z_back (normal [0, 0, -1])
-                push_quad(
+                push_quad!(
                     [r0_a[0], r0_a[1], z_back],
                     [r0_b[0], r0_b[1], z_back],
                     [r1_b[0], r1_b[1], z_back],
@@ -2478,7 +2480,7 @@ pub fn create_wheel_rim_with_settings(
             let t1 = ((kr + 1) as f64) / (n_r_spoke as f64);
             let p0 = [hl[0] + dxl * t0, hl[1] + dyl * t0];
             let p1 = [hl[0] + dxl * t1, hl[1] + dyl * t1];
-            push_quad(
+            push_quad!(
                 [p0[0], p0[1], z_front],
                 [p0[0], p0[1], z_back],
                 [p1[0], p1[1], z_back],
@@ -2500,7 +2502,7 @@ pub fn create_wheel_rim_with_settings(
             let t1 = ((kr + 1) as f64) / (n_r_spoke as f64);
             let p0 = [ht[0] + dxt * t0, ht[1] + dyt * t0];
             let p1 = [ht[0] + dxt * t1, ht[1] + dyt * t1];
-            push_quad(
+            push_quad!(
                 [p1[0], p1[1], z_front],
                 [p1[0], p1[1], z_back],
                 [p0[0], p0[1], z_back],
@@ -2519,7 +2521,7 @@ pub fn create_wheel_rim_with_settings(
             let dyh = h1[1] - h0[1];
             let len_h = dxh.hypot(dyh).max(1e-12);
             let nh = [dyh / len_h, -dxh / len_h, 0.0];
-            push_quad(
+            push_quad!(
                 [h0[0], h0[1], z_front],
                 [h0[0], h0[1], z_back],
                 [h1[0], h1[1], z_back],
@@ -2598,11 +2600,11 @@ pub fn create_wheel_rim_with_settings(
         // Emit front (+Z) and back (-Z) hub annular sector caps using 2-to-1 halving transition
         // Note: perim_loop and mid_loop are CCW around bolt_center, so for +Z outward normal we pass Winding::Cw
         // to add_halving_ring_transition_2d (where Winding::Cw emits (O_{2i}, M_i, O_{2i+1}) -> CCW in XY!).
-        add_halving_ring_transition_2d(&mut vertices, &mut indices, &perim_loop, &mid_loop, z_front, [0.0, 0.0, 1.0], Winding::Cw);
-        add_bridged_ring_strip_2d(&mut vertices, &mut indices, &hole_loop, &mid_loop, z_front, [0.0, 0.0, 1.0], Winding::Ccw, 1);
+        add_halving_ring_transition_2d(&mut vertices, &mut indices, &perim_loop, &mid_loop, z_front, true);
+        add_bridged_ring_strip_2d(&mut vertices, &mut indices, &mid_loop, &hole_loop, z_front, true);
 
-        add_halving_ring_transition_2d(&mut vertices, &mut indices, &perim_loop, &mid_loop, z_back, [0.0, 0.0, -1.0], Winding::Ccw);
-        add_bridged_ring_strip_2d(&mut vertices, &mut indices, &hole_loop, &mid_loop, z_back, [0.0, 0.0, -1.0], Winding::Cw, 1);
+        add_halving_ring_transition_2d(&mut vertices, &mut indices, &perim_loop, &mid_loop, z_back, false);
+        add_bridged_ring_strip_2d(&mut vertices, &mut indices, &mid_loop, &hole_loop, z_back, false);
 
         // Bolt hole inner vertical wall with axial subdivision (normal pointing inward toward bolt_center)
         let bolt_chord = (2.0 * PI * r_bolt_eff / (n_bolt as f64)).max(1e-6);
@@ -2620,7 +2622,7 @@ pub fn create_wheel_rim_with_settings(
                 let tz1 = ((iz + 1) as f64) / (bolt_z_steps as f64);
                 let za = z_front + (z_back - z_front) * tz0;
                 let zb = z_front + (z_back - z_front) * tz1;
-                push_quad(
+                push_quad!(
                     [h1[0], h1[1], za],
                     [h1[0], h1[1], zb],
                     [h0[0], h0[1], zb],
@@ -2641,7 +2643,7 @@ pub fn create_wheel_rim_with_settings(
         let dy = b1[1] - b0[1];
         let len = dx.hypot(dy).max(1e-12);
         let n_in = [-dy / len, dx / len, 0.0];
-        push_quad(
+        push_quad!(
             [b1[0], b1[1], z_front],
             [b1[0], b1[1], z_back],
             [b0[0], b0[1], z_back],
