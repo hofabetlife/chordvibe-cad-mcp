@@ -63,6 +63,15 @@ export const GOLDEN_WINDOWS_MAPPINGS: Record<string, GoldenArtifactMapping> = {
     expectedGenus: 1,
     title: 'M10 Hex Nut (DIN 934 / ISO 68-1)',
   },
+  v8_piston: {
+    presetId: 'v8_piston',
+    artifactPrefix: 'v8_racing_piston',
+    stlUrl: '/output/v8_racing_piston.stl',
+    compiledStlUrl: '/output/v8_racing_piston.stl',
+    expectedTriangles: 62676,
+    expectedGenus: 0,
+    title: 'V8 Racing Piston (Combustion Bowl & Ring Belt)',
+  },
   twist_drill: {
     presetId: 'twist_drill',
     artifactPrefix: 'spur_gear_hub_keyway',
@@ -189,7 +198,7 @@ export async function probeWindowsMcpServer(
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 650);
 
-      const res = await fetch(`${base}/mcp`, {
+      const res = await fetch(`${base}/message`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -247,7 +256,7 @@ export async function executeRemoteWindowsMcpTool(
   args: Record<string, any>
 ): Promise<{ ok: boolean; payload: any }> {
   const base = endpointUrl.replace(/\/+$/, '');
-  const res = await fetch(`${base}/mcp`, {
+  const res = await fetch(`${base}/message`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({

@@ -410,6 +410,69 @@ export function App() {
         setParts([prismPart]);
         setSelectedPartId(prismPart.id);
         setJoints([]);
+      } else if (presetId === 'v8_piston' || presetId === 'raw_stl_v8_piston') {
+        const dag = [
+          {
+            id: 'node_1',
+            name: 'Piston Revolve Body',
+            type: 'revolve' as const,
+            params: {
+              angle_deg: 360,
+              segments: 64,
+              profile: [
+                [0.0425, 0.0],
+                [0.0425, 0.038],
+                [0.039, 0.038],
+                [0.039, 0.041],
+                [0.0425, 0.041],
+                [0.0425, 0.045],
+                [0.039, 0.045],
+                [0.039, 0.0475],
+                [0.0425, 0.0475],
+                [0.0425, 0.052],
+                [0.039, 0.052],
+                [0.039, 0.0545],
+                [0.042, 0.0545],
+                [0.042, 0.065],
+                [0.03, 0.065],
+                [0.024, 0.061],
+                [0.0, 0.061],
+                [0.0, 0.052],
+                [0.032, 0.052],
+                [0.036, 0.04],
+                [0.036, 0.0],
+              ],
+            },
+            enabled: true,
+          },
+          {
+            id: 'node_2',
+            name: 'Piston Pin Bore Ø22mm',
+            type: 'cut_hole' as const,
+            params: {
+              center: [-0.05, 0, 0.025],
+              normal: [1, 0, 0],
+              radius: 0.011,
+              depth: 0.1,
+            },
+            enabled: true,
+          },
+        ];
+        const pistonMesh = evaluateFeatureTree(dag, q, 2700);
+        const pistonPart: CadPart = {
+          id: 'piston_01',
+          name: 'V8 Racing Piston (Al 6061-T6)',
+          materialId: 'al_6061',
+          dag,
+          mesh: pistonMesh,
+          visible: true,
+          position: [0, 0, 0],
+          rotation: [0, 0, 0],
+          scale: [1, 1, 1],
+        };
+        setParts([pistonPart]);
+        setSelectedPartId(pistonPart.id);
+        setJoints([]);
       } else if (presetId === 'twist_drill') {
         const dag = [
           {
@@ -960,7 +1023,8 @@ export function App() {
   );
 
   useEffect(() => {
-    loadScenePreset('spur_gear', 'standard');
+    const urlPreset = typeof window !== 'undefined' ? new URLSearchParams(window.location.search).get('preset') : null;
+    loadScenePreset(urlPreset || 'v8_piston', 'standard');
   }, []);
 
   const cycleQualityPreset = useCallback(() => {
@@ -1744,6 +1808,9 @@ export function App() {
                 className="w-36 xl:w-44 shrink bg-[#222730] hover:bg-[#282e3a] text-[#f1f5f9] text-xs font-mono px-2 py-1 rounded border border-[#333b4a] focus:outline-none focus:border-[#38bdf8] cursor-pointer truncate"
               >
                 <optgroup label="Параметрические модели (WGPU Golden)">
+                                    <option value="v8_piston">
+                    Поршень ДВС V8 (Камера сгорания, 3 кольца)
+                  </option>
                   <option value="spur_gear">
                     Шестерня Z=20, m=2.0 (Шпоночный паз)
                   </option>
