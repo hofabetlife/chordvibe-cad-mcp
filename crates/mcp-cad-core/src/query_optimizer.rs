@@ -1328,7 +1328,7 @@ pub fn optimize_feature_tree_dag(
         part_id: part_id.to_string(),
         part_name: part_name.to_string(),
         status: "optimized".to_string(),
-        applied,
+        applied: apply,
         logical_nodes_count: logical_nodes.len(),
         physical_nodes_count: current_nodes.len(),
         logical_cost: logical_cost.total_cost_score,

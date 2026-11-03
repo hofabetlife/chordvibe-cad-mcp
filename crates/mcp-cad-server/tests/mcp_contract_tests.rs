@@ -2332,7 +2332,9 @@ async fn test_mcp_optimize_feature_tree_cbo() {
 
 #[tokio::test]
 async fn test_bug015_create_joint_and_create_part_schema_contract() {
-    let state = EngineState::new_shared();
+    let state = EngineState::new()
+        .expect("EngineState initialization failed")
+        .into_shared();
     let list_resp = rpc_call(&state, json!({
         "jsonrpc": "2.0",
         "id": 960,
@@ -2398,7 +2400,9 @@ async fn test_bug015_create_joint_and_create_part_schema_contract() {
 
 #[tokio::test]
 async fn test_bug016_revolve_boundary_and_self_intersection_validation() {
-    let state = EngineState::new_shared();
+    let state = EngineState::new()
+        .expect("EngineState initialization failed")
+        .into_shared();
     let p_resp = rpc_call(&state, json!({
         "jsonrpc": "2.0",
         "id": 970,
