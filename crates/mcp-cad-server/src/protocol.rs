@@ -168,6 +168,17 @@ impl ToolCallResult {
     }
 }
 
+/// Concise agent operating instructions returned in the MCP `initialize` response (`instructions` field).
+/// Summarizes the full guide in `docs/AGENT_GUIDE.md` (~1480 characters).
+pub const AGENT_INSTRUCTIONS: &str = "\
+MCP-CAD Agent Guide (full text: docs/AGENT_GUIDE.md, docs/MCP_API_REFERENCE.md, docs/UNITS.md):
+1. SCENE SUMMARY: Call 'get_scene_summary' first in a new context to inspect active units, parts (id, bbox, volume, mass, mesh validity, FEA FoS/verdict/stale), joints, and requirements.
+2. UNITS: Default length_unit is 'mm' (switch to 'm' via 'set_units' or per-call 'length_unit'). Force: N, moment: N*m, stress/pressure: MPa, Young's modulus: GPa, displacement: mm, mass: kg, density: kg/m^3, angles: deg, angular velocity: rad/s, time: s (step_size_ms: ms). STL files on disk use meters (m).
+3. REQUIREMENTS: Declare constraints ('bbox_max', 'bbox_min', 'mass_max', 'mesh_valid', 'min_safety_factor') via 'set_requirements' with 'auto_check': true so mutating tools append 'requirements_status' and 'failed_requirements'.
+4. TRANSACTIONS & VALIDATION: Use 'batch_cad_operations' for atomic multi-step edits (rolls back on error). Always call 'validate_mesh' after 'boolean_*', 'cut_hole', or 'cut_helical_groove' to confirm status=='PASS' before FEA.
+5. FEA & NAMED FACES: Run 'run_fea_analysis' only after 'validate_mesh' PASS. Reference named faces from 'query_part_geometry' ('cap_bottom', 'cap_top', 'left', 'right', 'hole_wall:*') in 'fixed' and 'loads'. Edits bump part.revision and mark FEA 'STALE'.
+6. ERRORS & LOOP: When isError=true, parse JSON {'error':{'code','param','hint','details'}} and follow 'hint'. Workflow: Build -> Validate ('validate_mesh') -> Analyze ('run_fea_analysis') -> Iterate ('modify_feature' + 'check_requirements') -> 'save_project'.";
+
 /// Dispatches an MCP request and returns the optional JSON-RPC response.
 pub async fn handle_request(req: JsonRpcRequest, state: &SharedState) -> Option<JsonRpcResponse> {
     let id = req.id.clone();
@@ -175,6 +186,13 @@ pub async fn handle_request(req: JsonRpcRequest, state: &SharedState) -> Option<
 
     match req.method.as_str() {
         "initialize" => {
+            let (length_unit, units) = {
+                let engine = state.read();
+                (
+                    engine.length_unit.as_str(),
+                    engine.length_unit.units_metadata(),
+                )
+            };
             let result = json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": {
@@ -183,7 +201,10 @@ pub async fn handle_request(req: JsonRpcRequest, state: &SharedState) -> Option<
                 "serverInfo": {
                     "name": "mcp-cad-engine",
                     "version": "0.1.0"
-                }
+                },
+                "instructions": AGENT_INSTRUCTIONS,
+                "length_unit": length_unit,
+                "units": units
             });
             Some(JsonRpcResponse::success(id, result))
         }
@@ -214,14 +235,18 @@ pub async fn handle_request(req: JsonRpcRequest, state: &SharedState) -> Option<
                 }
             };
 
-            let call_res = {
+            let tool_result = {
                 let mut engine = state.write();
-                dispatch_tool(tool_name, &arguments, &mut engine)
-            };
-
-            let tool_result = match call_res {
-                Ok(res) => res,
-                Err(err) => ToolCallResult::error(err.to_string()),
+                let call_res = dispatch_tool(tool_name, &arguments, &mut engine);
+                match call_res {
+                    Ok(res) => res,
+                    Err(err) => {
+                        let mut existing_parts: Vec<String> = engine.parts.keys().cloned().collect();
+                        existing_parts.sort();
+                        let error_body = err.to_error_body_with_parts(Some(&existing_parts));
+                        ToolCallResult::error(error_body.to_json_string())
+                    }
+                }
             };
 
             let res_value = match serde_json::to_value(&tool_result) {

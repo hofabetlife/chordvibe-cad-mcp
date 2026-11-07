@@ -8,6 +8,7 @@
 ## Оглавление
 
 1. [Общие положения](#общие-положения)
+   - [Ошибки (Контракт ошибок MCP и JSON-RPC)](#ошибки)
 2. [Группа 1: Управление деталями и материалами](#группа-1-управление-деталями-и-материалами)
    - [1. `create_part`](#1-create_part)
    - [2. `list_parts`](#2-list_parts)
@@ -42,6 +43,14 @@
    - [26. `batch_cad_operations`](#26-batch_cad_operations)
    - [27. `validate_mesh`](#27-validate_mesh)
    - [28. `optimize_feature_tree`](#28-optimize_feature_tree)
+   - [29. `set_units`](#29-set_units)
+8. [Группа 7: Персистентность и управление проектами](#группа-7-персистентность-и-управление-проектами)
+   - [30. `save_project`](#30-save_project)
+   - [31. `load_project`](#31-load_project)
+9. [Группа 8: Слой инженерных требований и сводка сцены (Requirements & Scene Summary)](#группа-8-слой-инженерных-требований-requirements-layer)
+   - [32. `set_requirements`](#32-set_requirements)
+   - [33. `check_requirements`](#33-check_requirements)
+   - [34. `get_scene_summary`](#34-get_scene_summary)
 
 ---
 
@@ -101,6 +110,140 @@
 }
 ```
 
+### Контракт единиц измерения (`[DECISION-UNITS-1]`)
+
+В соответствии с [`docs/UNITS.md`](UNITS.md):
+- **Внутри вычислительных ядер (`mcp-cad-core`, `mcp-cad-fea`, `mcp-cad-physics`)** строго используется система **СИ**: длина — метры (`m`), площадь — `m²`, объём — `m³`, масса — `kg`, плотность — `kg/m³`, сила — `N`, момент — `N·m`, напряжение и модуль упругости — паскали (`Pa`), время — секунды (`s`), углы в динамике — радианы (`rad`).
+- **На границе MCP-сервера (`crates/mcp-cad-server/src/tools/*.rs`)** действует настройка единицы длины сессии `EngineState::length_unit`:
+  - **По умолчанию `length_unit = "mm"` (миллиметры)** для всех линейных входов и выходов (`width`, `height`, `depth`, `radius`, `module`, `pitch`, `chamfer`, `position`, `translation`, `anchor_a`, `anchor_b`, `fixed_plane.origin`, `fixed_plane.tolerance`, `applied_force.position`, `chord_tolerance`, `max_edge_length`, `bounding_box`, `dimensions`, `center_of_mass`).
+  - Площади (`surface_area`, `detected_planar_faces[].area`) возвращаются в `mm²` (или `m²` при `length_unit = "m"`), объёмы (`volume`) — в `mm³` (или `m³`), при этом дополнительно дублируются эталонные СИ-поля `volume_m3`, `surface_area_m2`, `mass_kg`.
+  - Физические величины, не зависящие от переключения `mm` ↔ `m`: сила — `N`, крутящий момент — `N·m`, напряжение МКЭ — `MPa` (`max_von_mises_mpa`, `yield_strength_mpa`), модуль Юнга — `GPa` (`young_modulus_gpa`), перемещение МКЭ — `mm` (`max_displacement_mm`), масса — `kg`, плотность — `kg/m³`, углы в CAD и вращательных шарнирах — `deg` (`limits` вращательного шарнира конвертируются из градусов в радианы на границе сервера; опционально поддерживается `limits_unit: "deg" | "rad"`), угловая скорость — `rad/s`, время — `s` (`duration_seconds`) / `ms` (`step_size_ms`, `computation_time_ms`).
+  - Переключение единицы длины сессии выполняется инструментом **`set_units`** (`{"length_unit": "mm" | "m"}`), либо локально для одного вызова передачей опционального поля `"length_unit": "mm" | "m"` в аргументах инструмента.
+  - Все инструменты, возвращающие численные/геометрические данные (а также ответ `initialize`), включают поле `"length_unit"` и объект `"units"`, а геометрические мутации (`add_feature_primitive`, `cut_hole`, `modify_feature`, `cut_helical_groove`, `transform_part`, `import_stl`) возвращают массив `"warnings": []` с проверкой адекватности масштаба (`SCALE_TOO_LARGE` при $> 10\text{ м}$, `SCALE_TOO_SMALL` при $< 0.1\text{ мм}$, `SCALE_EXTREME_VOLUME`, `WHEEL_RIM_SCALE` при диаметре обода $< 150\text{ мм}`).
+  - **Формат файлов STL (`export_stl`, `import_stl`)**: координаты вершин внутри самих файлов `.stl` на диске записываются и читаются во внутренних единицах ядра — **метрах (`m`)** (`"stl_vertex_unit": "m"`), тогда как параметры `chord_tolerance` и `bounding_box` в JSON-ответах MCP масштабируются согласно активному `length_unit`.
+
+### Ошибки
+
+В соответствии со спецификацией **Model Context Protocol (MCP `2024-11-05`)** и реализацией сервера (`crates/mcp-cad-server/src/protocol.rs`), ошибки строго разделяются на два уровня: **ошибки выполнения инструмента** и **протокольные ошибки JSON-RPC 2.0**.
+
+#### 1. Ошибки выполнения инструмента (`result.isError = true`, контракт P2-T3)
+
+Любая ошибка, возникшая внутри диспетчера `dispatch_tool` (`ServerError`), считается **ошибкой выполнения инструмента**.
+
+Для таких ошибок сервер возвращает **успешный JSON-RPC конверт** (верхнеуровневое поле `"error"` отсутствует, присутствует `"result"`), где в объекте `result` установлен флаг `"isError": true`, а массив `content` содержит структурированный JSON-объект в строке `text` (`ErrorEnvelope`):
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 971,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"error\":{\"code\":\"INVALID_ARGUMENT\",\"message\":\"Invalid argument: Revolve profile r-coordinate cannot be negative: -10\",\"param\":\"profile\",\"hint\":\"All radial coordinates r in revolve profile must be >= 0 because the axis of rotation is at r=0.\",\"retryable\":false,\"details\":{}}}"
+      }
+    ],
+    "isError": true
+  }
+}
+```
+
+##### Структура тела ошибки (`ErrorBody`):
+| Поле | Тип | Описание |
+|---|---|---|
+| `code` | `string` | Стабильный машиночитаемый код ошибки (см. реестр ниже) |
+| `message` | `string` | Человекочитаемое сообщение об ошибке (сохранено для обратной совместимости) |
+| `param` | `string \| null` | Имя невалидного или пропущенного параметра аргументов инструмента |
+| `hint` | `string \| null` | Действенное указание следующего шага для ИИ-агента или инженера |
+| `retryable` | `boolean` | `true`, если повторный вызов (после коррекции шага/допуска) может увенчаться успехом |
+| `details` | `object` | Контекстные данные (доступные детали, поддерживаемые типы примитивов, параметры решателя) |
+
+##### Пример ошибки `PART_NOT_FOUND` с перечислением доступных деталей:
+```json
+{
+  "error": {
+    "code": "PART_NOT_FOUND",
+    "message": "Part not found: shaft_pin",
+    "param": "part_id",
+    "hint": "Part 'shaft_pin' was not found. Available parts: [part-19ea129a, part-d9d1370f]. Inspect parts via 'list_parts' or create it with 'create_part'.",
+    "retryable": false,
+    "details": {
+      "part_id": "shaft_pin",
+      "available_parts": ["part-19ea129a", "part-d9d1370f"]
+    }
+  }
+}
+```
+
+##### Реестр стабильных кодов ошибок (`code`):
+| Код ошибки | Домен | Описание | `param` | `retryable` |
+|---|---|---|---|---|
+| `PART_NOT_FOUND` | Сцена / Сервер | Деталь с указанным `part_id` не найдена в сессии | `part_id` | `false` |
+| `FEATURE_NOT_FOUND` | CAD / DAG | Фича с `feature_id` отсутствует в истории детали | `feature_id` | `false` |
+| `JOINT_NOT_FOUND` | Физика | Шарнир с `joint_id` не найден в `physics_world` | `joint_id` | `false` |
+| `TOOL_NOT_FOUND` | MCP | Запрошенный инструмент не зарегистрирован на сервере | `name` | `false` |
+| `INVALID_ARGUMENT` | Валидация | Некорректный аргумент вызова (выход из диапазона, нечисловое значение) | Имя параметра | `false` |
+| `INVALID_PARAMETER` | CAD | Недопустимый геометрический параметр операции | Имя параметра | `false` |
+| `INVALID_PRIMITIVE_TYPE` | CAD | Неизвестный тип примитива (возвращает `supported_primitives`) | `primitive_type` | `false` |
+| `UNKNOWN_MATERIAL` | Материалы | Неизвестный материал (возвращает `builtin_materials`) | `material` | `false` |
+| `PART_ALREADY_EXISTS` | Сцена | Попытка создать деталь с уже занятым идентификатором/именем | `name` / `part_id` | `false` |
+| `JOINT_ALREADY_EXISTS` | Физика | Шарнир с данным идентификатором уже существует | `joint_id` | `false` |
+| `EMPTY_GEOMETRY` | CAD / Сцена | Деталь не содержит геометрии (пустая полигональная сетка) | `part_id` | `false` |
+| `CSG_BOOLEAN_ERROR` | CAD / CSG | Сбой булевой операции BSP (самопересечения, открытые рёбра) | `null` | `false` |
+| `CAD_EVALUATION_ERROR` | CAD / DAG | Ошибка пересчёта параметрического дерева фич детали | `null` | `false` |
+| `MESH_INVALID` | Топология | Сетка не прошла валидацию `validate_mesh` (не-многообразие, дыры) | `null` | `false` |
+| `FEA_EMPTY_MESH` | МКЭ | Тетраэдрическая сетка МКЭ пуста (0 элементов) | `part_id` | `false` |
+| `FEA_DEGENERATE_ELEMENT` | МКЭ | Тетраэдр сетки имеет нулевой или отрицательный объём | `null` | `false` |
+| `FEA_INVALID_MATERIAL` | МКЭ | Физически невалидные свойства материала ($E \le 0$ или $\nu \notin (0, 0.5)$) | `material` | `false` |
+| `FEA_UNCONSTRAINED` | МКЭ | Отсутствуют граничные условия Дирихле (свободное твёрдое тело) | `fixed_faces` | `false` |
+| `FEA_NO_LOADS` | МКЭ | Не задана ни одна приложенная сила или давление | `applied_forces` | `false` |
+| `FEA_NO_BOUNDARY_NODES` | МКЭ | Селектор грани или плоскости не захватил ни одного узла тетра-сетки | `fixed_faces` | `false` |
+| `FEA_NODE_OUT_OF_BOUNDS` | МКЭ | Индекс узла МКЭ выходит за границы сетки | `null` | `false` |
+| `FEA_SOLVER_CONVERGENCE_FAILED` | МКЭ | Итерационный PCG-решатель МКЭ не сошёлся за заданное число итераций | `null` | `true` |
+| `FEA_MESH_GENERATION_FAILED` | МКЭ | Сбой воксельной тетраэдризации геометрии детали | `null` | `false` |
+| `PHYSICS_INVALID_GEOMETRY` | Физика | Невалидная или вырожденная геометрия для физического твердого тела | `part_id` | `false` |
+| `PHYSICS_COLLIDER_FAILED` | Физика | Ошибка построения коллидера твердого тела в Rapier | `part_id` | `false` |
+| `INVALID_JOINT_CONFIGURATION` | Физика | Некорректная кинематическая конфигурация сустава/шарнира | `null` | `false` |
+| `PHYSICS_SIMULATION_ERROR` | Физика | Сбой численного шага физической симуляции твердых тел | `null` | `true` |
+| `VIEWER_EMPTY_MESH` | Визуализация | Попытка отрендерить деталь без полигональной сетки | `part_id` | `false` |
+| `INVALID_DIMENSIONS` | Визуализация | Недопустимые размеры окна/изображения рендера ($W, H \le 0$) | `dimensions` | `false` |
+| `STRESS_SCALAR_MISMATCH` | Визуализация | Число скаляров напряжений МКЭ не совпадает с числом вершин сетки | `null` | `false` |
+| `GPU_ADAPTER_UNAVAILABLE` | Визуализация | Отсутствует подходящий графический адаптер GPU/wgpu | `null` | `false` |
+| `GPU_DEVICE_ERROR` | Визуализация | Сбой инициализации логического устройства GPU | `null` | `false` |
+| `IO_ERROR` | Система | Ошибка файлового ввода-вывода при импорте/экспорте | `null` | `false` |
+| `JSON_ERROR` | Протокол | Ошибка сериализации или десериализации JSON | `null` | `false` |
+| `PROJECT_SCHEMA_MISMATCH` | Проект / Схема | Несовместимая версия схемы проекта (поддерживается `1.0.0`) | `schema_version` | `false` |
+| `FACE_NOT_FOUND` | Топология / Грани | Именованная грань или фильтр `face_selector` не совпали ни с одной гранью детали | `face_selector` | `false` |
+| `AMBIGUOUS_FACE_SELECTOR` | Топология / Грани | Неквалифицированное имя/алиас совпало более чем с одной гранью (требуется `feat_N:<role>` или `face_id`) | `face_selector` | `false` |
+| `INTERNAL_ERROR` | Движок | Непредвиденная внутренняя ошибка ядра сервера | `null` | `false` |
+
+#### 2. Протокольные ошибки JSON-RPC 2.0 (верхнеуровневое поле `"error"`)
+
+Верхнеуровневое поле `"error"` (объект `JsonRpcError { code, message, data }`, при отсутствии поля `"result"`) возвращается только при нарушениях протокола JSON-RPC 2.0 до запуска инструмента:
+
+| Код JSON-RPC | Константа / Конструктор | Условие возникновения |
+|---|---|---|
+| `-32700` | `JsonRpcError::parse_error` | Входная строка не является синтаксически валидным JSON (`handle_message`) |
+| `-32600` | `JsonRpcError::invalid_request` | Некорректная структура конверта JSON-RPC 2.0 |
+| `-32601` | `JsonRpcError::method_not_found` | Неизвестный метод JSON-RPC (метод отличен от `"initialize"`, `"notifications/initialized"`, `"ping"`, `"tools/list"`, `"tools/call"`) |
+| `-32602` | `JsonRpcError::invalid_params` | В запросе `"tools/call"` отсутствует обязательное строковое поле `params.name` (`"Missing tool 'name' in arguments"`) |
+| `-32603` | `JsonRpcError::internal_error` | Внутренняя ошибка сериализации структуры ответа (`serde_json::to_value`) |
+
+Пример протокольной ошибки:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 99,
+  "error": {
+    "code": -32601,
+    "message": "Unknown MCP method: 'tools/unknown'"
+  }
+}
+```
+
+> **Примечание о неизвестном имени инструмента (`ServerError::ToolNotFound`):**  
+> В текущей реализации вызов метода `"tools/call"` с несуществующим именем инструмента в `params.name` обрабатывается внутри `dispatch_tool` как `Err(ServerError::ToolNotFound(name))` и возвращается через `result.isError = true` (`"Tool not found: <name>"`), а не через протокольную ошибку JSON-RPC (`-32601` / `-32602`).
+
 ---
 
 ## Группа 1: Управление деталями и материалами
@@ -116,15 +259,15 @@
 | `material` | `string` | Да | Идентификатор материала из базы пресетов |
 | `is_fixed` | `boolean` | Нет | Закрепить деталь неподвижно в мировом пространстве (статическое тело с бесконечной массой для физических расчетов и кинематики, например станина или корпус редуктора). По умолчанию `false` |
 
-**Доступные пресеты материалов**:
-- `aluminum_6061_t6`: Авиационный алюминиевый сплав ($E=68.9$ GPa, $\sigma_y=276$ MPa, $\rho=2700$ kg/m³).
-- `steel_structural_aisi1020`: Конструкционная углеродистая сталь ($E=205.0$ GPa, $\sigma_y=250$ MPa, $\rho=7850$ kg/m³).
-- `steel_high_strength_4140`: Высокопрочная легированная сталь ($E=210.0$ GPa, $\sigma_y=655$ MPa, $\rho=7850$ kg/m³).
-- `titanium_grade5_ti6al4v`: Титановый сплав Grade 5 ($E=114.0$ GPa, $\sigma_y=880$ MPa, $\rho=4430$ kg/m³).
-- `brass_c360`: Автоматная свинцовая латунь ($E=100.0$ GPa, $\sigma_y=310$ MPa, $\rho=8500$ kg/m³).
-- `pla_filament_3dprint`: Пластик PLA для 3D-печати ($E=3.5$ GPa, $\sigma_y=60$ MPa, $\rho=1240$ kg/m³).
-- `petg_filament_3dprint`: Пластик PETG для 3D-печати ($E=2.1$ GPa, $\sigma_y=50$ MPa, $\rho=1270$ kg/m³).
-- `nylon_pa12`: Инженерный полиамид PA12 ($E=1.8$ GPa, $\sigma_y=45$ MPa, $\rho=1010$ kg/m³).
+**Доступные пресеты материалов (и поддерживаемые канонические алиасы P2-T13)**:
+- `aluminum_6061_t6` (алиасы: `alu_6061`, `Al6061-T6`, `Al-6061-T6`, `aluminum_6061`): Авиационный алюминиевый сплав ($E=68.9$ GPa, $\sigma_y=276$ MPa, $\rho=2700$ kg/m³).
+- `steel_structural_aisi1020` (алиасы: `steel_1045`, `steel_1020`, `AISI 1020`, `steel`): Конструкционная углеродистая сталь ($E=205.0$ GPa, $\sigma_y=250$ MPa, $\rho=7850$ kg/m³).
+- `steel_high_strength_4140` (алиасы: `steel_4140`, `AISI 4140`): Высокопрочная легированная сталь ($E=210.0$ GPa, $\sigma_y=655$ MPa, $\rho=7850$ kg/m³).
+- `titanium_grade5_ti6al4v` (алиасы: `ti_6al_4v`, `Ti-6Al-4V`, `Ti6Al4V`, `titanium_ti6al4v`): Титановый сплав Grade 5 ($E=114.0$ GPa, $\sigma_y=880$ MPa, $\rho=4430$ kg/m³).
+- `brass_c360` (алиасы: `brass_c36000`, `brass`): Автоматная свинцовая латунь ($E=100.0$ GPa, $\sigma_y=310$ MPa, $\rho=8500$ kg/m³).
+- `pla_filament_3dprint` (алиасы: `pla_3d`, `pla_plastic`, `pla`): Пластик PLA для 3D-печати ($E=3.5$ GPa, $\sigma_y=60$ MPa, $\rho=1240$ kg/m³).
+- `petg_filament_3dprint` (алиасы: `petg_3d`, `petg_plastic`, `petg`): Пластик PETG для 3D-печати ($E=2.1$ GPa, $\sigma_y=50$ MPa, $\rho=1270$ kg/m³).
+- `nylon_pa12` (алиасы: `nylon_pa6`, `nylon`): Инженерный полиамид PA12 ($E=1.8$ GPa, $\sigma_y=45$ MPa, $\rho=1010$ kg/m³).
 
 #### Пример запроса
 ```json
@@ -258,9 +401,9 @@
 - `"cylinder"`: `{"radius": number, "height": number, "segments"?: integer}`
 - `"sphere"`: `{"radius": number, "sectors"?: integer, "stacks"?: integer}`
 - `"cone"`: `{"radius_bottom": number, "radius_top"?: number, "height": number, "segments"?: integer}`
-- `"polygon_prism"`: `{"height": number, "sides"?: integer, "width_across_flats"?: number, "radius"?: number, "chamfer"?: number}` (правильная призма для гаек/болтов с коническими торцевыми фасками 30° по DIN 934)
+- `"polygon_prism"`: `{"height": number, "sides"?: integer, "width_across_flats"?: number, "radius"?: number, "outer_radius"?: number, "chamfer"?: number, "chamfer_radius"?: number}` (правильная призма для гаек/болтов с коническими торцевыми фасками 30° по DIN 934; поддерживаются алиасы `outer_radius` для `radius` и `chamfer_radius` для `chamfer`)
 - `"spur_gear"`: `{"module": number, "teeth": integer, "face_width": number, "pressure_angle_deg"?: number, "bore_radius"?: number, "bore_diameter"?: number, "keyway_width"?: number, "keyway_depth"?: number, "hub_diameter"?: number, "hub_length"?: number}` (прямозубая цилиндрическая шестерня с точным эвольвентным профилем по DIN 867 / ISO 53, опциональной ступицей и шпоночным пазом DIN 6885)
-- `"revolve"`: `{"profile": [[r, z], ...], "angle_deg"?: number, "segments"?: integer}` (тело вращения 2D-профиля вокруг оси Z; угол поворота `angle_deg` по умолчанию 360°, с плоскими крышками для углов < 360°)
+- `"revolve"`: `{"profile": [[r, z], ...], "inner_radius"?: number, "angle_deg"?: number, "segments"?: integer}` (тело вращения 2D-профиля вокруг оси Z; при задании 2-точечной внешней образующей `[[r0, z0], [r1, z1]]` и `inner_radius` автоматически формируется 4-точечный кольцевой профиль `[[inner_r, z0], [r0, z0], [r1, z1], [inner_r, z1]]`; угол поворота `angle_deg` по умолчанию 360°, с плоскими крышками для углов < 360°)
 - `"wheel_rim"`: `{"rim_diameter": number, "rim_width": number, "flange_diameter"?: number, "hub_diameter"?: number, "hub_bore_diameter"?: number, "pcd_diameter"?: number, "bolt_holes_count"?: integer, "bolt_hole_diameter"?: number, "spokes_count"?: integer, "spoke_width"?: number, "spoke_thickness"?: number, "offset_et"?: number}` (параметрический легкосплавный колесный диск со ступенчатым ободом, закраинами, монтажным ручьем, ступицей, PCD разболтовкой и спицами с открытыми окнами вентиляции тормозов)
 - *Общие опциональные параметры*: `"position"?: [x, y, z]`, `"rotation_deg"?: [rx, ry, rz]`
 
@@ -311,12 +454,13 @@
 | Параметр | Тип | Обязательный | Описание |
 |---|---|---|---|
 | `part_id` | `string` | Да | Идентификатор целевой детали |
-| `position` | `[number, number, number]` | Да | Координаты точки входа отверстия `[x, y, z]` (м) |
-| `normal` | `[number, number, number]` | Да | Единичный вектор направления оси отверстия `[nx, ny, nz]` |
-| `radius` | `number` | Да | Радиус отверстия в метрах |
-| `depth` | `number` | Да | Глубина выреза в метрах |
-| `keyway_width` | `number` | Нет | Ширина шпоночного паза DIN 6885 в метрах |
-| `keyway_depth` | `number` | Нет | Глубина шпоночного паза DIN 6885 в стенку в метрах |
+| `position` | `[number, number, number]` | Да | Координаты центра отверстия `[x, y, z]` (в активном `length_unit`: `mm` или `m`) |
+| `normal` (или `direction`) | `[number, number, number]` | Да | Ненулевой вектор направления оси отверстия `[nx, ny, nz]` |
+| `radius` (или `diameter`) | `number` | Да | Радиус (или диаметр `diameter = 2 * radius`) отверстия (в активном `length_unit`) |
+| `depth` | `number` | Нет (если `through: true`) | Глубина выреза (в активном `length_unit`). Обязателен, если не задан `"through": true` |
+| `through` | `boolean` | Нет | Если `true`, автоматически прорезает сквозное отверстие через всю толщину детали вдоль `normal`/`direction` без необходимости указывать `depth` |
+| `keyway_width` | `number` | Нет | Ширина шпоночного паза DIN 6885 (в активном `length_unit`) |
+| `keyway_depth` | `number` | Нет | Глубина шпоночного паза DIN 6885 в стенку (в активном `length_unit`) |
 
 #### Пример запроса
 ```json
@@ -534,6 +678,7 @@
 #### Входные параметры
 | Параметр | Тип | Обязательный | Описание |
 |---|---|---|---|
+| `joint_id` (или `id`) | `string` | Нет | Пользовательский идентификатор сочленения (по умолчанию автогенерируется `joint-<uuid>`). При дублировании возвращает ошибку `JOINT_ALREADY_EXISTS` |
 | `joint_type` | `string` | Да | `"revolute"`, `"prismatic"`, `"spherical"`, `"fixed"`, `"gear"` |
 | `part_a` | `string` | Да | Идентификатор первой сопрягаемой детали (или `"ground"` / `"world"` для привязки к неподвижному пространству) |
 | `part_b` | `string` | Да | Идентификатор второй сопрягаемой детали (или `"ground"` / `"world"`) |
@@ -609,14 +754,16 @@
 
 ### 12. `set_joint_motor`
 
-Активирует сервопривод или мотор поддержания скорости на сочленении.
+Активирует сервопривод или мотор поддержания скорости на сочленении (`revolute` или `prismatic`).
 
 #### Входные параметры
 | Параметр | Тип | Обязательный | Описание |
 |---|---|---|---|
 | `joint_id` | `string` | Да | Идентификатор сочленения |
-| `target_velocity` | `number` | Да | Целевая скорость: угловая в рад/с или линейная в м/с |
-| `max_force` | `number` | Да | Предельный крутящий момент ($Н\cdot м$) или сила ($Н$) |
+| `target_velocity` | `number` | Да | Конечная (`is_finite()`) целевая скорость: угловая в $\text{рад/с}$ (для `revolute`) или линейная в $\text{м/с}$ (для `prismatic`). Отрицательные значения задают реверсивное направление движения |
+| `max_force` | `number` | Да | Неотрицательный конечный (`>= 0.0`, `is_finite()`) предельный крутящий момент в $\text{Н}\cdot\text{м}$ (для `revolute`) или усилие в $\text{Н}$ (для `prismatic`) |
+
+> **Валидация (P2-T11):** передача нечисловых значений, `NaN`, `±Infinity` (включая значения `f64`, переполняющие диапазон `f32` в решателе Rapier3D) для `target_velocity` или `max_force`, а также отрицательного `max_force < 0.0` возвращает структурированную ошибку `INVALID_ARGUMENT` с указанием `param: "target_velocity"` или `param: "max_force"`.
 
 #### Пример запроса
 ```json
@@ -644,7 +791,7 @@
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"status\": \"motor_active\"\n}"
+        "text": "{\n  \"status\": \"motor_active\",\n  \"length_unit\": \"mm\",\n  \"units\": {\n    \"length\": \"mm\",\n    \"force\": \"N\",\n    \"stress\": \"MPa\"\n  }\n}"
       }
     ]
   }
@@ -704,19 +851,22 @@
 
 ### 14. `run_fea_analysis`
 
-Выполняет автоматическую тетраэдризацию детали (TET4), решает 3D уравнения линейной упругости ($K \cdot u = F$), вычисляет эквивалентные напряжения по Мизесу и запас прочности.
+Выполняет автоматическую тетраэдризацию детали (TET4), решает 3D уравнения линейной упругости ($K \cdot u = F$), вычисляет эквивалентные напряжения по Мизесу и запас прочности. Поддерживает задание граничных условий закрепления и нагрузок по именам граней / селекторам (`fixed`, `loads`), а также по осевым граням AABB и координатам (`fixed_faces`, `fixed_plane`, `applied_forces`).
 
 #### Входные параметры
 | Параметр | Тип | Обязательный | Описание |
 |---|---|---|---|
 | `part_id` | `string` | Да | Идентификатор анализируемой детали |
+| `length_unit` | `string` | Нет | Переопределение единиц длины на вызов (`"mm"` или `"m"`) |
 | `mesh_density` | `string` | Нет | Плотность сетки: `"coarse"` (по умолчанию), `"medium"`, `"fine"` |
-| `fixed_faces` | `string[]` | Нет | Грани AABB для жесткого закрепления: `"min_x"`, `"max_x"`, `"min_y"`, `"max_y"`, `"min_z"`, `"max_z"` |
-| `fixed_plane` | `object` | Нет | Опорная плоскость: `{"origin": [x,y,z], "normal": [nx,ny,nz], "tolerance"?: number}` |
-| `applied_force` | `object` | Нет | Одиночная нагрузка: `{"position"?: [x,y,z], "force_vector": [Fx,Fy,Fz]}` |
+| `fixed` | `object[]` | Нет | Закрепления Дирихле по именованным граням или селекторам: `[{"face": "cap_bottom", "components"?: "all"\|"x"\|"y"\|"z", "tolerance"?: number}, {"where": {...}}]` |
+| `fixed_faces` | `string[]` | Нет | Грани AABB (`"min_x"`, `"max_x"`, `"min_y"`, `"max_y"`, `"min_z"`, `"max_z"`) или имена граней детали (`"cap_bottom"`, `"left"`) для жесткого закрепления |
+| `fixed_plane` | `object` | Нет | Опорная плоскость: `{"origin": [x,y,z], "normal": [nx,ny,nz], "tolerance"?: number}` (в активных `length_unit`) |
+| `loads` | `object[]` | Нет | Нагрузки по именованным граням или селекторам: суммарная сила `{"face": "cap_top", "force": [Fx, Fy, Fz]}` (в `N`, распределяется пропорционально грузовым площадям узлов $\sum \mathbf{f}_i = \mathbf{F}$), нормальное давление `{"face": "hole_wall", "pressure": p_mpa}` (в `MPa`) или момент `{"face": "cap_top", "moment": [Mx, My, Mz]}` (в `N·m`) |
+| `applied_force` | `object` | Нет | Одиночная нагрузка: `{"position"?: [x,y,z], "face"?: string, "force_vector": [Fx,Fy,Fz]}` |
 | `applied_forces` | `object[]` | Нет | Массив распределенных или точечных нагрузок |
 
-#### Пример запроса
+#### Пример запроса (по именованным граням)
 ```json
 {
   "jsonrpc": "2.0",
@@ -727,11 +877,13 @@
     "arguments": {
       "part_id": "part-a1b2c3d4e5f64789",
       "mesh_density": "medium",
-      "fixed_faces": ["min_x"],
-      "applied_forces": [
+      "fixed": [
+        { "face": "cap_bottom" }
+      ],
+      "loads": [
         {
-          "position": [0.20, 0.025, 0.0],
-          "force_vector": [0.0, -1200.0, 0.0]
+          "face": "cap_top",
+          "force": [0.0, 0.0, 50000.0]
         }
       ]
     }
@@ -918,12 +1070,15 @@
 
 Импортирует внешнюю 3D-модель из файла формата STL (бинарного или ASCII) в сцену как новую деталь с автоматической оптимизацией и сшивкой вершин.
 
+> **Важно (единицы координат STL):** Координаты вершин из файла `.stl` читаются во внутреннее СИ-ядро как **метры (`m`)**. В JSON-ответе габаритный бокс `bounding_box` возвращается в активной единице `length_unit` (`mm` по умолчанию), а при подозрении на несоответствие масштаба (например, если STL был сохранён в миллиметрах без масштабирования и его габарит превышает `10 м`) в массив `warnings` добавляется предупреждение `SCALE_TOO_LARGE`.
+
 #### Входные параметры
 | Параметр | Тип | Обязательный | Описание |
 |---|---|---|---|
 | `filepath` | `string` | Да | Путь к STL-файлу на диске |
 | `name` | `string` | Нет | Пользовательское имя детали (по умолчанию имя файла) |
 | `material` | `string` | Нет | Идентификатор материала из реестра (по умолчанию `steel_structural_aisi1020`) |
+| `length_unit` | `string` | Нет | Переопределение единицы длины для `bounding_box` в ответе (`"mm"` или `"m"`) |
 
 #### Пример запроса
 ```json
@@ -951,7 +1106,7 @@
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"material\": \"aluminum_6061_t6\",\n  \"name\": \"imported_bracket\",\n  \"part_id\": \"part-imported-1234\",\n  \"status\": \"stl_imported\",\n  \"triangles_count\": 5420,\n  \"vertices_count\": 2712\n}"
+        "text": "{\n  \"material\": \"aluminum_6061_t6\",\n  \"name\": \"imported_bracket\",\n  \"part_id\": \"part-imported-1234\",\n  \"status\": \"stl_imported\",\n  \"triangles_count\": 5420,\n  \"vertices_count\": 2712,\n  \"length_unit\": \"mm\"\n}"
       }
     ]
   }
@@ -964,6 +1119,8 @@
 
 Экспортирует поверхностную сетку детали в файл стандартного формата STL с поддержкой адаптивной тесселяции по хорде для прецизионного производства и 3D-печати.
 
+> **Важно (единицы координат STL):** Координаты вершин в записываемом на диск файле `.stl` всегда сохраняются во внутренних единицах СИ — **метрах (`m`)** (в JSON-ответе возвращается `"stl_vertex_unit": "m"`). Входной параметр `chord_tolerance` интерпретируется в активной единице `length_unit` (`mm` по умолчанию).
+
 #### Входные параметры
 | Параметр | Тип | Обязательный | Описание |
 |---|---|---|---|
@@ -971,7 +1128,8 @@
 | `filepath` | `string` | Да | Путь для сохранения файла на диске (например, `"./output/bracket.stl"`) |
 | `binary` | `boolean` | Нет | `true` — компактный Binary STL (по умолчанию); `false` — ASCII STL |
 | `quality` | `string` | Нет | Пресет тесселяции: `"coarse"`, `"medium"`, `"fine"` (по умолчанию: `"fine"`) |
-| `chord_tolerance` | `number` | Нет | Пользовательский допуск хорды (стрела прогиба) в метрах (например, `0.00005`) |
+| `chord_tolerance` | `number` | Нет | Пользовательский допуск хорды (стрела прогиба) в активных `length_unit` (по умолчанию в `mm`, например `0.05`) |
+| `length_unit` | `string` | Нет | Переопределение единицы длины для `chord_tolerance` (`"mm"` или `"m"`) |
 
 #### Пример запроса
 ```json
@@ -1000,7 +1158,7 @@
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"file_path\": \"./output/cantilever_beam.stl\",\n  \"triangles_count\": 2480\n}"
+        "text": "{\n  \"file_path\": \"./output/cantilever_beam.stl\",\n  \"triangles_count\": 2480,\n  \"stl_vertex_unit\": \"m\",\n  \"length_unit\": \"mm\"\n}"
       }
     ]
   }
@@ -1051,12 +1209,15 @@
 
 ### 21. `query_part_geometry`
 
-Выполняет глубокую топологическую и геометрическую инспекцию твердотельной детали. Возвращает точный габаритный ящик AABB (`min`, `max`, `dimensions`), абсолютный объем, площадь поверхности, центр масс (centroid), количество полигонов и вершин, а также массив до 15 крупнейших компланарных плоских граней (`detected_planar_faces`) с вычисленными нормалями и средневзвешенными центрами. Это исключает проблему "слепоты координат" у ИИ-агентов при сверлении отверстий и закреплении граней.
+Выполняет глубокую топологическую и геометрическую инспекцию твердотельной детали. Возвращает точный габаритный ящик AABB (`min`, `max`, `dimensions`), абсолютный объем, площадь поверхности, центр масс (centroid), количество полигонов и вершин, реестр именованных топологических граней (`faces`: `id`, `name`, `aliases`, `role`, `kind`, `origin_feature`, `area`, `area_m2`, `centroid`, `sample_point`, `normal_or_axis`, `radius`, `triangles_count`), а также массив крупнейших компланарных плоских граней (`detected_planar_faces`). Поддерживает фильтрацию граней через `face_selector` или `where` (см. [`docs/FACE_NAMING_DESIGN.md`](FACE_NAMING_DESIGN.md)).
 
 #### Входные параметры
 | Параметр | Тип | Обязательный | Описание |
 |---|---|:---:|---|
 | `part_id` | `string` | **Да** | Уникальный идентификатор инспектируемой детали |
+| `length_unit` | `"mm" \| "m"` | Нет | Опциональное переопределение единицы длины для этого вызова (по умолчанию используется единица сессии) |
+| `face_selector` | `string \| object` | Нет | Селектор граней: имя/алиас/шаблон (`"top"`, `"side"`, `"feat_0:top"`, `"hole_wall:*"`, `"cut:*"`), `{"face": name}`, `{"face_id": id}`, `{"faces": [...]}` или `{"where": {"kind", "radius", "tolerance", "normal", "axis", "near", "closest", "origin_feature", "role", "min_area", "max_area"}}` |
+| `where` | `object` | Нет | Сокращённая запись геометрического/топологического фильтра граней (эквивалентна `face_selector.where`) |
 
 #### Пример запроса
 ```json
@@ -1082,7 +1243,7 @@
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"part_id\": \"part-bracket-001\",\n  \"bounding_box\": {\n    \"min\": [-0.06, -0.015, -0.03],\n    \"max\": [0.06, 0.015, 0.03],\n    \"dimensions\": [0.12, 0.03, 0.06]\n  },\n  \"volume\": 0.000216,\n  \"surface_area\": 0.0252,\n  \"center_of_mass\": [0.0, 0.0, 0.0],\n  \"faces_count\": 12,\n  \"vertices_count\": 24,\n  \"detected_planar_faces\": [\n    {\n      \"normal\": [0.0, 1.0, 0.0],\n      \"center\": [0.0, 0.015, 0.0],\n      \"area\": 0.0072,\n      \"triangles_count\": 2\n    },\n    {\n      \"normal\": [0.0, -1.0, 0.0],\n      \"center\": [0.0, -0.015, 0.0],\n      \"area\": 0.0072,\n      \"triangles_count\": 2\n    },\n    {\n      \"normal\": [1.0, 0.0, 0.0],\n      \"center\": [0.06, 0.0, 0.0],\n      \"area\": 0.0018,\n      \"triangles_count\": 2\n    },\n    {\n      \"normal\": [-1.0, 0.0, 0.0],\n      \"center\": [-0.06, 0.0, 0.0],\n      \"area\": 0.0018,\n      \"triangles_count\": 2\n    }\n  ]\n}"
+        "text": "{\n  \"part_id\": \"part-bracket-001\",\n  \"bounding_box\": {\n    \"min\": [-60.0, -15.0, -30.0],\n    \"max\": [60.0, 15.0, 30.0],\n    \"dimensions\": [120.0, 30.0, 60.0]\n  },\n  \"volume\": 216000.0,\n  \"volume_m3\": 0.000216,\n  \"surface_area\": 25200.0,\n  \"surface_area_m2\": 0.0252,\n  \"center_of_mass\": [0.0, 0.0, 0.0],\n  \"faces_count\": 12,\n  \"vertices_count\": 24,\n  \"faces\": [\n    {\n      \"id\": 1,\n      \"name\": \"feat_0:top\",\n      \"aliases\": [\"top\", \"max_z\", \"feat_0:top\"],\n      \"role\": \"top\",\n      \"kind\": \"plane\",\n      \"origin_feature\": \"d7a8e2f0-1234-5678-90ab-cdef11223344\",\n      \"area\": 3600.0,\n      \"area_m2\": 0.0036,\n      \"centroid\": [0.0, 0.0, 30.0],\n      \"sample_point\": [0.0, 0.0, 30.0],\n      \"normal_or_axis\": [0.0, 0.0, 1.0],\n      \"radius\": null,\n      \"triangles_count\": 2\n    }\n  ],\n  \"detected_planar_faces\": [\n    {\n      \"normal\": [0.0, 1.0, 0.0],\n      \"center\": [0.0, 15.0, 0.0],\n      \"area\": 7200.0,\n      \"area_m2\": 0.0072\n    }\n  ],\n  \"length_unit\": \"mm\"\n}"
       }
     ]
   }
@@ -1181,15 +1342,17 @@
 
 ### 24. `transform_part`
 
-Применяет пространственные преобразования к твердотельному телу в дереве построений DAG (`FeatureOp::Transform`): линейное перемещение (`translation`), углы вращения Эйлера Roll-Pitch-Yaw в градусах (`rotation_deg`) и масштабирование (`scale`). Пересчитывает габариты AABB, объем и обновляет физические свойства.
+Применяет пространственные преобразования к твердотельному телу в дереве построений DAG (`FeatureOp::Transform`): линейное перемещение (`translation`), углы вращения Эйлера Roll-Pitch-Yaw в градусах (`rotation_deg`) и масштабирование (`scale`), с сохранением `face_id` и автоматическим обновлением нормалей, осей, центроидов, площадей и радиусов именованных граней (включая зеркальное отражение при отрицательном масштабе $\det(S) < 0$). Поддерживает привязку точки поворота/масштабирования к центроиду выбранной грани (`pivot_face`) и выравнивание грани по целевой точке (`align_face`).
 
 #### Входные параметры
 | Параметр | Тип | Обязательный | Описание |
 |---|---|:---:|---|
 | `part_id` | `string` | **Да** | ID трансформируемой детали |
-| `translation` | `[f64; 3]` | Нет | Вектор смещения $[x, y, z]$ в метрах (по умолчанию `[0.0, 0.0, 0.0]`) |
+| `translation` | `[f64; 3]` | Нет | Вектор смещения $[x, y, z]$ в активных единицах длины (`mm` по умолчанию, или `m`; по умолчанию `[0.0, 0.0, 0.0]`) |
 | `rotation_deg` | `[f64; 3]` | Нет | Углы поворота $[roll_x, pitch_y, yaw_z]$ в градусах (по умолчанию `[0.0, 0.0, 0.0]`) |
 | `scale` | `[f64; 3]` | Нет | Коэффициенты масштабирования $[s_x, s_y, s_z]$ (по умолчанию `[1.0, 1.0, 1.0]`, компоненты $\ne 0$) |
+| `pivot_face` | `string \| object` | Нет | Опциональный селектор именованной грани, чей центроид используется как центр вращения/масштабирования |
+| `align_face` | `object` | Нет | Опциональное выравнивание грани `{"face": <selector>, "target_point": [x, y, z]}`: сдвигает деталь так, чтобы центроид выбранной грани совпал с `target_point` |
 
 #### Пример запроса
 ```json
@@ -1281,7 +1444,7 @@
 
 ### 26. `batch_cad_operations`
 
-Последовательно выполняет массив инструментов MCP CAD в едином контексте движка за один сетевой запрос JSON-RPC. Инструмент устраняет десятки повторных сетевых вызовов (roundtrip latency) при моделировании составных деталей. Все шаги валидируются и выполняются по порядку. Если любая операция завершается с ошибкой, выполнение немедленно прерывается с указанием индекса сбойного шага и подробной диагностикой. Вложенные вызовы `batch_cad_operations` запрещены.
+Последовательно выполняет массив инструментов MCP CAD в едином контексте движка за один сетевой запрос JSON-RPC. Инструмент устраняет десятки повторных сетевых вызовов (roundtrip latency) при моделировании составных деталей. Все шаги валидируются и выполняются по порядку в рамках транзакции: если любая операция завершается с ошибкой, выполнение немедленно прерывается с указанием индекса сбойного шага и подробной диагностикой, а состояние сцены (`parts`, `materials`, `physics_world` со всеми телами/шарнирами/моторами, кэши FEA и `requirements`) полностью откатывается к состоянию до начала пакета. Вложенные вызовы `batch_cad_operations` запрещены.
 
 #### Входные параметры
 | Параметр | Тип | Обязательный | Описание |
@@ -1441,3 +1604,210 @@
   }
 }
 ```
+
+---
+
+### 29. `set_units`
+
+Устанавливает активную единицу длины сессии (`EngineState::length_unit`: `"mm"` или `"m"`) для всех последующих вызовов инструментов MCP. Уже созданные в сцене детали хранятся во внутреннем ядре в СИ (`m`) и не требуют перестроения при переключении `set_units`.
+
+#### Входные параметры
+| Параметр | Тип | Обязательный | Описание |
+|---|---|:---:|---|
+| `length_unit` | `string` | **Да** | Активная единица длины: `"mm"` (миллиметры, по умолчанию при старте сервера) или `"m"` (метры) |
+
+#### Пример запроса
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 29,
+  "method": "tools/call",
+  "params": {
+    "name": "set_units",
+    "arguments": {
+      "length_unit": "mm"
+    }
+  }
+}
+```
+
+#### Пример ответа
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 29,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"status\": \"units_updated\",\n  \"previous_length_unit\": \"m\",\n  \"length_unit\": \"mm\",\n  \"units\": {\n    \"length\": \"mm\",\n    \"area\": \"mm²\",\n    \"volume\": \"mm³\",\n    \"volume_si\": \"m³\",\n    \"mass\": \"kg\",\n    \"density\": \"kg/m³\",\n    \"force\": \"N\",\n    \"torque\": \"N·m\",\n    \"stress\": \"MPa\",\n    \"stress_output\": \"MPa\",\n    \"young_modulus\": \"GPa\",\n    \"displacement\": \"mm\",\n    \"displacement_output\": \"mm\",\n    \"angle\": \"deg\",\n    \"angular_velocity\": \"rad/s\",\n    \"linear_velocity\": \"m/s\",\n    \"time\": \"s\"\n  }\n}"
+      }
+    ]
+  }
+}
+```
+
+---
+
+## Группа 7: Персистентность и управление проектами
+
+### 30. `save_project`
+
+Сохраняет текущее полное состояние CAD-движка (детали с их параметрическими деревьями фич DAG, пользовательские материалы из `define_material`, кинематические шарниры с моторами из `physics_world`, активный `length_unit` и контракт единиц) в версионированный JSON-файл проекта на диске (`schema_version = "1.0.0"`).
+
+Полигональные поверхностные сетки треугольников не сериализуются для процедурных деталей (пересчитываются из DAG при загрузке), что обеспечивает компактность файла (~несколько килобайт вместо сотен мегабайт) и сохранение полной параметричности.
+
+#### Входные параметры
+| Параметр | Тип | Обязательный | Описание |
+|---|---|:---:|---|
+| `path` | `string` | **Да** | Путь к сохраняемому JSON-файлу проекта (например, `"./output/crank_slider_mechanism.json"`) |
+| `project_name` | `string` | Нет | Человекочитаемое название проекта (по умолчанию `"MCP-CAD Project"`) |
+
+#### Пример запроса
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 30,
+  "method": "tools/call",
+  "params": {
+    "name": "save_project",
+    "arguments": {
+      "path": "./output/my_assembly.json",
+      "project_name": "Linkage Arm Assembly"
+    }
+  }
+}
+```
+
+#### Пример ответа
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 30,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"status\": \"saved\",\n  \"path\": \"./output/my_assembly.json\",\n  \"schema_version\": \"1.0.0\",\n  \"project\": \"Linkage Arm Assembly\",\n  \"parts_count\": 2,\n  \"joints_count\": 1,\n  \"materials_count\": 1,\n  \"file_size_bytes\": 3280,\n  \"length_unit\": \"mm\",\n  \"units\": {\n    \"length\": \"mm\",\n    \"mass\": \"kg\",\n    \"force\": \"N\"\n  }\n}"
+      }
+    ]
+  }
+}
+```
+
+---
+
+### 31. `load_project`
+
+Транзакционно загружает проект из JSON-файла, полностью заменяя текущее состояние сессии (материалы, детали, симулятор физики и шарниры, единицы длины). Пересчитывает параметрические деревья DAG для каждой детали, восстанавливая точные граничные 3D-сетки и инерционные характеристики.
+
+**Транзакционность:** Если файл повреждён, отсутствует, содержит синтаксические ошибки JSON или несовместимую версию схемы (`schema_version`), операция немедленно возвращает структурированную ошибку (`IO_ERROR`, `JSON_ERROR` или `PROJECT_SCHEMA_MISMATCH`), а текущее состояние сессии остаётся нетронутым.
+
+#### Входные параметры
+| Параметр | Тип | Обязательный | Описание |
+|---|---|:---:|---|
+| `path` | `string` | **Да** | Путь к загружаемому JSON-файлу проекта |
+
+#### Пример запроса
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 31,
+  "method": "tools/call",
+  "params": {
+    "name": "load_project",
+    "arguments": {
+      "path": "./output/my_assembly.json"
+    }
+  }
+}
+```
+
+#### Пример ответа
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 31,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"status\": \"loaded\",\n  \"path\": \"./output/my_assembly.json\",\n  \"schema_version\": \"1.0.0\",\n  \"project\": \"Linkage Arm Assembly\",\n  \"parts_count\": 2,\n  \"joints_count\": 1,\n  \"materials_count\": 9,\n  \"length_unit\": \"mm\",\n  \"units\": {\n    \"length\": \"mm\"\n  },\n  \"parts\": [\n    {\n      \"part_id\": \"part_base\",\n      \"name\": \"Base Plate\",\n      \"material\": \"inconel_718\",\n      \"volume\": 48000.0,\n      \"mass_kg\": 0.3931,\n      \"triangles_count\": 12,\n      \"is_fixed\": true\n    },\n    {\n      \"part_id\": \"part_arm\",\n      \"name\": \"Link Arm\",\n      \"material\": \"aluminum_6061_t6\",\n      \"volume\": 10053.09,\n      \"mass_kg\": 0.0271,\n      \"triangles_count\": 124,\n      \"is_fixed\": false\n    }\n  ],\n  \"joints\": [\n    {\n      \"joint_id\": \"joint-1\",\n      \"part_a\": \"part_base\",\n      \"part_b\": \"part_arm\",\n      \"joint_type\": \"revolute\",\n      \"has_motor\": true\n    }\n  ]\n}"
+      }
+    ]
+  }
+}
+```
+
+---
+
+## Группа 8: Слой инженерных требований (Requirements Layer)
+
+### 32. `set_requirements`
+
+Объявляет формальные инженерные требования к конкретной детали (`part_id`) или ко всей сцене (`scope: "scene"`). Поддерживает режим автоматической обратной связи (`auto_check: true`), при котором каждый мутирующий CAD-инструмент (`add_feature_primitive`, `cut_hole`, `modify_feature`, `cut_helical_groove`, `boolean_difference`, `boolean_union`, `boolean_intersection`, `transform_part`, `batch_cad_operations`, `optimize_feature_tree`, `import_stl`) автоматически добавляет в свой JSON-ответ сводку `requirements_status` и список нарушенных требований `failed_requirements`.
+
+#### Входные параметры
+| Параметр | Тип | Обязательный | Описание |
+|---|---|:---:|---|
+| `part_id` | `string` | Нет* | Идентификатор целевой детали (обязателен при `scope = "part"`, не указывается при `scope = "scene"`) |
+| `scope` | `string` | Нет | Область действия требований: `"part"` (по умолчанию при наличии `part_id`) или `"scene"` (сборка целиком) |
+| `length_unit` | `string` | Нет | Локальное переопределение единицы длины (`"mm"` или `"m"`) для габаритов `bbox_max` / `bbox_min` |
+| `auto_check` | `boolean` | Нет | Если `true`, включает автоматическое добавление `requirements_status` и `failed_requirements` в ответы мутирующих CAD-инструментов |
+| `requirements` | `array<object>` | **Да** | Массив спецификаций инженерных требований |
+
+#### Поддерживаемые типы требований (`requirements[].type`)
+| `type` | Параметры | Описание |
+|---|---|---|
+| `"bbox_max"` | `"dims": [dx, dy, dz]` | Максимально допустимые габариты AABB детали вдоль осей `[X, Y, Z]` в активном `length_unit` (`mm` или `m`) |
+| `"bbox_min"` | `"dims": [dx, dy, dz]` | Минимально допустимые габариты AABB детали вдоль осей `[X, Y, Z]` в активном `length_unit` (`mm` или `m`) |
+| `"mass_max"` | `"kg": number` | Максимально допустимая расчётная масса детали в килограммах (`kg`) |
+| `"mesh_valid"` | `"expected_genus"?: integer` | Требование прохождения 12-пунктовой топологической валидации `validate_mesh` (`status == "PASS"`) с опциональной проверкой рода поверхности `expected_genus` |
+| `"min_safety_factor"` | `"value": number, "fea_case"?: string` | Минимальный коэффициент запаса прочности по Мизесу (`safety_factor >= value`). Не перезапускает МКЭ автоматически: если `part.revision` изменился после последнего вызова `run_fea_analysis`, возвращает статус `"STALE"` |
+| `"no_interference"` | `"pairs"?: [[part_a, part_b], ...]` | Отсутствие геометрических коллизий/пересечений между деталями (возвращает `"NOT_AVAILABLE"` до реализации `P3-T10`) |
+| `"mechanism_dof"` | `"expected": integer` | Ожидаемое число степеней свободы кинематической цепи механизма (возвращает `"NOT_AVAILABLE"` до реализации `P3-T9`) |
+
+---
+
+### 33. `check_requirements`
+
+Проверяет выполнение зарегистрированных инженерных требований для указанной детали (`part_id`) или для всей сцены (если `part_id` не передан). Возвращает по каждому требованию статус (`PASS | FAIL | STALE | NOT_AVAILABLE`), измеренное значение `measured`, целевой порог `target`, запас `margin` и действенную подсказку `hint`.
+
+#### Входные параметры
+| Параметр | Тип | Обязательный | Описание |
+|---|---|:---:|---|
+| `part_id` | `string` | Нет | Опциональный идентификатор детали для фильтрации проверки только по одной детали |
+| `length_unit` | `string` | Нет | Локальное переопределение единицы длины (`"mm"` или `"m"`) для возвращаемых габаритов и запасов |
+
+---
+
+### 34. `get_scene_summary`
+
+Возвращает компактную текстовую (`summary_text`) и структурированную JSON-сводку всей сцены для первого обращения ИИ-агента в новом контексте (или после загрузки проекта через `load_project`).
+
+Сводка включает:
+- **Единицы проекта**: активный `length_unit` (`"mm"` или `"m"`) и полный словарь `"units"`.
+- **Детали (`parts`)**: `part_id`, `name`, `material`, `is_fixed`, `revision`, `features_count`, `bounding_box` и `dimensions` `[dx, dy, dz]` в активном `length_unit`, `volume` (`mm³` или `m³`) и `volume_m3`, `mass_kg`, `triangles_count`, валидность сетки (`mesh_valid`, `mesh_status`: `PASS | FAIL | WARN | EMPTY`, `is_watertight`, `is_manifold`, `open_edges_count`, `genus`), а также статус последнего расчёта МКЭ (`last_fea`: `verdict`, `factor_of_safety`, `max_von_mises_mpa`, `max_displacement_mm`, `fea_revision`, `part_revision`, `stale`, `status: "FRESH" | "STALE"`).
+- **Кинематические шарниры (`joints`)**: `joint_id`, `joint_type` (`revolute`, `prismatic`, `spherical`, `fixed`, `gear`), соединённые детали `part_a` и `part_b`, якоря `anchor_a`/`anchor_b` в активном `length_unit` и параметры мотора `motor` (`target_velocity`, `max_force`).
+- **Инженерные требования (`requirements`)**: общий статус (`PASS | FAIL | STALE | NOT_AVAILABLE`), флаг `auto_check`, счётчики `total`, `passed`, `failed`, `stale`, `not_available`, полный список проверенных требований `items` и список нарушений `failed_requirements`.
+
+#### Входные параметры
+| Параметр | Тип | Обязательный | Описание |
+|---|---|:---:|---|
+| `length_unit` | `string` | Нет | Локальное переопределение единицы длины (`"mm"` или `"m"`, по умолчанию используется единица сессии) |
+
+#### Пример запроса
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 34,
+  "method": "tools/call",
+  "params": {
+    "name": "get_scene_summary",
+    "arguments": {}
+  }
+}
+```
+
+
+

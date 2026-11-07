@@ -1,5 +1,5 @@
 # Multi-stage Dockerfile for headless MCP-CAD Server on Linux with Software GPU (Mesa Lavapipe / llvmpipe)
-FROM rust:1.82-bookworm AS builder
+FROM rust:1.91-bookworm AS builder
 
 WORKDIR /workspace
 COPY Cargo.toml Cargo.lock ./

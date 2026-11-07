@@ -26,6 +26,8 @@ pub struct CadJointRecord {
     pub part_b: String,
     /// CAD joint configuration type and anchors.
     pub joint_type: CadJointType,
+    /// Optional motor configuration for actuated joints.
+    pub motor: Option<MotorConfig>,
     /// Rapier impulse joint handle.
     pub handle: ImpulseJointHandle,
 }
@@ -71,6 +73,42 @@ pub struct PhysicsWorld {
 
     // Current elapsed simulation time in seconds
     current_time_s: f64,
+}
+
+impl Clone for PhysicsWorld {
+    fn clone(&self) -> Self {
+        let (collision_sender, collision_receiver) = rapier3d::crossbeam::channel::unbounded();
+        let (contact_force_sender, contact_force_receiver) =
+            rapier3d::crossbeam::channel::unbounded();
+
+        Self {
+            pipeline: PhysicsPipeline::new(),
+            gravity: self.gravity,
+            integration_parameters: self.integration_parameters,
+            island_manager: self.island_manager.clone(),
+            broad_phase: self.broad_phase.clone(),
+            narrow_phase: self.narrow_phase.clone(),
+            bodies: self.bodies.clone(),
+            colliders: self.colliders.clone(),
+            impulse_joints: self.impulse_joints.clone(),
+            multibody_joints: self.multibody_joints.clone(),
+            ccd_solver: self.ccd_solver.clone(),
+
+            collision_sender,
+            collision_receiver,
+            contact_force_sender,
+            contact_force_receiver,
+
+            part_to_body: self.part_to_body.clone(),
+            body_to_part: self.body_to_part.clone(),
+            collider_to_part: self.collider_to_part.clone(),
+            part_to_colliders: self.part_to_colliders.clone(),
+            joints: self.joints.clone(),
+            gear_constraints: self.gear_constraints.clone(),
+
+            current_time_s: self.current_time_s,
+        }
+    }
 }
 
 impl Default for PhysicsWorld {
@@ -282,6 +320,7 @@ impl PhysicsWorld {
                 part_a: part_a.to_string(),
                 part_b: part_b.to_string(),
                 joint_type: joint_type.clone(),
+                motor,
                 handle: joint_handle,
             },
         );
@@ -303,6 +342,11 @@ impl PhysicsWorld {
         Ok(joint_handle)
     }
 
+    /// Returns a reference to all registered CAD joints.
+    pub fn joints(&self) -> &HashMap<String, CadJointRecord> {
+        &self.joints
+    }
+
     /// Updates motor actuation on an existing joint.
     pub fn set_joint_motor(
         &mut self,
@@ -311,30 +355,38 @@ impl PhysicsWorld {
     ) -> Result<(), PhysicsError> {
         let record = self
             .joints
-            .get(joint_id)
+            .get_mut(joint_id)
             .ok_or_else(|| PhysicsError::JointNotFound(joint_id.to_string()))?;
+
+        record.motor = Some(motor);
+        let handle = record.handle;
+        let joint_type = record.joint_type.clone();
 
         let joint = self
             .impulse_joints
-            .get_mut(record.handle)
+            .get_mut(handle)
             .ok_or_else(|| PhysicsError::JointNotFound(joint_id.to_string()))?;
 
-        record.joint_type.apply_motor(&mut joint.data, motor)
+        joint_type.apply_motor(&mut joint.data, motor)
     }
 
     /// Disables motor actuation on an existing joint.
     pub fn disable_joint_motor(&mut self, joint_id: &str) -> Result<(), PhysicsError> {
         let record = self
             .joints
-            .get(joint_id)
+            .get_mut(joint_id)
             .ok_or_else(|| PhysicsError::JointNotFound(joint_id.to_string()))?;
+
+        record.motor = None;
+        let handle = record.handle;
+        let joint_type = record.joint_type.clone();
 
         let joint = self
             .impulse_joints
-            .get_mut(record.handle)
+            .get_mut(handle)
             .ok_or_else(|| PhysicsError::JointNotFound(joint_id.to_string()))?;
 
-        record.joint_type.disable_motor(&mut joint.data)
+        joint_type.disable_motor(&mut joint.data)
     }
 
     /// Removes a joint by identifier.
@@ -635,6 +687,17 @@ impl PhysicsWorld {
         self.bodies
             .get_mut(*handle)
             .ok_or_else(|| PhysicsError::PartNotFound(part_id.to_string()))
+    }
+
+    /// Returns `true` if a part is registered in the physics world.
+    pub fn has_part(&self, part_id: &str) -> bool {
+        self.part_to_body.contains_key(part_id)
+    }
+
+    /// Returns `true` if a registered part's rigid body is dynamic (movable), or `false` if fixed.
+    pub fn is_part_dynamic(&self, part_id: &str) -> Result<bool, PhysicsError> {
+        let rb = self.get_body(part_id)?;
+        Ok(rb.is_dynamic())
     }
 
     /// Retrieves current 3D position [x, y, z] of a part.

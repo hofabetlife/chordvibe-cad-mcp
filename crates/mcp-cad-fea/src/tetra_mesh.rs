@@ -344,14 +344,37 @@ impl TetrahedralMesh {
         let ny = ((dims[1] / h).round() as usize).clamp(2, 60);
         let nz = ((dims[2] / h).round() as usize).clamp(2, 60);
 
-        let dx = dims[0] / nx as f64;
-        let dy = dims[1] / ny as f64;
-        let dz = dims[2] / nz as f64;
-
         // Check if the input mesh is a standard axis-aligned box
         if is_axis_aligned_box(mesh, &aabb) {
             return Self::from_box(aabb.min, aabb.max, nx, ny, nz);
         }
+
+        // For non-box (curved/perforated) shapes, ensure cross-sectional axes have at least 6 voxel cells
+        // so circular shafts and holes do not degenerate into a 2x2 square grid (+27% area error).
+        let min_curved_cells = match density {
+            MeshDensity::Coarse => 8,
+            MeshDensity::Medium => 12,
+            MeshDensity::Fine => 16,
+            MeshDensity::Custom { .. } => 8,
+        };
+        let max_dim = dims[0].max(dims[1]).max(dims[2]);
+        let min_dim = dims[0].min(dims[1]).min(dims[2]);
+        // An axis is a thin-plate thickness only if it is the sole minimum dimension and < 25% of max_dim.
+        let min_count = dims.iter().filter(|&&d| (d - min_dim).abs() <= 0.15 * min_dim).count();
+        let adjust_axis = |n: usize, d: f64| -> usize {
+            let is_sole_thin_axis = min_count == 1 && (d - min_dim).abs() <= 1e-9 && d < 0.25 * max_dim;
+            if is_sole_thin_axis {
+                n.max(2)
+            } else {
+                n.max(min_curved_cells).min(60)
+            }
+        };
+        let nx = adjust_axis(nx, dims[0]);
+        let ny = adjust_axis(ny, dims[1]);
+        let nz = adjust_axis(nz, dims[2]);
+        let dx = dims[0] / nx as f64;
+        let dy = dims[1] / ny as f64;
+        let dz = dims[2] / nz as f64;
 
         // For general shapes: test voxel containment using ray-triangle parity check
         let node_idx = |i: usize, j: usize, k: usize| -> usize {
@@ -668,8 +691,16 @@ pub fn refine_mesh_max_edge_length(mesh: &TriangleMesh, max_edge_len: f64) -> Tr
             }
         };
 
+        let has_face_ids =
+            current.face_ids.len() == current.indices.len() && !current.face_ids.is_empty();
         let mut new_indices = Vec::with_capacity(current.indices.len() * 4);
-        for tri in &current.indices {
+        let mut new_face_ids = if has_face_ids {
+            Vec::with_capacity(current.indices.len() * 4)
+        } else {
+            Vec::new()
+        };
+
+        for (tri_idx, tri) in current.indices.iter().enumerate() {
             let [i0, i1, i2] = *tri;
             let m01 = get_or_create_midpoint(i0, i1, &mut new_vertices);
             let m12 = get_or_create_midpoint(i1, i2, &mut new_vertices);
@@ -679,9 +710,18 @@ pub fn refine_mesh_max_edge_length(mesh: &TriangleMesh, max_edge_len: f64) -> Tr
             new_indices.push([m01, i1, m12]);
             new_indices.push([m20, m12, i2]);
             new_indices.push([m01, m12, m20]);
+
+            if has_face_ids {
+                let fid = current.face_ids[tri_idx];
+                new_face_ids.extend_from_slice(&[fid, fid, fid, fid]);
+            }
         }
 
-        current = TriangleMesh::new(new_vertices, new_indices);
+        current = if has_face_ids {
+            TriangleMesh::with_faces(new_vertices, new_indices, new_face_ids, current.faces.clone())
+        } else {
+            TriangleMesh::new(new_vertices, new_indices)
+        };
     }
 
     current

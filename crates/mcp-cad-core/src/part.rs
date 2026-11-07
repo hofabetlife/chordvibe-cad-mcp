@@ -19,6 +19,7 @@ pub struct Part {
     /// Parametric history tree defining the part geometry.
     pub dag: FeatureTree,
     /// The currently evaluated triangular boundary surface mesh.
+    #[serde(default)]
     pub mesh: TriangleMesh,
     /// Cached evaluation mesh for lazy tessellation.
     #[serde(default)]
@@ -29,6 +30,9 @@ pub struct Part {
     /// Indicates whether the part should be treated as fixed/static in physics simulations.
     #[serde(default)]
     pub is_fixed: bool,
+    /// Monotonically increasing revision counter incremented on each DAG/geometry rebuild or transform.
+    #[serde(default)]
+    pub revision: u64,
 }
 
 impl Part {
@@ -43,7 +47,14 @@ impl Part {
             cached_mesh: None,
             cached_settings: None,
             is_fixed: false,
+            revision: 0,
         }
+    }
+
+    /// Increments the part's geometry revision counter.
+    #[inline]
+    pub fn bump_revision(&mut self) {
+        self.revision = self.revision.saturating_add(1);
     }
 
     /// Evaluates the parametric feature tree with the specified tessellation settings lazily.
@@ -59,6 +70,7 @@ impl Part {
         self.mesh = evaluated.clone();
         self.cached_mesh = Some(evaluated);
         self.cached_settings = Some(settings.clone());
+        self.revision = self.revision.saturating_add(1);
         Ok(self.cached_mesh.as_ref().unwrap())
     }
 
@@ -76,6 +88,7 @@ impl Part {
         self.mesh = evaluated.clone();
         self.cached_mesh = Some(evaluated);
         self.cached_settings = Some(settings);
+        self.revision = self.revision.saturating_add(1);
         Ok(())
     }
 
@@ -181,6 +194,7 @@ impl Part {
             triangle_count: mesh.triangle_count(),
             bounding_box_dimensions: aabb.dimensions(),
             is_fixed: self.is_fixed,
+            revision: self.revision,
         }
     }
 }
@@ -197,6 +211,8 @@ pub struct PartSummary {
     pub bounding_box_dimensions: [f64; 3],
     #[serde(default)]
     pub is_fixed: bool,
+    #[serde(default)]
+    pub revision: u64,
 }
 
 #[cfg(test)]
@@ -211,6 +227,7 @@ mod tests {
         let aluminum = registry.get("aluminum_6061_t6").unwrap().clone();
 
         let mut part = Part::new("part-001", "Bracket Base", aluminum);
+        assert_eq!(part.revision, 0);
         // Box: 0.1m x 0.2m x 0.05m = 0.001 m³
         part.dag.add_feature(
             FeatureOp::AddBox {
@@ -224,6 +241,7 @@ mod tests {
         );
 
         part.rebuild().unwrap();
+        assert_eq!(part.revision, 1);
 
         let vol = part.volume();
         assert!((vol - 0.001).abs() < 1e-6);

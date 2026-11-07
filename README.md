@@ -2,11 +2,11 @@
 
 <div align="center">
 
-[![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg?logo=rust&logoColor=white)](https://www.rust-lang.org)
-[![Platform](https://img.shields.io/badge/platform-Windows%20x64-blue.svg?logo=windows&logoColor=white)](https://www.microsoft.com/windows)
+[![Rust](https://img.shields.io/badge/rust-1.91%2B-orange.svg?logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![Platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux-blue.svg?logo=windows&logoColor=white)](https://www.microsoft.com/windows)
 [![Dependencies](https://img.shields.io/badge/dependencies-Zero%20C%2B%2B%20%2F%20Pure%20Rust-brightgreen.svg)](Cargo.toml)
 [![Protocol](https://img.shields.io/badge/MCP-2024--11--05-blueviolet.svg)](https://modelcontextprotocol.io)
-[![Tests](https://img.shields.io/badge/tests-100%25%20Passing%20(99%2F99)-success.svg)](crates/)
+[![Tests](https://img.shields.io/badge/tests-Rust%20149%2F154%20(5%20ignored)%20%7C%20TS%2025%2F26-yellow.svg)](TASKS.md)
 [![License](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-blue.svg)](LICENSE)
 
 **Первая в мире автономная инженерная среда 3D CAD/CAE на чистом Rust под Windows, спроектированная под прямое управление ИИ-агентами по протоколу Model Context Protocol (MCP).**
@@ -89,9 +89,9 @@ flowchart LR
 ## ⚡ Быстрый старт (Quick Start)
 
 ### Системные требования
-- **ОС**: Windows 10 или Windows 11 x64.
-- **Компилятор**: Rust $\ge 1.80$ (устанавливается через [rustup.rs](https://rustup.rs)).
-- **Видеоподсистема**: Любая видеокарта с поддержкой DirectX 12 или Vulkan (для систем без GPU автоматически подключается программный адаптер).
+- **ОС**: Windows 10 или Windows 11 x64, либо Linux (Debian / Ubuntu x86_64).
+- **Компилятор**: Rust $\ge 1.91$ (зафиксирован в [`rust-toolchain.toml`](rust-toolchain.toml); зависимости в `Cargo.lock` требуют `rustc >= 1.89`, устанавливается через [rustup.rs](https://rustup.rs)).
+- **Видеоподсистема**: Любая видеокарта с поддержкой DirectX 12 или Vulkan (для систем без GPU и контейнеров Linux автоматически подключается программный адаптер Mesa Lavapipe `WGPU_BACKEND=vulkan LIBGL_ALWAYS_SOFTWARE=1`).
 
 ### 1. Клонирование и сборка
 ```powershell
@@ -298,18 +298,33 @@ graph TD
 
 ## 🧪 Тестирование и верификация
 
-В репозитории реализован полный набор юнит-, интеграционных и верификационных тестов:
-- **Аналитическая верификация МКЭ**: Сравнение численного прогиба консольной балки под изгибом с теоретической формулой сопротивления материалов ($\delta = \frac{F L^3}{3 E I}$, совпадение с точностью до 5%).
-- **Верификация кинематики**: Тестирование степеней свободы сочленений Rapier3D, работы моторов и детекции коллизий.
-- **Сквозное E2E тестирование MCP**: Проверка обработки всех 28 инструментов и соответствия схеме MCP 2024-11-05 (18 тестов контракта, 100% Passing).
+В репозитории реализован набор юнит-, интеграционных и инвариантных тестов:
+- **Инварианты примитивов и CSG (`mcp-cad-core`)**: Проверка водонепроницаемости (`validate_mesh`), внешней ориентации нормалей, характеристики Эйлера ($\chi = 2 - 2g$), отсутствия вырожденных углов (`Sliver Gate`) и аналитических тождеств объёма.
+- **Аналитическая верификация МКЭ (`mcp-cad-fea`)**: Проверка решения 3D-задач теории упругости на тетраэдрах `TET4` методом сопряжённых градиентов (PCG).
+- **Верификация кинематики (`mcp-cad-physics`)**: Тестирование степеней свободы сочленений Rapier3D, работы моторов и детекции коллизий.
+- **Контрактное и сквозное E2E тестирование MCP (`mcp-cad-server`)**: Проверка обработки всех 28 инструментов и соответствия схеме MCP 2024-11-05 (`mcp_contract_tests`, `qa_wide_scan`, `gear_kinematic_test`).
 
-Запуск всего набора тестов:
-```powershell
-cargo test --workspace
+> [!IMPORTANT]
+> **Требуемая версия Rust и фактическое состояние тестов:**
+> - Для сборки и тестирования требуется **Rust $\ge 1.91$** (зафиксирован в [`rust-toolchain.toml`](rust-toolchain.toml)).
+> - **Rust Workspace (`cargo test --workspace --no-fail-fast`)**: 154 теста — **149 проходят, 0 падают, 5 помечены `#[ignore]`** (краевые случаи качества сетки примитивов в `primitive_invariants.rs`, задача `P0-T10`).
+> - **TypeScript / Web Studio (`npx tsx --test src/cad/cad_engine.test.ts`)**: 26 тестов — **25 проходят, 1 падает** (`AssertionError: 5 !== 4` в тесте №17 `FEA_QUICK_LOAD_PRESETS`, задача `TS-FIX-01`).
+> - **Clippy (`cargo clippy --workspace --all-targets -- -D warnings`)**: выявляет предупреждения/ошибки в `mcp-cad-core` (отслеживаются в CI и бэклоге).
+> - Актуальный источник истины по статусу тестов и задач — [`TASKS.md`](TASKS.md) и [`VERIFICATION_REPORT.md`](VERIFICATION_REPORT.md) (отчёты в каталоге `qa/` устарели).
+
+Запуск всего набора тестов (требуется **Rust $\ge 1.91$**):
+```bash
+# Windows (PowerShell):
+cargo test --workspace --no-fail-fast
+
+# Linux / Headless CI (с программным драйвером Vulkan Lavapipe):
+WGPU_BACKEND=vulkan LIBGL_ALWAYS_SOFTWARE=1 cargo test --workspace --no-fail-fast
 ```
-Проверка линтером без предупреждений:
-```powershell
-cargo clippy --workspace -- -D warnings
+Проверка линтером Clippy и тесты веб-клиента:
+```bash
+cargo clippy --workspace --all-targets -- -D warnings
+npm run lint
+npx tsx --test src/cad/cad_engine.test.ts
 ```
 
 ---

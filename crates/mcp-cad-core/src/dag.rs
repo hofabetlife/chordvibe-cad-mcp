@@ -254,6 +254,92 @@ fn apply_pos_rot(
     }
 }
 
+fn normalize_feature_slug(name: &str) -> String {
+    let mut slug = String::with_capacity(name.len());
+    let mut prev_underscore = true;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            prev_underscore = false;
+        } else if !prev_underscore {
+            slug.push('_');
+            prev_underscore = true;
+        }
+    }
+    while slug.ends_with('_') {
+        slug.pop();
+    }
+    slug
+}
+
+fn push_unique_alias(aliases: &mut Vec<String>, candidate: String) {
+    if !aliases.iter().any(|a| a.eq_ignore_ascii_case(&candidate)) {
+        aliases.push(candidate);
+    }
+}
+
+fn tag_node_faces(mesh: &mut TriangleMesh, node: &FeatureNode, node_idx: usize) {
+    if mesh.faces.is_empty() {
+        return;
+    }
+    let uuid_str = node.id.to_string();
+    let idx_prefix = format!("feat_{node_idx}");
+    let slug = normalize_feature_slug(&node.name);
+
+    for face in &mut mesh.faces {
+        face.origin_feature = Some(uuid_str.clone());
+        let role = face.role.clone();
+        if node_idx == 0 {
+            face.name = role.clone();
+        } else {
+            push_unique_alias(&mut face.aliases, role.clone());
+            face.name = format!("{idx_prefix}:{role}");
+        }
+        push_unique_alias(&mut face.aliases, format!("{idx_prefix}:{role}"));
+        if !slug.is_empty() {
+            push_unique_alias(&mut face.aliases, format!("{slug}:{role}"));
+        }
+        push_unique_alias(&mut face.aliases, format!("{uuid_str}:{role}"));
+    }
+}
+
+fn tag_new_cutter_faces(
+    mesh: &mut TriangleMesh,
+    prev_max_id: u32,
+    node: &FeatureNode,
+    node_idx: usize,
+) {
+    let uuid_str = node.id.to_string();
+    let idx_prefix = format!("feat_{node_idx}");
+    let slug = normalize_feature_slug(&node.name);
+
+    for face in &mut mesh.faces {
+        if face.id <= prev_max_id {
+            continue;
+        }
+        if face.origin_feature.is_none() {
+            face.origin_feature = Some(uuid_str.clone());
+        }
+        let role = face.role.clone();
+        push_unique_alias(&mut face.aliases, role.clone());
+        push_unique_alias(&mut face.aliases, format!("{role}:{idx_prefix}"));
+        push_unique_alias(&mut face.aliases, format!("{idx_prefix}:{role}"));
+        push_unique_alias(&mut face.aliases, format!("{role}:{node_idx}"));
+        push_unique_alias(&mut face.aliases, format!("cut:{idx_prefix}:{role}"));
+        if !slug.is_empty() {
+            push_unique_alias(&mut face.aliases, format!("{role}:{slug}"));
+            push_unique_alias(&mut face.aliases, format!("{slug}:{role}"));
+        }
+        push_unique_alias(&mut face.aliases, format!("{role}:{uuid_str}"));
+        push_unique_alias(&mut face.aliases, format!("{uuid_str}:{role}"));
+
+        if role.starts_with("hole_") || role.starts_with("keyway_") || role.starts_with("helical_")
+        {
+            face.name = format!("{role}:{idx_prefix}");
+        }
+    }
+}
+
 /// A node in the parametric history tree.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FeatureNode {
@@ -325,6 +411,13 @@ impl FeatureTree {
         id
     }
 
+    /// Appends a pre-constructed [`FeatureNode`] to the history tree, returning its unique ID.
+    pub fn add_node(&mut self, node: FeatureNode) -> Uuid {
+        let id = node.id;
+        self.nodes.push(node);
+        id
+    }
+
     /// Modifies an existing feature operation by ID without altering other history steps.
     pub fn modify_feature(&mut self, id: Uuid, new_op: FeatureOp) -> Result<(), CadError> {
         let node = self
@@ -366,11 +459,14 @@ impl FeatureTree {
     /// Evaluates the complete feature history tree with adaptive tessellation settings.
     pub fn evaluate_with_settings(&self, settings: &TessellationSettings) -> Result<TriangleMesh, CadError> {
         let mut current_mesh: Option<TriangleMesh> = None;
+        let mut active_node_idx = 0usize;
 
         for node in &self.nodes {
             if !node.enabled {
                 continue;
             }
+            let node_idx = active_node_idx;
+            active_node_idx += 1;
 
             match &node.op {
                 FeatureOp::AddBox {
@@ -388,6 +484,7 @@ impl FeatureTree {
                     }
                     let mut box_mesh = create_box(*width, *height, *depth);
                     apply_pos_rot(&mut box_mesh, position, rotation_deg);
+                    tag_node_faces(&mut box_mesh, node, node_idx);
                     current_mesh = match current_mesh {
                         Some(m) => Some(csg_union(&m, &box_mesh)),
                         None => Some(box_mesh),
@@ -409,6 +506,7 @@ impl FeatureTree {
                     let segs = settings.calculate_segments(*radius);
                     let mut cyl_mesh = create_cylinder(*radius, *height, segs);
                     apply_pos_rot(&mut cyl_mesh, position, rotation_deg);
+                    tag_node_faces(&mut cyl_mesh, node, node_idx);
                     current_mesh = match current_mesh {
                         Some(m) => Some(csg_union(&m, &cyl_mesh)),
                         None => Some(cyl_mesh),
@@ -450,6 +548,7 @@ impl FeatureTree {
                         *chamfer,
                     );
                     apply_pos_rot(&mut prism_mesh, position, rotation_deg);
+                    tag_node_faces(&mut prism_mesh, node, node_idx);
                     current_mesh = match current_mesh {
                         Some(m) => Some(csg_union(&m, &prism_mesh)),
                         None => Some(prism_mesh),
@@ -471,6 +570,7 @@ impl FeatureTree {
                     let (sec, stk) = settings.calculate_sphere_resolution(*radius);
                     let mut sph_mesh = create_sphere(*radius, sec, stk);
                     apply_pos_rot(&mut sph_mesh, position, rotation_deg);
+                    tag_node_faces(&mut sph_mesh, node, node_idx);
                     current_mesh = match current_mesh {
                         Some(m) => Some(csg_union(&m, &sph_mesh)),
                         None => Some(sph_mesh),
@@ -498,6 +598,7 @@ impl FeatureTree {
                     let segs = settings.calculate_segments(max_r);
                     let mut cone_mesh = create_cone(*radius_bottom, *radius_top, *height, segs);
                     apply_pos_rot(&mut cone_mesh, position, rotation_deg);
+                    tag_node_faces(&mut cone_mesh, node, node_idx);
                     current_mesh = match current_mesh {
                         Some(m) => Some(csg_union(&m, &cone_mesh)),
                         None => Some(cone_mesh),
@@ -535,6 +636,7 @@ impl FeatureTree {
                         settings,
                     );
                     apply_pos_rot(&mut gear_mesh, position, rotation_deg);
+                    tag_node_faces(&mut gear_mesh, node, node_idx);
                     current_mesh = match current_mesh {
                         Some(m) => Some(csg_union(&m, &gear_mesh)),
                         None => Some(gear_mesh),
@@ -565,6 +667,7 @@ impl FeatureTree {
                     }
                     let mut mesh = create_revolve_with_settings(profile, *angle_deg, settings);
                     apply_pos_rot(&mut mesh, position, rotation_deg);
+                    tag_node_faces(&mut mesh, node, node_idx);
                     current_mesh = match current_mesh {
                         Some(m) => Some(csg_union(&m, &mesh)),
                         None => Some(mesh),
@@ -608,6 +711,7 @@ impl FeatureTree {
                         settings,
                     );
                     apply_pos_rot(&mut mesh, position, rotation_deg);
+                    tag_node_faces(&mut mesh, node, node_idx);
                     current_mesh = match current_mesh {
                         Some(m) => Some(csg_union(&m, &mesh)),
                         None => Some(mesh),
@@ -630,7 +734,8 @@ impl FeatureTree {
                     let mesh = current_mesh.ok_or_else(|| {
                         CadError::EvaluationError("Cannot cut hole in empty solid".into())
                     })?;
-                    current_mesh = Some(cut_hole_with_settings(
+                    let prev_max_id = mesh.faces.iter().map(|f| f.id).max().unwrap_or(0);
+                    let mut out_mesh = cut_hole_with_settings(
                         &mesh,
                         *center,
                         *normal,
@@ -639,7 +744,9 @@ impl FeatureTree {
                         *keyway_width,
                         *keyway_depth,
                         settings,
-                    ));
+                    );
+                    tag_new_cutter_faces(&mut out_mesh, prev_max_id, node, node_idx);
+                    current_mesh = Some(out_mesh);
                 }
                 FeatureOp::CutHelicalGroove {
                     helix_radius,
@@ -660,6 +767,7 @@ impl FeatureTree {
                     let mesh = current_mesh.ok_or_else(|| {
                         CadError::EvaluationError("Cannot cut helical groove in empty solid".into())
                     })?;
+                    let prev_max_id = mesh.faces.iter().map(|f| f.id).max().unwrap_or(0);
                     let turns = *height / *pitch;
                     let tool = create_helical_cutter_with_settings(
                         *helix_radius,
@@ -673,25 +781,48 @@ impl FeatureTree {
                         profile_type,
                         settings,
                     );
-                    current_mesh = Some(csg_difference(&mesh, &tool));
+                    let mut out_mesh = csg_difference(&mesh, &tool);
+                    tag_new_cutter_faces(&mut out_mesh, prev_max_id, node, node_idx);
+                    current_mesh = Some(out_mesh);
                 }
                 FeatureOp::BooleanDifferenceMesh { tool_mesh } => {
                     let mesh = current_mesh.ok_or_else(|| {
                         CadError::EvaluationError("Cannot perform boolean difference on empty solid".into())
                     })?;
-                    current_mesh = Some(csg_difference(&mesh, tool_mesh));
+                    let prev_max_id = mesh.faces.iter().map(|f| f.id).max().unwrap_or(0);
+                    let mut tagged_tool = tool_mesh.clone();
+                    if tagged_tool.faces.iter().all(|f| f.origin_feature.is_none()) {
+                        tag_node_faces(&mut tagged_tool, node, node_idx);
+                    }
+                    let mut out_mesh = csg_difference(&mesh, &tagged_tool);
+                    tag_new_cutter_faces(&mut out_mesh, prev_max_id, node, node_idx);
+                    current_mesh = Some(out_mesh);
                 }
                 FeatureOp::BooleanUnionMesh { tool_mesh } => {
                     let mesh = current_mesh.ok_or_else(|| {
                         CadError::EvaluationError("Cannot perform boolean union on empty solid".into())
                     })?;
-                    current_mesh = Some(csg_union(&mesh, tool_mesh));
+                    let prev_max_id = mesh.faces.iter().map(|f| f.id).max().unwrap_or(0);
+                    let mut tagged_tool = tool_mesh.clone();
+                    if tagged_tool.faces.iter().all(|f| f.origin_feature.is_none()) {
+                        tag_node_faces(&mut tagged_tool, node, node_idx);
+                    }
+                    let mut out_mesh = csg_union(&mesh, &tagged_tool);
+                    tag_new_cutter_faces(&mut out_mesh, prev_max_id, node, node_idx);
+                    current_mesh = Some(out_mesh);
                 }
                 FeatureOp::BooleanIntersectionMesh { tool_mesh } => {
                     let mesh = current_mesh.ok_or_else(|| {
                         CadError::EvaluationError("Cannot perform boolean intersection on empty solid".into())
                     })?;
-                    current_mesh = Some(csg_intersection(&mesh, tool_mesh));
+                    let prev_max_id = mesh.faces.iter().map(|f| f.id).max().unwrap_or(0);
+                    let mut tagged_tool = tool_mesh.clone();
+                    if tagged_tool.faces.iter().all(|f| f.origin_feature.is_none()) {
+                        tag_node_faces(&mut tagged_tool, node, node_idx);
+                    }
+                    let mut out_mesh = csg_intersection(&mesh, &tagged_tool);
+                    tag_new_cutter_faces(&mut out_mesh, prev_max_id, node, node_idx);
+                    current_mesh = Some(out_mesh);
                 }
                 FeatureOp::Transform { translation, rotation_deg, scale } => {
                     let mut mesh = current_mesh.ok_or_else(|| {

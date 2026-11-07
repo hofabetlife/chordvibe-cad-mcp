@@ -113,6 +113,145 @@ impl BoundingBox {
     }
 }
 
+/// Geometric class of an analytical or mesh face surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FaceKind {
+    /// Planar face (caps, box/prism sides, chamfers, blind hole bottom, keyway walls).
+    Plane,
+    /// Cylindrical surface (cylinder side wall, round hole wall, shaft journal).
+    Cylinder,
+    /// Conical surface (cone/frustum side wall, countersink/revolved chamfer).
+    Cone,
+    /// Spherical surface.
+    Sphere,
+    /// Toroidal surface or revolved fillet/rounding surface.
+    Torus,
+    /// Helical surface (drill flute, thread profile `CutHelicalGroove`).
+    Helical,
+    /// Arbitrary or composite surface (involute tooth profile, wheel rim spoke, untagged mesh).
+    #[default]
+    Other,
+}
+
+#[allow(non_upper_case_globals)]
+impl FaceKind {
+    /// Alias for [`FaceKind::Plane`].
+    pub const Planar: Self = Self::Plane;
+    /// Alias for [`FaceKind::Cylinder`].
+    pub const Cylindrical: Self = Self::Cylinder;
+    /// Alias for [`FaceKind::Cone`].
+    pub const Conical: Self = Self::Cone;
+    /// Alias for [`FaceKind::Sphere`].
+    pub const Spherical: Self = Self::Sphere;
+    /// Alias for [`FaceKind::Torus`].
+    pub const Toroidal: Self = Self::Torus;
+    /// Alias for [`FaceKind::Other`].
+    pub const Freeform: Self = Self::Other;
+
+    /// Canonical lowercase snake_case string representation.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FaceKind::Plane => "plane",
+            FaceKind::Cylinder => "cylinder",
+            FaceKind::Cone => "cone",
+            FaceKind::Sphere => "sphere",
+            FaceKind::Torus => "torus",
+            FaceKind::Helical => "helical",
+            FaceKind::Other => "other",
+        }
+    }
+
+    /// Parses a `FaceKind` from a string (case-insensitive).
+    pub fn from_str_ignore_case(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "plane" | "planar" | "flat" => Some(FaceKind::Plane),
+            "cylinder" | "cylindrical" => Some(FaceKind::Cylinder),
+            "cone" | "conical" | "frustum" => Some(FaceKind::Cone),
+            "sphere" | "spherical" => Some(FaceKind::Sphere),
+            "torus" | "toroidal" | "fillet" => Some(FaceKind::Torus),
+            "helical" | "helix" | "thread" => Some(FaceKind::Helical),
+            "other" | "freeform" => Some(FaceKind::Other),
+            _ => None,
+        }
+    }
+}
+
+/// Metadata for a named topological face of a `TriangleMesh`.
+///
+/// All dimensional values inside `mcp-cad-core` are stored strictly in SI (`m`, `m²`),
+/// and converted to the active `length_unit` at the MCP API boundary (`crates/mcp-cad-server/src/tools/*.rs`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FaceInfo {
+    /// Unique non-zero face identifier (`>= 1`) within this `TriangleMesh`.
+    /// Value `0` in `TriangleMesh::face_ids` is reserved for untagged triangles.
+    pub id: u32,
+    /// Canonical stable face name (e.g. `"cap_top"`, `"feat_0:cap_top"`, `"hole_wall:1"`).
+    pub name: String,
+    /// Additional short or compatible aliases for convenient selector matching
+    /// (e.g. `["cap_top", "top", "max_z", "+z"]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    /// Local role of the face within the originating primitive/operation (`"cap_top"`, `"side"`, `"hole_wall"`).
+    pub role: String,
+    /// Geometric surface type of the face.
+    pub kind: FaceKind,
+    /// Identifier of the originating `FeatureNode::id` (UUID string) or feature key in `FeatureTree`.
+    /// `None` for meshes created directly outside the DAG.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_feature: Option<String>,
+    /// Total surface area of the face triangles in m² (SI).
+    pub area: f64,
+    /// Area-weighted centroid of the face `[x, y, z]` in m (SI):
+    /// `sum(area_t * centroid_t) / sum(area_t)`.
+    pub centroid: [f64; 3],
+    /// A point guaranteed to lie on the face surface itself `[x, y, z]` in m (SI)
+    /// (centroid of the triangle belonging to this face that is closest to `centroid`).
+    #[serde(default)]
+    pub sample_point: [f64; 3],
+    /// For `FaceKind::Plane` — unit outward normal vector `[nx, ny, nz]`.
+    /// For `Cylinder`, `Cone`, `Torus`, `Helical` — unit axis of revolution `[ax, ay, az]`.
+    /// For `Sphere` / `Other` — average outward normal or `[0.0, 0.0, 1.0]`.
+    pub normal_or_axis: [f64; 3],
+    /// Characteristic radius in m (SI):
+    /// - for `Cylinder`, `Sphere`, `Helical` — surface radius `Some(r)`;
+    /// - for `Cone` — mean radius `Some(0.5 * (r_bottom + r_top))`;
+    /// - for circular/annular/polygonal planar cap `Plane` — outer radius `Some(r_outer)`;
+    /// - for rectangular box/prism side faces — `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radius: Option<f64>,
+    /// Number of triangles in `TriangleMesh::indices` belonging to this face (`face_ids[t] == id`).
+    pub triangles_count: usize,
+}
+
+impl FaceInfo {
+    /// Creates a face descriptor before computing triangle metrics (`area`, `centroid`, `sample_point`, `triangles_count`).
+    pub fn new_descriptor(
+        id: u32,
+        role: impl Into<String>,
+        aliases: Vec<String>,
+        kind: FaceKind,
+        normal_or_axis: [f64; 3],
+        radius: Option<f64>,
+    ) -> Self {
+        let role_str = role.into();
+        Self {
+            id,
+            name: role_str.clone(),
+            aliases,
+            role: role_str,
+            kind,
+            origin_feature: None,
+            area: 0.0,
+            centroid: [0.0, 0.0, 0.0],
+            sample_point: [0.0, 0.0, 0.0],
+            normal_or_axis,
+            radius,
+            triangles_count: 0,
+        }
+    }
+}
+
 /// Information about a detected planar face composed of coplanar triangles.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanarFaceInfo {
@@ -152,6 +291,23 @@ pub struct TriangleMesh {
     pub vertices: Vec<Vertex>,
     /// Array of triangle vertex indices (3 indices per face).
     pub indices: Vec<[u32; 3]>,
+    /// Parallel array of face IDs (1 `u32` per triangle in `indices`).
+    /// Invariant: `face_ids.is_empty()` (untagged) OR `face_ids.len() == indices.len()`.
+    /// Value `0` denotes an untagged triangle (`FaceKind::Other`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub face_ids: Vec<u32>,
+    /// Registry of named topological faces of the solid, ordered by `id` ascending.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub faces: Vec<FaceInfo>,
+}
+
+#[inline]
+fn clean_zero_vec3(v: [f64; 3]) -> [f64; 3] {
+    [
+        if v[0].abs() < 1e-15 { 0.0 } else { v[0] },
+        if v[1].abs() < 1e-15 { 0.0 } else { v[1] },
+        if v[2].abs() < 1e-15 { 0.0 } else { v[2] },
+    ]
 }
 
 impl Default for TriangleMesh {
@@ -161,9 +317,32 @@ impl Default for TriangleMesh {
 }
 
 impl TriangleMesh {
-    /// Creates a new triangle mesh.
+    /// Creates a new triangle mesh without face tags.
     pub fn new(vertices: Vec<Vertex>, indices: Vec<[u32; 3]>) -> Self {
-        Self { vertices, indices }
+        Self {
+            vertices,
+            indices,
+            face_ids: Vec::new(),
+            faces: Vec::new(),
+        }
+    }
+
+    /// Creates a new triangle mesh with per-triangle `face_ids` and `faces` descriptors,
+    /// automatically computing exact `area`, `centroid`, `sample_point`, and `triangles_count` for each face.
+    pub fn with_faces(
+        vertices: Vec<Vertex>,
+        indices: Vec<[u32; 3]>,
+        face_ids: Vec<u32>,
+        faces: Vec<FaceInfo>,
+    ) -> Self {
+        let mut mesh = Self {
+            vertices,
+            indices,
+            face_ids,
+            faces,
+        };
+        mesh.recompute_face_registry();
+        mesh
     }
 
     /// Creates an empty mesh.
@@ -171,7 +350,99 @@ impl TriangleMesh {
         Self {
             vertices: Vec::new(),
             indices: Vec::new(),
+            face_ids: Vec::new(),
+            faces: Vec::new(),
         }
+    }
+
+    /// Recomputes `area`, `centroid`, `sample_point`, `triangles_count` (and planar `normal_or_axis`)
+    /// for all registered faces in `self.faces` from `self.vertices`, `self.indices`, and `self.face_ids`.
+    pub fn recompute_face_registry(&mut self) {
+        if self.indices.is_empty() {
+            self.face_ids.clear();
+            self.faces.clear();
+            return;
+        }
+
+        if !self.face_ids.is_empty() && self.face_ids.len() != self.indices.len() {
+            self.face_ids.resize(self.indices.len(), 0);
+        }
+
+        if self.faces.is_empty() || self.face_ids.is_empty() {
+            return;
+        }
+
+        for face in &mut self.faces {
+            face.area = 0.0;
+            face.centroid = [0.0, 0.0, 0.0];
+            face.sample_point = [0.0, 0.0, 0.0];
+            face.triangles_count = 0;
+        }
+
+        let mut weighted_centroids: Vec<Vector3<f64>> = vec![Vector3::zeros(); self.faces.len()];
+        let mut accum_normals: Vec<Vector3<f64>> = vec![Vector3::zeros(); self.faces.len()];
+        let mut tri_centroids: Vec<[f64; 3]> = Vec::with_capacity(self.indices.len());
+
+        for (t_idx, tri) in self.indices.iter().enumerate() {
+            let v0 = self.vertices[tri[0] as usize].pos_vec();
+            let v1 = self.vertices[tri[1] as usize].pos_vec();
+            let v2 = self.vertices[tri[2] as usize].pos_vec();
+
+            let cross = (v1 - v0).cross(&(v2 - v0));
+            let area = 0.5 * cross.norm();
+            let c = (v0 + v1 + v2) / 3.0;
+            tri_centroids.push([c.x, c.y, c.z]);
+
+            let fid = self.face_ids[t_idx];
+            if fid == 0 {
+                continue;
+            }
+
+            if let Some(pos) = self.faces.iter().position(|f| f.id == fid) {
+                self.faces[pos].area += area;
+                self.faces[pos].triangles_count += 1;
+                weighted_centroids[pos] += c * area;
+                accum_normals[pos] += cross;
+            }
+        }
+
+        for (f_idx, face) in self.faces.iter_mut().enumerate() {
+            if face.triangles_count == 0 {
+                continue;
+            }
+            if face.area > 1e-18 {
+                let ctr = weighted_centroids[f_idx] / face.area;
+                face.centroid = clean_zero_vec3([ctr.x, ctr.y, ctr.z]);
+            }
+            if face.kind == FaceKind::Plane {
+                let n_len = accum_normals[f_idx].norm();
+                if n_len > 1e-12 {
+                    let n = accum_normals[f_idx] / n_len;
+                    face.normal_or_axis = clean_zero_vec3([n.x, n.y, n.z]);
+                }
+            }
+
+            // Find the triangle belonging to `face.id` whose centroid is closest to `face.centroid`
+            let mut best_dist_sq = f64::INFINITY;
+            let mut best_pt = face.centroid;
+            for (t_idx, &fid) in self.face_ids.iter().enumerate() {
+                if fid == face.id {
+                    let tc = tri_centroids[t_idx];
+                    let dx = tc[0] - face.centroid[0];
+                    let dy = tc[1] - face.centroid[1];
+                    let dz = tc[2] - face.centroid[2];
+                    let d2 = dx * dx + dy * dy + dz * dz;
+                    if d2 < best_dist_sq {
+                        best_dist_sq = d2;
+                        best_pt = tc;
+                    }
+                }
+            }
+            face.sample_point = clean_zero_vec3(best_pt);
+        }
+
+        self.faces.retain(|f| f.triangles_count > 0);
+        self.faces.sort_by_key(|f| f.id);
     }
 
     /// Number of triangles in the mesh.
@@ -306,6 +577,18 @@ impl TriangleMesh {
             v.position[1] += translation[1];
             v.position[2] += translation[2];
         }
+        for face in &mut self.faces {
+            face.centroid = clean_zero_vec3([
+                face.centroid[0] + translation[0],
+                face.centroid[1] + translation[1],
+                face.centroid[2] + translation[2],
+            ]);
+            face.sample_point = clean_zero_vec3([
+                face.sample_point[0] + translation[0],
+                face.sample_point[1] + translation[1],
+                face.sample_point[2] + translation[2],
+            ]);
+        }
     }
 
     /// Scales all vertices of the mesh along X, Y, Z axes.
@@ -332,6 +615,52 @@ impl TriangleMesh {
                 tri.swap(1, 2);
             }
         }
+
+        if !self.faces.is_empty() {
+            let sx = scale_factors[0].abs();
+            let sy = scale_factors[1].abs();
+            let sz = scale_factors[2].abs();
+            for face in &mut self.faces {
+                if face.kind != FaceKind::Plane {
+                    let ax = face.normal_or_axis[0];
+                    let ay = face.normal_or_axis[1];
+                    let az = face.normal_or_axis[2];
+                    // Compute transverse scale factor perpendicular to axis
+                    let perp_scale = if face.kind == FaceKind::Sphere {
+                        (sx * sy * sz).cbrt()
+                    } else {
+                        let w_x = 1.0 - ax * ax;
+                        let w_y = 1.0 - ay * ay;
+                        let w_z = 1.0 - az * az;
+                        let w_sum = (w_x + w_y + w_z).max(1e-12);
+                        ((w_x * sx * sx + w_y * sy * sy + w_z * sz * sz) / w_sum).sqrt()
+                    };
+                    if let Some(ref mut r) = face.radius {
+                        *r *= perp_scale;
+                    }
+                    let nax = ax * scale_factors[0];
+                    let nay = ay * scale_factors[1];
+                    let naz = az * scale_factors[2];
+                    let n_len = (nax * nax + nay * nay + naz * naz).sqrt();
+                    if n_len > 1e-12 {
+                        face.normal_or_axis =
+                            clean_zero_vec3([nax / n_len, nay / n_len, naz / n_len]);
+                    }
+                } else if let Some(ref mut r) = face.radius {
+                    let nx = face.normal_or_axis[0];
+                    let ny = face.normal_or_axis[1];
+                    let nz = face.normal_or_axis[2];
+                    let w_x = 1.0 - nx * nx;
+                    let w_y = 1.0 - ny * ny;
+                    let w_z = 1.0 - nz * nz;
+                    let w_sum = (w_x + w_y + w_z).max(1e-12);
+                    let perp_scale =
+                        ((w_x * sx * sx + w_y * sy * sy + w_z * sz * sz) / w_sum).sqrt();
+                    *r *= perp_scale;
+                }
+            }
+            self.recompute_face_registry();
+        }
     }
 
     /// Rotates the mesh around X, Y, Z axes using Roll-Pitch-Yaw angles in degrees.
@@ -347,6 +676,24 @@ impl TriangleMesh {
             let n = rot * v.normal_vec();
             v.position = [pos.x, pos.y, pos.z];
             v.normal = [n.x, n.y, n.z];
+        }
+        for face in &mut self.faces {
+            let c = rot * Vector3::new(face.centroid[0], face.centroid[1], face.centroid[2]);
+            let s = rot
+                * Vector3::new(
+                    face.sample_point[0],
+                    face.sample_point[1],
+                    face.sample_point[2],
+                );
+            let n = rot
+                * Vector3::new(
+                    face.normal_or_axis[0],
+                    face.normal_or_axis[1],
+                    face.normal_or_axis[2],
+                );
+            face.centroid = clean_zero_vec3([c.x, c.y, c.z]);
+            face.sample_point = clean_zero_vec3([s.x, s.y, s.z]);
+            face.normal_or_axis = clean_zero_vec3([n.x, n.y, n.z]);
         }
     }
 
@@ -364,6 +711,25 @@ impl TriangleMesh {
             let n = rot * v.normal_vec();
             v.position = [pos.x, pos.y, pos.z];
             v.normal = [n.x, n.y, n.z];
+        }
+        for face in &mut self.faces {
+            let c = rot * Vector3::new(face.centroid[0], face.centroid[1], face.centroid[2]) + t;
+            let s = rot
+                * Vector3::new(
+                    face.sample_point[0],
+                    face.sample_point[1],
+                    face.sample_point[2],
+                )
+                + t;
+            let n = rot
+                * Vector3::new(
+                    face.normal_or_axis[0],
+                    face.normal_or_axis[1],
+                    face.normal_or_axis[2],
+                );
+            face.centroid = clean_zero_vec3([c.x, c.y, c.z]);
+            face.sample_point = clean_zero_vec3([s.x, s.y, s.z]);
+            face.normal_or_axis = clean_zero_vec3([n.x, n.y, n.z]);
         }
     }
 

@@ -1,3 +1,5 @@
+> ⚠ **Устарело:** утверждения не подтверждаются CI; источник истины — результаты `cargo test` (см. [`TASKS.md`](../TASKS.md) и [`VERIFICATION_REPORT.md`](../VERIFICATION_REPORT.md)).
+
 # MCP-CAD Engine: Mesh Quality Report (Round 2 Post-Fix Final Audit)
 
 Отчет о качестве полигональных сеток примитивов и операций по результатам полного цикла исправления дефектов Раунда 2 (BUG-018..BUG-024).

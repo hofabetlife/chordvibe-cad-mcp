@@ -156,14 +156,78 @@ impl MaterialRegistry {
         ));
     }
 
+    /// Resolves common material identifier aliases (such as `steel_1045`, `steel_4140`,
+    /// `alu_6061`, `Al6061-T6`, `ti_6al_4v`, `Ti-6Al-4V`, `pla_3d`, `petg_3d`, `nylon_pa6`)
+    /// to their canonical preset names in the registry.
+    pub fn resolve_alias(name: &str) -> &str {
+        let normalized = name.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+        match normalized.as_str() {
+            "steel_structural_aisi1020"
+            | "steel_1045"
+            | "steel_1020"
+            | "aisi_1020"
+            | "aisi1020"
+            | "aisi_1045"
+            | "aisi1045"
+            | "steel"
+            | "structural_steel"
+            | "steel_structural" => "steel_structural_aisi1020",
+
+            "steel_high_strength_4140"
+            | "steel_4140"
+            | "aisi_4140"
+            | "aisi4140"
+            | "4140"
+            | "alloy_steel_4140" => "steel_high_strength_4140",
+
+            "aluminum_6061_t6"
+            | "alu_6061"
+            | "alu_6061_t6"
+            | "al6061_t6"
+            | "al_6061_t6"
+            | "al6061"
+            | "al_6061"
+            | "aluminum_6061"
+            | "aluminum"
+            | "aluminium_6061_t6"
+            | "aluminium_6061"
+            | "aluminium" => "aluminum_6061_t6",
+
+            "titanium_grade5_ti6al4v"
+            | "ti_6al_4v"
+            | "ti6al4v"
+            | "titanium_ti6al4v"
+            | "titanium_grade5"
+            | "titanium_grade_5"
+            | "ti_grade5"
+            | "titanium" => "titanium_grade5_ti6al4v",
+
+            "brass_c360" | "brass_c36000" | "c360" | "c36000" | "brass" => "brass_c360",
+
+            "pla_filament_3dprint" | "pla_3d" | "pla_plastic" | "pla_filament" | "pla" => {
+                "pla_filament_3dprint"
+            }
+
+            "petg_filament_3dprint" | "petg_3d" | "petg_plastic" | "petg_filament" | "petg" => {
+                "petg_filament_3dprint"
+            }
+
+            "nylon_pa12" | "nylon_pa6" | "nylon" | "pa12" | "pa6" | "polyamide_12" => "nylon_pa12",
+
+            _ => name,
+        }
+    }
+
     /// Registers or overwrites a material by its name.
     pub fn register(&mut self, material: Material) {
         self.materials.insert(material.name.clone(), material);
     }
 
-    /// Looks up a material by name.
+    /// Looks up a material by name or known preset alias.
     pub fn get(&self, name: &str) -> Option<&Material> {
-        self.materials.get(name)
+        self.materials
+            .get(name)
+            .or_else(|| self.materials.get(Self::resolve_alias(name)))
     }
 
     /// Returns a list of all registered materials.
@@ -171,9 +235,10 @@ impl MaterialRegistry {
         self.materials.values().collect()
     }
 
-    /// Checks if a material is registered.
+    /// Checks if a material (or known preset alias) is registered.
     pub fn contains(&self, name: &str) -> bool {
         self.materials.contains_key(name)
+            || self.materials.contains_key(Self::resolve_alias(name))
     }
 
     /// Total number of materials registered.
@@ -205,6 +270,42 @@ mod tests {
         let steel = registry.get("steel_structural_aisi1020").unwrap();
         assert!((steel.youngs_modulus_gpa - 205.0).abs() < 1e-4);
         assert!((steel.density_kg_m3 - 7850.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_material_preset_aliases() {
+        let registry = MaterialRegistry::new();
+        // Default preset count remains 8 (aliases do not duplicate list() entries)
+        assert_eq!(registry.len(), 8);
+
+        let alias_pairs = [
+            ("steel_1045", "steel_structural_aisi1020"),
+            ("steel_1020", "steel_structural_aisi1020"),
+            ("AISI 1020", "steel_structural_aisi1020"),
+            ("steel_4140", "steel_high_strength_4140"),
+            ("AISI 4140", "steel_high_strength_4140"),
+            ("alu_6061", "aluminum_6061_t6"),
+            ("Al6061-T6", "aluminum_6061_t6"),
+            ("Al-6061-T6", "aluminum_6061_t6"),
+            ("aluminum_6061", "aluminum_6061_t6"),
+            ("ti_6al_4v", "titanium_grade5_ti6al4v"),
+            ("Ti-6Al-4V", "titanium_grade5_ti6al4v"),
+            ("Ti6Al4V", "titanium_grade5_ti6al4v"),
+            ("brass_c36000", "brass_c360"),
+            ("pla_3d", "pla_filament_3dprint"),
+            ("pla_plastic", "pla_filament_3dprint"),
+            ("petg_3d", "petg_filament_3dprint"),
+            ("petg_plastic", "petg_filament_3dprint"),
+            ("nylon_pa6", "nylon_pa12"),
+        ];
+
+        for (alias, canonical) in alias_pairs {
+            assert!(registry.contains(alias), "Registry should contain alias '{alias}'");
+            let mat = registry
+                .get(alias)
+                .unwrap_or_else(|| panic!("Alias '{alias}' failed to resolve"));
+            assert_eq!(mat.name, canonical);
+        }
     }
 
     #[test]

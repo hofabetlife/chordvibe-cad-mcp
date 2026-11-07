@@ -1,3 +1,5 @@
+> ⚠ **Устарело:** утверждения не подтверждаются CI; источник истины — результаты `cargo test` (см. [`TASKS.md`](../TASKS.md) и [`VERIFICATION_REPORT.md`](../VERIFICATION_REPORT.md)).
+
 # MCP-CAD Engine: Autonomous QA & R&D Final Report (Round 2)
 
 **Дата отчёта**: 2026-11-01  

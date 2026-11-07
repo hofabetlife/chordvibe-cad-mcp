@@ -582,21 +582,21 @@ async fn test_wide_scan_operations_and_chains() {
     let _ = call_tool(
         &state,
         "add_feature_primitive",
-        json!({"part_id": pid, "primitive_type": "box", "width": 0.1, "height": 0.1, "depth": 0.1}),
+        json!({"part_id": pid, "primitive_type": "box", "width": 100.0, "height": 100.0, "depth": 100.0}),
     )
     .await;
-    // Hole 1 along Z at y = -0.025
+    // Hole 1 along Z at y = -25 mm
     let _ = call_tool(
         &state,
         "cut_hole",
-        json!({"part_id": pid, "position": [0.0, -0.025, 0.0], "normal": [0.0, 0.0, 1.0], "radius": 0.012, "depth": 0.2}),
+        json!({"part_id": pid, "position": [0.0, -25.0, 0.0], "normal": [0.0, 0.0, 1.0], "radius": 12.0, "depth": 200.0}),
     )
     .await;
-    // Hole 2 along X at y = +0.025 (non-intersecting with Hole 1 -> genus = 2)
+    // Hole 2 along X at y = +25 mm (non-intersecting with Hole 1 -> genus = 2)
     let _ = call_tool(
         &state,
         "cut_hole",
-        json!({"part_id": pid, "position": [0.0, 0.025, 0.0], "normal": [1.0, 0.0, 0.0], "radius": 0.012, "depth": 0.2}),
+        json!({"part_id": pid, "position": [0.0, 25.0, 0.0], "normal": [1.0, 0.0, 0.0], "radius": 12.0, "depth": 200.0}),
     )
     .await;
     let (_, val_chain) = call_tool(
@@ -717,7 +717,7 @@ async fn test_wide_scan_analytical_benchmarks() {
     let _ = call_tool(
         &state,
         "add_feature_primitive",
-        json!({"part_id": beam_id, "primitive_type": "box", "width": 0.2, "height": 0.02, "depth": 0.02}),
+        json!({"part_id": beam_id, "primitive_type": "box", "width": 200.0, "height": 20.0, "depth": 20.0}),
     )
     .await;
     let (ok_fea, fea_res) = call_tool(
@@ -807,15 +807,15 @@ async fn test_wide_scan_functional_matrix_26_tools() {
     let (ok_valid_box, _) = call_tool(
         &state,
         "add_feature_primitive",
-        json!({"part_id": pid, "primitive_type": "box", "width": 0.1, "height": 0.1, "depth": 0.1}),
+        json!({"part_id": pid, "primitive_type": "box", "width": 100.0, "height": 100.0, "depth": 100.0}),
     )
     .await;
 
-    // Now try adding an invalid box (width = -0.1)
+    // Now try adding an invalid box (width = -100.0)
     let (ok_neg_box, _) = call_tool(
         &state,
         "add_feature_primitive",
-        json!({"part_id": pid, "primitive_type": "box", "width": -0.1, "height": 0.1, "depth": 0.1}),
+        json!({"part_id": pid, "primitive_type": "box", "width": -100.0, "height": 100.0, "depth": 100.0}),
     )
     .await;
 
@@ -833,7 +833,7 @@ async fn test_wide_scan_functional_matrix_26_tools() {
     let (ok_hole_after_fail, hole_err) = call_tool(
         &state,
         "cut_hole",
-        json!({"part_id": pid, "position": [0.0, 0.0, 0.0], "normal": [0.0, 0.0, 1.0], "radius": 0.02, "depth": 0.2}),
+        json!({"part_id": pid, "position": [0.0, 0.0, 0.0], "normal": [0.0, 0.0, 1.0], "radius": 20.0, "depth": 200.0}),
     )
     .await;
 
@@ -891,7 +891,7 @@ async fn test_wide_scan_functional_matrix_26_tools() {
     let (ok_prism_2sides, _) = call_tool(
         &state,
         "add_feature_primitive",
-        json!({"part_id": p2_id, "primitive_type": "polygon_prism", "sides": 2, "height": 0.05, "radius": 0.02}),
+        json!({"part_id": p2_id, "primitive_type": "polygon_prism", "sides": 2, "height": 50.0, "radius": 20.0}),
     )
     .await;
     matrix_results.push(json!({
@@ -1072,7 +1072,7 @@ async fn test_bug_005_polygon_prism_chamfer_and_sides_validation() {
     let (ok_s2, _) = call_tool(
         &state,
         "add_feature_primitive",
-        json!({"part_id": pid, "primitive_type": "polygon_prism", "sides": 2, "height": 0.05, "radius": 0.02}),
+        json!({"part_id": pid, "primitive_type": "polygon_prism", "sides": 2, "height": 50.0, "radius": 20.0}),
     )
     .await;
     assert!(!ok_s2, "sides=2 must be rejected by add_feature_primitive");
@@ -1379,7 +1379,7 @@ fn test_bug_008_dag_rollback_on_failed_rebuild() {
     let f_box = mcp_cad_server::tools::cad::add_feature_primitive(&json!({
         "part_id": part_id,
         "primitive_type": "box",
-        "params": {"width": 0.1, "height": 0.1, "depth": 0.1}
+        "params": {"width": 100.0, "height": 100.0, "depth": 100.0}
     }), &mut state).unwrap();
     let box_feat_id = f_box["feature_id"].as_str().unwrap();
 
@@ -1394,7 +1394,7 @@ fn test_bug_008_dag_rollback_on_failed_rebuild() {
         "position": [0.0, 0.0, 0.0],
         "normal": [0.0, 0.0, 1.0],
         "radius": 0.0,
-        "depth": 0.1
+        "depth": 100.0
     }), &mut state);
     assert!(bad_hole.is_err());
 
@@ -1402,11 +1402,11 @@ fn test_bug_008_dag_rollback_on_failed_rebuild() {
     assert_eq!(state.parts[part_id].dag.nodes.len(), 1);
     assert_eq!(state.parts[part_id].mesh.vertices.len(), initial_verts);
 
-    // 4. Attempt an invalid modify_feature (e.g. box width -0.05)
+    // 4. Attempt an invalid modify_feature (e.g. box width -50.0)
     let bad_mod = mcp_cad_server::tools::cad::modify_feature(&json!({
         "part_id": part_id,
         "feature_id": box_feat_id,
-        "params": {"width": -0.05}
+        "params": {"width": -50.0}
     }), &mut state);
     assert!(bad_mod.is_err());
 
@@ -1425,7 +1425,7 @@ fn test_bug_009_batch_operations_atomic_rollback() {
     mcp_cad_server::tools::cad::add_feature_primitive(&json!({
         "part_id": part_id,
         "primitive_type": "box",
-        "params": {"width": 0.1, "height": 0.1, "depth": 0.1}
+        "params": {"width": 100.0, "height": 100.0, "depth": 100.0}
     }), &mut state).unwrap();
 
     let initial_parts_count = state.parts.len();

@@ -3309,13 +3309,18 @@ export function evaluateFeatureTree(
       case 'polygon_prism': {
         const sides = Number(p.sides ?? 6);
         const outerR =
-          p.outer_radius !== undefined || p.outerRadius !== undefined
-            ? Number(p.outer_radius ?? p.outerRadius)
+          p.outer_radius !== undefined ||
+          p.outerRadius !== undefined ||
+          p.radius !== undefined ||
+          p.r !== undefined
+            ? Number(p.outer_radius ?? p.outerRadius ?? p.radius ?? p.r)
             : p.width_across_flats !== undefined
               ? Number(p.width_across_flats) / (2 * Math.cos(Math.PI / sides))
               : 0.0098;
         const h = Number(p.height ?? 0.008);
-        const chamferR = Number(p.chamfer_radius ?? p.chamferRadius ?? 0.0008);
+        const chamferR = Number(
+          p.chamfer_radius ?? p.chamferRadius ?? p.chamfer ?? 0.0008
+        );
         const boreR = Number(p.bore_radius ?? p.boreRadius ?? 0);
         const threadPitch = Number(p.thread_pitch ?? p.threadPitch ?? 0);
         const threadDepth = Number(p.thread_depth ?? p.threadDepth ?? 0);
@@ -3406,13 +3411,16 @@ export function evaluateFeatureTree(
         break;
       }
       case 'cut_hole': {
-        const r = Number(p.radius ?? 0.005);
+        const r = Number(
+          p.radius ?? (p.diameter !== undefined ? Number(p.diameter) * 0.5 : 0.005)
+        );
         const d = Number(p.depth ?? 0.05);
         const pos: [number, number, number] = Array.isArray(p.position)
           ? [Number(p.position[0]), Number(p.position[1]), Number(p.position[2])]
           : [0, 0, 0];
-        const norm: [number, number, number] = Array.isArray(p.normal)
-          ? [Number(p.normal[0]), Number(p.normal[1]), Number(p.normal[2])]
+        const rawNorm = p.normal ?? p.direction;
+        const norm: [number, number, number] = Array.isArray(rawNorm)
+          ? [Number(rawNorm[0]), Number(rawNorm[1]), Number(rawNorm[2])]
           : [0, -1, 0];
         const kwW = p.keyway_width !== undefined ? Number(p.keyway_width) : undefined;
         const kwD = p.keyway_depth !== undefined ? Number(p.keyway_depth) : undefined;
@@ -3426,9 +3434,9 @@ export function evaluateFeatureTree(
           const bp = basePrimitiveNode.params;
           currentMesh = createPolygonPrismMesh(
             Number(bp.sides ?? 6),
-            Number(bp.outer_radius ?? 0.0098),
+            Number(bp.outer_radius ?? bp.outerRadius ?? bp.radius ?? bp.r ?? 0.0098),
             Number(bp.height ?? 0.008),
-            Number(bp.chamfer_radius ?? 0.0008),
+            Number(bp.chamfer_radius ?? bp.chamferRadius ?? bp.chamfer ?? 0.0008),
             density,
             r
           );

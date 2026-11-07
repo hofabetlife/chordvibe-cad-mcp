@@ -113,13 +113,90 @@ export const MATERIALS_LIBRARY: MaterialSpec[] = [
 
 export const DEFAULT_MATERIALS = MATERIALS_LIBRARY;
 
+const MATERIAL_ALIAS_MAP: Record<string, string> = {
+  steel_structural_aisi1020: 'steel_1045',
+  steel_1045: 'steel_1045',
+  steel_1020: 'steel_1045',
+  aisi_1020: 'steel_1045',
+  aisi1020: 'steel_1045',
+  aisi_1045: 'steel_1045',
+  aisi1045: 'steel_1045',
+  steel: 'steel_1045',
+  structural_steel: 'steel_1045',
+  steel_structural: 'steel_1045',
+
+  steel_high_strength_4140: 'steel_4140',
+  steel_4140: 'steel_4140',
+  aisi_4140: 'steel_4140',
+  aisi4140: 'steel_4140',
+  '4140': 'steel_4140',
+  alloy_steel_4140: 'steel_4140',
+
+  aluminum_6061_t6: 'alu_6061',
+  alu_6061: 'alu_6061',
+  alu_6061_t6: 'alu_6061',
+  al6061_t6: 'alu_6061',
+  al_6061_t6: 'alu_6061',
+  al6061: 'alu_6061',
+  al_6061: 'alu_6061',
+  aluminum_6061: 'alu_6061',
+  aluminum: 'alu_6061',
+  aluminium_6061_t6: 'alu_6061',
+  aluminium_6061: 'alu_6061',
+  aluminium: 'alu_6061',
+
+  titanium_grade5_ti6al4v: 'ti_6al_4v',
+  ti_6al_4v: 'ti_6al_4v',
+  ti6al4v: 'ti_6al_4v',
+  titanium_ti6al4v: 'ti_6al_4v',
+  titanium_grade5: 'ti_6al_4v',
+  titanium_grade_5: 'ti_6al_4v',
+  ti_grade5: 'ti_6al_4v',
+  titanium: 'ti_6al_4v',
+
+  brass_c360: 'brass_c360',
+  brass_c36000: 'brass_c360',
+  c360: 'brass_c360',
+  c36000: 'brass_c360',
+  brass: 'brass_c360',
+
+  pla_filament_3dprint: 'pla_3d',
+  pla_3d: 'pla_3d',
+  pla_plastic: 'pla_3d',
+  pla_filament: 'pla_3d',
+  pla: 'pla_3d',
+
+  petg_filament_3dprint: 'petg_3d',
+  petg_3d: 'petg_3d',
+  petg_plastic: 'petg_3d',
+  petg_filament: 'petg_3d',
+  petg: 'petg_3d',
+
+  nylon_pa12: 'nylon_pa12',
+  nylon_pa6: 'nylon_pa12',
+  nylon: 'nylon_pa12',
+  pa12: 'nylon_pa12',
+  pa6: 'nylon_pa12',
+  polyamide_12: 'nylon_pa12',
+};
+
+export function resolveMaterialAlias(id: string): string {
+  const normalized = String(id || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[-\s]+/g, '_');
+  return MATERIAL_ALIAS_MAP[normalized] || id;
+}
+
 export function getMaterialById(
   id: string,
   customList: MaterialSpec[] = MATERIALS_LIBRARY
 ): MaterialSpec {
+  const resolved = resolveMaterialAlias(id);
   return (
-    customList.find((m) => m.id === id) ||
-    MATERIALS_LIBRARY.find((m) => m.id === id) ||
+    customList.find((m) => m.id === id || m.id === resolved) ||
+    MATERIALS_LIBRARY.find((m) => m.id === id || m.id === resolved) ||
     MATERIALS_LIBRARY[0]
   );
 }
+

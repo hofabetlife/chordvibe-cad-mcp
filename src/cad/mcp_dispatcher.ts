@@ -24,6 +24,7 @@ import {
   csgUnionMesh,
 } from './csg_bsp';
 import { optimizeCadFeatureTree } from './query_optimizer';
+import { getMaterialById, resolveMaterialAlias } from './materials';
 
 export interface McpToolDefinition {
   name: string;
@@ -422,7 +423,11 @@ export function executeMcpToolOnEngineState(
   let exportedStlBuffer: { filename: string; buffer: ArrayBuffer } | undefined;
 
   const getDensity = (matId: string): number => {
-    return state.materials.find((m) => m.id === matId)?.density ?? 7850;
+    const resolved = resolveMaterialAlias(matId);
+    return (
+      state.materials.find((m) => m.id === matId || m.id === resolved)
+        ?.density ?? getMaterialById(matId, state.materials).density ?? 7850
+    );
   };
 
   let response: Record<string, any> = {};
@@ -560,8 +565,21 @@ export function executeMcpToolOnEngineState(
 
     case 'cut_hole': {
       const part = resolveTargetPart(state, params.part_id);
-      const radius = Number(params.radius ?? 0.005);
-      const depth = Number(params.depth ?? 0.04);
+      const radius = Number(
+        params.radius ??
+          (params.diameter !== undefined ? Number(params.diameter) * 0.5 : 0.005)
+      );
+      const through = Boolean(params.through ?? params.through_all ?? false);
+      const bbox = part.mesh.boundingBox;
+      const maxSpan = Math.max(
+        0.04,
+        bbox.max[0] - bbox.min[0],
+        bbox.max[1] - bbox.min[1],
+        bbox.max[2] - bbox.min[2]
+      );
+      const depth = through
+        ? Math.max(Number(params.depth ?? 0), maxSpan)
+        : Number(params.depth ?? 0.04);
       if (radius <= 0 || depth <= 0) {
         throw new Error('cut_hole requires radius > 0 and depth > 0');
       }
@@ -573,10 +591,11 @@ export function executeMcpToolOnEngineState(
             : `Hole Ø${(radius * 2000).toFixed(1)}mm`,
         type: 'cut_hole' as const,
         params: {
-          position: params.position || [0, 0, 0],
-          normal: params.normal || [0, 0, -1],
+          position: params.position || params.center || [0, 0, 0],
+          normal: params.normal || params.direction || [0, 0, -1],
           radius,
           depth,
+          ...(through ? { through: true } : {}),
           ...(params.keyway_width !== undefined
             ? { keyway_width: Number(params.keyway_width) }
             : {}),
@@ -1083,9 +1102,18 @@ export function executeMcpToolOnEngineState(
     }
 
     case 'create_joint': {
-      const jointId = String(params.joint_id || `joint_${state.joints.length + 1}`);
+      const rawJointId = params.joint_id ?? params.id;
+      if (rawJointId !== undefined && rawJointId !== null) {
+        if (typeof rawJointId !== 'string' || !rawJointId.trim()) {
+          throw new Error("Argument 'joint_id' must be a non-empty string");
+        }
+      }
+      const jointId = rawJointId
+        ? String(rawJointId).trim()
+        : `joint_${state.joints.length + 1}`;
       const jointType = String(params.joint_type || 'revolute') as KinematicJoint['type'];
-      const partA = String(params.part_a || 'world');
+      const rawPartA = String(params.part_a || 'world');
+      const partA = rawPartA === 'ground' ? 'world' : rawPartA;
       const partB =
         params.part_b === 'active' || !params.part_b
           ? state.selectedPartId
@@ -1098,17 +1126,18 @@ export function executeMcpToolOnEngineState(
         throw new Error(`create_joint part_b '${partB}' does not exist`);
       }
 
+      const rawAnchor = params.anchor ?? params.anchor_a ?? params.anchor_b;
       const newJoint: KinematicJoint = {
         id: jointId,
         name: String(params.name || `${jointType.toUpperCase()} (${partB})`),
         type: jointType,
         partA,
         partB,
-        anchor: Array.isArray(params.anchor)
+        anchor: Array.isArray(rawAnchor)
           ? [
-              Number(params.anchor[0]),
-              Number(params.anchor[1]),
-              Number(params.anchor[2]),
+              Number(rawAnchor[0]),
+              Number(rawAnchor[1]),
+              Number(rawAnchor[2]),
             ]
           : [0, 0, 0],
         axis: Array.isArray(params.axis)
@@ -1123,7 +1152,11 @@ export function executeMcpToolOnEngineState(
         motorEnabled: Boolean(params.motor_enabled ?? false),
         currentAngleRad: 0,
         gearRatio:
-          params.gear_ratio !== undefined ? Number(params.gear_ratio) : undefined,
+          params.gear_ratio !== undefined
+            ? Number(params.gear_ratio)
+            : params.ratio !== undefined
+              ? Number(params.ratio)
+              : undefined,
       };
 
       state.joints = [
@@ -1147,7 +1180,7 @@ export function executeMcpToolOnEngineState(
         throw new Error(`Joint '${jointId}' not found`);
       }
       const targetVel = Number(params.target_velocity ?? 6.283);
-      const maxTorque = Number(params.max_torque ?? 45.0);
+      const maxTorque = Number(params.max_torque ?? params.max_force ?? 45.0);
       joint.motorSpeedRpm = targetVel;
       joint.motorTorqueNm = maxTorque;
       joint.motorEnabled = Math.abs(targetVel) > 1e-6;

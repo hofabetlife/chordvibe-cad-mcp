@@ -299,17 +299,31 @@ pub fn weld_vertices(mesh: &TriangleMesh, tolerance: f64) -> TriangleMesh {
         index_remap.push(new_idx);
     }
 
+    let has_face_ids = mesh.face_ids.len() == mesh.indices.len();
     let mut welded_indices = Vec::with_capacity(mesh.indices.len());
-    for tri in &mesh.indices {
+    let mut welded_face_ids = if has_face_ids {
+        Vec::with_capacity(mesh.indices.len())
+    } else {
+        Vec::new()
+    };
+
+    for (t_idx, tri) in mesh.indices.iter().enumerate() {
         let i0 = index_remap[tri[0] as usize];
         let i1 = index_remap[tri[1] as usize];
         let i2 = index_remap[tri[2] as usize];
         if i0 != i1 && i1 != i2 && i0 != i2 {
             welded_indices.push([i0, i1, i2]);
+            if has_face_ids {
+                welded_face_ids.push(mesh.face_ids[t_idx]);
+            }
         }
     }
 
-    let mut new_mesh = TriangleMesh::new(welded_vertices, welded_indices);
+    let mut new_mesh = if has_face_ids {
+        TriangleMesh::with_faces(welded_vertices, welded_indices, welded_face_ids, mesh.faces.clone())
+    } else {
+        TriangleMesh::new(welded_vertices, welded_indices)
+    };
     new_mesh.recompute_vertex_normals();
     new_mesh
 }

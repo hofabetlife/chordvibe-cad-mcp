@@ -1496,7 +1496,78 @@ describe('MCP-CAD Core Geometry & Topological Verification Suite', () => {
 
     assert.equal(totalChainsTested, 1000, 'Exactly 1,000 fuzzer chains must be executed');
   });
+
+  it('supports P2-T13 custom joint_id, cut_hole through: true, revolve.inner_radius, polygon_prism aliases, and material ID aliases', () => {
+    let state: EngineStateSnapshot = {
+      parts: [],
+      selectedPartId: '',
+      joints: [],
+      materials: [...DEFAULT_MATERIALS],
+      feaResult: null,
+      physicsFrames: [],
+      quality: 'standard',
+      renderMode: 'shaded',
+    };
+
+    // 1. Annular bushing via revolve with 2-point profile + inner_radius and brass_c36000 alias
+    state = executeMcpToolOnEngineState(state, 'add_feature_primitive', {
+      part_id: 't07_bushing',
+      material: 'brass_c36000',
+      primitive_type: 'revolve',
+      params: {
+        profile: [
+          [0.035, -0.04],
+          [0.035, 0.04],
+        ],
+        inner_radius: 0.015,
+        angle_deg: 360,
+      },
+    }).nextState;
+    const bushing = state.parts.find((p) => p.id === 't07_bushing')!;
+    assert.equal(bushing.mesh.isWatertight, true);
+    assert.equal(bushing.mesh.eulerGenus, 1);
+
+    // 2. Hex nut M10 with polygon_prism (outer_radius/chamfer_radius) + cut_hole (through: true)
+    state = executeMcpToolOnEngineState(state, 'add_feature_primitive', {
+      part_id: 't08_nut_m10',
+      material: 'steel_high_strength_4140',
+      primitive_type: 'polygon_prism',
+      params: {
+        sides: 6,
+        outer_radius: 0.0098,
+        height: 0.008,
+        chamfer_radius: 0.0008,
+      },
+    }).nextState;
+    state = executeMcpToolOnEngineState(state, 'cut_hole', {
+      part_id: 't08_nut_m10',
+      position: [0, 0, 0],
+      normal: [0, 0, -1],
+      radius: 0.00425,
+      through: true,
+    }).nextState;
+    const nut = state.parts.find((p) => p.id === 't08_nut_m10')!;
+    assert.equal(nut.mesh.isWatertight, true);
+    assert.equal(nut.mesh.eulerGenus, 1);
+
+    // 3. Custom joint_id in create_joint + set_joint_motor
+    const jRes = executeMcpToolOnEngineState(state, 'create_joint', {
+      joint_id: 'j_custom_bushing',
+      joint_type: 'revolute',
+      part_a: 'ground',
+      part_b: 't07_bushing',
+      axis: [0, 0, 1],
+    });
+    state = jRes.nextState;
+    assert.equal(jRes.response.joint_id, 'j_custom_bushing');
+
+    const mRes = executeMcpToolOnEngineState(state, 'set_joint_motor', {
+      joint_id: 'j_custom_bushing',
+      target_velocity: 6.283185,
+      max_force: 120.0,
+    });
+    assert.equal(mRes.response.status, 'motor_configured');
+    assert.equal(mRes.response.joint_id, 'j_custom_bushing');
+  });
 });
-
-
 

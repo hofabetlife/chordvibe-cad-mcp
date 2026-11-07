@@ -1,3 +1,5 @@
+> ⚠ **Устарело:** утверждения не подтверждаются CI; источник истины — результаты `cargo test` (см. [`TASKS.md`](../TASKS.md) и [`VERIFICATION_REPORT.md`](../VERIFICATION_REPORT.md)).
+
 # MCP-CAD Engine: Round 2 Bug Registry (`BUG-018` .. `BUG-024`)
 
 > **Note**: Historical bugs BUG-001 through BUG-017 resolved in Round 1 have been archived in [`qa/archive/round1/FIXED_BUGS.md`](./archive/round1/FIXED_BUGS.md).

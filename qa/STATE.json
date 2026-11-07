@@ -1,4 +1,5 @@
 {
+  "_warning": "⚠ Устарело: утверждения не подтверждаются CI; источник истины — результаты `cargo test` (см. TASKS.md и VERIFICATION_REPORT.md).",
   "round": 2,
   "branch": "qa/round2-2026-11-01",
   "phase": "PHASE_2_CLEANUP_COMPLETE",

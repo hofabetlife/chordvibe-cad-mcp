@@ -151,12 +151,12 @@
       "issues": [],
       "orientation_consistent": true,
       "quality": "coarse",
-      "signed_volume": 0.0002585552390254817,
+      "signed_volume": 0.0002558415252971122,
       "status": "PASS",
       "target": "cone_sharp",
-      "triangles": 598,
+      "triangles": 502,
       "warnings": [
-        "Notice: 896 un-welded duplicate vertices found (CAD split normals)"
+        "Notice: 774 un-welded duplicate vertices found (CAD split normals)"
       ],
       "watertight": true
     },
@@ -181,12 +181,12 @@
       "issues": [],
       "orientation_consistent": true,
       "quality": "medium",
-      "signed_volume": 0.0002606167582680273,
+      "signed_volume": 0.00026026565641554993,
       "status": "PASS",
       "target": "cone_sharp",
-      "triangles": 1550,
+      "triangles": 1422,
       "warnings": [
-        "Notice: 2474 un-welded duplicate vertices found (CAD split normals)"
+        "Notice: 2318 un-welded duplicate vertices found (CAD split normals)"
       ],
       "watertight": true
     },
@@ -211,12 +211,12 @@
       "issues": [],
       "orientation_consistent": true,
       "quality": "fine",
-      "signed_volume": 0.0002614552678897113,
+      "signed_volume": 0.0002614460889350857,
       "status": "PASS",
       "target": "cone_sharp",
-      "triangles": 4536,
+      "triangles": 4508,
       "warnings": [
-        "Notice: 7391 un-welded duplicate vertices found (CAD split normals)"
+        "Notice: 7363 un-welded duplicate vertices found (CAD split normals)"
       ],
       "watertight": true
     },
@@ -258,12 +258,12 @@
       "issues": [],
       "orientation_consistent": true,
       "sides": 3,
-      "signed_volume": 0.00010368704845413267,
+      "signed_volume": 0.00010368704845413214,
       "status": "PASS",
       "target": "polygon_prism_3sides_chamfer_0.002",
-      "triangles": 420,
+      "triangles": 732,
       "warnings": [
-        "Notice: 588 un-welded duplicate vertices found (CAD split normals)"
+        "Notice: 1278 un-welded duplicate vertices found (CAD split normals)"
       ],
       "watertight": true
     },
@@ -290,12 +290,12 @@
       "issues": [],
       "orientation_consistent": true,
       "sides": 4,
-      "signed_volume": 0.00007974487949697456,
+      "signed_volume": 0.00007974487949697445,
       "status": "PASS",
       "target": "polygon_prism_4sides_chamfer_0.002",
-      "triangles": 256,
+      "triangles": 480,
       "warnings": [
-        "Notice: 352 un-welded duplicate vertices found (CAD split normals)"
+        "Notice: 824 un-welded duplicate vertices found (CAD split normals)"
       ],
       "watertight": true
     },
@@ -322,12 +322,12 @@
       "issues": [],
       "orientation_consistent": true,
       "sides": 6,
-      "signed_volume": 0.000069012904173544,
+      "signed_volume": 0.00006901290417354391,
       "status": "PASS",
       "target": "polygon_prism_6sides_chamfer_0.002",
-      "triangles": 180,
+      "triangles": 336,
       "warnings": [
-        "Notice: 306 un-welded duplicate vertices found (CAD split normals)"
+        "Notice: 564 un-welded duplicate vertices found (CAD split normals)"
       ],
       "watertight": true
     },
@@ -354,12 +354,12 @@
       "issues": [],
       "orientation_consistent": true,
       "sides": 8,
-      "signed_volume": 0.0000660000730267146,
+      "signed_volume": 0.00006600007302671466,
       "status": "PASS",
       "target": "polygon_prism_8sides_chamfer_0.002",
-      "triangles": 384,
+      "triangles": 464,
       "warnings": [
-        "Notice: 544 un-welded duplicate vertices found (CAD split normals)"
+        "Notice: 776 un-welded duplicate vertices found (CAD split normals)"
       ],
       "watertight": true
     },
@@ -443,10 +443,12 @@
     {
       "euler_chi": 0,
       "genus": 1.0,
-      "issues": [],
+      "issues": [
+        "Sliver quality gate failed: 2 needle triangles with min angle < 1° (min_angle=0.6600°)"
+      ],
       "orientation_consistent": true,
       "signed_volume": 0.0001705396415471469,
-      "status": "PASS",
+      "status": "FAIL",
       "target": "spur_gear_teeth_60_with_hub_bore_keyway",
       "teeth": 60,
       "triangles": 33172,
@@ -508,9 +510,8 @@
       "signed_volume": 0.000050184775848732156,
       "status": "PASS",
       "target": "revolve_partial_180",
-      "triangles": 1852,
+      "triangles": 1844,
       "warnings": [
-        "Notice: 8 sliver triangles detected (min angle < 5° or aspect ratio > 100)",
         "Notice: 980 un-welded duplicate vertices found (CAD split normals)"
       ],
       "watertight": true
@@ -520,12 +521,12 @@
       "genus": 0.0,
       "issues": [],
       "orientation_consistent": true,
-      "signed_volume": 0.00011237202548129023,
+      "signed_volume": 0.0001123720254812905,
       "status": "PASS",
       "target": "revolve_touching_axis_360",
-      "triangles": 832,
+      "triangles": 640,
       "warnings": [
-        "Notice: 478 un-welded duplicate vertices found (CAD split normals)"
+        "Notice: 350 un-welded duplicate vertices found (CAD split normals)"
       ],
       "watertight": true
     },
@@ -534,7 +535,7 @@
       "genus": 11.0,
       "issues": [],
       "orientation_consistent": true,
-      "signed_volume": 0.0038188091386453598,
+      "signed_volume": 0.003818809138645353,
       "spokes": 5,
       "status": "PASS",
       "target": "wheel_rim_5spoke",
@@ -549,7 +550,7 @@
       "genus": 12.0,
       "issues": [],
       "orientation_consistent": true,
-      "signed_volume": 0.003851659058962717,
+      "signed_volume": 0.003851659058962761,
       "spokes": 6,
       "status": "PASS",
       "target": "wheel_rim_6spoke",
@@ -564,7 +565,7 @@
       "genus": 16.0,
       "issues": [],
       "orientation_consistent": true,
-      "signed_volume": 0.004061663630599119,
+      "signed_volume": 0.004061663630599059,
       "spokes": 10,
       "status": "PASS",
       "target": "wheel_rim_10spoke",

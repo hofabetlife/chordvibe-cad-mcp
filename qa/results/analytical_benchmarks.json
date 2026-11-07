@@ -40,21 +40,21 @@
     },
     {
       "benchmark": "fea_cantilever_beam",
-      "delta_mm_actual": 0.5361825705874009,
+      "delta_mm_actual": 0.8783159830639895,
       "delta_mm_expected": 1.0,
-      "delta_rel_err": 0.46381742941259907,
+      "delta_rel_err": 0.1216840169360105,
       "fos_err": 0.0,
       "ok": true,
-      "pass": false,
-      "sigma_mpa_actual": 85.42534259260582,
+      "pass": true,
+      "sigma_mpa_actual": 133.4092941652343,
       "sigma_mpa_expected": 150.0,
-      "sigma_rel_err": 0.43049771604929454
+      "sigma_rel_err": 0.11060470556510477
     },
     {
       "benchmark": "fea_axial_rod_tension",
-      "delta_mm_actual": 0.09923686233539109,
+      "delta_mm_actual": 0.09795140231170044,
       "delta_mm_expected": 0.1,
-      "delta_rel_err": 0.007631376646089205,
+      "delta_rel_err": 0.020485976882995693,
       "ok": true,
       "pass": true
     }

@@ -15,7 +15,9 @@ pub mod solver;
 pub mod tetra_mesh;
 
 pub use boundary::{
-    AabbFace, BoundaryConditions, DirichletConstraint, DofComponent, NeumannLoad, ResolvedBoundary,
+    extract_face_triangles, match_surface_nodes_and_weights, point_to_triangle_distance_3d,
+    AabbFace, BoundaryConditions, DirichletConstraint, DofComponent, MatchedSurfaceNode,
+    NeumannLoad, ResolvedBoundary,
 };
 pub use elasticity::{
     bulk_modulus, elasticity_matrix_from_material, isotropic_elasticity_matrix, shear_modulus,

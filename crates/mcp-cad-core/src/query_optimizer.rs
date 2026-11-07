@@ -286,7 +286,7 @@ pub fn estimate_dag_cost(
             continue;
         }
 
-        let mut node_cost_ms = 0.5;
+        let node_cost_ms;
         let mut op_desc = node.name.clone();
 
         match &node.op {
@@ -1216,14 +1216,29 @@ pub fn optimize_feature_tree_dag(
     let genus_before = val_before.topology.genus.round() as i32;
     let genus_after = val_after.topology.genus.round() as i32;
 
-    // Equivalence passes if ΔV < 0.5% and watertightness is preserved or improved
-    let equivalence_ok = vol_delta_pct < 0.5
-        && (!val_before.topology.is_watertight || val_after.topology.is_watertight);
+    // Equivalence passes if candidate passes validate_mesh (status == "PASS"), ΔV <= 1.0%,
+    // watertightness is preserved or improved, and genus matches when watertight.
+    // If the input logical tree already had mesh defects (e.g. helical cutter CSG slivers),
+    // candidate mesh must not degrade mesh issues.
+    let mesh_validation_passed = if val_before.status == "PASS" {
+        val_after.status == "PASS"
+    } else {
+        val_after.status == "PASS" || val_after.issues.len() <= val_before.issues.len()
+    };
+    let genus_ok = !val_before.topology.is_watertight
+        || !val_after.topology.is_watertight
+        || genus_before == genus_after;
+
+    let equivalence_ok = applied_rules.is_empty()
+        || (vol_delta_pct <= 1.0
+            && mesh_validation_passed
+            && (!val_before.topology.is_watertight || val_after.topology.is_watertight)
+            && genus_ok);
 
     let (final_tree, final_vol_after, final_val_after, final_delta_pct) = if equivalence_ok {
         (candidate_tree, vol_after, val_after, vol_delta_pct)
     } else {
-        // Safe fallback to logical tree if any rewrite exceeded volume tolerance
+        // Safe fallback to logical tree if any rewrite exceeded volume tolerance or failed validation
         current_nodes = logical_nodes.clone();
         applied_rules.clear();
         fused_prism_thread = false;
@@ -1300,7 +1315,7 @@ pub fn optimize_feature_tree_dag(
     };
 
     let equivalence_verification = EquivalenceVerification {
-        passed: true,
+        passed: equivalence_ok,
         volume_before_m3: vol_before,
         volume_after_m3: final_vol_after,
         volume_before_cm3: vol_before * 1.0e6,
@@ -1405,6 +1420,121 @@ mod tests {
         );
         assert!(report.equivalence_verification.watertight_after);
         assert_eq!(report.equivalence_verification.genus_after, 1);
+
+        let optimized_mesh = optimized_tree
+            .evaluate_with_settings(&settings)
+            .expect("Optimized tree evaluation failed");
+        let val = validate_mesh(&optimized_mesh, None);
+        assert_eq!(
+            val.status, "PASS",
+            "Optimized revolve mesh must pass validate_mesh: {:?}",
+            val.issues
+        );
+    }
+
+    #[test]
+    fn test_r4_negative_off_axis_hole_does_not_trigger_revolve_reduction() {
+        let settings = TessellationSettings::default();
+
+        // Case 1: Hole parallel to cylinder Z axis, but shifted off-axis in XY
+        let mut tree_offset_xy = FeatureTree::new();
+        tree_offset_xy.add_feature(
+            FeatureOp::AddCylinder {
+                radius: 0.030,
+                height: 0.050,
+                segments: 32,
+                position: None,
+                rotation_deg: None,
+            },
+            Some("Outer Cylinder".into()),
+        );
+        tree_offset_xy.add_feature(
+            FeatureOp::CutHole {
+                center: [0.010, 0.0, 0.0], // 10mm radial offset -> NOT coaxial!
+                normal: [0.0, 0.0, 1.0],
+                radius: 0.005,
+                depth: 0.060,
+                keyway_width: None,
+                keyway_depth: None,
+            },
+            Some("Off-Axis Hole".into()),
+        );
+
+        let (report_xy, optimized_tree_xy) = optimize_feature_tree_dag(
+            "part-eccentric",
+            "Off-Axis Bushing",
+            &tree_offset_xy,
+            &settings,
+            true,
+        )
+        .expect("Optimization should succeed");
+
+        assert!(
+            !report_xy
+                .applied_rules
+                .contains(&"R4_COAXIAL_REVOLVE_REDUCTION".to_string()),
+            "Off-axis hole in XY must NOT trigger R4_COAXIAL_REVOLVE_REDUCTION, applied: {:?}",
+            report_xy.applied_rules
+        );
+        assert_eq!(
+            report_xy.physical_nodes_count, 2,
+            "Off-axis hole must preserve both nodes in physical plan (CSG subtractive)"
+        );
+        assert!(
+            matches!(optimized_tree_xy.nodes[0].op, FeatureOp::AddCylinder { .. }),
+            "Base operation must remain AddCylinder"
+        );
+        assert!(report_xy.equivalence_verification.passed);
+
+        // Case 2: Transverse cross-hole (normal along X instead of Z)
+        let mut tree_cross_hole = FeatureTree::new();
+        tree_cross_hole.add_feature(
+            FeatureOp::AddCylinder {
+                radius: 0.030,
+                height: 0.050,
+                segments: 32,
+                position: None,
+                rotation_deg: None,
+            },
+            Some("Outer Cylinder".into()),
+        );
+        tree_cross_hole.add_feature(
+            FeatureOp::CutHole {
+                center: [0.0, 0.0, 0.0],
+                normal: [1.0, 0.0, 0.0], // Transverse normal along X -> NOT coaxial with Z!
+                radius: 0.005,
+                depth: 0.070,
+                keyway_width: None,
+                keyway_depth: None,
+            },
+            Some("Transverse Cross-Hole".into()),
+        );
+
+        let (report_transverse, optimized_tree_transverse) = optimize_feature_tree_dag(
+            "part-cross-hole",
+            "Cross-Hole Cylinder",
+            &tree_cross_hole,
+            &settings,
+            true,
+        )
+        .expect("Optimization should succeed");
+
+        assert!(
+            !report_transverse
+                .applied_rules
+                .contains(&"R4_COAXIAL_REVOLVE_REDUCTION".to_string()),
+            "Transverse hole must NOT trigger R4_COAXIAL_REVOLVE_REDUCTION, applied: {:?}",
+            report_transverse.applied_rules
+        );
+        assert_eq!(
+            report_transverse.physical_nodes_count, 2,
+            "Transverse hole must preserve both nodes in physical plan"
+        );
+        assert!(
+            matches!(optimized_tree_transverse.nodes[0].op, FeatureOp::AddCylinder { .. }),
+            "Base operation must remain AddCylinder"
+        );
+        assert!(report_transverse.equivalence_verification.passed);
     }
 
     #[test]

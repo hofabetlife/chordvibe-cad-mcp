@@ -1,3 +1,5 @@
+> ⚠ **Устарело:** утверждения не подтверждаются CI; источник истины — результаты `cargo test` (см. [`TASKS.md`](../TASKS.md) и [`VERIFICATION_REPORT.md`](../VERIFICATION_REPORT.md)).
+
 # MCP-CAD Engine: Coverage Matrix (Round 2)
 
 Матрица инструментов (28 шт.) по сценариям тестирования:

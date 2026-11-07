@@ -362,4 +362,203 @@ fn test_mesh_edge_refinement() {
         refined_max_len
     );
     assert!(refined.indices.len() > box_mesh.indices.len());
+    assert_eq!(
+        refined.face_ids.len(),
+        refined.indices.len(),
+        "Refined mesh must preserve face_ids per triangle"
+    );
+    assert_eq!(
+        refined.faces.len(),
+        box_mesh.faces.len(),
+        "Refined mesh must preserve all logical FaceInfo entries"
+    );
 }
+
+#[test]
+fn test_p2_t8_cylindrical_shaft_axial_tension_by_named_faces() {
+    use mcp_cad_core::primitives::create_cylinder;
+    use mcp_cad_fea::{extract_face_triangles, DofComponent};
+
+    let e_gpa = 205.0;
+    let e_pa = e_gpa * 1.0e9;
+    let material = Material::new(
+        "steel_structural_aisi1020",
+        e_gpa,
+        0.29,
+        250.0,
+        7850.0,
+        "Structural steel",
+    );
+
+    let radius = 0.025; // 25 mm
+    let length = 0.25; // 250 mm
+    let cyl_mesh = create_cylinder(radius, length, 48);
+
+    let cap_bottom = cyl_mesh
+        .faces
+        .iter()
+        .find(|f| f.role == "cap_bottom")
+        .expect("Cylinder must have cap_bottom face");
+    let cap_top = cyl_mesh
+        .faces
+        .iter()
+        .find(|f| f.role == "cap_top")
+        .expect("Cylinder must have cap_top face");
+
+    let bottom_tris = extract_face_triangles(&cyl_mesh, &[cap_bottom.id]);
+    let top_tris = extract_face_triangles(&cyl_mesh, &[cap_top.id]);
+    assert!(!bottom_tris.is_empty());
+    assert!(!top_tris.is_empty());
+
+    let tet_mesh = TetrahedralMesh::from_mesh(&cyl_mesh, MeshDensity::Medium)
+        .expect("Cylinder tetrahedral mesh should succeed");
+
+    let force_z = 50_000.0; // 50 kN axial tension
+    let mut bc = BoundaryConditions::new();
+    bc.fix_named_face(&cyl_mesh, cap_bottom.id, Some("cap_bottom".to_string()), 0.0, DofComponent::All);
+    bc.add_named_face_force(&cyl_mesh, cap_top.id, Some("cap_top".to_string()), 0.0, [0.0, 0.0, force_z]);
+
+    // 1. Verify exact nodal force conservation (< 1e-9 relative error)
+    let resolved = bc.resolve(&tet_mesh).expect("Named face BCs must resolve");
+    let mut sum_f = [0.0_f64; 3];
+    for nf in &resolved.nodal_forces {
+        sum_f[0] += nf[0];
+        sum_f[1] += nf[1];
+        sum_f[2] += nf[2];
+    }
+    let force_rel_err = ((sum_f[2] - force_z).powi(2) + sum_f[0].powi(2) + sum_f[1].powi(2)).sqrt() / force_z;
+    assert!(
+        force_rel_err < 1e-9,
+        "Sum of nodal forces {sum_f:?} must match total force [0, 0, {force_z}] within 1e-9 (rel_err = {force_rel_err:e})"
+    );
+
+    // 2. Solve FEA and compare against analytical axial tension:
+    //    sigma = F / A, delta = F * L / (E * A)
+    let report = analyze_mesh("cyl_shaft", &tet_mesh, &material, &bc, None)
+        .expect("FEA solve on cylindrical shaft must converge");
+
+    let area = std::f64::consts::PI * radius * radius;
+    let expected_sigma_pa = force_z / area;
+    let expected_delta_m = (force_z * length) / (e_pa * area);
+
+    let disp_rel_err = (report.max_displacement_m - expected_delta_m).abs() / expected_delta_m;
+    assert!(
+        disp_rel_err < 0.05,
+        "Cylindrical shaft axial elongation {} m must match analytical {} m within 5% (rel_err = {:.2}%)",
+        report.max_displacement_m,
+        expected_delta_m,
+        disp_rel_err * 100.0
+    );
+
+    let mean_stress_pa: f64 =
+        report.nodal_von_mises_stresses.iter().sum::<f64>() / (report.nodal_von_mises_stresses.len() as f64);
+    let stress_rel_err = (mean_stress_pa - expected_sigma_pa).abs() / expected_sigma_pa;
+    assert!(
+        stress_rel_err < 0.15,
+        "Cylindrical shaft mean axial stress {:.2} MPa must match analytical {:.2} MPa within 15% (rel_err = {:.2}%)",
+        mean_stress_pa / 1e6,
+        expected_sigma_pa / 1e6,
+        stress_rel_err * 100.0
+    );
+
+    // 3. Verify pure torsion moment on cap_top conserves zero net force and exact resultant torque
+    let torque_nm = [0.0, 0.0, 250.0];
+    let mut bc_moment = BoundaryConditions::new();
+    bc_moment.fix_surface_triangles(Some("cap_bottom".to_string()), bottom_tris, 0.0, DofComponent::All);
+    bc_moment.add_surface_triangles_moment(Some("cap_top".to_string()), top_tris, 0.0, torque_nm);
+    let resolved_m = bc_moment.resolve(&tet_mesh).expect("Moment BC must resolve");
+    let mut net_f = [0.0_f64; 3];
+    let mut net_m = [0.0_f64; 3];
+    for (nid, f) in resolved_m.nodal_forces.iter().enumerate() {
+        net_f[0] += f[0];
+        net_f[1] += f[1];
+        net_f[2] += f[2];
+        let p = tet_mesh.nodes[nid].position;
+        let rx = p[0] - cap_top.centroid[0];
+        let ry = p[1] - cap_top.centroid[1];
+        let rz = p[2] - cap_top.centroid[2];
+        net_m[0] += ry * f[2] - rz * f[1];
+        net_m[1] += rz * f[0] - rx * f[2];
+        net_m[2] += rx * f[1] - ry * f[0];
+    }
+    assert!(
+        (net_f[0].powi(2) + net_f[1].powi(2) + net_f[2].powi(2)).sqrt() < 1e-8,
+        "Pure moment load must have zero net translational force, got {net_f:?}"
+    );
+    let torque_rel_err = (net_m[2] - torque_nm[2]).abs() / torque_nm[2];
+    assert!(
+        torque_rel_err < 1e-9,
+        "Resultant nodal torque {net_m:?} must match {torque_nm:?} within 1e-9 (rel_err = {torque_rel_err:e})"
+    );
+}
+
+#[test]
+fn test_p2_t8_plate_with_hole_bearing_load_and_pressure_on_hole_wall() {
+    use mcp_cad_core::primitives::cut_hole;
+    use mcp_cad_fea::{extract_face_triangles, DofComponent};
+
+    let material = Material::new(
+        "steel_structural_aisi1020",
+        205.0,
+        0.29,
+        250.0,
+        7850.0,
+        "Structural steel",
+    );
+
+    let plate = create_box(0.10, 0.08, 0.02);
+    let perforated = cut_hole(&plate, [0.0, 0.0, -0.015], [0.0, 0.0, 1.0], 0.015, 0.03, None, None);
+
+    let left_face = perforated
+        .faces
+        .iter()
+        .find(|f| f.role == "left")
+        .expect("Perforated plate must preserve 'left' face");
+    let hole_wall = perforated
+        .faces
+        .iter()
+        .find(|f| f.role == "hole_wall")
+        .expect("Perforated plate must have 'hole_wall' face");
+
+    let left_tris = extract_face_triangles(&perforated, &[left_face.id]);
+    let hole_tris = extract_face_triangles(&perforated, &[hole_wall.id]);
+
+    let tet_mesh = TetrahedralMesh::from_mesh(&perforated, MeshDensity::Coarse)
+        .expect("Perforated plate tetrahedral mesh should succeed");
+
+    // 1. Bearing load [Fx, 0, 0] on hole_wall
+    let bearing_force = [12_000.0, 0.0, 0.0];
+    let mut bc_force = BoundaryConditions::new();
+    bc_force.fix_surface_triangles(Some(left_face.name.clone()), left_tris.clone(), 0.0, DofComponent::All);
+    bc_force.add_surface_triangles_force(Some(hole_wall.name.clone()), hole_tris.clone(), 0.0, bearing_force);
+
+    let resolved_f = bc_force
+        .resolve(&tet_mesh)
+        .expect("Hole wall bearing force must match surface nodes");
+    let mut sum_fx = 0.0_f64;
+    for nf in &resolved_f.nodal_forces {
+        sum_fx += nf[0];
+    }
+    let rel_err = (sum_fx - bearing_force[0]).abs() / bearing_force[0];
+    assert!(
+        rel_err < 1e-9,
+        "Hole wall nodal force sum {sum_fx} N must equal {} N within 1e-9",
+        bearing_force[0]
+    );
+
+    let report_force = analyze_mesh("perforated_bearing", &tet_mesh, &material, &bc_force, None)
+        .expect("FEA solve with hole_wall bearing load must succeed");
+    assert!(report_force.max_displacement_m > 0.0);
+    assert!(report_force.max_stress_von_mises_pa > 0.0);
+
+    // 2. Internal pressure load on hole_wall
+    let mut bc_pressure = BoundaryConditions::new();
+    bc_pressure.fix_surface_triangles(Some(left_face.name.clone()), left_tris, 0.0, DofComponent::All);
+    bc_pressure.add_surface_triangles_pressure(Some(hole_wall.name.clone()), hole_tris, 0.0, 25.0e6); // 25 MPa
+
+    let report_pressure = analyze_mesh("perforated_pressure", &tet_mesh, &material, &bc_pressure, None)
+        .expect("FEA solve with hole_wall pressure load must succeed");
+    assert!(report_pressure.max_displacement_m > 0.0);
+    assert!(report_pressure.max_stress_von_mises_pa > 1.0e6);
+}
+

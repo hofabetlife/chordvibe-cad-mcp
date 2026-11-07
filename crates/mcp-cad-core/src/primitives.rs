@@ -4,7 +4,7 @@ use std::f64::consts::PI;
 use nalgebra::{Rotation3, Vector3};
 use crate::csg::csg_difference;
 use crate::tessellation::{TessellationQuality, TessellationSettings};
-use crate::topology::{TriangleMesh, Vertex};
+use crate::topology::{FaceInfo, FaceKind, TriangleMesh, Vertex};
 
 /// Generates a solid 3D box (cuboid) centered at the origin.
 ///
@@ -17,9 +17,18 @@ pub fn create_box(width: f64, height: f64, depth: f64) -> TriangleMesh {
 
     let mut vertices = Vec::with_capacity(24);
     let mut indices = Vec::with_capacity(12);
+    let mut face_ids = Vec::with_capacity(12);
+    let mut faces = Vec::with_capacity(6);
 
-    // Helper macro to append a rectangular face (4 vertices, 2 triangles)
-    let mut add_face = |p0: [f64; 3], p1: [f64; 3], p2: [f64; 3], p3: [f64; 3], normal: [f64; 3]| {
+    // Helper closure to append a rectangular face (4 vertices, 2 triangles) with its FaceInfo descriptor
+    let mut add_face = |fid: u32,
+                        role: &str,
+                        aliases: &[&str],
+                        p0: [f64; 3],
+                        p1: [f64; 3],
+                        p2: [f64; 3],
+                        p3: [f64; 3],
+                        normal: [f64; 3]| {
         let base = vertices.len() as u32;
         vertices.push(Vertex::new(p0, normal));
         vertices.push(Vertex::new(p1, normal));
@@ -29,10 +38,24 @@ pub fn create_box(width: f64, height: f64, depth: f64) -> TriangleMesh {
         // CCW when viewed from outside
         indices.push([base, base + 1, base + 2]);
         indices.push([base, base + 2, base + 3]);
+        face_ids.push(fid);
+        face_ids.push(fid);
+
+        faces.push(FaceInfo::new_descriptor(
+            fid,
+            role,
+            aliases.iter().map(|s| (*s).to_string()).collect(),
+            FaceKind::Plane,
+            normal,
+            None,
+        ));
     };
 
-    // Front face (+Z)
+    // 1. Top face (+Z)
     add_face(
+        1,
+        "top",
+        &["cap_top", "max_z", "+z", "front_z"],
         [-w2, -h2,  d2],
         [ w2, -h2,  d2],
         [ w2,  h2,  d2],
@@ -40,8 +63,11 @@ pub fn create_box(width: f64, height: f64, depth: f64) -> TriangleMesh {
         [0.0, 0.0, 1.0],
     );
 
-    // Back face (-Z)
+    // 2. Bottom face (-Z)
     add_face(
+        2,
+        "bottom",
+        &["cap_bottom", "min_z", "-z", "back_z"],
         [ w2, -h2, -d2],
         [-w2, -h2, -d2],
         [-w2,  h2, -d2],
@@ -49,8 +75,11 @@ pub fn create_box(width: f64, height: f64, depth: f64) -> TriangleMesh {
         [0.0, 0.0, -1.0],
     );
 
-    // Right face (+X)
+    // 3. Right face (+X)
     add_face(
+        3,
+        "right",
+        &["max_x", "+x"],
         [ w2, -h2,  d2],
         [ w2, -h2, -d2],
         [ w2,  h2, -d2],
@@ -58,8 +87,11 @@ pub fn create_box(width: f64, height: f64, depth: f64) -> TriangleMesh {
         [1.0, 0.0, 0.0],
     );
 
-    // Left face (-X)
+    // 4. Left face (-X)
     add_face(
+        4,
+        "left",
+        &["min_x", "-x"],
         [-w2, -h2, -d2],
         [-w2, -h2,  d2],
         [-w2,  h2,  d2],
@@ -67,8 +99,11 @@ pub fn create_box(width: f64, height: f64, depth: f64) -> TriangleMesh {
         [-1.0, 0.0, 0.0],
     );
 
-    // Top face (+Y)
+    // 5. Back face (+Y)
     add_face(
+        5,
+        "back",
+        &["max_y", "+y", "top_y"],
         [-w2,  h2,  d2],
         [ w2,  h2,  d2],
         [ w2,  h2, -d2],
@@ -76,8 +111,11 @@ pub fn create_box(width: f64, height: f64, depth: f64) -> TriangleMesh {
         [0.0, 1.0, 0.0],
     );
 
-    // Bottom face (-Y)
+    // 6. Front face (-Y)
     add_face(
+        6,
+        "front",
+        &["min_y", "-y", "bottom_y"],
         [-w2, -h2, -d2],
         [ w2, -h2, -d2],
         [ w2, -h2,  d2],
@@ -85,7 +123,7 @@ pub fn create_box(width: f64, height: f64, depth: f64) -> TriangleMesh {
         [0.0, -1.0, 0.0],
     );
 
-    TriangleMesh::new(vertices, indices)
+    TriangleMesh::with_faces(vertices, indices, face_ids, faces)
 }
 
 /// Splits a quad `(p0, p1, p2, p3)` along its shorter diagonal to maximize minimum interior angle.
@@ -172,10 +210,10 @@ fn add_bridged_ring_strip_2d(
             let p2 = [curr_ring[next][0], curr_ring[next][1], z_val];
             let p3 = [curr_ring[i][0], curr_ring[i][1], z_val];
             if is_top {
-                // ring_a is outer, ring_b is inner: [a_i, a_next, b_next, b_i] has -Z cross, so reverse for +Z
-                push_quad_shortest_diag(vertices, indices, p0, p3, p2, p1, normal);
-            } else {
+                // ring_a is outer, ring_b is inner: [a_i, a_next, b_next, b_i] is CCW in XY (+Z cross)
                 push_quad_shortest_diag(vertices, indices, p0, p1, p2, p3, normal);
+            } else {
+                push_quad_shortest_diag(vertices, indices, p0, p3, p2, p1, normal);
             }
         }
         prev_ring = curr_ring;
@@ -205,9 +243,9 @@ fn add_halving_ring_transition_2d(
         vertices.push(Vertex::new([b[0], b[1], z_val], normal));
         vertices.push(Vertex::new([c[0], c[1], z_val], normal));
         if is_top {
-            indices.push([base, base + 2, base + 1]);
-        } else {
             indices.push([base, base + 1, base + 2]);
+        } else {
+            indices.push([base, base + 2, base + 1]);
         }
     };
 
@@ -267,7 +305,7 @@ fn add_subdivided_disk_cap_2d(
             break;
         }
 
-        if m >= 16 && m % 2 == 0 && avg_c < avg_r * 0.38 {
+        if m >= 16 && m.is_multiple_of(2) && avg_c < avg_r * 0.38 {
             let next_scale = ((avg_r - avg_c * 1.15) / avg_r).clamp(0.45, 0.78);
             let half_m = m / 2;
             let halved_ring: Vec<[f64; 2]> = (0..half_m)
@@ -339,7 +377,10 @@ pub fn create_cylinder(radius: f64, height: f64, segments: usize) -> TriangleMes
 
     // 1. Top and bottom caps with concentric ring subdivision + 2-to-1 halving
     add_subdivided_disk_cap_2d(&mut vertices, &mut indices, &rim_ring, [0.0, 0.0], h2, true);
+    let top_cap_end = indices.len();
+
     add_subdivided_disk_cap_2d(&mut vertices, &mut indices, &rim_ring, [0.0, 0.0], -h2, false);
+    let bot_cap_end = indices.len();
 
     // 2. Side wall subdivided axially so height steps match circumferential chord length
     let chord = (2.0 * radius * (PI / (segs as f64)).sin()).max(1e-6);
@@ -366,7 +407,46 @@ pub fn create_cylinder(radius: f64, height: f64, segments: usize) -> TriangleMes
         }
     }
 
-    TriangleMesh::new(vertices, indices)
+    let total_tris = indices.len();
+    let mut face_ids = Vec::with_capacity(total_tris);
+    face_ids.resize(top_cap_end, 1);
+    face_ids.resize(bot_cap_end, 2);
+    face_ids.resize(total_tris, 3);
+
+    let faces = vec![
+        FaceInfo::new_descriptor(
+            1,
+            "cap_top",
+            vec!["top".to_string(), "max_z".to_string(), "+z".to_string()],
+            FaceKind::Plane,
+            [0.0, 0.0, 1.0],
+            Some(radius),
+        ),
+        FaceInfo::new_descriptor(
+            2,
+            "cap_bottom",
+            vec!["bottom".to_string(), "min_z".to_string(), "-z".to_string()],
+            FaceKind::Plane,
+            [0.0, 0.0, -1.0],
+            Some(radius),
+        ),
+        FaceInfo::new_descriptor(
+            3,
+            "side",
+            vec![
+                "outer_wall".to_string(),
+                "cylindrical_wall".to_string(),
+                "barrel".to_string(),
+                "outer".to_string(),
+                "mantle".to_string(),
+            ],
+            FaceKind::Cylinder,
+            [0.0, 0.0, 1.0],
+            Some(radius),
+        ),
+    ];
+
+    TriangleMesh::with_faces(vertices, indices, face_ids, faces)
 }
 
 /// Generates a solid 3D cylinder with adaptive tessellation based on `TessellationSettings`.
@@ -493,7 +573,22 @@ pub fn create_sphere(radius: f64, sectors: usize, stacks: usize) -> TriangleMesh
         indices.push([base, base + 1, base + 2]);
     }
 
-    TriangleMesh::new(vertices, indices)
+    let face_ids = vec![1; indices.len()];
+    let faces = vec![FaceInfo::new_descriptor(
+        1,
+        "surface",
+        vec![
+            "sphere_surface".to_string(),
+            "side".to_string(),
+            "outer".to_string(),
+            "shell".to_string(),
+        ],
+        FaceKind::Sphere,
+        [0.0, 0.0, 1.0],
+        Some(radius),
+    )];
+
+    TriangleMesh::with_faces(vertices, indices, face_ids, faces)
 }
 
 /// Generates a solid 3D UV sphere with adaptive tessellation based on `TessellationSettings`.
@@ -540,6 +635,27 @@ pub fn create_cylinder_oriented(
             pos.z + center[2],
         ];
         v.normal = [n.x, n.y, n.z];
+    }
+
+    let t = Vector3::new(center[0], center[1], center[2]);
+    for face in &mut mesh.faces {
+        let c = rot * Vector3::new(face.centroid[0], face.centroid[1], face.centroid[2]) + t;
+        let s = rot
+            * Vector3::new(
+                face.sample_point[0],
+                face.sample_point[1],
+                face.sample_point[2],
+            )
+            + t;
+        let n = rot
+            * Vector3::new(
+                face.normal_or_axis[0],
+                face.normal_or_axis[1],
+                face.normal_or_axis[2],
+            );
+        face.centroid = [c.x, c.y, c.z];
+        face.sample_point = [s.x, s.y, s.z];
+        face.normal_or_axis = [n.x, n.y, n.z];
     }
 
     mesh
@@ -644,7 +760,7 @@ pub fn cut_hole_with_settings(
     let drill_dir = -unit_norm;
     let tool_center = center_vec + unit_norm * (0.5 * (t_high + t_low));
 
-    let final_tool = if let (Some(kw), Some(kd)) = (keyway_width, keyway_depth) {
+    let mut final_tool = if let (Some(kw), Some(kd)) = (keyway_width, keyway_depth) {
         if kw > 1e-6 && kd > 1e-6 {
             build_keyway_cutter_prism(
                 tool_center,
@@ -673,6 +789,34 @@ pub fn cut_hole_with_settings(
             settings,
         )
     };
+
+    // Relabel standard cylinder tool faces (cap_top -> hole_bottom, cap_bottom -> hole_top, side -> hole_wall)
+    for face in &mut final_tool.faces {
+        match face.role.as_str() {
+            "cap_top" => {
+                face.name = "hole_bottom".to_string();
+                face.role = "hole_bottom".to_string();
+                face.aliases = vec!["blind_bottom".to_string(), "bottom".to_string()];
+            }
+            "cap_bottom" => {
+                face.name = "hole_top".to_string();
+                face.role = "hole_top".to_string();
+                face.aliases = vec![];
+            }
+            "side" => {
+                face.name = "hole_wall".to_string();
+                face.role = "hole_wall".to_string();
+                face.aliases = vec![
+                    "bore".to_string(),
+                    "hole".to_string(),
+                    "inner_wall".to_string(),
+                    "side".to_string(),
+                ];
+                face.normal_or_axis = [unit_norm.x, unit_norm.y, unit_norm.z];
+            }
+            _ => {}
+        }
+    }
 
     csg_difference(mesh, &final_tool)
 }
@@ -708,13 +852,26 @@ fn build_keyway_cutter_prism(
     profile.push([-half_kw, y_top]);
     profile.push([-half_kw, y_shoulder]);
 
-    let start_ang = std::f64::consts::FRAC_PI_2 + alpha;
-    let end_ang = 2.5 * std::f64::consts::PI - alpha;
-    let arc_steps = segments.max(16);
-    for i in 1..arc_steps {
-        let t = i as f64 / arc_steps as f64;
-        let ang = start_ang + t * (end_ang - start_ang);
-        profile.push([radius * ang.cos(), radius * ang.sin()]);
+    let ang0 = std::f64::consts::FRAC_PI_2 + alpha;
+    let ang1 = 1.5 * std::f64::consts::PI - alpha;
+    let ang2 = 1.5 * std::f64::consts::PI + alpha;
+    let ang3 = 2.5 * std::f64::consts::PI - alpha;
+    let step_ang = 2.0 * std::f64::consts::PI / (segments.max(16) as f64);
+
+    for (k, (a_start, a_end)) in [(ang0, ang1), (ang1, ang2), (ang2, ang3)]
+        .into_iter()
+        .enumerate()
+    {
+        let span_a = (a_end - a_start).max(0.0);
+        let sub_steps = ((span_a / step_ang).round() as usize).max(1);
+        for i in 1..=sub_steps {
+            if k == 2 && i == sub_steps {
+                break;
+            }
+            let t = i as f64 / sub_steps as f64;
+            let ang = a_start + t * span_a;
+            profile.push([radius * ang.cos(), radius * ang.sin()]);
+        }
     }
 
     let n = profile.len();
@@ -730,62 +887,112 @@ fn build_keyway_cutter_prism(
 
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
+    let mut face_ids = Vec::new();
 
-    // Bottom cap at z = -half_h (normal -w)
+    let (cap_pts, cap_tris) = triangulate_cap_polygon_2d(&profile);
+
+    // Bottom cap at z = -half_h (normal -w, entry end -> id = 2 "hole_top")
     let n_bot = norm_world(0.0, 0.0, -1.0);
-    let bot_center_idx = vertices.len() as u32;
-    vertices.push(Vertex::new(to_world(0.0, 0.0, -half_h), n_bot));
-    let bot_ring_start = vertices.len() as u32;
-    for &[px, py] in &profile {
+    let bot_start = vertices.len() as u32;
+    for &[px, py] in &cap_pts {
         vertices.push(Vertex::new(to_world(px, py, -half_h), n_bot));
     }
-    for i in 0..n {
-        let next = (i + 1) % n;
-        indices.push([
-            bot_center_idx,
-            bot_ring_start + next as u32,
-            bot_ring_start + i as u32,
-        ]);
+    for &[a, b, c] in &cap_tris {
+        indices.push([bot_start + a, bot_start + c, bot_start + b]);
+        face_ids.push(2);
     }
 
-    // Top cap at z = +half_h (normal +w)
+    // Top cap at z = +half_h (normal +w, blind bottom end -> id = 1 "hole_bottom")
     let n_top = norm_world(0.0, 0.0, 1.0);
-    let top_center_idx = vertices.len() as u32;
-    vertices.push(Vertex::new(to_world(0.0, 0.0, half_h), n_top));
-    let top_ring_start = vertices.len() as u32;
-    for &[px, py] in &profile {
+    let top_start = vertices.len() as u32;
+    for &[px, py] in &cap_pts {
         vertices.push(Vertex::new(to_world(px, py, half_h), n_top));
     }
-    for i in 0..n {
-        let next = (i + 1) % n;
-        indices.push([
-            top_center_idx,
-            top_ring_start + i as u32,
-            top_ring_start + next as u32,
-        ]);
+    for &[a, b, c] in &cap_tris {
+        indices.push([top_start + a, top_start + b, top_start + c]);
+        face_ids.push(1);
     }
 
-    // Side walls connecting bottom ring to top ring
+    // Side walls connecting bottom ring to top ring with axial subdivision matching chord length
+    let mut chord_sum = 0.0;
     for i in 0..n {
         let next = (i + 1) % n;
-        let p0 = profile[i];
-        let p1 = profile[next];
-        let dx = p1[0] - p0[0];
-        let dy = p1[1] - p0[1];
-        let len = (dx * dx + dy * dy).sqrt().max(1e-12);
-        let n_side = norm_world(dy / len, -dx / len, 0.0);
+        chord_sum += (profile[next][0] - profile[i][0]).hypot(profile[next][1] - profile[i][1]);
+    }
+    let avg_chord = (chord_sum / (n as f64)).max(1e-6);
+    let n_z = ((height / (avg_chord * 1.25)).ceil() as usize).clamp(1, 64);
 
-        let base = vertices.len() as u32;
-        vertices.push(Vertex::new(to_world(p0[0], p0[1], -half_h), n_side));
-        vertices.push(Vertex::new(to_world(p1[0], p1[1], -half_h), n_side));
-        vertices.push(Vertex::new(to_world(p1[0], p1[1], half_h), n_side));
-        vertices.push(Vertex::new(to_world(p0[0], p0[1], half_h), n_side));
+    for kz in 0..n_z {
+        let z0 = -half_h + (kz as f64) * (height / (n_z as f64));
+        let z1 = -half_h + ((kz + 1) as f64) * (height / (n_z as f64));
+        for i in 0..n {
+            let next = (i + 1) % n;
+            let p0 = profile[i];
+            let p1 = profile[next];
+            let dx = p1[0] - p0[0];
+            let dy = p1[1] - p0[1];
+            let len = (dx * dx + dy * dy).sqrt().max(1e-12);
+            let n_side = norm_world(dy / len, -dx / len, 0.0);
 
-        indices.push([base, base + 1, base + 2]);
-        indices.push([base, base + 2, base + 3]);
+            push_quad_shortest_diag(
+                &mut vertices,
+                &mut indices,
+                to_world(p0[0], p0[1], z0),
+                to_world(p1[0], p1[1], z0),
+                to_world(p1[0], p1[1], z1),
+                to_world(p0[0], p0[1], z1),
+                n_side,
+            );
+            // Segments i in 0..3 form the 3 walls of the rectangular keyway slot (id = 4);
+            // segments i >= 3 form the cylindrical bore wall (id = 3).
+            let wall_fid = if i < 3 { 4 } else { 3 };
+            face_ids.push(wall_fid);
+            face_ids.push(wall_fid);
+        }
     }
 
-    TriangleMesh::new(vertices, indices)
+    let hole_axis = [-w.x, -w.y, -w.z];
+    let faces = vec![
+        FaceInfo::new_descriptor(
+            1,
+            "hole_bottom",
+            vec!["blind_bottom".to_string(), "bottom".to_string()],
+            FaceKind::Plane,
+            n_top,
+            Some(radius),
+        ),
+        FaceInfo::new_descriptor(
+            2,
+            "hole_top",
+            vec![],
+            FaceKind::Plane,
+            n_bot,
+            Some(radius),
+        ),
+        FaceInfo::new_descriptor(
+            3,
+            "hole_wall",
+            vec![
+                "bore".to_string(),
+                "hole".to_string(),
+                "inner_wall".to_string(),
+                "side".to_string(),
+            ],
+            FaceKind::Cylinder,
+            hole_axis,
+            Some(radius),
+        ),
+        FaceInfo::new_descriptor(
+            4,
+            "keyway_wall",
+            vec!["keyway".to_string(), "slot_wall".to_string()],
+            FaceKind::Plane,
+            norm_world(0.0, -1.0, 0.0),
+            None,
+        ),
+    ];
+
+    TriangleMesh::with_faces(vertices, indices, face_ids, faces)
 }
 
 /// Generates a solid 3D cone or truncated cone (frustum) centered at the origin along the Z axis.
@@ -808,12 +1015,17 @@ pub fn create_cone(radius_bottom: f64, radius_top: f64, height: f64, segments: u
 
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
+    let mut face_ids = Vec::new();
+    let mut faces = Vec::new();
+    let mut next_face_id = 1u32;
 
     let has_bot_cap = radius_bottom > 1e-12;
     let has_top_cap = radius_top > 1e-12;
 
     // 1. Bottom cap (z = -h2, normal = [0, 0, -1])
     if has_bot_cap {
+        let bot_fid = next_face_id;
+        next_face_id += 1;
         let bot_ring: Vec<[f64; 2]> = (0..segs)
             .map(|i| {
                 let theta = (i as f64) * 2.0 * PI / (segs as f64);
@@ -821,10 +1033,21 @@ pub fn create_cone(radius_bottom: f64, radius_top: f64, height: f64, segments: u
             })
             .collect();
         add_subdivided_disk_cap_2d(&mut vertices, &mut indices, &bot_ring, [0.0, 0.0], -h2, false);
+        face_ids.resize(indices.len(), bot_fid);
+        faces.push(FaceInfo::new_descriptor(
+            bot_fid,
+            "cap_bottom",
+            vec!["bottom".to_string(), "min_z".to_string(), "-z".to_string()],
+            FaceKind::Plane,
+            [0.0, 0.0, -1.0],
+            Some(radius_bottom),
+        ));
     }
 
     // 2. Top cap (z = +h2, normal = [0, 0, 1]) if truncated cone
     if has_top_cap {
+        let top_fid = next_face_id;
+        next_face_id += 1;
         let top_ring: Vec<[f64; 2]> = (0..segs)
             .map(|i| {
                 let theta = (i as f64) * 2.0 * PI / (segs as f64);
@@ -832,7 +1055,18 @@ pub fn create_cone(radius_bottom: f64, radius_top: f64, height: f64, segments: u
             })
             .collect();
         add_subdivided_disk_cap_2d(&mut vertices, &mut indices, &top_ring, [0.0, 0.0], h2, true);
+        face_ids.resize(indices.len(), top_fid);
+        faces.push(FaceInfo::new_descriptor(
+            top_fid,
+            "cap_top",
+            vec!["top".to_string(), "max_z".to_string(), "+z".to_string()],
+            FaceKind::Plane,
+            [0.0, 0.0, 1.0],
+            Some(radius_top),
+        ));
     }
+
+    let side_fid = next_face_id;
 
     // 3. Side wall with axial subdivision and 2-to-1 halving near sharp cone apexes
     let dr = radius_bottom - radius_top;
@@ -862,8 +1096,9 @@ pub fn create_cone(radius_bottom: f64, radius_top: f64, height: f64, segments: u
             let chord_curr = 2.0 * PI * r_curr / (curr_segs as f64);
             let step_len = slant / (n_z as f64);
 
-            if curr_segs >= 16 && curr_segs % 2 == 0 && chord_curr < step_len * 0.55 {
+            if curr_segs >= 12 && chord_curr < step_len * 0.55 {
                 let half_segs = curr_segs / 2;
+                let is_odd = curr_segs % 2 != 0;
                 let next_ring: Vec<[f64; 3]> = (0..half_segs)
                     .map(|j| {
                         let theta = (j as f64) * 2.0 * PI / (half_segs as f64);
@@ -872,19 +1107,33 @@ pub fn create_cone(radius_bottom: f64, radius_top: f64, height: f64, segments: u
                     .collect();
                 for j in 0..half_segs {
                     let j_next = (j + 1) % half_segs;
-                    let o0 = prev_ring[2 * j];
-                    let o1 = prev_ring[2 * j + 1];
-                    let o2 = prev_ring[2 * j_next];
                     let i0 = next_ring[j];
                     let i1 = next_ring[j_next];
                     let ang = ((2 * j + 1) as f64) * 2.0 * PI / (curr_segs as f64);
                     let norm = [n_radial * ang.cos(), n_radial * ang.sin(), nz];
-                    for (a, b, c) in [(o0, o1, i0), (o1, i1, i0), (o1, o2, i1)] {
-                        let base = vertices.len() as u32;
-                        vertices.push(Vertex::new(a, norm));
-                        vertices.push(Vertex::new(b, norm));
-                        vertices.push(Vertex::new(c, norm));
-                        indices.push([base, base + 1, base + 2]);
+                    if is_odd && j == half_segs - 1 {
+                        let o0 = prev_ring[2 * j];
+                        let o1 = prev_ring[2 * j + 1];
+                        let o2 = prev_ring[2 * j + 2];
+                        let o3 = prev_ring[0];
+                        for (a, b, c) in [(o0, o1, i0), (o1, i1, i0), (o1, o2, i1), (o2, o3, i1)] {
+                            let base = vertices.len() as u32;
+                            vertices.push(Vertex::new(a, norm));
+                            vertices.push(Vertex::new(b, norm));
+                            vertices.push(Vertex::new(c, norm));
+                            indices.push([base, base + 1, base + 2]);
+                        }
+                    } else {
+                        let o0 = prev_ring[2 * j];
+                        let o1 = prev_ring[2 * j + 1];
+                        let o2 = prev_ring[(2 * j + 2) % curr_segs];
+                        for (a, b, c) in [(o0, o1, i0), (o1, i1, i0), (o1, o2, i1)] {
+                            let base = vertices.len() as u32;
+                            vertices.push(Vertex::new(a, norm));
+                            vertices.push(Vertex::new(b, norm));
+                            vertices.push(Vertex::new(c, norm));
+                            indices.push([base, base + 1, base + 2]);
+                        }
                     }
                 }
                 curr_segs = half_segs;
@@ -939,27 +1188,74 @@ pub fn create_cone(radius_bottom: f64, radius_top: f64, height: f64, segments: u
             let t = (k as f64) / (n_z as f64);
             let r_curr = radius_top * (1.0 - t);
             let z_curr = h2 - t * height;
-            let next_ring: Vec<[f64; 3]> = (0..curr_segs)
-                .map(|i| {
-                    let theta = (i as f64) * 2.0 * PI / (curr_segs as f64);
-                    [r_curr * theta.cos(), r_curr * theta.sin(), z_curr]
-                })
-                .collect();
-            for i in 0..curr_segs {
-                let next = (i + 1) % curr_segs;
-                let ang = ((i as f64) + 0.5) * 2.0 * PI / (curr_segs as f64);
-                let norm = [n_radial * ang.cos(), n_radial * ang.sin(), nz];
-                push_quad_shortest_diag(
-                    &mut vertices,
-                    &mut indices,
-                    prev_ring[i],
-                    next_ring[i],
-                    next_ring[next],
-                    prev_ring[next],
-                    norm,
-                );
+            let chord_curr = 2.0 * PI * r_curr / (curr_segs as f64);
+            let step_len = slant / (n_z as f64);
+
+            if curr_segs >= 12 && chord_curr < step_len * 0.55 {
+                let half_segs = curr_segs / 2;
+                let is_odd = curr_segs % 2 != 0;
+                let next_ring: Vec<[f64; 3]> = (0..half_segs)
+                    .map(|j| {
+                        let theta = (j as f64) * 2.0 * PI / (half_segs as f64);
+                        [r_curr * theta.cos(), r_curr * theta.sin(), z_curr]
+                    })
+                    .collect();
+                for j in 0..half_segs {
+                    let j_next = (j + 1) % half_segs;
+                    let i0 = next_ring[j];
+                    let i1 = next_ring[j_next];
+                    let ang = ((2 * j + 1) as f64) * 2.0 * PI / (curr_segs as f64);
+                    let norm = [n_radial * ang.cos(), n_radial * ang.sin(), nz];
+                    if is_odd && j == half_segs - 1 {
+                        let o0 = prev_ring[2 * j];
+                        let o1 = prev_ring[2 * j + 1];
+                        let o2 = prev_ring[2 * j + 2];
+                        let o3 = prev_ring[0];
+                        for (a, b, c) in [(o0, i0, o1), (o1, i0, i1), (o1, i1, o2), (o2, i1, o3)] {
+                            let base = vertices.len() as u32;
+                            vertices.push(Vertex::new(a, norm));
+                            vertices.push(Vertex::new(b, norm));
+                            vertices.push(Vertex::new(c, norm));
+                            indices.push([base, base + 1, base + 2]);
+                        }
+                    } else {
+                        let o0 = prev_ring[2 * j];
+                        let o1 = prev_ring[2 * j + 1];
+                        let o2 = prev_ring[(2 * j + 2) % curr_segs];
+                        for (a, b, c) in [(o0, i0, o1), (o1, i0, i1), (o1, i1, o2)] {
+                            let base = vertices.len() as u32;
+                            vertices.push(Vertex::new(a, norm));
+                            vertices.push(Vertex::new(b, norm));
+                            vertices.push(Vertex::new(c, norm));
+                            indices.push([base, base + 1, base + 2]);
+                        }
+                    }
+                }
+                curr_segs = half_segs;
+                prev_ring = next_ring;
+            } else {
+                let next_ring: Vec<[f64; 3]> = (0..curr_segs)
+                    .map(|i| {
+                        let theta = (i as f64) * 2.0 * PI / (curr_segs as f64);
+                        [r_curr * theta.cos(), r_curr * theta.sin(), z_curr]
+                    })
+                    .collect();
+                for i in 0..curr_segs {
+                    let next = (i + 1) % curr_segs;
+                    let ang = ((i as f64) + 0.5) * 2.0 * PI / (curr_segs as f64);
+                    let norm = [n_radial * ang.cos(), n_radial * ang.sin(), nz];
+                    push_quad_shortest_diag(
+                        &mut vertices,
+                        &mut indices,
+                        prev_ring[i],
+                        next_ring[i],
+                        next_ring[next],
+                        prev_ring[next],
+                        norm,
+                    );
+                }
+                prev_ring = next_ring;
             }
-            prev_ring = next_ring;
         }
 
         let apex = [0.0, 0.0, -h2];
@@ -1007,7 +1303,17 @@ pub fn create_cone(radius_bottom: f64, radius_top: f64, height: f64, segments: u
         }
     }
 
-    TriangleMesh::new(vertices, indices)
+    face_ids.resize(indices.len(), side_fid);
+    faces.push(FaceInfo::new_descriptor(
+        side_fid,
+        "side",
+        vec!["conical_wall".to_string(), "outer_wall".to_string()],
+        FaceKind::Cone,
+        [0.0, 0.0, 1.0],
+        Some(0.5 * (radius_bottom + radius_top)),
+    ));
+
+    TriangleMesh::with_faces(vertices, indices, face_ids, faces)
 }
 
 /// Generates a solid 3D cone or frustum with adaptive tessellation based on `TessellationSettings`.
@@ -1071,7 +1377,7 @@ pub fn create_polygon_prism(
 
     let h2 = height * 0.5;
     let c_val = chamfer.unwrap_or(0.0);
-    let has_chamfer = c_val > 1e-6;
+    let has_chamfer = c_val > 1e-12;
 
     let (r_cap, z_bot_mid, z_top_mid) = if has_chamfer {
         let tan_alpha = (PI / 6.0).tan(); // 30-degree DIN 934 chamfer angle
@@ -1087,53 +1393,163 @@ pub fn create_polygon_prism(
         (circumradius, -h2, h2)
     };
 
+    let sin_half = half_angle.sin();
+    let cos_half = half_angle.cos();
+    let tan_half = sin_half / cos_half;
+    let s_mid = 2.0 * circumradius * sin_half;
+    let s_cap = 2.0 * r_cap * sin_half;
+    let h_mid = (z_top_mid - z_bot_mid).max(1e-12);
+
+    let (m_edge, n_bevel_steps) = if has_chamfer {
+        let c_r_eff = circumradius - r_cap;
+        let c_z_eff = h2 - z_top_mid;
+        let h_bevel = ((c_r_eff * cos_half).powi(2) + c_z_eff.powi(2))
+            .sqrt()
+            .max(1e-12);
+        let min_band_h = h_bevel.min(h_mid).max(1e-12);
+        let mut m = 1usize;
+        while m < 512 && (s_mid / (m as f64)) > 3.0 * min_band_h {
+            m *= 2;
+        }
+        let s_cap_seg = (s_cap / (m as f64)).max(1e-12);
+        let bevel_steps = ((h_bevel / (1.5 * s_cap_seg)).ceil() as usize).clamp(1, 8);
+        (m, bevel_steps)
+    } else {
+        let mut m = 1usize;
+        while m < 512 && (s_mid / (m as f64)) > 10.0 * h_mid {
+            m *= 2;
+        }
+        (m, 1usize)
+    };
+
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
+    let mut face_ids = Vec::new();
+    let mut faces = Vec::with_capacity(if has_chamfer { 2 + 3 * n } else { 2 + n });
 
-    // 1. Top cap (z = +h2, flat normal = [0, 0, 1])
-    let top_center_idx = vertices.len() as u32;
-    vertices.push(Vertex::new([0.0, 0.0, h2], [0.0, 0.0, 1.0]));
+    // Helper to emit top or bottom planar polygonal cap with 2-to-1 inward halving from m_edge -> 1
+    let mut emit_polygon_cap = |is_top: bool, cap_fid: u32| {
+        let z_val = if is_top { h2 } else { -h2 };
+        let nz = if is_top { 1.0 } else { -1.0 };
+        let normal = [0.0, 0.0, nz];
 
-    let top_rim_start = vertices.len() as u32;
-    for i in 0..n {
-        let theta = (i as f64) * angle_step;
-        let x = r_cap * theta.cos();
-        let y = r_cap * theta.sin();
-        vertices.push(Vertex::new([x, y, h2], [0.0, 0.0, 1.0]));
-    }
+        let mut push_cap_tri = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| {
+            let base = vertices.len() as u32;
+            vertices.push(Vertex::new([a[0], a[1], z_val], normal));
+            vertices.push(Vertex::new([b[0], b[1], z_val], normal));
+            vertices.push(Vertex::new([c[0], c[1], z_val], normal));
+            if is_top {
+                indices.push([base, base + 1, base + 2]);
+            } else {
+                indices.push([base, base + 2, base + 1]);
+            }
+            face_ids.push(cap_fid);
+        };
 
-    for i in 0..n {
-        let next = (i + 1) % n;
-        indices.push([
-            top_center_idx,
-            top_rim_start + (i as u32),
-            top_rim_start + (next as u32),
-        ]);
-    }
+        let mut r_curr = r_cap;
+        let mut m_curr = m_edge;
 
-    // 2. Bottom cap (z = -h2, flat normal = [0, 0, -1])
-    let bot_center_idx = vertices.len() as u32;
-    vertices.push(Vertex::new([0.0, 0.0, -h2], [0.0, 0.0, -1.0]));
+        while m_curr > 1 {
+            let k = m_curr / 2;
+            let sigma = (0.65 * tan_half).min((0.55 * (k as f64)).min(0.75));
+            let eta = (1.0 - sigma / (k as f64)).clamp(0.45, 0.92);
+            let r_next = r_curr * eta;
 
-    let bot_rim_start = vertices.len() as u32;
-    for i in 0..n {
-        let theta = (i as f64) * angle_step;
-        let x = r_cap * theta.cos();
-        let y = r_cap * theta.sin();
-        vertices.push(Vertex::new([x, y, -h2], [0.0, 0.0, -1.0]));
-    }
+            for i in 0..n {
+                let next = (i + 1) % n;
+                let t1 = (i as f64) * angle_step;
+                let t2 = (next as f64) * angle_step;
+                let p_out_0 = [r_curr * t1.cos(), r_curr * t1.sin()];
+                let p_out_1 = [r_curr * t2.cos(), r_curr * t2.sin()];
+                let p_in_0 = [r_next * t1.cos(), r_next * t1.sin()];
+                let p_in_1 = [r_next * t2.cos(), r_next * t2.sin()];
 
-    for i in 0..n {
-        let next = (i + 1) % n;
-        indices.push([
-            bot_center_idx,
-            bot_rim_start + (next as u32),
-            bot_rim_start + (i as u32),
-        ]);
-    }
+                let lerp2 = |a: [f64; 2], b: [f64; 2], t: f64| -> [f64; 2] {
+                    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
+                };
 
-    // Helper closure to add a quad facet (p0_top, p1_bot, p2_bot_next, p3_top_next) with exact outward normal
-    let mut add_quad_facet = |p0: [f64; 3], p1: [f64; 3], p2: [f64; 3], p3: [f64; 3]| {
+                for l in 0..k {
+                    let o0 = lerp2(p_out_0, p_out_1, (2 * l) as f64 / (m_curr as f64));
+                    let o1 = lerp2(p_out_0, p_out_1, (2 * l + 1) as f64 / (m_curr as f64));
+                    let o2 = lerp2(p_out_0, p_out_1, (2 * l + 2) as f64 / (m_curr as f64));
+                    let i0 = lerp2(p_in_0, p_in_1, (l as f64) / (k as f64));
+                    let i1 = lerp2(p_in_0, p_in_1, ((l + 1) as f64) / (k as f64));
+
+                    push_cap_tri(o0, o1, i0);
+                    push_cap_tri(o1, i1, i0);
+                    push_cap_tri(o1, o2, i1);
+                }
+            }
+
+            r_curr = r_next;
+            m_curr = k;
+        }
+
+        // Central n-gon fan for m_curr == 1
+        let center_idx = vertices.len() as u32;
+        vertices.push(Vertex::new([0.0, 0.0, z_val], normal));
+        let rim_start = vertices.len() as u32;
+        for i in 0..n {
+            let theta = (i as f64) * angle_step;
+            vertices.push(Vertex::new(
+                [r_curr * theta.cos(), r_curr * theta.sin(), z_val],
+                normal,
+            ));
+        }
+        for i in 0..n {
+            let next = (i + 1) % n;
+            if is_top {
+                indices.push([
+                    center_idx,
+                    rim_start + (i as u32),
+                    rim_start + (next as u32),
+                ]);
+            } else {
+                indices.push([
+                    center_idx,
+                    rim_start + (next as u32),
+                    rim_start + (i as u32),
+                ]);
+            }
+            face_ids.push(cap_fid);
+        }
+    };
+
+    // 1. Top cap (z = +h2, id = 1) & 2. Bottom cap (z = -h2, id = 2)
+    emit_polygon_cap(true, 1);
+    faces.push(FaceInfo::new_descriptor(
+        1,
+        "cap_top",
+        vec!["top".to_string(), "max_z".to_string(), "+z".to_string()],
+        FaceKind::Plane,
+        [0.0, 0.0, 1.0],
+        Some(r_cap),
+    ));
+
+    emit_polygon_cap(false, 2);
+    faces.push(FaceInfo::new_descriptor(
+        2,
+        "cap_bottom",
+        vec!["bottom".to_string(), "min_z".to_string(), "-z".to_string()],
+        FaceKind::Plane,
+        [0.0, 0.0, -1.0],
+        Some(r_cap),
+    ));
+
+    // Helper function to add a subdivided planar quad facet (p0_top, p1_bot, p2_bot_next, p3_top_next)
+    #[allow(clippy::too_many_arguments)]
+    fn add_subdivided_quad_facet(
+        vertices: &mut Vec<Vertex>,
+        indices: &mut Vec<[u32; 3]>,
+        face_ids: &mut Vec<u32>,
+        facet_fid: u32,
+        p0: [f64; 3],
+        p1: [f64; 3],
+        p2: [f64; 3],
+        p3: [f64; 3],
+        m_horiz: usize,
+        n_vert: usize,
+    ) {
         let v0 = Vector3::new(p0[0], p0[1], p0[2]);
         let v1 = Vector3::new(p1[0], p1[1], p1[2]);
         let v2 = Vector3::new(p2[0], p2[1], p2[2]);
@@ -1146,15 +1562,35 @@ pub fn create_polygon_prism(
             [1.0, 0.0, 0.0]
         };
 
-        let base = vertices.len() as u32;
-        vertices.push(Vertex::new(p0, normal));
-        vertices.push(Vertex::new(p1, normal));
-        vertices.push(Vertex::new(p2, normal));
-        vertices.push(Vertex::new(p3, normal));
+        let lerp3 = |a: [f64; 3], b: [f64; 3], t: f64| -> [f64; 3] {
+            [
+                a[0] + (b[0] - a[0]) * t,
+                a[1] + (b[1] - a[1]) * t,
+                a[2] + (b[2] - a[2]) * t,
+            ]
+        };
 
-        indices.push([base, base + 1, base + 3]);
-        indices.push([base + 1, base + 2, base + 3]);
-    };
+        for rv in 0..n_vert {
+            let v_top = (rv as f64) / (n_vert as f64);
+            let v_bot = ((rv + 1) as f64) / (n_vert as f64);
+            let row_top_l = lerp3(p0, p1, v_top);
+            let row_top_r = lerp3(p3, p2, v_top);
+            let row_bot_l = lerp3(p0, p1, v_bot);
+            let row_bot_r = lerp3(p3, p2, v_bot);
+
+            for cu in 0..m_horiz {
+                let u_l = (cu as f64) / (m_horiz as f64);
+                let u_r = ((cu + 1) as f64) / (m_horiz as f64);
+                let q0 = lerp3(row_top_l, row_top_r, u_l);
+                let q1 = lerp3(row_bot_l, row_bot_r, u_l);
+                let q2 = lerp3(row_bot_l, row_bot_r, u_r);
+                let q3 = lerp3(row_top_l, row_top_r, u_r);
+                push_quad_shortest_diag(vertices, indices, q0, q1, q2, q3, normal);
+                face_ids.push(facet_fid);
+                face_ids.push(facet_fid);
+            }
+        }
+    }
 
     // 3. Side wall quads (and optional top/bottom chamfer bevel bands)
     for i in 0..n {
@@ -1171,46 +1607,152 @@ pub fn create_polygon_prism(
         let x2_mid = circumradius * c2;
         let y2_mid = circumradius * s2;
 
+        let side_fid = (3 + i) as u32;
+        let mid_theta = ((i as f64) + 0.5) * angle_step;
+        let side_normal = [mid_theta.cos(), mid_theta.sin(), 0.0];
+        faces.push(FaceInfo::new_descriptor(
+            side_fid,
+            format!("side_{i}"),
+            vec![format!("flat_{i}")],
+            FaceKind::Plane,
+            side_normal,
+            None,
+        ));
+
         if has_chamfer {
             let x1_cap = r_cap * c1;
             let y1_cap = r_cap * s1;
             let x2_cap = r_cap * c2;
             let y2_cap = r_cap * s2;
 
+            let chamfer_top_fid = (3 + n + i) as u32;
+            let chamfer_bot_fid = (3 + 2 * n + i) as u32;
+
             // Top bevel band: from z = h2 (r_cap) down to z = z_top_mid (circumradius)
-            add_quad_facet(
+            add_subdivided_quad_facet(
+                &mut vertices,
+                &mut indices,
+                &mut face_ids,
+                chamfer_top_fid,
                 [x1_cap, y1_cap, h2],
                 [x1_mid, y1_mid, z_top_mid],
                 [x2_mid, y2_mid, z_top_mid],
                 [x2_cap, y2_cap, h2],
+                m_edge,
+                n_bevel_steps,
             );
-
-            // Middle vertical band: from z = z_top_mid down to z = z_bot_mid
-            add_quad_facet(
-                [x1_mid, y1_mid, z_top_mid],
-                [x1_mid, y1_mid, z_bot_mid],
-                [x2_mid, y2_mid, z_bot_mid],
-                [x2_mid, y2_mid, z_top_mid],
-            );
+            faces.push(FaceInfo::new_descriptor(
+                chamfer_top_fid,
+                format!("chamfer_top_{i}"),
+                vec![format!("bevel_top_{i}")],
+                FaceKind::Plane,
+                [0.0, 0.0, 1.0],
+                None,
+            ));
 
             // Bottom bevel band: from z = z_bot_mid (circumradius) down to z = -h2 (r_cap)
-            add_quad_facet(
+            add_subdivided_quad_facet(
+                &mut vertices,
+                &mut indices,
+                &mut face_ids,
+                chamfer_bot_fid,
                 [x1_mid, y1_mid, z_bot_mid],
                 [x1_cap, y1_cap, -h2],
                 [x2_cap, y2_cap, -h2],
                 [x2_mid, y2_mid, z_bot_mid],
+                m_edge,
+                n_bevel_steps,
             );
-        } else {
-            add_quad_facet(
-                [x1_mid, y1_mid, h2],
-                [x1_mid, y1_mid, -h2],
-                [x2_mid, y2_mid, -h2],
-                [x2_mid, y2_mid, h2],
-            );
+            faces.push(FaceInfo::new_descriptor(
+                chamfer_bot_fid,
+                format!("chamfer_bottom_{i}"),
+                vec![format!("bevel_bottom_{i}")],
+                FaceKind::Plane,
+                [0.0, 0.0, -1.0],
+                None,
+            ));
         }
+
+        // Middle vertical band: from z = z_top_mid down to z = z_bot_mid, coarsening 2-to-1 from m_edge
+        let mut z_top_c = z_top_mid;
+        let mut z_bot_c = z_bot_mid;
+        let mut m_c = m_edge;
+
+        while m_c > 1 {
+            let ds = s_mid / (m_c as f64);
+            let h_rem = z_top_c - z_bot_c;
+            if h_rem < 1.3 * ds {
+                break;
+            }
+            let dz = (0.55 * ds).min(0.35 * h_rem);
+            let k = m_c / 2;
+            let z_top_in = z_top_c - dz;
+            let z_bot_in = z_bot_c + dz;
+
+            let lerp_xy = |t: f64| -> [f64; 2] {
+                [x1_mid + (x2_mid - x1_mid) * t, y1_mid + (y2_mid - y1_mid) * t]
+            };
+
+            for l in 0..k {
+                let xy_o0 = lerp_xy((2 * l) as f64 / (m_c as f64));
+                let xy_o1 = lerp_xy((2 * l + 1) as f64 / (m_c as f64));
+                let xy_o2 = lerp_xy((2 * l + 2) as f64 / (m_c as f64));
+                let xy_i0 = lerp_xy((l as f64) / (k as f64));
+                let xy_i1 = lerp_xy(((l + 1) as f64) / (k as f64));
+
+                // Top vertical halving strip (z_top_c -> z_top_in)
+                let base_t = vertices.len() as u32;
+                vertices.push(Vertex::new([xy_o0[0], xy_o0[1], z_top_c], side_normal));
+                vertices.push(Vertex::new([xy_o1[0], xy_o1[1], z_top_c], side_normal));
+                vertices.push(Vertex::new([xy_o2[0], xy_o2[1], z_top_c], side_normal));
+                vertices.push(Vertex::new([xy_i0[0], xy_i0[1], z_top_in], side_normal));
+                vertices.push(Vertex::new([xy_i1[0], xy_i1[1], z_top_in], side_normal));
+                indices.push([base_t, base_t + 3, base_t + 1]);
+                indices.push([base_t + 1, base_t + 3, base_t + 4]);
+                indices.push([base_t + 1, base_t + 4, base_t + 2]);
+                face_ids.extend_from_slice(&[side_fid, side_fid, side_fid]);
+
+                // Bottom vertical halving strip (z_bot_c -> z_bot_in)
+                let base_b = vertices.len() as u32;
+                vertices.push(Vertex::new([xy_o0[0], xy_o0[1], z_bot_c], side_normal));
+                vertices.push(Vertex::new([xy_o1[0], xy_o1[1], z_bot_c], side_normal));
+                vertices.push(Vertex::new([xy_o2[0], xy_o2[1], z_bot_c], side_normal));
+                vertices.push(Vertex::new([xy_i0[0], xy_i0[1], z_bot_in], side_normal));
+                vertices.push(Vertex::new([xy_i1[0], xy_i1[1], z_bot_in], side_normal));
+                indices.push([base_b, base_b + 1, base_b + 3]);
+                indices.push([base_b + 1, base_b + 4, base_b + 3]);
+                indices.push([base_b + 1, base_b + 2, base_b + 4]);
+                face_ids.extend_from_slice(&[side_fid, side_fid, side_fid]);
+            }
+
+            z_top_c = z_top_in;
+            z_bot_c = z_bot_in;
+            m_c = k;
+        }
+
+        let ds_rem = (s_mid / (m_c as f64)).max(1e-12);
+        let h_rem = (z_top_c - z_bot_c).max(0.0);
+        let n_z_mid = if !has_chamfer && m_edge == 1 && (h_rem / ds_rem) <= 10.0 {
+            1
+        } else {
+            ((h_rem / (1.5 * ds_rem)).ceil() as usize).max(1)
+        };
+
+        add_subdivided_quad_facet(
+            &mut vertices,
+            &mut indices,
+            &mut face_ids,
+            side_fid,
+            [x1_mid, y1_mid, z_top_c],
+            [x1_mid, y1_mid, z_bot_c],
+            [x2_mid, y2_mid, z_bot_c],
+            [x2_mid, y2_mid, z_top_c],
+            m_c,
+            n_z_mid,
+        );
     }
 
-    TriangleMesh::new(vertices, indices)
+    TriangleMesh::with_faces(vertices, indices, face_ids, faces)
 }
 
 /// Generates a closed, watertight (manifold) 3D mesh for a helical cutting tool
@@ -1412,7 +1954,20 @@ pub fn create_helical_cutter_with_settings(
         }
     }
 
-    TriangleMesh::new(all_vertices, all_indices)
+    let face_ids = vec![1; all_indices.len()];
+    let faces = vec![FaceInfo::new_descriptor(
+        1,
+        "helical_groove",
+        vec![
+            "thread".to_string(),
+            "flute".to_string(),
+            "groove".to_string(),
+        ],
+        FaceKind::Helical,
+        [0.0, 0.0, 1.0],
+        Some(helix_radius),
+    )];
+    TriangleMesh::with_faces(all_vertices, all_indices, face_ids, faces)
 }
 
 /// Generates a solid 3D parametric spur gear centered at origin along the Z axis.
@@ -1527,7 +2082,8 @@ pub fn create_spur_gear_with_settings(
     // Build radial levels for each tooth from level 0 (r_f) up to level M (r_a)
     let mut radial_levels: Vec<(f64, f64)> = Vec::new(); // (radius, half_angle_from_tooth_center)
     radial_levels.push((r_f, theta_root));
-    if r_f < r_b - 1e-9 {
+    let step_r = (r_a - r_inv_start) / (n_flank_steps as f64);
+    if r_f < r_b - 1e-9 && (r_b - r_f) >= 0.35 * step_r {
         radial_levels.push((r_b, theta_base));
     }
     for s_idx in 1..=n_flank_steps {
@@ -1888,10 +2444,140 @@ pub fn create_spur_gear_with_settings(
         }
     }
 
-    TriangleMesh::new(vertices, indices)
+    let mut mesh = TriangleMesh::new(vertices, indices);
+    mesh.face_ids = vec![0; mesh.indices.len()];
+    mesh
 }
 
-/// Helper: 2D polygon ear-clipping triangulation for simple polygons.
+#[inline]
+fn cross_2d(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
+    (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+}
+
+#[inline]
+fn min_triangle_angle_2d(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
+    let ab_sq = (b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2);
+    let bc_sq = (c[0] - b[0]).powi(2) + (c[1] - b[1]).powi(2);
+    let ca_sq = (a[0] - c[0]).powi(2) + (a[1] - c[1]).powi(2);
+    let ab = ab_sq.sqrt();
+    let bc = bc_sq.sqrt();
+    let ca = ca_sq.sqrt();
+    if ab <= 1e-14 || bc <= 1e-14 || ca <= 1e-14 {
+        return 0.0;
+    }
+    let cos_a = ((ab_sq + ca_sq - bc_sq) / (2.0 * ab * ca)).clamp(-1.0, 1.0);
+    let cos_b = ((ab_sq + bc_sq - ca_sq) / (2.0 * ab * bc)).clamp(-1.0, 1.0);
+    let cos_c = ((bc_sq + ca_sq - ab_sq) / (2.0 * bc * ca)).clamp(-1.0, 1.0);
+    cos_a.max(cos_b).max(cos_c).acos()
+}
+
+/// Performs iterative 2D Lawson Delaunay diagonal flips on adjacent triangles
+/// using the exact Delaunay incircle cotangent criterion (`cot(alpha_w) + cot(alpha_x) < 0`)
+/// and minimum interior angle maximization.
+fn optimize_2d_delaunay_edges(tris: &mut [[u32; 3]], pts: &[[f64; 2]]) {
+    let n_tris = tris.len();
+    if n_tris < 2 {
+        return;
+    }
+
+    for _pass in 0..64 {
+        let mut flipped_in_pass = 0usize;
+        let mut half_edge_map: std::collections::HashMap<(u32, u32), (usize, usize)> =
+            std::collections::HashMap::with_capacity(n_tris * 3);
+        let mut edge_count: std::collections::HashMap<(u32, u32), u8> =
+            std::collections::HashMap::with_capacity(n_tris * 2);
+
+        for (t_idx, t) in tris.iter().enumerate() {
+            for e in 0..3 {
+                let u = t[e];
+                let v = t[(e + 1) % 3];
+                half_edge_map.insert((u, v), (t_idx, e));
+                let key = if u < v { (u, v) } else { (v, u) };
+                *edge_count.entry(key).or_insert(0) += 1;
+            }
+        }
+
+        let mut locked = vec![false; n_tris];
+        for t1_idx in 0..n_tris {
+            if locked[t1_idx] {
+                continue;
+            }
+            let t1 = tris[t1_idx];
+            for e1 in 0..3 {
+                let u = t1[e1];
+                let v = t1[(e1 + 1) % 3];
+                let w = t1[(e1 + 2) % 3];
+                let key = if u < v { (u, v) } else { (v, u) };
+                if edge_count.get(&key).copied().unwrap_or(0) != 2 {
+                    continue;
+                }
+                let Some(&(t2_idx, e2)) = half_edge_map.get(&(v, u)) else {
+                    continue;
+                };
+                if t2_idx <= t1_idx || locked[t2_idx] {
+                    continue;
+                }
+                let t2 = tris[t2_idx];
+                let x = t2[(e2 + 2) % 3];
+                if x == w || x == u || x == v {
+                    continue;
+                }
+                let new_key = if w < x { (w, x) } else { (x, w) };
+                if edge_count.contains_key(&new_key) {
+                    continue;
+                }
+
+                let pu = pts[u as usize];
+                let pv = pts[v as usize];
+                let pw = pts[w as usize];
+                let px = pts[x as usize];
+
+                let a_new1 = cross_2d(pw, px, pu);
+                let a_new2 = cross_2d(px, pw, pv);
+                let scale_sq = (pu[0] - pv[0]).powi(2)
+                    + (pu[1] - pv[1]).powi(2)
+                    + (pw[0] - px[0]).powi(2)
+                    + (pw[1] - px[1]).powi(2);
+                if a_new1 <= 1e-10 * scale_sq || a_new2 <= 1e-10 * scale_sq {
+                    continue;
+                }
+
+                // Exact 2D Delaunay incircle condition: alpha_w + alpha_x > pi <=> cot(alpha_w) + cot(alpha_x) < 0
+                let area_w = cross_2d(pw, pu, pv);
+                let area_x = cross_2d(px, pv, pu);
+                let dot_w = (pu[0] - pw[0]) * (pv[0] - pw[0]) + (pu[1] - pw[1]) * (pv[1] - pw[1]);
+                let dot_x = (pv[0] - px[0]) * (pu[0] - px[0]) + (pv[1] - px[1]) * (pu[1] - px[1]);
+                let delaunay_flip = if area_w > 1e-14 * scale_sq && area_x > 1e-14 * scale_sq {
+                    (dot_w / area_w) + (dot_x / area_x) < -1e-6
+                } else {
+                    false
+                };
+
+                let min_before =
+                    min_triangle_angle_2d(pu, pv, pw).min(min_triangle_angle_2d(pv, pu, px));
+                let min_after =
+                    min_triangle_angle_2d(pw, px, pu).min(min_triangle_angle_2d(px, pw, pv));
+
+                if (delaunay_flip && min_after >= min_before - 1e-6)
+                    || min_after > min_before + 1e-5
+                {
+                    tris[t1_idx] = [w, x, u];
+                    tris[t2_idx] = [x, w, v];
+                    locked[t1_idx] = true;
+                    locked[t2_idx] = true;
+                    flipped_in_pass += 1;
+                    break;
+                }
+            }
+        }
+
+        if flipped_in_pass == 0 {
+            break;
+        }
+    }
+}
+
+/// Helper: 2D polygon quality ear-clipping triangulation + Lawson Delaunay optimization for simple polygons.
 /// Returns a list of triangle index triples indexing into `pts`.
 fn triangulate_simple_polygon_2d(pts: &[[f64; 2]]) -> Vec<[u32; 3]> {
     let n = pts.len();
@@ -1905,67 +2591,350 @@ fn triangulate_simple_polygon_2d(pts: &[[f64; 2]]) -> Vec<[u32; 3]> {
     let mut indices: Vec<u32> = (0..n as u32).collect();
     let mut triangles = Vec::with_capacity(n - 2);
 
-    let is_point_in_tri = |p: [f64; 2], a: [f64; 2], b: [f64; 2], c: [f64; 2]| -> bool {
-        let cross = |p1: [f64; 2], p2: [f64; 2], p3: [f64; 2]| {
-            (p2[0] - p1[0]) * (p3[1] - p1[1]) - (p2[1] - p1[1]) * (p3[0] - p1[0])
-        };
-        let c1 = cross(a, b, p);
-        let c2 = cross(b, c, p);
-        let c3 = cross(c, a, p);
-        let has_neg = (c1 < -1e-9) || (c2 < -1e-9) || (c3 < -1e-9);
-        let has_pos = (c1 > 1e-9) || (c2 > 1e-9) || (c3 > 1e-9);
-        !(has_neg && has_pos)
-    };
+    let is_ear = |prev: usize, curr: usize, next: usize, idxs: &[u32], area_tol: f64| -> Option<f64> {
+        let u = idxs[prev];
+        let v = idxs[curr];
+        let w = idxs[next];
+        let a = pts[u as usize];
+        let b = pts[v as usize];
+        let c = pts[w as usize];
 
-    let is_ear = |prev: usize, curr: usize, next: usize, idxs: &[u32]| -> bool {
-        let a = pts[idxs[prev] as usize];
-        let b = pts[idxs[curr] as usize];
-        let c = pts[idxs[next] as usize];
-        // Convex check (CCW interior angle)
-        let cross = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]);
-        if cross <= 1e-12 {
-            return false;
+        let ab_sq = (b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2);
+        let bc_sq = (c[0] - b[0]).powi(2) + (c[1] - b[1]).powi(2);
+        let ca_sq = (a[0] - c[0]).powi(2) + (a[1] - c[1]).powi(2);
+        let perim_sq = ab_sq + bc_sq + ca_sq;
+        if perim_sq <= 1e-24 || ca_sq <= 1e-24 {
+            return None;
         }
+
+        let area2 = cross_2d(a, b, c);
+        if area2 <= area_tol * perim_sq {
+            return None;
+        }
+
+        let chord = [c[0] - a[0], c[1] - a[1]];
         for (i, &idx) in idxs.iter().enumerate() {
-            if i == prev || i == curr || i == next {
+            if i == prev || i == curr || i == next || idx == u || idx == v || idx == w {
                 continue;
             }
             let p = pts[idx as usize];
-            if is_point_in_tri(p, a, b, c) {
-                return false;
+            // Scale-invariant barycentric inclusion check
+            let lc = cross_2d(a, b, p) / area2;
+            let la = cross_2d(b, c, p) / area2;
+            let lb = cross_2d(c, a, p) / area2;
+            if la >= -1e-7 && lb >= -1e-7 && lc >= -1e-7 {
+                return None;
+            }
+            // Reject if `p` lies on the open chord `(a, c)` (prevents bypassing collinear vertices)
+            let ap = [p[0] - a[0], p[1] - a[1]];
+            let t = (ap[0] * chord[0] + ap[1] * chord[1]) / ca_sq;
+            if t > -1e-5 && t < 1.0 + 1e-5 {
+                let tc = t.clamp(0.0, 1.0);
+                let dx = ap[0] - tc * chord[0];
+                let dy = ap[1] - tc * chord[1];
+                if dx * dx + dy * dy <= 1e-12 * ca_sq {
+                    return None;
+                }
             }
         }
-        true
+
+        Some(min_triangle_angle_2d(a, b, c))
     };
 
-    let mut stuck_count = 0;
-    while indices.len() > 3 && stuck_count < indices.len() * 2 {
+    while indices.len() > 3 {
         let len = indices.len();
-        let mut ear_found = false;
-        for i in 0..len {
-            let prev = (i + len - 1) % len;
-            let next = (i + 1) % len;
-            if is_ear(prev, i, next, &indices) {
-                triangles.push([indices[prev], indices[i], indices[next]]);
-                indices.remove(i);
-                ear_found = true;
+        let mut best_i: Option<usize> = None;
+        let mut best_angle = -1.0_f64;
+
+        for &tol in &[1e-9, 1e-13] {
+            for i in 0..len {
+                let prev = (i + len - 1) % len;
+                let next = (i + 1) % len;
+                if let Some(min_ang) = is_ear(prev, i, next, &indices, tol) {
+                    if min_ang > best_angle {
+                        best_angle = min_ang;
+                        best_i = Some(i);
+                    }
+                }
+            }
+            if best_i.is_some() {
                 break;
             }
         }
-        if !ear_found {
-            stuck_count += 1;
-            if stuck_count >= len {
-                triangles.push([indices[0], indices[1], indices[2]]);
-                indices.remove(1);
-            }
+
+        if let Some(i) = best_i {
+            let prev = (i + len - 1) % len;
+            let next = (i + 1) % len;
+            triangles.push([indices[prev], indices[i], indices[next]]);
+            indices.remove(i);
         } else {
-            stuck_count = 0;
+            // Fallback: pick strictly positive-area ear with largest normalized area
+            let mut fallback_i = 0usize;
+            let mut best_norm_area = f64::NEG_INFINITY;
+            for i in 0..len {
+                let prev = (i + len - 1) % len;
+                let next = (i + 1) % len;
+                let a = pts[indices[prev] as usize];
+                let b = pts[indices[i] as usize];
+                let c = pts[indices[next] as usize];
+                let perim_sq = ((b[0] - a[0]).powi(2)
+                    + (b[1] - a[1]).powi(2)
+                    + (c[0] - b[0]).powi(2)
+                    + (c[1] - b[1]).powi(2)
+                    + (a[0] - c[0]).powi(2)
+                    + (a[1] - c[1]).powi(2))
+                .max(1e-24);
+                let norm_area = cross_2d(a, b, c) / perim_sq;
+                if norm_area > best_norm_area {
+                    best_norm_area = norm_area;
+                    fallback_i = i;
+                }
+            }
+            let prev = (fallback_i + len - 1) % len;
+            let next = (fallback_i + 1) % len;
+            triangles.push([indices[prev], indices[fallback_i], indices[next]]);
+            indices.remove(fallback_i);
         }
     }
     if indices.len() == 3 {
         triangles.push([indices[0], indices[1], indices[2]]);
     }
+
+    optimize_2d_delaunay_edges(&mut triangles, pts);
     triangles
+}
+
+/// Triangulates a planar 2D cap polygon `boundary_pts` using quality ear-clipping + Lawson Delaunay flips,
+/// and if any triangle still has minimum angle < 5.5°, inserts Steiner points via Bowyer-Watson
+/// star-shaped circumcircle cavities (bypassing collinear boundary locks).
+fn triangulate_cap_polygon_2d(boundary_pts: &[[f64; 2]]) -> (Vec<[f64; 2]>, Vec<[u32; 3]>) {
+    let mut cap_pts = boundary_pts.to_vec();
+    let mut triangles = triangulate_simple_polygon_2d(&cap_pts);
+    if triangles.len() < 2 {
+        return (cap_pts, triangles);
+    }
+
+    let five_deg_rad = 5.0_f64.to_radians();
+    let target_min_rad = 6.0_f64.to_radians();
+
+    let eval_quality = |pts: &[[f64; 2]], tris: &[[u32; 3]]| -> (usize, f64) {
+        let mut lt_5_count = 0usize;
+        let mut min_ang = f64::INFINITY;
+        for t in tris {
+            let a = min_triangle_angle_2d(
+                pts[t[0] as usize],
+                pts[t[1] as usize],
+                pts[t[2] as usize],
+            );
+            if a < five_deg_rad {
+                lt_5_count += 1;
+            }
+            if a < min_ang {
+                min_ang = a;
+            }
+        }
+        (lt_5_count, min_ang)
+    };
+
+    let (mut best_lt5, mut best_min_ang) = eval_quality(&cap_pts, &triangles);
+    if best_lt5 == 0 && best_min_ang >= target_min_rad {
+        return (cap_pts, triangles);
+    }
+
+    let in_circumcircle = |p: [f64; 2], a: [f64; 2], b: [f64; 2], c: [f64; 2]| -> bool {
+        let ax = a[0] - p[0];
+        let ay = a[1] - p[1];
+        let bx = b[0] - p[0];
+        let by = b[1] - p[1];
+        let cx = c[0] - p[0];
+        let cy = c[1] - p[1];
+        let a2 = ax * ax + ay * ay;
+        let b2 = bx * bx + by * by;
+        let c2 = cx * cx + cy * cy;
+        let det = ax * (by * c2 - cy * b2) - ay * (bx * c2 - cx * b2) + a2 * (bx * cy - by * cx);
+        det > 1e-18 * (a2 + b2 + c2).powi(2)
+    };
+
+    let mut best_pts = cap_pts.clone();
+    let mut best_tris = triangles.clone();
+
+    for _iter in 0..48 {
+        let (curr_lt5, curr_min_ang) = eval_quality(&cap_pts, &triangles);
+        if curr_lt5 < best_lt5 || (curr_lt5 == best_lt5 && curr_min_ang > best_min_ang + 1e-5) {
+            best_lt5 = curr_lt5;
+            best_min_ang = curr_min_ang;
+            best_pts = cap_pts.clone();
+            best_tris = triangles.clone();
+        }
+        if curr_lt5 == 0 && curr_min_ang >= target_min_rad {
+            break;
+        }
+
+        // Find the worst sliver triangle (smallest min_angle < target_min_rad)
+        let mut worst_idx: Option<usize> = None;
+        let mut worst_ang = target_min_rad;
+        for (idx, t) in triangles.iter().enumerate() {
+            let p0 = cap_pts[t[0] as usize];
+            let p1 = cap_pts[t[1] as usize];
+            let p2 = cap_pts[t[2] as usize];
+            let ang = min_triangle_angle_2d(p0, p1, p2);
+            if ang < worst_ang {
+                worst_ang = ang;
+                worst_idx = Some(idx);
+            }
+        }
+
+        let Some(seed_idx) = worst_idx else {
+            break;
+        };
+
+        // Place Steiner point halfway along the median from the shortest edge to the opposite apex
+        let [u, v, w] = triangles[seed_idx];
+        let pu = cap_pts[u as usize];
+        let pv = cap_pts[v as usize];
+        let pw = cap_pts[w as usize];
+        let d_uv = (pu[0] - pv[0]).powi(2) + (pu[1] - pv[1]).powi(2);
+        let d_vw = (pv[0] - pw[0]).powi(2) + (pv[1] - pw[1]).powi(2);
+        let d_wu = (pw[0] - pu[0]).powi(2) + (pw[1] - pu[1]).powi(2);
+        let steiner = if d_uv <= d_vw && d_uv <= d_wu {
+            [0.25 * (pu[0] + pv[0]) + 0.5 * pw[0], 0.25 * (pu[1] + pv[1]) + 0.5 * pw[1]]
+        } else if d_vw <= d_uv && d_vw <= d_wu {
+            [0.25 * (pv[0] + pw[0]) + 0.5 * pu[0], 0.25 * (pv[1] + pw[1]) + 0.5 * pu[1]]
+        } else {
+            [0.25 * (pw[0] + pu[0]) + 0.5 * pv[0], 0.25 * (pw[1] + pu[1]) + 0.5 * pv[1]]
+        };
+
+        // Build connected Bowyer-Watson circumcircle cavity around `seed_idx`
+        let n_tris = triangles.len();
+        let mut half_edge_map: std::collections::HashMap<(u32, u32), usize> =
+            std::collections::HashMap::with_capacity(n_tris * 3);
+        for (t_idx, t) in triangles.iter().enumerate() {
+            for e in 0..3 {
+                half_edge_map.insert((t[e], t[(e + 1) % 3]), t_idx);
+            }
+        }
+
+        let mut in_cavity = vec![false; n_tris];
+        let mut queue = std::collections::VecDeque::new();
+        in_cavity[seed_idx] = true;
+        queue.push_back(seed_idx);
+
+        while let Some(curr_t) = queue.pop_front() {
+            let t = triangles[curr_t];
+            for e in 0..3 {
+                let a = t[e];
+                let b = t[(e + 1) % 3];
+                if let Some(&nbr_t) = half_edge_map.get(&(b, a)) {
+                    if !in_cavity[nbr_t] {
+                        let nt = triangles[nbr_t];
+                        if in_circumcircle(
+                            steiner,
+                            cap_pts[nt[0] as usize],
+                            cap_pts[nt[1] as usize],
+                            cap_pts[nt[2] as usize],
+                        ) {
+                            in_cavity[nbr_t] = true;
+                            queue.push_back(nbr_t);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Prune non-star-shaped cavity triangles (except seed_idx) so `steiner` sees all cavity boundary edges
+        loop {
+            let mut removed_any = false;
+            for t_idx in 0..n_tris {
+                if !in_cavity[t_idx] || t_idx == seed_idx {
+                    continue;
+                }
+                let t = triangles[t_idx];
+                let mut bad_boundary = false;
+                for e in 0..3 {
+                    let a = t[e];
+                    let b = t[(e + 1) % 3];
+                    let is_cav_boundary = match half_edge_map.get(&(b, a)) {
+                        Some(&nbr) => !in_cavity[nbr],
+                        None => true,
+                    };
+                    if is_cav_boundary {
+                        let pa = cap_pts[a as usize];
+                        let pb = cap_pts[b as usize];
+                        let len_sq = (pa[0] - pb[0]).powi(2) + (pa[1] - pb[1]).powi(2);
+                        if cross_2d(pa, pb, steiner) <= 1e-10 * len_sq {
+                            bad_boundary = true;
+                            break;
+                        }
+                    }
+                }
+                if bad_boundary {
+                    in_cavity[t_idx] = false;
+                    removed_any = true;
+                }
+            }
+            if !removed_any {
+                break;
+            }
+        }
+
+        // Collect cavity boundary edges and verify all are strictly visible from `steiner`
+        let mut boundary_edges: Vec<(u32, u32)> = Vec::new();
+        let mut all_visible = true;
+        for t_idx in 0..n_tris {
+            if !in_cavity[t_idx] {
+                continue;
+            }
+            let t = triangles[t_idx];
+            for e in 0..3 {
+                let a = t[e];
+                let b = t[(e + 1) % 3];
+                let is_cav_boundary = match half_edge_map.get(&(b, a)) {
+                    Some(&nbr) => !in_cavity[nbr],
+                    None => true,
+                };
+                if is_cav_boundary {
+                    let pa = cap_pts[a as usize];
+                    let pb = cap_pts[b as usize];
+                    let len_sq = (pa[0] - pb[0]).powi(2) + (pa[1] - pb[1]).powi(2);
+                    if cross_2d(pa, pb, steiner) <= 1e-10 * len_sq {
+                        all_visible = false;
+                        break;
+                    }
+                    boundary_edges.push((a, b));
+                }
+            }
+            if !all_visible {
+                break;
+            }
+        }
+
+        if !all_visible || boundary_edges.len() < 3 {
+            break;
+        }
+
+        let s_idx = cap_pts.len() as u32;
+        cap_pts.push(steiner);
+
+        let mut next_tris = Vec::with_capacity(n_tris + boundary_edges.len());
+        for (t_idx, &t) in triangles.iter().enumerate() {
+            if !in_cavity[t_idx] {
+                next_tris.push(t);
+            }
+        }
+        for (a, b) in boundary_edges {
+            next_tris.push([a, b, s_idx]);
+        }
+        triangles = next_tris;
+
+        optimize_2d_delaunay_edges(&mut triangles, &cap_pts);
+    }
+
+    let (curr_lt5, curr_min_ang) = eval_quality(&cap_pts, &triangles);
+    if curr_lt5 < best_lt5 || (curr_lt5 == best_lt5 && curr_min_ang > best_min_ang + 1e-5) {
+        (cap_pts, triangles)
+    } else {
+        (best_pts, best_tris)
+    }
 }
 
 /// Generates a solid 3D body of revolution by rotating a 2D profile `[r, z]` around the Z axis.
@@ -2027,36 +2996,115 @@ pub fn create_revolve(profile: &[[f64; 2]], angle_deg: f64, segments: usize) -> 
         raw_pts.reverse();
     }
 
-    // Subdivide long profile segments so revolved quads and partial-angle end caps have balanced aspect ratios
-    let target_seg_len = ((max_r * sweep_angle_rad) / (segs as f64) * 1.35).max(max_r * 0.15).max(1e-5);
-    let mut pts: Vec<[f64; 2]> = Vec::with_capacity(raw_pts.len() * 2);
+    // Subdivide profile segments so revolved quads, axis transitions, and partial-angle end caps have balanced aspect ratios
+    let base_target_len = ((max_r * sweep_angle_rad) / (segs as f64) * 1.35)
+        .max(max_r * 0.15)
+        .max(1e-5);
+    let mut pts: Vec<[f64; 2]> = Vec::with_capacity(raw_pts.len() * 4);
+    let mut pt_segs: Vec<usize> = Vec::with_capacity(raw_pts.len() * 4);
+
     for i in 0..raw_pts.len() {
         let p0 = raw_pts[i];
         let p1 = raw_pts[(i + 1) % raw_pts.len()];
+        let r0 = if p0[0] < 1e-9 { 0.0 } else { p0[0] };
+        let r1 = if p1[0] < 1e-9 { 0.0 } else { p1[0] };
         let seg_len = (p1[0] - p0[0]).hypot(p1[1] - p0[1]);
-        let n_sub = ((seg_len / target_seg_len).ceil() as usize).clamp(1, 16);
-        for s in 0..n_sub {
-            let t = (s as f64) / (n_sub as f64);
-            pts.push([p0[0] + (p1[0] - p0[0]) * t, p0[1] + (p1[1] - p0[1]) * t]);
+
+        if r0 < 1e-9 && r1 < 1e-9 {
+            // Edge along rotation axis Z
+            let n_sub = ((seg_len / base_target_len).ceil() as usize).clamp(1, 16);
+            for s in 0..n_sub {
+                let t = (s as f64) / (n_sub as f64);
+                pts.push([0.0, p0[1] + (p1[1] - p0[1]) * t]);
+                pt_segs.push(segs);
+            }
+        } else if r0 < 1e-9 || r1 < 1e-9 {
+            // Edge touching rotation axis at one end: build stations from outer (u=0, r=R) to axis (u=1, r=0)
+            // using 2-to-1 angular halving when angular step < ~10.3 deg so apex fan and inner rings have zero slivers
+            let r_outer = r0.max(r1);
+            let p_outer = if r0 > 0.0 { p0 } else { p1 };
+            let p_axis = if r0 > 0.0 { p1 } else { p0 };
+            let radial_ratio = (r_outer / seg_len.max(1e-12)).clamp(0.1, 1.0);
+
+            let mut stations: Vec<(f64, usize)> = vec![(0.0, segs)];
+            let mut rem = 1.0_f64;
+            let mut curr_s = segs;
+
+            for _step in 0..12 {
+                let dtheta_eff = (sweep_angle_rad / (curr_s as f64)) * radial_ratio;
+                if curr_s > 2 && dtheta_eff < 0.18 {
+                    let factor = (1.0 - 1.25 * dtheta_eff).clamp(0.55, 0.85);
+                    rem *= factor;
+                    curr_s = curr_s.div_ceil(2);
+                    stations.push((1.0 - rem, curr_s));
+                } else if rem * seg_len > base_target_len * 1.45 {
+                    let next_s = if curr_s >= 8 && dtheta_eff < 0.30 {
+                        curr_s.div_ceil(2)
+                    } else {
+                        curr_s
+                    };
+                    rem *= 0.62;
+                    curr_s = next_s;
+                    stations.push((1.0 - rem, curr_s));
+                } else {
+                    break;
+                }
+            }
+
+            if r0 > 0.0 {
+                // Outer -> Axis
+                for &(u, s_cnt) in &stations {
+                    pts.push([
+                        p_outer[0] + (p_axis[0] - p_outer[0]) * u,
+                        p_outer[1] + (p_axis[1] - p_outer[1]) * u,
+                    ]);
+                    pt_segs.push(s_cnt);
+                }
+            } else {
+                // Axis -> Outer
+                let last_s = stations.last().map(|x| x.1).unwrap_or(segs);
+                pts.push([0.0, p_axis[1]]);
+                pt_segs.push(last_s);
+                for &(u, s_cnt) in stations.iter().skip(1).rev() {
+                    pts.push([
+                        p_outer[0] + (p_axis[0] - p_outer[0]) * u,
+                        p_outer[1] + (p_axis[1] - p_outer[1]) * u,
+                    ]);
+                    pt_segs.push(s_cnt);
+                }
+            }
+        } else {
+            // Both endpoints have r > 0: ensure sub-segment length stays within 9x of local minimum circumferential chord
+            let r_min = r0.min(r1);
+            let c_min = (r_min * sweep_angle_rad / (segs as f64)).max(1e-6);
+            let local_target = base_target_len.min(c_min * 9.0).max(1e-5);
+            let n_sub = ((seg_len / local_target).ceil() as usize).clamp(1, 32);
+            for s in 0..n_sub {
+                let t = (s as f64) / (n_sub as f64);
+                pts.push([p0[0] + (p1[0] - p0[0]) * t, p0[1] + (p1[1] - p0[1]) * t]);
+                pt_segs.push(segs);
+            }
         }
     }
     let m = pts.len();
 
-    // 3. Generate side-wall quad strips per profile segment with exact analytical normals
-    let n_steps = if is_full_circle { segs } else { segs + 1 };
-    let mut vertices = Vec::with_capacity(n_steps * m * 2);
-    let mut indices = Vec::new();
+    let build_thetas = |s_cnt: usize| -> Vec<(f64, f64)> {
+        let n_steps = if is_full_circle { s_cnt } else { s_cnt + 1 };
+        (0..n_steps)
+            .map(|j| {
+                let theta = if is_full_circle {
+                    (j as f64) * 2.0 * PI / (s_cnt as f64)
+                } else {
+                    (j as f64) * sweep_angle_rad / (s_cnt as f64)
+                };
+                (theta.cos(), theta.sin())
+            })
+            .collect()
+    };
 
-    let thetas: Vec<(f64, f64)> = (0..n_steps)
-        .map(|j| {
-            let theta = if is_full_circle {
-                (j as f64) * 2.0 * PI / (segs as f64)
-            } else {
-                (j as f64) * sweep_angle_rad / (segs as f64)
-            };
-            (theta.cos(), theta.sin())
-        })
-        .collect();
+    // 3. Generate side-wall strips per profile sub-segment with exact analytical normals
+    let mut vertices = Vec::with_capacity((segs + 1) * m * 2);
+    let mut indices = Vec::new();
 
     for i in 0..m {
         let next_i = (i + 1) % m;
@@ -2077,51 +3125,106 @@ pub fn create_revolve(profile: &[[f64; 2]], angle_deg: f64, segments: usize) -> 
         let nr = dz / seg_len;
         let nz = -dr / seg_len;
 
-        let base_v = vertices.len() as u32;
-        for &(cos_t, sin_t) in &thetas {
+        let segs_a = if r_a < 1e-9 { pt_segs[next_i] } else { pt_segs[i] };
+        let segs_b = if r_b < 1e-9 { pt_segs[i] } else { pt_segs[next_i] };
+
+        let thetas_a = build_thetas(segs_a);
+        let thetas_b = build_thetas(segs_b);
+
+        let base_va = vertices.len() as u32;
+        for &(cos_t, sin_t) in &thetas_a {
             let xa = if r_a == 0.0 { 0.0 } else { r_a * cos_t };
             let ya = if r_a == 0.0 { 0.0 } else { r_a * sin_t };
+            let n3 = [nr * cos_t, nr * sin_t, nz];
+            vertices.push(Vertex::new([xa, ya, z_a], n3));
+        }
+        let base_vb = vertices.len() as u32;
+        for &(cos_t, sin_t) in &thetas_b {
             let xb = if r_b == 0.0 { 0.0 } else { r_b * cos_t };
             let yb = if r_b == 0.0 { 0.0 } else { r_b * sin_t };
             let n3 = [nr * cos_t, nr * sin_t, nz];
-            vertices.push(Vertex::new([xa, ya, z_a], n3));
             vertices.push(Vertex::new([xb, yb, z_b], n3));
         }
 
-        for j in 0..segs {
-            let next_j = if is_full_circle {
-                (j + 1) % segs
-            } else {
-                j + 1
-            };
+        let va = |j: usize| -> u32 {
+            let idx = if is_full_circle { j % segs_a } else { j };
+            base_va + (idx as u32)
+        };
+        let vb = |j: usize| -> u32 {
+            let idx = if is_full_circle { j % segs_b } else { j };
+            base_vb + (idx as u32)
+        };
 
-            let v_curr_a = base_v + (j as u32) * 2;
-            let v_curr_b = v_curr_a + 1;
-            let v_next_a = base_v + (next_j as u32) * 2;
-            let v_next_b = v_next_a + 1;
-
-            if r_a < 1e-9 {
-                // Triangle fan around axis point at a
-                indices.push([v_curr_a, v_next_b, v_curr_b]);
-            } else if r_b < 1e-9 {
-                // Triangle fan around axis point at b
-                indices.push([v_curr_a, v_next_a, v_next_b]);
-            } else {
-                // Regular quad split into 2 triangles
-                indices.push([v_curr_a, v_next_a, v_next_b]);
-                indices.push([v_curr_a, v_next_b, v_curr_b]);
+        if r_a < 1e-9 {
+            for j in 0..segs_b {
+                indices.push([va(j), vb(j + 1), vb(j)]);
+            }
+        } else if r_b < 1e-9 {
+            for j in 0..segs_a {
+                indices.push([va(j), va(j + 1), vb(j)]);
+            }
+        } else if segs_a == segs_b {
+            for j in 0..segs_a {
+                let a0 = va(j);
+                let a1 = va(j + 1);
+                let b0 = vb(j);
+                let b1 = vb(j + 1);
+                indices.push([a0, a1, b1]);
+                indices.push([a0, b1, b0]);
+            }
+        } else if segs_a > segs_b {
+            // 2-to-1 reduction from ring a (segs_a) to ring b (segs_b = (segs_a + 1) / 2)
+            let k = segs_a - segs_b;
+            for j in 0..k {
+                let a0 = va(2 * j);
+                let a1 = va(2 * j + 1);
+                let a2 = va(2 * j + 2);
+                let b0 = vb(j);
+                let b1 = vb(j + 1);
+                indices.push([a0, a1, b0]);
+                indices.push([a1, b1, b0]);
+                indices.push([a1, a2, b1]);
+            }
+            if 2 * k < segs_a {
+                let a0 = va(2 * k);
+                let a1 = va(2 * k + 1);
+                let b0 = vb(k);
+                let b1 = vb(k + 1);
+                indices.push([a0, a1, b1]);
+                indices.push([a0, b1, b0]);
+            }
+        } else {
+            // 1-to-2 expansion from ring a (segs_a = (segs_b + 1) / 2) to ring b (segs_b)
+            let k = segs_b - segs_a;
+            for j in 0..k {
+                let a0 = va(j);
+                let a1 = va(j + 1);
+                let b0 = vb(2 * j);
+                let b1 = vb(2 * j + 1);
+                let b2 = vb(2 * j + 2);
+                indices.push([a0, b1, b0]);
+                indices.push([a0, a1, b1]);
+                indices.push([a1, b2, b1]);
+            }
+            if 2 * k < segs_b {
+                let a0 = va(k);
+                let a1 = va(k + 1);
+                let b0 = vb(2 * k);
+                let b1 = vb(2 * k + 1);
+                indices.push([a0, a1, b1]);
+                indices.push([a0, b1, b0]);
             }
         }
     }
 
     // 4. If partial angle, cap the planar start and end faces with dedicated flat-normal vertices
     if !is_full_circle {
-        let cap_triangles = triangulate_simple_polygon_2d(&pts);
+        let (cap_pts, cap_triangles) = triangulate_cap_polygon_2d(&pts);
 
         // Start cap at theta = 0: outward normal points towards -Y (e_r x e_z = [0, -1, 0])
         let start_cap_base = vertices.len() as u32;
         let start_normal = [0.0, -1.0, 0.0];
-        for p in &pts {
+        for p in &cap_pts {
             let r = if p[0] < 1e-9 { 0.0 } else { p[0] };
             vertices.push(Vertex::new([r, 0.0, p[1]], start_normal));
         }
@@ -2135,9 +3238,9 @@ pub fn create_revolve(profile: &[[f64; 2]], angle_deg: f64, segments: usize) -> 
 
         // End cap at theta = sweep_angle: outward normal points towards +e_theta = [-sin, cos, 0]
         let end_cap_base = vertices.len() as u32;
-        let (cos_end, sin_end) = thetas[segs];
+        let (cos_end, sin_end) = (sweep_angle_rad.cos(), sweep_angle_rad.sin());
         let end_normal = [-sin_end, cos_end, 0.0];
-        for p in &pts {
+        for p in &cap_pts {
             let r = if p[0] < 1e-9 { 0.0 } else { p[0] };
             let x = if r == 0.0 { 0.0 } else { r * cos_end };
             let y = if r == 0.0 { 0.0 } else { r * sin_end };
@@ -2153,6 +3256,7 @@ pub fn create_revolve(profile: &[[f64; 2]], angle_deg: f64, segments: usize) -> 
     }
 
     let mut mesh = TriangleMesh::new(vertices, indices);
+    mesh.face_ids = vec![0; mesh.indices.len()];
 
     // 5. Enforce outward orientation
     if mesh.signed_volume() < 0.0 {
@@ -2290,18 +3394,6 @@ pub fn create_wheel_rim_with_settings(
         * 0.55;
     let r_bolt_eff = r_bolt.clamp(0.002, max_r_bolt.max(0.0025));
 
-    let h_w = w_rim * 0.5;
-    let z_well_bot = -h_w + 0.30 * w_rim;
-    let z_well_top = h_w - 0.30 * w_rim;
-    let max_disc_t = (z_well_top - z_well_bot) * 0.55;
-    let t_disc = t_spoke.clamp(0.010, max_disc_t.max(0.012));
-    let z_disc_center = (et - t_disc * 0.5).clamp(
-        z_well_bot + t_disc * 0.65,
-        z_well_top - t_disc * 0.65,
-    );
-    let z_back = z_disc_center - t_disc * 0.5;
-    let z_front = z_disc_center + t_disc * 0.5;
-
     let q_mult = match settings.quality {
         TessellationQuality::Coarse => 1,
         TessellationQuality::Medium => 2,
@@ -2315,6 +3407,19 @@ pub fn create_wheel_rim_with_settings(
     let k_sec = k_s + k_w;
     let n_theta = n_spokes * k_sec;
     let d_theta_sec = 2.0 * PI / (n_spokes as f64);
+
+    let h_w = w_rim * 0.5;
+    let z_well_bot = -h_w + 0.30 * w_rim;
+    let z_well_top = h_w - 0.30 * w_rim;
+    let max_disc_t = (z_well_top - z_well_bot) * 0.55;
+    let t_disc = t_spoke.clamp(0.010, max_disc_t.max(0.012));
+    let min_barrel_dz = (2.0 * PI * r_inner_barrel / (n_theta as f64) * 0.12).max(0.006);
+    let z_disc_center = (et - t_disc * 0.5).clamp(
+        z_well_bot + t_disc * 0.5 + min_barrel_dz,
+        z_well_top - t_disc * 0.5 - min_barrel_dz,
+    );
+    let z_back = z_disc_center - t_disc * 0.5;
+    let z_front = z_disc_center + t_disc * 0.5;
 
     let delta_hub = (w_spoke / (2.0 * r_hub_eff)).clamp(0.12 * d_theta_sec, 0.34 * d_theta_sec);
     let delta_barrel =
@@ -2719,7 +3824,9 @@ pub fn create_wheel_rim_with_settings(
         }
     }
 
-    TriangleMesh::new(vertices, indices)
+    let mut mesh = TriangleMesh::new(vertices, indices);
+    mesh.face_ids = vec![0; mesh.indices.len()];
+    mesh
 }
 
 #[cfg(test)]
@@ -3086,5 +4193,261 @@ mod tests {
             "Wheel Y diameter {} should be close to flange diameter 0.490",
             dims[1]
         );
+    }
+
+    fn verify_cap_normals_and_validation(mesh: &TriangleMesh, z_top: Option<f64>, z_bot: Option<f64>) {
+        let mut top_count = 0usize;
+        let mut bot_count = 0usize;
+        for tri in &mesh.indices {
+            let p0 = mesh.vertices[tri[0] as usize].pos_vec();
+            let p1 = mesh.vertices[tri[1] as usize].pos_vec();
+            let p2 = mesh.vertices[tri[2] as usize].pos_vec();
+            let n_geo = (p1 - p0).cross(&(p2 - p0));
+            if let Some(zt) = z_top {
+                if (p0.z - zt).abs() < 1e-6 && (p1.z - zt).abs() < 1e-6 && (p2.z - zt).abs() < 1e-6 {
+                    assert!(
+                        n_geo.z > 0.0,
+                        "Top cap triangle at z={} has inward geometric normal {:?}",
+                        zt,
+                        n_geo
+                    );
+                    top_count += 1;
+                }
+            }
+            if let Some(zb) = z_bot {
+                if (p0.z - zb).abs() < 1e-6 && (p1.z - zb).abs() < 1e-6 && (p2.z - zb).abs() < 1e-6 {
+                    assert!(
+                        n_geo.z < 0.0,
+                        "Bottom cap triangle at z={} has inward geometric normal {:?}",
+                        zb,
+                        n_geo
+                    );
+                    bot_count += 1;
+                }
+            }
+        }
+        if z_top.is_some() {
+            assert!(top_count > 0, "Expected at least one top cap triangle");
+        }
+        if z_bot.is_some() {
+            assert!(bot_count > 0, "Expected at least one bottom cap triangle");
+        }
+        let report = crate::diagnostics::validate_mesh(mesh, None);
+        assert!(
+            report.topology.orientation_consistent,
+            "validate_mesh reported inconsistent orientation: {:?}",
+            report.issues
+        );
+        assert_eq!(report.topology.inconsistent_edges_count, 0);
+        assert_eq!(report.status, "PASS", "validate_mesh failed: {:?}", report.issues);
+    }
+
+    #[test]
+    fn cap_orientation_cylinder() {
+        let r = 1.5;
+        let h = 5.0;
+        let cyl = create_cylinder(r, h, 64);
+        verify_cap_normals_and_validation(&cyl, Some(h * 0.5), Some(-h * 0.5));
+        let expected_vol = PI * r * r * h;
+        let signed_vol = cyl.signed_volume();
+        assert!(
+            signed_vol > 0.0 && (signed_vol - expected_vol).abs() / expected_vol < 0.01,
+            "Cylinder signed_volume {} must be within 1% of analytical {}",
+            signed_vol,
+            expected_vol
+        );
+    }
+
+    #[test]
+    fn cap_orientation_cone_sharp() {
+        let r = 3.0;
+        let h = 6.0;
+        let cone = create_cone(r, 0.0, h, 64);
+        verify_cap_normals_and_validation(&cone, None, Some(-h * 0.5));
+        let expected_vol = (1.0 / 3.0) * PI * r * r * h;
+        let signed_vol = cone.signed_volume();
+        assert!(
+            signed_vol > 0.0 && (signed_vol - expected_vol).abs() / expected_vol < 0.01,
+            "Sharp cone signed_volume {} must be within 1% of analytical {}",
+            signed_vol,
+            expected_vol
+        );
+    }
+
+    #[test]
+    fn cap_orientation_cone_frustum() {
+        let r_bot = 4.0;
+        let r_top = 2.0;
+        let h = 5.0;
+        let frustum = create_cone(r_bot, r_top, h, 64);
+        verify_cap_normals_and_validation(&frustum, Some(h * 0.5), Some(-h * 0.5));
+        let expected_vol = (1.0 / 3.0) * PI * h * (r_bot * r_bot + r_bot * r_top + r_top * r_top);
+        let signed_vol = frustum.signed_volume();
+        assert!(
+            signed_vol > 0.0 && (signed_vol - expected_vol).abs() / expected_vol < 0.01,
+            "Frustum cone signed_volume {} must be within 1% of analytical {}",
+            signed_vol,
+            expected_vol
+        );
+    }
+
+    #[test]
+    fn cap_orientation_spur_gear() {
+        let m = 0.002;
+        let teeth = 20usize;
+        let pa_deg = 20.0;
+        let b = 0.015;
+        let gear = create_spur_gear(m, teeth, pa_deg, b, None, None, None, None, None);
+        verify_cap_normals_and_validation(&gear, Some(b * 0.5), Some(-b * 0.5));
+
+        // Analytical volume of extruded 2D gear profile via divergence theorem on top cap
+        // (verified against polar integration of root disk + involute teeth)
+        let z = teeth as f64;
+        let r = m * z * 0.5;
+        let r_a = r + m;
+        let r_f = (r - 1.25 * m).max(0.1 * m);
+        let alpha = pa_deg * PI / 180.0;
+        let r_b = r * alpha.cos();
+        let psi = PI / (2.0 * z);
+        let trough_half = PI / z;
+        let inv_alpha = alpha.tan() - alpha;
+        let min_tip = (trough_half * 0.15).max(1e-4);
+        let theta_at_r = |rad: f64| -> f64 {
+            let raw = if rad < r_b {
+                psi + inv_alpha
+            } else {
+                let alpha_r = (r_b / rad).clamp(0.0, 1.0).acos();
+                (psi + inv_alpha - (alpha_r.tan() - alpha_r)).max(min_tip)
+            };
+            raw.min(trough_half * 0.70)
+        };
+        let theta_base = theta_at_r(r_b);
+        let theta_root = if r_f < r_b - 1e-9 {
+            (theta_base + 0.25 * (trough_half - theta_base).max(1e-4)).min(trough_half * 0.75)
+        } else {
+            theta_at_r(r_f)
+        };
+        // Exact polar integral of A = pi * r_f^2 + 2 * z * \int_{r_f}^{r_a} r * theta(r) dr
+        let n_int = 1000usize;
+        let mut integral = 0.0;
+        for i in 0..n_int {
+            let r_mid = r_f + ((i as f64) + 0.5) * (r_a - r_f) / (n_int as f64);
+            let th = if r_mid < r_b && r_f < r_b - 1e-9 {
+                let t = (r_mid - r_f) / (r_b - r_f);
+                theta_root + t * (theta_base - theta_root)
+            } else {
+                theta_at_r(r_mid)
+            };
+            integral += r_mid * th * (r_a - r_f) / (n_int as f64);
+        }
+        let analytical_area = PI * r_f * r_f + 2.0 * z * integral;
+        let expected_vol = analytical_area * b;
+        let signed_vol = gear.signed_volume();
+        assert!(
+            signed_vol > 0.0 && (signed_vol - expected_vol).abs() / expected_vol < 0.01,
+            "Spur gear signed_volume {} must be within 1% of analytical {}",
+            signed_vol,
+            expected_vol
+        );
+    }
+
+    /// Computes `(area, r_centroid)` of a simple 2D polygon in the `(r, z)` plane for Pappus's theorem.
+    fn compute_polygon_area_and_r_centroid(profile: &[[f64; 2]]) -> (f64, f64) {
+        let n = profile.len();
+        let mut signed_area2 = 0.0;
+        let mut r_moment6 = 0.0;
+        for i in 0..n {
+            let p0 = profile[i];
+            let p1 = profile[(i + 1) % n];
+            let cross = p0[0] * p1[1] - p1[0] * p0[1];
+            signed_area2 += cross;
+            r_moment6 += (p0[0] + p1[0]) * cross;
+        }
+        let area = 0.5 * signed_area2.abs();
+        let r_c = (r_moment6 / (3.0 * signed_area2)).abs();
+        (area, r_c)
+    }
+
+    #[test]
+    fn test_revolve_partial_angles_validation_and_pappus_volume() {
+        let rect_hollow = vec![[0.01, -0.02], [0.03, -0.02], [0.03, 0.02], [0.01, 0.02]];
+        let rect_solid = vec![[0.0, -0.02], [0.03, -0.02], [0.03, 0.02], [0.0, 0.02]];
+        let l_hollow = vec![
+            [0.01, -0.02],
+            [0.04, -0.02],
+            [0.04, -0.01],
+            [0.02, -0.01],
+            [0.02, 0.02],
+            [0.01, 0.02],
+        ];
+        let l_solid = vec![
+            [0.0, -0.02],
+            [0.04, -0.02],
+            [0.04, -0.01],
+            [0.02, -0.01],
+            [0.02, 0.02],
+            [0.0, 0.02],
+        ];
+
+        let profiles: [(&str, &[[f64; 2]], i32); 4] = [
+            ("rect_hollow", &rect_hollow, 0),
+            ("rect_solid", &rect_solid, 0),
+            ("l_hollow", &l_hollow, 0),
+            ("l_solid", &l_solid, 0),
+        ];
+
+        let segs = 32usize;
+        for &(name, profile, partial_genus) in &profiles {
+            let (area, r_c) = compute_polygon_area_and_r_centroid(profile);
+            assert!(area > 0.0 && r_c > 0.0);
+
+            for &angle_deg in &[30.0_f64, 90.0, 180.0, 270.0, 360.0] {
+                let expected_genus = if (angle_deg - 360.0).abs() < 1e-5 {
+                    if name.contains("hollow") { 1 } else { 0 }
+                } else {
+                    partial_genus
+                };
+
+                let mesh = create_revolve(profile, angle_deg, segs);
+                let report = crate::diagnostics::validate_mesh(&mesh, Some(expected_genus));
+                assert_eq!(
+                    report.status, "PASS",
+                    "Revolve {name} at {angle_deg}° failed validate_mesh: issues={:?}",
+                    report.issues
+                );
+                assert!(
+                    report.angle_stats.min_angle_deg >= 1.0,
+                    "Revolve {name} at {angle_deg}° has min_angle={}° < 1°",
+                    report.angle_stats.min_angle_deg
+                );
+                assert_eq!(report.geometry.lt_1_deg_count, 0);
+                assert!(
+                    report.geometry.lt_5_deg_ratio < 0.01,
+                    "Revolve {name} at {angle_deg}° has lt_5_deg_ratio={} >= 1%",
+                    report.geometry.lt_5_deg_ratio
+                );
+
+                // Pappus's centroid theorem: V = theta * r_c * A
+                let theta_rad = angle_deg * PI / 180.0;
+                let v_pappus = theta_rad * r_c * area;
+                let dtheta = theta_rad / (segs as f64);
+                let arc_poly_factor = dtheta.sin() / dtheta;
+                let v_pappus_poly = v_pappus * arc_poly_factor;
+
+                let signed_vol = mesh.signed_volume();
+                let rel_err_pappus = (signed_vol - v_pappus).abs() / v_pappus;
+                let rel_err_poly = (signed_vol - v_pappus_poly).abs() / v_pappus_poly;
+
+                assert!(
+                    rel_err_pappus < 0.01,
+                    "Revolve {name} at {angle_deg}° signed_volume={signed_vol} differs from Pappus volume {v_pappus} by {:.4}% (> 1%)",
+                    rel_err_pappus * 100.0
+                );
+                assert!(
+                    rel_err_poly < 1e-6,
+                    "Revolve {name} at {angle_deg}° signed_volume={signed_vol} differs from polygonal Pappus volume {v_pappus_poly} by {rel_err_poly}"
+                );
+            }
+        }
     }
 }

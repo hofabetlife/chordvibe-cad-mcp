@@ -17,7 +17,7 @@ pub mod query_optimizer;
 pub use error::CadError;
 pub use material::{Material, MaterialRegistry};
 pub use tessellation::{TessellationQuality, TessellationSettings};
-pub use topology::{BoundingBox, GeometryInspection, PlanarFaceInfo, TriangleMesh, Vertex};
+pub use topology::{BoundingBox, FaceInfo, FaceKind, GeometryInspection, PlanarFaceInfo, TriangleMesh, Vertex};
 pub use diagnostics::{validate_mesh, MeshValidationReport, TopologyMetrics, GeometryMetrics, AngleStatistics};
 pub use query_optimizer::{
     estimate_dag_cost, optimize_feature_tree_dag, AppliedRewriteRule, CadExecutionPlan,
