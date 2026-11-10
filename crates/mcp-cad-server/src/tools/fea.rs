@@ -95,6 +95,25 @@ fn parse_dof_components(val: Option<&Value>) -> Result<DofComponent, ServerError
     ))
 }
 
+/// Helper to validate and extract a 3-element array of finite `f64` numbers.
+fn parse_finite_vec3(arr: &[Value], field_name: &str) -> Result<[f64; 3], ServerError> {
+    if arr.len() != 3 {
+        return Err(ServerError::InvalidArgument(format!(
+            "Invalid '{field_name}': must be a 3-element array of finite numbers"
+        )));
+    }
+    let mut out = [0.0; 3];
+    for (i, item) in arr.iter().enumerate() {
+        let val = item.as_f64().filter(|v| v.is_finite()).ok_or_else(|| {
+            ServerError::InvalidArgument(format!(
+                "Invalid '{field_name}': element at index {i} must be a finite number"
+            ))
+        })?;
+        out[i] = val;
+    }
+    Ok(out)
+}
+
 /// Resolves a face selector entry against `part.mesh` and extracts its 3D triangles and metadata.
 fn resolve_face_triangles_and_info<'a>(
     mesh: &'a TriangleMesh,
@@ -155,69 +174,138 @@ pub fn run_fea_analysis(args: &Value, state: &mut EngineState) -> Result<Value, 
     let mut dirichlet_added = false;
 
     // Check fixed_plane (origin and tolerance in active length_unit)
-    if let Some(fp) = args.get("fixed_plane").and_then(|v| v.as_object()) {
-        if let (Some(orig_val), Some(norm_val)) = (fp.get("origin").and_then(|v| v.as_array()), fp.get("normal").and_then(|v| v.as_array())) {
-            if orig_val.len() == 3 && norm_val.len() == 3 {
-                let origin = [
-                    orig_val[0].as_f64().unwrap_or(0.0) * k_to_m,
-                    orig_val[1].as_f64().unwrap_or(0.0) * k_to_m,
-                    orig_val[2].as_f64().unwrap_or(0.0) * k_to_m,
-                ];
-                let normal = [
-                    norm_val[0].as_f64().unwrap_or(1.0),
-                    norm_val[1].as_f64().unwrap_or(0.0),
-                    norm_val[2].as_f64().unwrap_or(0.0),
-                ];
-                let tolerance = fp
-                    .get("tolerance")
-                    .and_then(|v| v.as_f64())
-                    .map(|t| t * k_to_m)
-                    .unwrap_or(1e-3);
-                boundary.fix_plane(origin, normal, tolerance);
-                dirichlet_added = true;
+    if let Some(fp_val) = args.get("fixed_plane") {
+        if !fp_val.is_null() {
+            let fp = fp_val.as_object().ok_or_else(|| {
+                ServerError::InvalidArgument(
+                    "Invalid 'fixed_plane': expected an object with 'origin' and 'normal' arrays".to_string(),
+                )
+            })?;
+            let orig_val = fp.get("origin").and_then(|v| v.as_array()).ok_or_else(|| {
+                ServerError::InvalidArgument(
+                    "Invalid 'fixed_plane': missing or non-array 'origin' [x, y, z]".to_string(),
+                )
+            })?;
+            let norm_val = fp.get("normal").and_then(|v| v.as_array()).ok_or_else(|| {
+                ServerError::InvalidArgument(
+                    "Invalid 'fixed_plane': missing or non-array 'normal' [nx, ny, nz]".to_string(),
+                )
+            })?;
+            let orig_raw = parse_finite_vec3(orig_val, "fixed_plane.origin")?;
+            let normal = parse_finite_vec3(norm_val, "fixed_plane.normal")?;
+            let norm_len_sq = normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2];
+            if norm_len_sq <= 1e-18 {
+                return Err(ServerError::InvalidArgument(
+                    "Invalid 'fixed_plane': 'normal' vector must be non-zero".to_string(),
+                ));
             }
+            let origin = [
+                orig_raw[0] * k_to_m,
+                orig_raw[1] * k_to_m,
+                orig_raw[2] * k_to_m,
+            ];
+            let tolerance = if let Some(tol_val) = fp.get("tolerance") {
+                if !tol_val.is_null() {
+                    let t = tol_val.as_f64().filter(|v| v.is_finite() && *v > 0.0).ok_or_else(|| {
+                        ServerError::InvalidArgument(
+                            "Invalid 'fixed_plane': 'tolerance' must be a positive finite number".to_string(),
+                        )
+                    })?;
+                    t * k_to_m
+                } else {
+                    1e-3
+                }
+            } else {
+                1e-3
+            };
+            boundary.fix_plane(origin, normal, tolerance);
+            dirichlet_added = true;
         }
     }
 
-    // Check fixed_faces (supports both legacy AABB face strings and named CAD faces)
-    if let Some(faces) = args.get("fixed_faces").and_then(|v| v.as_array()) {
-        for f in faces {
-            if let Some(f_str) = f.as_str() {
-                if let Some(face) = parse_aabb_face(f_str) {
-                    boundary.fix_aabb_face(face, 1e-4);
-                    dirichlet_added = true;
+    // Check fixed_faces (supports both legacy AABB face strings and named CAD faces; rejects unrecognized/empty entries)
+    if let Some(ff_val) = args.get("fixed_faces") {
+        if !ff_val.is_null() {
+            let faces = ff_val.as_array().ok_or_else(|| {
+                ServerError::InvalidArgument(
+                    "Invalid 'fixed_faces': expected a non-empty array of face names (e.g. ['min_x', 'cap_bottom'])"
+                        .to_string(),
+                )
+            })?;
+            if faces.is_empty() {
+                return Err(ServerError::InvalidArgument(
+                    "Unconstrained FEA model: 'fixed_faces' array cannot be empty; specify at least one fixed boundary face"
+                        .to_string(),
+                ));
+            }
+            for f in faces {
+                if let Some(f_str) = f.as_str() {
+                    if f_str.trim().is_empty() {
+                        return Err(ServerError::InvalidArgument(
+                            "Invalid 'fixed_faces': face name cannot be empty".to_string(),
+                        ));
+                    }
+                    if let Some(face) = parse_aabb_face(f_str) {
+                        boundary.fix_aabb_face(face, 1e-4);
+                        dirichlet_added = true;
+                    } else {
+                        let (label, _, triangles) = resolve_face_triangles_and_info(&part.mesh, f, unit)?;
+                        boundary.fix_surface_triangles(Some(label), triangles, 0.0, DofComponent::All);
+                        dirichlet_added = true;
+                    }
                 } else {
                     let (label, _, triangles) = resolve_face_triangles_and_info(&part.mesh, f, unit)?;
                     boundary.fix_surface_triangles(Some(label), triangles, 0.0, DofComponent::All);
                     dirichlet_added = true;
                 }
-            } else {
-                let (label, _, triangles) = resolve_face_triangles_and_info(&part.mesh, f, unit)?;
-                boundary.fix_surface_triangles(Some(label), triangles, 0.0, DofComponent::All);
-                dirichlet_added = true;
             }
         }
     }
 
     // Check 'fixed' parameter (array or single FaceSelector object/string)
     if let Some(fixed_val) = args.get("fixed") {
-        let fixed_items: Vec<&Value> = if let Some(arr) = fixed_val.as_array() {
-            arr.iter().collect()
-        } else {
-            vec![fixed_val]
-        };
+        if !fixed_val.is_null() {
+            let fixed_items: Vec<&Value> = if let Some(arr) = fixed_val.as_array() {
+                if arr.is_empty() {
+                    return Err(ServerError::InvalidArgument(
+                        "Unconstrained FEA model: 'fixed' array cannot be empty; specify at least one fixed boundary constraint"
+                            .to_string(),
+                    ));
+                }
+                arr.iter().collect()
+            } else {
+                vec![fixed_val]
+            };
 
-        for item in fixed_items {
-            let components = parse_dof_components(item.get("components"))?;
-            let tol_m = item
-                .get("tolerance")
-                .and_then(|v| v.as_f64())
-                .map(|t| t * k_to_m)
-                .unwrap_or(0.0);
+            for item in fixed_items {
+                let components = parse_dof_components(item.get("components"))?;
+                let tol_m = item
+                    .get("tolerance")
+                    .and_then(|v| v.as_f64())
+                    .map(|t| t * k_to_m)
+                    .unwrap_or(0.0);
 
-            let (label, _, triangles) = resolve_face_triangles_and_info(&part.mesh, item, unit)?;
-            boundary.fix_surface_triangles(Some(label), triangles, tol_m, components);
-            dirichlet_added = true;
+                let aabb_opt = item
+                    .as_str()
+                    .or_else(|| item.get("face").and_then(|v| v.as_str()))
+                    .or_else(|| item.get("face_id").and_then(|v| v.as_str()))
+                    .and_then(parse_aabb_face);
+
+                if let Some(aabb_face) = aabb_opt {
+                    boundary.dirichlet.push(
+                        mcp_cad_fea::boundary::DirichletConstraint::FixedAabbFace {
+                            face: aabb_face,
+                            tolerance: if tol_m > 0.0 { tol_m } else { 1e-4 },
+                            components,
+                        },
+                    );
+                    dirichlet_added = true;
+                } else {
+                    let (label, _, triangles) = resolve_face_triangles_and_info(&part.mesh, item, unit)?;
+                    boundary.fix_surface_triangles(Some(label), triangles, tol_m, components);
+                    dirichlet_added = true;
+                }
+            }
         }
     }
 
@@ -230,12 +318,18 @@ pub fn run_fea_analysis(args: &Value, state: &mut EngineState) -> Result<Value, 
 
     // Applied loads
     let mut loads_added = false;
-    let explicit_loads_key = args.get("applied_forces").is_some()
-        || args.get("applied_force").is_some()
-        || args.get("loads").is_some();
+    let explicit_loads_key = args.get("applied_forces").is_some_and(|v| !v.is_null())
+        || args.get("applied_force").is_some_and(|v| !v.is_null())
+        || args.get("loads").is_some_and(|v| !v.is_null());
 
     // Helper closure to parse and register a single load object (from 'loads' or 'applied_forces')
     let mut process_load_obj = |load_obj: &Value| -> Result<(), ServerError> {
+        if !load_obj.is_object() {
+            return Err(ServerError::InvalidArgument(
+                "Invalid load entry in 'applied_forces' / 'loads': expected a JSON object".to_string(),
+            ));
+        }
+
         let has_face_selector = load_obj.get("face").is_some()
             || load_obj.get("faces").is_some()
             || load_obj.get("face_id").is_some()
@@ -247,47 +341,93 @@ pub fn run_fea_analysis(args: &Value, state: &mut EngineState) -> Result<Value, 
             .map(|t| t * k_to_m)
             .unwrap_or(0.0);
 
-        let f_vec_val = load_obj
+        let f_raw_opt = load_obj
             .get("force")
             .or_else(|| load_obj.get("force_vector"))
-            .or_else(|| load_obj.get("total_force"))
-            .and_then(|v| v.as_array());
+            .or_else(|| load_obj.get("total_force"));
 
-        let pressure_pa_opt = if let Some(p_mpa) = load_obj
+        let pressure_pa_opt = if let Some(p_val) = load_obj
             .get("pressure")
             .or_else(|| load_obj.get("pressure_mpa"))
-            .and_then(|v| v.as_f64())
         {
-            Some(p_mpa * 1.0e6)
+            if !p_val.is_null() {
+                let p_mpa = p_val.as_f64().filter(|v| v.is_finite()).ok_or_else(|| {
+                    ServerError::InvalidArgument(
+                        "Load 'pressure' must be a finite number in MPa".to_string(),
+                    )
+                })?;
+                Some(p_mpa * 1.0e6)
+            } else {
+                None
+            }
+        } else if let Some(p_val) = load_obj.get("pressure_pa") {
+            if !p_val.is_null() {
+                let p_pa = p_val.as_f64().filter(|v| v.is_finite()).ok_or_else(|| {
+                    ServerError::InvalidArgument(
+                        "Load 'pressure_pa' must be a finite number in Pa".to_string(),
+                    )
+                })?;
+                Some(p_pa)
+            } else {
+                None
+            }
         } else {
-            load_obj.get("pressure_pa").and_then(|v| v.as_f64())
+            None
         };
 
         let moment_val_opt = load_obj
             .get("moment")
             .or_else(|| load_obj.get("torque"))
-            .or_else(|| load_obj.get("moment_nm"));
+            .or_else(|| load_obj.get("moment_nm"))
+            .filter(|v| !v.is_null());
 
         if has_face_selector {
+            let aabb_opt = load_obj
+                .get("face")
+                .and_then(|v| v.as_str())
+                .or_else(|| load_obj.get("face_id").and_then(|v| v.as_str()))
+                .and_then(parse_aabb_face);
+
+            if let Some(aabb_face) = aabb_opt {
+                if pressure_pa_opt.is_none() && moment_val_opt.is_none() {
+                    let f_raw = f_raw_opt.ok_or_else(|| {
+                        ServerError::InvalidArgument(
+                            "Each entry in 'loads' / 'applied_forces' must specify 'force' / 'force_vector' ([Fx, Fy, Fz] in N)".to_string(),
+                        )
+                    })?;
+                    let f_vec = f_raw.as_array().ok_or_else(|| {
+                        ServerError::InvalidArgument(
+                            "Load 'force' must be a 3-element array [Fx, Fy, Fz] in Newtons (N)".to_string(),
+                        )
+                    })?;
+                    let force = parse_finite_vec3(f_vec, "force")?;
+                    boundary.add_aabb_face_force(
+                        aabb_face,
+                        if tol_m > 0.0 { tol_m } else { 1e-4 },
+                        force,
+                    );
+                    loads_added = true;
+                    return Ok(());
+                }
+            }
+
             let (label, matched_faces, triangles) =
                 resolve_face_triangles_and_info(&part.mesh, load_obj, unit)?;
 
             let mut applied_any_on_face = false;
 
-            if let Some(f_vec) = f_vec_val {
-                if f_vec.len() != 3 {
-                    return Err(ServerError::InvalidArgument(
-                        "Load 'force' must be a 3-element array [Fx, Fy, Fz] in Newtons (N)".to_string(),
-                    ));
+            if let Some(f_raw) = f_raw_opt {
+                if !f_raw.is_null() {
+                    let f_vec = f_raw.as_array().ok_or_else(|| {
+                        ServerError::InvalidArgument(
+                            "Load 'force' must be a 3-element array [Fx, Fy, Fz] in Newtons (N)".to_string(),
+                        )
+                    })?;
+                    let force = parse_finite_vec3(f_vec, "force")?;
+                    boundary.add_surface_triangles_force(Some(label.clone()), triangles.clone(), tol_m, force);
+                    loads_added = true;
+                    applied_any_on_face = true;
                 }
-                let force = [
-                    f_vec[0].as_f64().unwrap_or(0.0),
-                    f_vec[1].as_f64().unwrap_or(0.0),
-                    f_vec[2].as_f64().unwrap_or(0.0),
-                ];
-                boundary.add_surface_triangles_force(Some(label.clone()), triangles.clone(), tol_m, force);
-                loads_added = true;
-                applied_any_on_face = true;
             }
 
             if let Some(pressure_pa) = pressure_pa_opt {
@@ -303,12 +443,8 @@ pub fn run_fea_analysis(args: &Value, state: &mut EngineState) -> Result<Value, 
                             "Load 'moment' must be a 3-element array [Mx, My, Mz] in N*m or a scalar".to_string(),
                         ));
                     }
-                    [
-                        m_arr[0].as_f64().unwrap_or(0.0),
-                        m_arr[1].as_f64().unwrap_or(0.0),
-                        m_arr[2].as_f64().unwrap_or(0.0),
-                    ]
-                } else if let Some(m_scalar) = m_val.as_f64() {
+                    parse_finite_vec3(m_arr, "moment")?
+                } else if let Some(m_scalar) = m_val.as_f64().filter(|v| v.is_finite()) {
                     let axis = matched_faces
                         .first()
                         .map(|f| f.normal_or_axis)
@@ -316,7 +452,7 @@ pub fn run_fea_analysis(args: &Value, state: &mut EngineState) -> Result<Value, 
                     [axis[0] * m_scalar, axis[1] * m_scalar, axis[2] * m_scalar]
                 } else {
                     return Err(ServerError::InvalidArgument(
-                        "Load 'moment' must be a 3-element array [Mx, My, Mz] in N*m or a scalar".to_string(),
+                        "Load 'moment' must be a 3-element array [Mx, My, Mz] in N*m or a finite scalar".to_string(),
                     ));
                 };
 
@@ -333,79 +469,113 @@ pub fn run_fea_analysis(args: &Value, state: &mut EngineState) -> Result<Value, 
             return Ok(());
         }
 
-        if let Some(f_vec) = f_vec_val {
-            if f_vec.len() == 3 {
-                let force = [
-                    f_vec[0].as_f64().unwrap_or(0.0),
-                    f_vec[1].as_f64().unwrap_or(0.0),
-                    f_vec[2].as_f64().unwrap_or(0.0),
+        if pressure_pa_opt.is_some() || moment_val_opt.is_some() {
+            return Err(ServerError::InvalidArgument(
+                "Applying 'pressure' or 'moment' in 'loads' / 'applied_forces' requires a target face selector ('face', 'faces', 'face_id', or 'where')".to_string(),
+            ));
+        }
+
+        let f_raw = f_raw_opt.filter(|v| !v.is_null()).ok_or_else(|| {
+            ServerError::InvalidArgument(
+                "At least one applied force or pressure must be specified: each entry in 'applied_forces' must include 'force_vector' (or 'force') as [Fx, Fy, Fz] in Newtons (N)".to_string(),
+            )
+        })?;
+        let f_vec = f_raw.as_array().ok_or_else(|| {
+            ServerError::InvalidArgument(
+                "Load 'force_vector' / 'force' in 'applied_forces' must be a 3-element array [Fx, Fy, Fz] in Newtons (N)".to_string(),
+            )
+        })?;
+        let force = parse_finite_vec3(f_vec, "force_vector")?;
+
+        if let Some(pos_raw) = load_obj.get("position") {
+            if !pos_raw.is_null() {
+                let pos_val = pos_raw.as_array().ok_or_else(|| {
+                    ServerError::InvalidArgument(
+                        "Invalid 'position' in 'applied_forces': expected a 3-element coordinate array [x, y, z]".to_string(),
+                    )
+                })?;
+                let pos_coords = parse_finite_vec3(pos_val, "position")?;
+                let target_pos = [
+                    pos_coords[0] * k_to_m,
+                    pos_coords[1] * k_to_m,
+                    pos_coords[2] * k_to_m,
                 ];
 
-                if let Some(pos_val) = load_obj.get("position").and_then(|v| v.as_array()) {
-                    if pos_val.len() == 3 {
-                        let target_pos = [
-                            pos_val[0].as_f64().unwrap_or(0.0) * k_to_m,
-                            pos_val[1].as_f64().unwrap_or(0.0) * k_to_m,
-                            pos_val[2].as_f64().unwrap_or(0.0) * k_to_m,
-                        ];
-
-                        // Find closest node to target position
-                        let mut closest_node = 0;
-                        let mut min_dist_sq = f64::INFINITY;
-                        for node in &tet_mesh.nodes {
-                            let dx = node.position[0] - target_pos[0];
-                            let dy = node.position[1] - target_pos[1];
-                            let dz = node.position[2] - target_pos[2];
-                            let dist_sq = dx * dx + dy * dy + dz * dz;
-                            if dist_sq < min_dist_sq {
-                                min_dist_sq = dist_sq;
-                                closest_node = node.id;
-                            }
-                        }
-
-                        boundary.neumann.push(NeumannLoad::NodalForce {
-                            node_id: closest_node,
-                            force,
-                        });
-                        loads_added = true;
+                // Find closest node to target position
+                let mut closest_node = 0;
+                let mut min_dist_sq = f64::INFINITY;
+                for node in &tet_mesh.nodes {
+                    let dx = node.position[0] - target_pos[0];
+                    let dy = node.position[1] - target_pos[1];
+                    let dz = node.position[2] - target_pos[2];
+                    let dist_sq = dx * dx + dy * dy + dz * dz;
+                    if dist_sq < min_dist_sq {
+                        min_dist_sq = dist_sq;
+                        closest_node = node.id;
                     }
-                } else {
-                    // No explicit position or face selector: apply to MaxX face
-                    boundary.add_aabb_face_force(AabbFace::MaxX, 1e-4, force);
-                    loads_added = true;
                 }
+
+                boundary.neumann.push(NeumannLoad::NodalForce {
+                    node_id: closest_node,
+                    force,
+                });
+                loads_added = true;
+            } else {
+                boundary.add_aabb_face_force(AabbFace::MaxX, 1e-4, force);
+                loads_added = true;
             }
+        } else {
+            // No explicit position or face selector: apply to MaxX face
+            boundary.add_aabb_face_force(AabbFace::MaxX, 1e-4, force);
+            loads_added = true;
         }
         Ok(())
     };
 
     // Check 'loads' parameter (array or single object)
     if let Some(loads_val) = args.get("loads") {
-        let loads_list: Vec<&Value> = if let Some(arr) = loads_val.as_array() {
-            arr.iter().collect()
-        } else {
-            vec![loads_val]
-        };
-        for load_obj in loads_list {
-            process_load_obj(load_obj)?;
+        if !loads_val.is_null() {
+            let loads_list: Vec<&Value> = if let Some(arr) = loads_val.as_array() {
+                arr.iter().collect()
+            } else if loads_val.is_object() {
+                vec![loads_val]
+            } else {
+                return Err(ServerError::InvalidArgument(
+                    "Invalid 'loads': expected a non-empty array of load objects or a single load object".to_string(),
+                ));
+            };
+            for load_obj in loads_list {
+                process_load_obj(load_obj)?;
+            }
         }
     }
 
     // Check applied_forces array or applied_force object
-    let forces_list: Vec<&Value> = if let Some(arr) = args.get("applied_forces").and_then(|v| v.as_array()) {
-        arr.iter().collect()
-    } else if let Some(single) = args.get("applied_force") {
-        vec![single]
-    } else {
-        Vec::new()
-    };
-
-    for force_obj in forces_list {
-        process_load_obj(force_obj)?;
+    if let Some(af_val) = args.get("applied_forces") {
+        if !af_val.is_null() {
+            let arr = af_val.as_array().ok_or_else(|| {
+                ServerError::InvalidArgument(
+                    "Invalid 'applied_forces': expected a non-empty array of load objects".to_string(),
+                )
+            })?;
+            for force_obj in arr {
+                process_load_obj(force_obj)?;
+            }
+        }
+    }
+    if let Some(single) = args.get("applied_force") {
+        if !single.is_null() {
+            process_load_obj(single)?;
+        }
     }
 
-    // Only apply default load if neither loads, applied_forces, nor applied_force was passed in args
-    if !loads_added && !explicit_loads_key {
+    // Reject explicit empty loads; only apply default load when neither loads, applied_forces, nor applied_force was passed
+    if !loads_added {
+        if explicit_loads_key {
+            return Err(ServerError::InvalidArgument(
+                "At least one applied force or pressure must be specified in 'applied_forces' or 'loads'".to_string(),
+            ));
+        }
         boundary.add_aabb_face_force(AabbFace::MaxX, 1e-4, [0.0, -1000.0, 0.0]);
     }
 
@@ -529,4 +699,116 @@ pub fn get_fea_heatmap_image(args: &Value, state: &mut EngineState) -> Result<Va
         "length_unit": unit.as_str(),
         "units": unit.units_metadata(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::cad::{add_feature_primitive, create_part};
+
+    #[test]
+    fn test_p2_t16_fea_rejects_unrecognized_fixed_faces_and_empty_or_invalid_applied_forces() {
+        let mut state = EngineState::new().expect("EngineState init");
+        let p_res = create_part(
+            &json!({
+                "part_id": "beam_t16",
+                "name": "BeamT16",
+                "material": "steel_structural_aisi1020"
+            }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(p_res["part_id"], "beam_t16");
+
+        add_feature_primitive(
+            &json!({
+                "part_id": "beam_t16",
+                "primitive_type": "box",
+                "width": 100.0,
+                "height": 20.0,
+                "depth": 20.0
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        // 1. Typo in fixed_faces with trailing whitespace ("min_z ") must return InvalidArgument (FACE_NOT_FOUND)
+        let err_typo = run_fea_analysis(
+            &json!({
+                "part_id": "beam_t16",
+                "fixed_faces": ["min_z "],
+                "applied_forces": [{"force_vector": [0.0, -500.0, 0.0]}]
+            }),
+            &mut state,
+        )
+        .expect_err("Unrecognized fixed_faces entry 'min_z ' must fail");
+        let body_typo = err_typo.to_error_body();
+        assert_eq!(body_typo.code, "FACE_NOT_FOUND");
+
+        // 2. Empty fixed_faces array must fail with FEA_UNCONSTRAINED
+        let err_empty_ff = run_fea_analysis(
+            &json!({
+                "part_id": "beam_t16",
+                "fixed_faces": [],
+                "applied_forces": [{"force_vector": [0.0, -500.0, 0.0]}]
+            }),
+            &mut state,
+        )
+        .expect_err("Empty fixed_faces array must fail");
+        assert_eq!(err_empty_ff.to_error_body().code, "FEA_UNCONSTRAINED");
+
+        // 3. Empty applied_forces: [] must fail with FEA_NO_LOADS instead of returning 0.0 MPa PASS
+        let err_empty_loads = run_fea_analysis(
+            &json!({
+                "part_id": "beam_t16",
+                "fixed_faces": ["min_x"],
+                "applied_forces": []
+            }),
+            &mut state,
+        )
+        .expect_err("Empty applied_forces array must fail");
+        let body_empty_loads = err_empty_loads.to_error_body();
+        assert_eq!(body_empty_loads.code, "FEA_NO_LOADS");
+        assert_eq!(body_empty_loads.param.as_deref(), Some("applied_forces"));
+
+        // 4. Non-empty applied_forces with unrecognized force key (no force/force_vector) must fail with FEA_NO_LOADS
+        let err_bad_key = run_fea_analysis(
+            &json!({
+                "part_id": "beam_t16",
+                "fixed_faces": ["min_x"],
+                "applied_forces": [{"wrong_key": [0.0, -500.0, 0.0]}]
+            }),
+            &mut state,
+        )
+        .expect_err("applied_forces entry without force/force_vector must fail");
+        let body_bad_key = err_bad_key.to_error_body();
+        assert_eq!(body_bad_key.code, "FEA_NO_LOADS");
+        assert_eq!(body_bad_key.param.as_deref(), Some("applied_forces"));
+
+        // 5. Malformed position (2 elements instead of 3) in applied_forces must fail with INVALID_ARGUMENT
+        let err_bad_pos = run_fea_analysis(
+            &json!({
+                "part_id": "beam_t16",
+                "fixed_faces": ["min_x"],
+                "applied_forces": [{"position": [50.0, 0.0], "force_vector": [0.0, -500.0, 0.0]}]
+            }),
+            &mut state,
+        )
+        .expect_err("2-element position in applied_forces must fail");
+        let body_bad_pos = err_bad_pos.to_error_body();
+        assert_eq!(body_bad_pos.code, "INVALID_ARGUMENT");
+        assert_eq!(body_bad_pos.param.as_deref(), Some("position"));
+
+        // 6. Valid applied_forces with 'force' alias or 'face_id': 'max_x' succeeds with positive stress
+        let ok_res = run_fea_analysis(
+            &json!({
+                "part_id": "beam_t16",
+                "fixed_faces": ["min_x"],
+                "applied_forces": [{"face_id": "max_x", "force": [0.0, -500.0, 0.0]}]
+            }),
+            &mut state,
+        )
+        .expect("Valid applied_forces with face_id='max_x' and force must succeed");
+        assert!(ok_res["max_von_mises_mpa"].as_f64().unwrap() > 0.0);
+    }
 }

@@ -268,9 +268,22 @@ fn map_invalid_argument_error(full_message: String, msg: &str) -> ErrorBody {
 
     // 3. Part with id already exists
     if msg.contains("already exists") && msg.contains("Part") {
+        let param = if msg.contains("Part with id") { "part_id" } else { "name" };
         return ErrorBody::new("PART_ALREADY_EXISTS", full_message)
-            .with_param("name")
+            .with_param(param)
             .with_hint("Part ID or name must be unique. Choose another name or inspect existing parts with 'list_parts'.");
+    }
+
+    // 3b. Reserved part id or cannot delete reserved static anchor
+    if msg.contains("is reserved") && (msg.contains("ground") || msg.contains("world")) {
+        return ErrorBody::new("INVALID_ARGUMENT", full_message)
+            .with_param("part_id")
+            .with_hint("Part IDs 'ground' and 'world' (case-insensitive) are reserved static anchors for kinematic joints. Choose a different part ID.");
+    }
+    if msg.contains("Cannot delete reserved static anchor") {
+        return ErrorBody::new("INVALID_ARGUMENT", full_message)
+            .with_param("part_id")
+            .with_hint("Reserved static anchors 'ground' and 'world' cannot be deleted.");
     }
 
     // 4. Part has no geometry / empty mesh
@@ -302,17 +315,20 @@ fn map_invalid_argument_error(full_message: String, msg: &str) -> ErrorBody {
     }
 
     // 8. FEA boundary / unconstrained
-    if msg.contains("FEA requires at least one constraint") || msg.contains("unconstrained") {
+    if msg.contains("FEA requires at least one constraint")
+        || msg.contains("unconstrained")
+        || msg.contains("Unconstrained FEA model")
+    {
         return ErrorBody::new("FEA_UNCONSTRAINED", full_message)
             .with_param("fixed_faces")
-            .with_hint("Specify fixed boundary faces (e.g. ['min_x', 'max_z']) or 'fixed_plane' to prevent rigid body motion in FEA.");
+            .with_hint("Specify fixed boundary faces (e.g. ['min_x', 'max_z'] or 'fixed': [{'face': 'cap_bottom'}]) or 'fixed_plane' to prevent rigid body motion in FEA.");
     }
 
     // 9. FEA no loads
     if msg.contains("At least one applied force or pressure must be specified") {
         return ErrorBody::new("FEA_NO_LOADS", full_message)
             .with_param("applied_forces")
-            .with_hint("Specify at least one force via 'applied_forces' (e.g. [{'face':'max_z', 'force':[0,0,-1000]}]) or 'applied_pressures'.");
+            .with_hint("Specify at least one force via 'applied_forces' (e.g. [{'face':'max_z', 'force':[0,0,-1000]}]) or 'loads'.");
     }
 
     // 10. Cannot connect part to itself
@@ -419,6 +435,43 @@ fn map_invalid_argument_error(full_message: String, msg: &str) -> ErrorBody {
         return ErrorBody::new("INVALID_ARGUMENT", full_message)
             .with_param("max_force")
             .with_hint("Provide a finite non-negative number (>= 0.0) for 'max_force' (maximum torque in N*m for revolute joints, or maximum force in N for prismatic joints).");
+    }
+
+    // 18. Gear joint ratio, teeth_a, teeth_b, and physics step_size_ms validations
+    if msg.contains("'teeth_a'") {
+        return ErrorBody::new("INVALID_ARGUMENT", full_message)
+            .with_param("teeth_a")
+            .with_hint("Provide a positive finite number (> 0) for tooth count 'teeth_a' in gear joint configuration.");
+    }
+    if msg.contains("'teeth_b'") {
+        return ErrorBody::new("INVALID_ARGUMENT", full_message)
+            .with_param("teeth_b")
+            .with_hint("Provide a positive finite number (> 0) for tooth count 'teeth_b' in gear joint configuration.");
+    }
+    if msg.contains("Gear 'ratio'") || msg.contains("gear ratio") {
+        return ErrorBody::new("INVALID_ARGUMENT", full_message)
+            .with_param("ratio")
+            .with_hint("Provide a non-zero finite number for gear transmission 'ratio' (omega_a / omega_b).");
+    }
+    if msg.contains("'axis_a'") {
+        return ErrorBody::new("INVALID_ARGUMENT", full_message)
+            .with_param("axis_a")
+            .with_hint("Provide a non-zero 3D direction vector [x, y, z] for gear rotation 'axis_a'.");
+    }
+    if msg.contains("'axis_b'") {
+        return ErrorBody::new("INVALID_ARGUMENT", full_message)
+            .with_param("axis_b")
+            .with_hint("Provide a non-zero 3D direction vector [x, y, z] for gear rotation 'axis_b'.");
+    }
+    if msg.contains("'step_size_ms'") {
+        return ErrorBody::new("INVALID_ARGUMENT", full_message)
+            .with_param("step_size_ms")
+            .with_hint("Provide a positive finite number (> 0) for physics simulation discrete step 'step_size_ms' (e.g. 10.0 or 16.6667 ms).");
+    }
+    if msg.contains("Unsupported length_unit") || msg.contains("'length_unit'") {
+        return ErrorBody::new("INVALID_ARGUMENT", full_message)
+            .with_param("length_unit")
+            .with_hint("Supported values for 'length_unit' are 'mm' and 'm'.");
     }
 
     // 18. Missing required argument or requires '<name>'
@@ -616,9 +669,25 @@ fn map_physics_error(
                 .with_details(json!({ "part_id": id, "reason": msg }))
         }
         mcp_cad_physics::PhysicsError::InvalidJointConfiguration(msg) => {
-            ErrorBody::new("INVALID_JOINT_CONFIGURATION", full_message)
-                .with_hint("Check joint anchor coordinates, rotation axis normalization, and part connectivity.")
-                .with_details(json!({ "reason": msg }))
+            let mut body = ErrorBody::new("INVALID_JOINT_CONFIGURATION", full_message)
+                .with_hint("Check joint anchor coordinates, rotation axis normalization, joint limits [min <= max], and part connectivity.")
+                .with_details(json!({ "reason": msg }));
+            if msg.contains("limits") {
+                body = body.with_param("limits");
+            } else if msg.contains("axis_a") {
+                body = body.with_param("axis_a");
+            } else if msg.contains("axis_b") {
+                body = body.with_param("axis_b");
+            } else if msg.contains("axis") {
+                body = body.with_param("axis");
+            } else if msg.contains("ratio") {
+                body = body.with_param("ratio");
+            } else if msg.contains("motor") || msg.contains("Motor") {
+                body = body
+                    .with_param("joint_id")
+                    .with_hint("Motors are only supported on 'revolute' and 'prismatic' joints. For 'gear' constraints, apply the motor to one of the connected revolute joints.");
+            }
+            body
         }
         mcp_cad_physics::PhysicsError::SimulationError(msg) => {
             ErrorBody::new("PHYSICS_SIMULATION_ERROR", full_message)

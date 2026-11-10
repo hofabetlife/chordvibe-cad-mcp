@@ -434,20 +434,63 @@ export function executeMcpToolOnEngineState(
 
   switch (toolName) {
     case 'list_parts': {
+      const rawUnit = String(params.length_unit ?? 'mm').toLowerCase();
+      if (rawUnit !== 'mm' && rawUnit !== 'm') {
+        throw new Error(`Unsupported length_unit '${rawUnit}'. Supported: mm, m`);
+      }
+      const kFromM = rawUnit === 'mm' ? 1000.0 : 1.0;
+      const kVol = Math.pow(kFromM, 3);
       response = {
         parts_count: state.parts.length,
-        parts: state.parts.map((p) => ({
-          id: p.id,
-          name: p.name,
-          material: p.materialId,
-          triangles: p.mesh.triangleCount,
-          vertices: p.mesh.vertexCount,
-          welded_vertices: p.mesh.weldedVertexCount,
-          volume_m3: Number(p.mesh.volume.toFixed(7)),
-          mass_kg: Number(p.mesh.mass.toFixed(4)),
-          is_watertight: p.mesh.isWatertight,
-          euler_genus: p.mesh.eulerGenus,
-        })),
+        parts: state.parts.map((p) => {
+          const minM = p.mesh.boundingBox.min;
+          const maxM = p.mesh.boundingBox.max;
+          const dimsM: [number, number, number] = [
+            maxM[0] - minM[0],
+            maxM[1] - minM[1],
+            maxM[2] - minM[2],
+          ];
+          return {
+            id: p.id,
+            part_id: p.id,
+            name: p.name,
+            material: p.materialId,
+            triangles: p.mesh.triangleCount,
+            triangle_count: p.mesh.triangleCount,
+            triangles_count: p.mesh.triangleCount,
+            vertices: p.mesh.vertexCount,
+            welded_vertices: p.mesh.weldedVertexCount,
+            bounding_box: {
+              min: [minM[0] * kFromM, minM[1] * kFromM, minM[2] * kFromM],
+              max: [maxM[0] * kFromM, maxM[1] * kFromM, maxM[2] * kFromM],
+              dimensions: [dimsM[0] * kFromM, dimsM[1] * kFromM, dimsM[2] * kFromM],
+            },
+            bounding_box_dimensions: [
+              dimsM[0] * kFromM,
+              dimsM[1] * kFromM,
+              dimsM[2] * kFromM,
+            ],
+            bounding_box_dimensions_m: dimsM,
+            volume: Number((p.mesh.volume * kVol).toFixed(6)),
+            volume_m3: Number(p.mesh.volume.toFixed(7)),
+            mass: Number(p.mesh.mass.toFixed(4)),
+            mass_kg: Number(p.mesh.mass.toFixed(4)),
+            is_watertight: p.mesh.isWatertight,
+            euler_genus: p.mesh.eulerGenus,
+            revision: (p as any).revision ?? p.dag.length,
+            length_unit: rawUnit,
+          };
+        }),
+        length_unit: rawUnit,
+        units: {
+          length: rawUnit,
+          area: `${rawUnit}^2`,
+          volume: `${rawUnit}^3`,
+          mass: 'kg',
+          force: 'N',
+          stress: 'MPa',
+          angle: 'deg',
+        },
       };
       break;
     }
@@ -549,12 +592,16 @@ export function executeMcpToolOnEngineState(
         part.mesh = nextMesh;
       }
 
+      (part as any).revision = ((part as any).revision ?? 0) + 1;
+      const addedFeatureId = part.dag[part.dag.length - 1].id;
       state.selectedPartId = part.id;
       response = {
         status: 'ok',
         part_id: part.id,
-        node_id: part.dag[part.dag.length - 1].id,
+        feature_id: addedFeatureId,
+        node_id: addedFeatureId,
         primitive_type: primType,
+        revision: (part as any).revision,
         triangles: part.mesh.triangleCount,
         volume_m3: Number(part.mesh.volume.toFixed(7)),
         is_watertight: part.mesh.isWatertight,
@@ -613,10 +660,15 @@ export function executeMcpToolOnEngineState(
       );
       part.dag = nextDag;
       part.mesh = nextMesh;
+      (part as any).revision = ((part as any).revision ?? part.dag.length - 1) + 1;
       response = {
         status: 'ok',
         part_id: part.id,
+        feature_id: holeNode.id,
         node_id: holeNode.id,
+        revision: (part as any).revision,
+        depth,
+        through,
         triangles: part.mesh.triangleCount,
         volume_m3: Number(part.mesh.volume.toFixed(7)),
         is_watertight: part.mesh.isWatertight,
@@ -633,6 +685,12 @@ export function executeMcpToolOnEngineState(
       const height = Number(params.height ?? 0.01);
       const starts = Number(params.starts ?? 1);
       const profileType = String(params.profile_type || 'circular');
+      const startZ =
+        params.start_z !== undefined
+          ? Number(params.start_z)
+          : part.mesh.vertexCount > 0
+            ? part.mesh.boundingBox.min[2]
+            : -height * 0.5;
 
       if (helixR <= 0 || grooveR <= 0 || pitch <= 0 || height <= 0) {
         throw new Error(
@@ -652,6 +710,7 @@ export function executeMcpToolOnEngineState(
           groove_radius: grooveR,
           pitch,
           height,
+          start_z: startZ,
           starts,
           profile_type: profileType,
         },
@@ -665,10 +724,14 @@ export function executeMcpToolOnEngineState(
       );
       part.dag = nextDag;
       part.mesh = nextMesh;
+      (part as any).revision = ((part as any).revision ?? part.dag.length - 1) + 1;
       response = {
         status: 'ok',
         part_id: part.id,
+        feature_id: grooveNode.id,
         node_id: grooveNode.id,
+        revision: (part as any).revision,
+        start_z: startZ,
         triangles: part.mesh.triangleCount,
         volume_m3: Number(part.mesh.volume.toFixed(7)),
         is_watertight: part.mesh.isWatertight,
@@ -678,17 +741,18 @@ export function executeMcpToolOnEngineState(
 
     case 'modify_feature': {
       const part = resolveTargetPart(state, params.part_id);
-      const nodeId = String(params.node_id || 'node_root');
-      const targetNode =
-        part.dag.find((n) => n.id === nodeId) || part.dag[0];
+      const requestedId = params.feature_id ?? params.node_id;
+      const targetNode = requestedId
+        ? part.dag.find((n) => n.id === String(requestedId))
+        : part.dag[0];
       if (!targetNode) {
-        throw new Error(`Feature node '${nodeId}' not found on part '${part.id}'`);
+        throw new Error(`Feature node '${requestedId}' not found on part '${part.id}'`);
       }
 
-      // Transactional update: evaluate nextDag before mutating part (BUG-008)
+      // Transactional update: evaluate nextDag before mutating part (BUG-008 / P2-T19)
       const nextDag = part.dag.map((n) =>
         n.id === targetNode.id
-          ? { ...n, params: { ...n.params, ...(params.params || {}) } }
+          ? { ...n, params: { ...n.params, ...(params.params || params.new_params || {}) } }
           : n
       );
       const nextMesh = evaluateFeatureTree(
@@ -698,10 +762,13 @@ export function executeMcpToolOnEngineState(
       );
       part.dag = nextDag;
       part.mesh = nextMesh;
+      (part as any).revision = ((part as any).revision ?? part.dag.length) + 1;
       response = {
         status: 'modified',
         part_id: part.id,
+        feature_id: targetNode.id,
         node_id: targetNode.id,
+        revision: (part as any).revision,
         triangles: part.mesh.triangleCount,
         volume_m3: Number(part.mesh.volume.toFixed(7)),
         is_watertight: part.mesh.isWatertight,
@@ -710,11 +777,78 @@ export function executeMcpToolOnEngineState(
     }
 
     case 'get_feature_tree': {
+      const rawUnit = params.length_unit ? String(params.length_unit).toLowerCase() : 'mm';
+      if (rawUnit !== 'mm' && rawUnit !== 'm') {
+        throw new Error(`Invalid length_unit '${params.length_unit}'. Supported: 'mm', 'm'`);
+      }
+      const kFromM = rawUnit === 'mm' ? 1000.0 : 1.0;
+      const kArea = Math.pow(kFromM, 2);
+      const scaleMeshForTree = (mesh: MeshGeometryData): MeshGeometryData => {
+        if (Math.abs(kFromM - 1.0) <= 1e-12) return mesh;
+        const scaledVerts = new Float32Array(mesh.vertices.length);
+        for (let i = 0; i < mesh.vertices.length; i++) {
+          scaledVerts[i] = mesh.vertices[i] * kFromM;
+        }
+        return {
+          ...mesh,
+          vertices: scaledVerts,
+          boundingBox: {
+            min: [
+              mesh.boundingBox.min[0] * kFromM,
+              mesh.boundingBox.min[1] * kFromM,
+              mesh.boundingBox.min[2] * kFromM,
+            ],
+            max: [
+              mesh.boundingBox.max[0] * kFromM,
+              mesh.boundingBox.max[1] * kFromM,
+              mesh.boundingBox.max[2] * kFromM,
+            ],
+          },
+          centerOfMass: [
+            mesh.centerOfMass[0] * kFromM,
+            mesh.centerOfMass[1] * kFromM,
+            mesh.centerOfMass[2] * kFromM,
+          ],
+          surfaceArea: mesh.surfaceArea * kArea,
+          detectedPlanarFaces: mesh.detectedPlanarFaces.map((f) => ({
+            ...f,
+            area: f.area * kArea,
+            centroid: [
+              f.centroid[0] * kFromM,
+              f.centroid[1] * kFromM,
+              f.centroid[2] * kFromM,
+            ],
+          })),
+        };
+      };
       const part = resolveTargetPart(state, params.part_id);
+      const scaledDag = part.dag.map((node) => {
+        const nextParams: Record<string, any> = { ...node.params };
+        if (nextParams.mesh) {
+          nextParams.mesh = scaleMeshForTree(nextParams.mesh);
+        }
+        if (nextParams.tool_mesh) {
+          nextParams.tool_mesh = scaleMeshForTree(nextParams.tool_mesh);
+        }
+        return { ...node, params: nextParams };
+      });
       response = {
         part_id: part.id,
-        node_count: part.dag.length,
-        nodes: part.dag,
+        revision: part.dag.length,
+        features_count: scaledDag.length,
+        node_count: scaledDag.length,
+        nodes: scaledDag,
+        dag: scaledDag,
+        length_unit: rawUnit,
+        units: {
+          length: rawUnit,
+          area: `${rawUnit}^2`,
+          volume: `${rawUnit}^3`,
+          mass: 'kg',
+          force: 'N',
+          stress: 'MPa',
+          angle: 'deg',
+        },
       };
       break;
     }
@@ -722,13 +856,24 @@ export function executeMcpToolOnEngineState(
     case 'boolean_difference':
     case 'boolean_union':
     case 'boolean_intersection': {
-      const partAId = params.part_a_id || params.part_a;
-      const partBId = params.part_b_id || params.part_b;
+      const partAId =
+        params.target_part_id || params.part_a_id || params.part_a;
+      const partBId =
+        params.tool_part_id || params.part_b_id || params.part_b;
       const resultId = String(params.new_part_id || params.result_id || partAId);
+
+      const rawUnit = params.length_unit ? String(params.length_unit).toLowerCase() : 'mm';
+      if (rawUnit !== 'mm' && rawUnit !== 'm') {
+        throw new Error(`Invalid length_unit '${params.length_unit}'. Supported: 'mm', 'm'`);
+      }
+      const kFromM = rawUnit === 'mm' ? 1000.0 : 1.0;
 
       const partA = resolveTargetPart(state, partAId);
       if (!partBId) {
-        throw new Error(`CSG ${toolName} requires part_b / part_b_id`);
+        throw new Error(`CSG ${toolName} requires tool_part_id / part_b`);
+      }
+      if (partA.id === partBId && !params.new_part_id && !params.result_id) {
+        throw new Error('target_part_id and tool_part_id must be different parts');
       }
       const partB = state.parts.find((p) => p.id === partBId);
       if (!partB) {
@@ -754,13 +899,14 @@ export function executeMcpToolOnEngineState(
         nextMesh = csgIntersectionMesh(partA.mesh, partB.mesh, density);
       }
 
+      const featureId = `csg_${partA.dag.length + 1}`;
       const nextDag = [
         ...partA.dag,
         {
-          id: `csg_${partA.dag.length + 1}`,
+          id: featureId,
           name: `CSG ${opType.replace('boolean_', '').toUpperCase()} (${partBId})`,
           type: opType,
-          params: { tool_part_id: partBId },
+          params: { tool_part_id: partBId, tool_mesh: partB.mesh },
           enabled: true,
         },
       ];
@@ -785,12 +931,58 @@ export function executeMcpToolOnEngineState(
         state.selectedPartId = resultId;
       }
 
+      const minM = nextMesh.boundingBox.min;
+      const maxM = nextMesh.boundingBox.max;
+      const dimsM: [number, number, number] = [
+        maxM[0] - minM[0],
+        maxM[1] - minM[1],
+        maxM[2] - minM[2],
+      ];
+      const maxDimM = Math.max(dimsM[0], dimsM[1], dimsM[2]);
+      const minDimM = Math.min(dimsM[0], dimsM[1], dimsM[2]);
+      const warnings: Array<{ code: string; message: string }> = [];
+      if (maxDimM > 10.0) {
+        warnings.push({
+          code: 'SCALE_TOO_LARGE',
+          message: `Part '${resultId}' has maximum bounding-box dimension ${maxDimM.toFixed(3)} m (> 10 m).`,
+        });
+      } else if (maxDimM > 0 && minDimM < 1e-4) {
+        warnings.push({
+          code: 'SCALE_TOO_SMALL',
+          message: `Part '${resultId}' has minimum bounding-box dimension ${minDimM.toExponential(2)} m (< 0.1 mm).`,
+        });
+      }
+
+      const volM3 = Number(nextMesh.volume.toFixed(9));
+      const volDisplay = Number((nextMesh.volume * Math.pow(kFromM, 3)).toFixed(6));
+
       response = {
         status: 'ok',
         operation: toolName,
         result_id: resultId,
+        part_id: resultId,
+        target_part_id: resultId,
+        feature_id: featureId,
+        revision: nextDag.length,
         triangles: nextMesh.triangleCount,
-        volume_m3: Number(nextMesh.volume.toFixed(7)),
+        triangles_count: nextMesh.triangleCount,
+        vertices_count: nextMesh.vertexCount,
+        bounding_box: {
+          min: [minM[0] * kFromM, minM[1] * kFromM, minM[2] * kFromM],
+          max: [maxM[0] * kFromM, maxM[1] * kFromM, maxM[2] * kFromM],
+          dimensions: [dimsM[0] * kFromM, dimsM[1] * kFromM, dimsM[2] * kFromM],
+        },
+        volume: volDisplay,
+        volume_m3: volM3,
+        length_unit: rawUnit,
+        units: {
+          length: rawUnit,
+          area: `${rawUnit}^2`,
+          volume: `${rawUnit}^3`,
+          mass: 'kg',
+          angle: 'deg',
+        },
+        warnings,
         is_watertight: nextMesh.isWatertight,
         euler_genus: nextMesh.eulerGenus,
       };
@@ -799,6 +991,9 @@ export function executeMcpToolOnEngineState(
 
     case 'transform_part': {
       const part = resolveTargetPart(state, params.part_id);
+      if (part.dag.length === 0 && (!part.mesh || part.mesh.vertices.length === 0)) {
+        throw new Error('Cannot transform empty solid');
+      }
       const tr: [number, number, number] = Array.isArray(params.translation)
         ? [
             Number(params.translation[0]),
@@ -806,11 +1001,12 @@ export function executeMcpToolOnEngineState(
             Number(params.translation[2]),
           ]
         : [0, 0, 0];
-      const rotDeg: [number, number, number] = Array.isArray(params.rotation_deg)
+      const rotRaw = params.rotation_deg ?? params.rotation_rpy_deg;
+      const rotDeg: [number, number, number] = Array.isArray(rotRaw)
         ? [
-            Number(params.rotation_deg[0]),
-            Number(params.rotation_deg[1]),
-            Number(params.rotation_deg[2]),
+            Number(rotRaw[0]),
+            Number(rotRaw[1]),
+            Number(rotRaw[2]),
           ]
         : [0, 0, 0];
       const sc: [number, number, number] = Array.isArray(params.scale)
@@ -820,6 +1016,21 @@ export function executeMcpToolOnEngineState(
             Number(params.scale[2]),
           ]
         : [1, 1, 1];
+      if (sc[0] === 0 || sc[1] === 0 || sc[2] === 0) {
+        throw new Error('Scale components cannot be zero');
+      }
+
+      if (part.dag.length === 0 && part.mesh.vertices.length > 0) {
+        part.dag = [
+          {
+            id: 'node_stl',
+            name: `Imported Mesh (${part.name})`,
+            type: 'stl_import',
+            params: { mesh: part.mesh },
+            enabled: true,
+          },
+        ];
+      }
 
       part.mesh = applyTransformToMesh(
         part.mesh,
@@ -828,20 +1039,36 @@ export function executeMcpToolOnEngineState(
         sc,
         getDensity(part.materialId)
       );
+      const featureId = `transform_${part.dag.length + 1}`;
       part.dag = [
         ...part.dag,
         {
-          id: `transform_${part.dag.length + 1}`,
+          id: featureId,
           name: 'Transform 3D',
           type: 'transform',
           params: { translation: tr, rotation_deg: rotDeg, scale: sc },
           enabled: true,
         },
       ];
+      const bbox = part.mesh.boundingBox;
+      const dims: [number, number, number] = [
+        bbox.max[0] - bbox.min[0],
+        bbox.max[1] - bbox.min[1],
+        bbox.max[2] - bbox.min[2],
+      ];
+      const volM3 = Number(part.mesh.volume.toFixed(7));
       response = {
         status: 'transformed',
         part_id: part.id,
-        volume_m3: Number(part.mesh.volume.toFixed(7)),
+        feature_id: featureId,
+        revision: part.dag.length,
+        bounding_box: {
+          min: bbox.min,
+          max: bbox.max,
+          dimensions: dims,
+        },
+        volume: volM3,
+        volume_m3: volM3,
         is_outward_oriented: part.mesh.isOutwardOriented,
         is_watertight: part.mesh.isWatertight,
       };
@@ -918,6 +1145,11 @@ export function executeMcpToolOnEngineState(
     }
 
     case 'validate_mesh': {
+      const rawUnit = params.length_unit ? String(params.length_unit).toLowerCase() : 'mm';
+      if (rawUnit !== 'mm' && rawUnit !== 'm') {
+        throw new Error(`Invalid length_unit '${params.length_unit}'. Supported: 'mm', 'm'`);
+      }
+      const kFromM = rawUnit === 'mm' ? 1000.0 : 1.0;
       const part = resolveTargetPart(state, params.part_id);
       const expectedGenus =
         params.expected_genus !== undefined ? Number(params.expected_genus) : undefined;
@@ -927,6 +1159,7 @@ export function executeMcpToolOnEngineState(
         issues: report.warnings.filter((w) => !w.toLowerCase().includes('warning')),
         warnings: report.warnings,
         part_id: report.partId,
+        revision: part.dag.length,
         raw_vertices_count: report.rawVerticesCount,
         welded_vertices_count: report.weldedVerticesCount,
         triangles_count: report.trianglesCount,
@@ -996,11 +1229,23 @@ export function executeMcpToolOnEngineState(
             deg_45_to_60: report.angleHistogram.deg45To60,
           },
         },
-        volume: report.volume,
-        surface_area: report.surfaceArea,
+        volume_m3: report.volume,
+        surface_area_m2: report.surfaceArea,
+        volume: report.volume * Math.pow(kFromM, 3),
+        surface_area: report.surfaceArea * Math.pow(kFromM, 2),
         bounding_box: report.boundingBox,
         center_of_mass: report.centerOfMass,
         principal_inertia: report.principalInertia,
+        length_unit: rawUnit,
+        units: {
+          length: rawUnit,
+          area: `${rawUnit}^2`,
+          volume: `${rawUnit}^3`,
+          mass: 'kg',
+          force: 'N',
+          stress: 'MPa',
+          angle: 'deg',
+        },
       };
       break;
     }
@@ -1126,6 +1371,17 @@ export function executeMcpToolOnEngineState(
         throw new Error(`create_joint part_b '${partB}' does not exist`);
       }
 
+      if (params.limits !== undefined && params.limits !== null) {
+        if (!Array.isArray(params.limits) || params.limits.length !== 2) {
+          throw new Error("create_joint 'limits' must be a 2-element array [min, max]");
+        }
+        const l0 = Number(params.limits[0]);
+        const l1 = Number(params.limits[1]);
+        if (!Number.isFinite(l0) || !Number.isFinite(l1) || l0 > l1) {
+          throw new Error(`create_joint 'limits' [min, max] invalid: [${l0}, ${l1}]`);
+        }
+      }
+
       const rawAnchor = params.anchor ?? params.anchor_a ?? params.anchor_b;
       const newJoint: KinematicJoint = {
         id: jointId,
@@ -1146,7 +1402,9 @@ export function executeMcpToolOnEngineState(
               Number(params.axis[1]),
               Number(params.axis[2]),
             ]
-          : [0, 0, 1],
+          : jointType === 'prismatic'
+            ? [1, 0, 0]
+            : [0, 0, 1],
         motorSpeedRpm: Number(params.motor_speed_rpm ?? 0),
         motorTorqueNm: Number(params.motor_torque_nm ?? 25),
         motorEnabled: Boolean(params.motor_enabled ?? false),
@@ -1433,23 +1691,25 @@ export function executeMcpToolOnEngineState(
     }
 
     case 'import_stl': {
-      const filePath = String(params.file_path || 'output/spur_gear.stl');
+      const filePath = String(params.file_path || params.filepath || 'output/spur_gear.stl');
       if (!filePath.toLowerCase().endsWith('.stl')) {
         throw new Error('import_stl requires a valid .stl file_path');
       }
       const partId = String(params.part_id || 'imported_stl_part');
+      const isFixed = Boolean(params.is_fixed);
       const density = getDensity('steel_1045');
       const mesh = createBoxMesh(0.05, 0.05, 0.05, density);
       const importedPart: CadPart = {
         id: partId,
-        name: partId,
-        materialId: 'steel_1045',
+        name: String(params.name || partId),
+        materialId: String(params.material || 'steel_1045'),
+        isFixed,
         dag: [
           {
             id: 'node_stl',
             name: `STL Import (${filePath.split('/').pop()})`,
             type: 'stl_import',
-            params: { file_path: filePath },
+            params: { file_path: filePath, mesh },
             enabled: true,
           },
         ],
@@ -1468,6 +1728,7 @@ export function executeMcpToolOnEngineState(
       response = {
         status: 'imported',
         part_id: partId,
+        is_fixed: isFixed,
         file_path: filePath,
         native_stl_url: importedPart.nativeStlUrl,
       };
@@ -1495,29 +1756,118 @@ export function executeMcpToolOnEngineState(
     }
 
     case 'get_simulation_metrics_json': {
+      const rawUnit = String(params.length_unit ?? 'mm').toLowerCase();
+      if (rawUnit !== 'mm' && rawUnit !== 'm') {
+        throw new Error(`Unsupported length_unit '${rawUnit}'. Supported: mm, m`);
+      }
+      const kFromM = rawUnit === 'mm' ? 1000.0 : 1.0;
+      const kVol = Math.pow(kFromM, 3);
+      const partsSummary = state.parts.map((p) => {
+        const minM = p.mesh.boundingBox.min;
+        const maxM = p.mesh.boundingBox.max;
+        const dimsM: [number, number, number] = [
+          maxM[0] - minM[0],
+          maxM[1] - minM[1],
+          maxM[2] - minM[2],
+        ];
+        return {
+          id: p.id,
+          name: p.name,
+          material: p.materialId,
+          volume_m3: Number(p.mesh.volume.toFixed(7)),
+          volume: Number((p.mesh.volume * kVol).toFixed(6)),
+          mass_kg: Number(p.mesh.mass.toFixed(4)),
+          triangles: p.mesh.triangleCount,
+          bounding_box_dimensions: [
+            dimsM[0] * kFromM,
+            dimsM[1] * kFromM,
+            dimsM[2] * kFromM,
+          ],
+          is_watertight: p.mesh.isWatertight,
+          euler_genus: p.mesh.eulerGenus,
+          revision: p.dag.length,
+        };
+      });
+      const feaReports = state.feaResult
+        ? [
+            (() => {
+              const targetPart =
+                state.parts.find((p) => p.id === state.selectedPartId) ||
+                state.parts[0];
+              const partRev = targetPart ? targetPart.dag.length : 1;
+              const feaRev = (state.feaResult as any).feaRevision ?? partRev;
+              const stale = feaRev !== partRev;
+              return {
+                part_id: targetPart?.id ?? 'active',
+                verdict: state.feaResult!.safetyFactor >= 1.0 ? 'PASS' : 'FAIL',
+                factor_of_safety: state.feaResult!.safetyFactor,
+                safety_factor: state.feaResult!.safetyFactor,
+                max_von_mises_mpa: state.feaResult!.maxVonMisesMPa,
+                max_displacement_mm: state.feaResult!.maxDisplacementMm,
+                fea_revision: feaRev,
+                part_revision: partRev,
+                stale,
+                is_stale: stale,
+                status: stale ? 'STALE' : 'FRESH',
+              };
+            })(),
+          ]
+        : [];
       response = {
         engine: 'MCP-CAD Core Engine v1.0.0 (Rust/WGPU Parity)',
         parts_count: state.parts.length,
         joints_count: state.joints.length,
         physics_frames_buffered: state.physicsFrames.length,
-        parts: state.parts.map((p) => ({
-          id: p.id,
-          name: p.name,
-          material: p.materialId,
-          volume_m3: Number(p.mesh.volume.toFixed(7)),
-          mass_kg: Number(p.mesh.mass.toFixed(4)),
-          triangles: p.mesh.triangleCount,
-          is_watertight: p.mesh.isWatertight,
-          euler_genus: p.mesh.eulerGenus,
-        })),
+        parts: partsSummary,
         active_fea: state.feaResult,
+        fea_reports: feaReports,
+        current_metrics: {
+          parts_count: state.parts.length,
+          parts: partsSummary,
+          joints_count: state.joints.length,
+          physics: {
+            accumulated_time_s: 0.0,
+            gravity: [0.0, -9.81 * kFromM, 0.0],
+            gravity_m_s2: [0.0, -9.81, 0.0],
+            joints_count: state.joints.length,
+            last_simulation: null,
+          },
+          fea_reports: feaReports,
+          length_unit: rawUnit,
+          units: {
+            length: rawUnit,
+            area: `${rawUnit}^2`,
+            volume: `${rawUnit}^3`,
+            mass: 'kg',
+            force: 'N',
+            stress: 'MPa',
+            angle: 'deg',
+          },
+        },
+        length_unit: rawUnit,
+        units: {
+          length: rawUnit,
+          area: `${rawUnit}^2`,
+          volume: `${rawUnit}^3`,
+          mass: 'kg',
+          force: 'N',
+          stress: 'MPa',
+          angle: 'deg',
+        },
       };
       break;
     }
 
     case 'optimize_feature_tree': {
+      const rawUnit = String(params.length_unit ?? 'mm').toLowerCase();
+      if (rawUnit !== 'mm' && rawUnit !== 'm') {
+        throw new Error(`Unsupported length_unit '${rawUnit}'. Supported: mm, m`);
+      }
+      const kFromM = rawUnit === 'mm' ? 1000.0 : 1.0;
+      const kVol = Math.pow(kFromM, 3);
       const part = resolveTargetPart(state, params.part_id);
       const density = getDensity(part.materialId);
+      const prevRev = (part as any).revision ?? part.dag.length;
       const report = optimizeCadFeatureTree(
         part.id,
         part.name,
@@ -1525,8 +1875,13 @@ export function executeMcpToolOnEngineState(
         state.quality,
         density
       );
-      const shouldApply = params.apply_best_plan !== false;
-      if (shouldApply && report.bestPlan.dag.length > 0) {
+      const appliedRules = report.bestPlan.appliedRules.map((r) => r.ruleId);
+      const shouldApply =
+        params.apply !== undefined
+          ? Boolean(params.apply)
+          : params.apply_best_plan !== false;
+      let nextRev = prevRev;
+      if (shouldApply && appliedRules.length > 0 && report.bestPlan.dag.length > 0) {
         part.dag = report.bestPlan.dag;
         part.mesh = evaluateFeatureTree(
           part.dag,
@@ -1534,10 +1889,23 @@ export function executeMcpToolOnEngineState(
           density,
           part.mesh
         );
+        nextRev = prevRev + 1;
+        (part as any).revision = nextRev;
       }
       response = {
         status: shouldApply ? 'optimized_and_applied' : 'explained_only',
         part_id: part.id,
+        revision: nextRev,
+        volume: Number((part.mesh.volume * kVol).toFixed(6)),
+        volume_m3: Number(part.mesh.volume.toFixed(9)),
+        length_unit: rawUnit,
+        units: {
+          length: rawUnit,
+          area: `${rawUnit}^2`,
+          volume: `${rawUnit}^3`,
+          mass: 'kg',
+          angle: 'deg',
+        },
         selected_plan_id: report.bestPlan.planId,
         strategy: report.bestPlan.strategyName,
         nodes_before: report.originalNodeCount,
@@ -1547,7 +1915,7 @@ export function executeMcpToolOnEngineState(
         cost_reduction_pct: report.costReductionPct,
         sliver_risk_reduction_pct: report.sliverRiskReductionPct,
         speedup_factor: report.speedupFactor,
-        applied_rules: report.bestPlan.appliedRules.map((r) => r.ruleId),
+        applied_rules: appliedRules,
         invariants: report.invariantCheck,
         explain_tree: report.bestPlan.explainTree,
       };

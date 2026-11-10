@@ -182,16 +182,19 @@ fn test_part_lazy_tessellation_and_caching() {
     };
     assert_eq!(mesh_coarse_ptr, mesh_coarse_ptr_2, "Cache hit must return the same memory address");
 
-    // 3. Tessellate with Fine quality updates the cache
+    // 3. Tessellate with Fine quality updates the cache without bumping revision (P2-T24)
+    let rev_before_tess = part.revision;
     let fine = TessellationSettings::fine();
     part.tessellate(&fine).unwrap();
     let fine_tris = part.mesh().triangle_count();
     assert!(fine_tris > coarse_tris, "Fine mesh must have higher triangle count than Coarse");
     assert_eq!(part.cached_settings.as_ref().unwrap(), &fine);
+    assert_eq!(part.revision, rev_before_tess, "Part::tessellate must not increment part.revision");
 
-    // 4. Rebuild preserves cached settings
+    // 4. Rebuild preserves cached settings and increments revision
     part.rebuild().unwrap();
     assert_eq!(part.mesh().triangle_count(), fine_tris);
+    assert_eq!(part.revision, rev_before_tess + 1);
 
     // 5. Invalidate cache resets it
     part.invalidate_cache();
@@ -215,15 +218,19 @@ fn test_export_part_stl_with_quality() {
         },
         Some("Spindle Body".into()),
     );
+    part.rebuild().unwrap();
+    assert_eq!(part.revision, 1);
 
-    // 1. In-memory binary STL export with Coarse vs Fine
+    // 1. In-memory binary STL export with Coarse vs Fine must preserve part.revision == 1
     let mut bin_coarse = Vec::new();
     export_part_stl_with_quality(&mut part, TessellationQuality::Coarse, &mut bin_coarse, true)
         .expect("Export binary STL Coarse failed");
+    assert_eq!(part.revision, 1);
 
     let mut bin_fine = Vec::new();
     export_part_stl_with_quality(&mut part, TessellationQuality::Fine, &mut bin_fine, true)
         .expect("Export binary STL Fine failed");
+    assert_eq!(part.revision, 1);
 
     assert!(
         bin_fine.len() > bin_coarse.len(),
@@ -250,6 +257,7 @@ fn test_export_part_stl_with_quality() {
     let tmp_file = NamedTempFile::new().unwrap();
     write_part_stl_with_quality(&mut part, TessellationQuality::Fine, tmp_file.path(), true)
         .expect("Write binary STL to disk failed");
+    assert_eq!(part.revision, 1);
 
     let metadata = std::fs::metadata(tmp_file.path()).unwrap();
     assert_eq!(metadata.len() as usize, bin_fine.len());

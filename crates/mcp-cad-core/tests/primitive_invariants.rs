@@ -1166,3 +1166,67 @@ fn p2_t6_legacy_json_deserialization_and_dag_origin_tags() {
     assert!((top.centroid[2] - 0.06).abs() < 1e-9);
 }
 
+#[test]
+fn p2_t15_wheel_rim_small_diameters_no_clamp_panic_and_watertight() {
+    use mcp_cad_core::dag::{FeatureNode, FeatureOp, FeatureTree};
+
+    for &(d_rim, w_rim, bolts, spokes) in &[
+        (0.05, 0.025, 5usize, 5usize),
+        (0.10, 0.050, 4usize, 6usize),
+        (0.12, 0.055, 5usize, 5usize),
+        (0.14, 0.060, 3usize, 3usize),
+    ] {
+        let expected_genus = (1 + bolts + spokes) as i32;
+        let mesh = create_wheel_rim(
+            d_rim,
+            w_rim,
+            None,
+            None,
+            None,
+            None,
+            Some(bolts),
+            None,
+            Some(spokes),
+            None,
+            None,
+            None,
+        );
+        let report = validate_mesh(&mesh, Some(expected_genus));
+        assert_eq!(
+            report.status, "PASS",
+            "Small wheel rim d={d_rim}, w={w_rim} failed validate_mesh: {:?}",
+            report.issues
+        );
+
+        // Also verify via FeatureTree JSON round-trip (default_bolt_hole_diameter)
+        let mut tree = FeatureTree::new();
+        tree.add_node(FeatureNode::new(
+            "SmallWheel",
+            FeatureOp::AddWheelRim {
+                rim_diameter: d_rim,
+                rim_width: w_rim,
+                flange_diameter: None,
+                hub_diameter: None,
+                hub_bore_diameter: None,
+                pcd_diameter: None,
+                bolt_holes_count: Some(bolts),
+                bolt_hole_diameter: None,
+                spokes_count: Some(spokes),
+                spoke_width: None,
+                spoke_thickness: None,
+                offset_et: None,
+                position: None,
+                rotation_deg: None,
+            },
+        ));
+        let json_str = serde_json::to_string(&tree).expect("serialize wheel tree");
+        let roundtrip: FeatureTree = serde_json::from_str(&json_str).expect("deserialize wheel tree");
+        let dag_mesh = roundtrip.evaluate().expect("evaluate small wheel DAG");
+        let dag_report = validate_mesh(&dag_mesh, Some(expected_genus));
+        assert_eq!(
+            dag_report.status, "PASS",
+            "DAG small wheel rim d={d_rim}, w={w_rim} failed validate_mesh: {:?}",
+            dag_report.issues
+        );
+    }
+}

@@ -32,6 +32,27 @@ fn scale_vec3(v: [f64; 3], factor: f64) -> [f64; 3] {
     [v[0] * factor, v[1] * factor, v[2] * factor]
 }
 
+/// Scales a `TriangleMesh` stored in internal SI meters (`m`) to the requested output `LengthUnit` (`k_from_m`).
+fn scale_mesh_from_meters(mesh: &mcp_cad_core::TriangleMesh, k_from_m: f64) -> mcp_cad_core::TriangleMesh {
+    let mut scaled = mesh.clone();
+    if (k_from_m - 1.0).abs() <= 1e-12 {
+        return scaled;
+    }
+    let k_area = k_from_m.powi(2);
+    for v in &mut scaled.vertices {
+        v.position = scale_vec3(v.position, k_from_m);
+    }
+    for face in &mut scaled.faces {
+        face.area *= k_area;
+        face.centroid = scale_vec3(face.centroid, k_from_m);
+        face.sample_point = scale_vec3(face.sample_point, k_from_m);
+        if let Some(ref mut r) = face.radius {
+            *r *= k_from_m;
+        }
+    }
+    scaled
+}
+
 /// Converts a `FeatureOp` stored in internal SI meters (`m`) to the requested output `LengthUnit` (`k_from_m`).
 fn scale_feature_op_from_meters(op: &FeatureOp, k_from_m: f64) -> FeatureOp {
     match op {
@@ -198,13 +219,16 @@ fn scale_feature_op_from_meters(op: &FeatureOp, k_from_m: f64) -> FeatureOp {
             profile_type: profile_type.clone(),
         },
         FeatureOp::BooleanDifferenceMesh { tool_mesh } => FeatureOp::BooleanDifferenceMesh {
-            tool_mesh: tool_mesh.clone(),
+            tool_mesh: scale_mesh_from_meters(tool_mesh, k_from_m),
         },
         FeatureOp::BooleanUnionMesh { tool_mesh } => FeatureOp::BooleanUnionMesh {
-            tool_mesh: tool_mesh.clone(),
+            tool_mesh: scale_mesh_from_meters(tool_mesh, k_from_m),
         },
         FeatureOp::BooleanIntersectionMesh { tool_mesh } => FeatureOp::BooleanIntersectionMesh {
-            tool_mesh: tool_mesh.clone(),
+            tool_mesh: scale_mesh_from_meters(tool_mesh, k_from_m),
+        },
+        FeatureOp::ImportedMesh { mesh } => FeatureOp::ImportedMesh {
+            mesh: scale_mesh_from_meters(mesh, k_from_m),
         },
         FeatureOp::CutHole {
             center,
@@ -241,6 +265,7 @@ pub(crate) fn part_summary_in_unit(part: &Part, unit: LengthUnit) -> Value {
     let k_vol = k_from_m.powi(3);
     json!({
         "id": s.id,
+        "part_id": s.id,
         "name": s.name,
         "material_name": s.material_name,
         "material": s.material_name,
@@ -319,6 +344,12 @@ pub fn create_part(args: &Value, state: &mut EngineState) -> Result<Value, Serve
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("part-{}", Uuid::new_v4().simple()));
 
+    if part_id.eq_ignore_ascii_case("ground") || part_id.eq_ignore_ascii_case("world") {
+        return Err(ServerError::InvalidArgument(format!(
+            "Part id '{part_id}' is reserved ('ground' and 'world' are reserved static physics anchors)"
+        )));
+    }
+
     if state.parts.contains_key(&part_id) {
         return Err(ServerError::InvalidArgument(format!("Part with id '{}' already exists", part_id)));
     }
@@ -340,14 +371,16 @@ pub fn create_part(args: &Value, state: &mut EngineState) -> Result<Value, Serve
 }
 
 /// 2. `list_parts`: Returns summary metadata of all active parts in the engine.
-pub fn list_parts(_args: &Value, state: &EngineState) -> Result<Value, ServerError> {
-    let unit = state.length_unit;
-    let summaries: Vec<Value> = state
-        .parts
-        .values()
+pub fn list_parts(args: &Value, state: &EngineState) -> Result<Value, ServerError> {
+    let unit = state.resolve_length_unit(args)?;
+    let mut sorted_parts: Vec<&Part> = state.parts.values().collect();
+    sorted_parts.sort_by(|a, b| a.id.cmp(&b.id));
+    let summaries: Vec<Value> = sorted_parts
+        .into_iter()
         .map(|p| part_summary_in_unit(p, unit))
         .collect();
     Ok(json!({
+        "parts_count": summaries.len(),
         "parts": summaries,
         "length_unit": unit.as_str(),
         "units": unit.units_metadata(),
@@ -360,6 +393,12 @@ pub fn delete_part(args: &Value, state: &mut EngineState) -> Result<Value, Serve
         .get("part_id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'part_id'".to_string()))?;
+
+    if part_id.eq_ignore_ascii_case("ground") || part_id.eq_ignore_ascii_case("world") {
+        return Err(ServerError::InvalidArgument(format!(
+            "Cannot delete reserved static anchor '{part_id}'"
+        )));
+    }
 
     if state.parts.remove(part_id).is_none() {
         return Err(ServerError::PartNotFound(part_id.to_string()));
@@ -390,7 +429,10 @@ pub fn add_feature_primitive(args: &Value, state: &mut EngineState) -> Result<Va
         .and_then(|v| v.as_str())
         .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'primitive_type'".to_string()))?;
 
-    let params = args.get("params").unwrap_or(args);
+    let params = args
+        .get("params")
+        .or_else(|| args.get("parameters"))
+        .unwrap_or(args);
     let unit = if params.get("length_unit").is_some() {
         state.resolve_length_unit(params)?
     } else {
@@ -862,7 +904,8 @@ pub fn add_feature_primitive(args: &Value, state: &mut EngineState) -> Result<Va
         }
     };
 
-    let (feature_id, mesh_clone, part_rev) = {
+    let k_from_m = unit.from_meters_factor();
+    let (feature_id, aabb, volume_m3, mesh_clone, part_rev) = {
         let part = state
             .parts
             .get_mut(part_id)
@@ -870,14 +913,27 @@ pub fn add_feature_primitive(args: &Value, state: &mut EngineState) -> Result<Va
 
         let prev_dag = part.dag.clone();
         let prev_mesh = part.mesh.clone();
+        let prev_cached_mesh = part.cached_mesh.clone();
+        let prev_cached_settings = part.cached_settings.clone();
+        let prev_revision = part.revision;
+        part.ensure_imported_mesh_in_dag();
         let feature_id = part.dag.add_feature(op, None);
         if let Err(e) = part.rebuild() {
             part.dag = prev_dag;
             part.mesh = prev_mesh;
+            part.cached_mesh = prev_cached_mesh;
+            part.cached_settings = prev_cached_settings;
+            part.revision = prev_revision;
             return Err(ServerError::Cad(e));
         }
 
-        (feature_id, part.mesh.clone(), part.revision)
+        (
+            feature_id,
+            part.bounding_box(),
+            part.volume(),
+            part.mesh.clone(),
+            part.revision,
+        )
     };
 
     let warnings = if let Some(part) = state.parts.get(part_id) {
@@ -888,9 +944,26 @@ pub fn add_feature_primitive(args: &Value, state: &mut EngineState) -> Result<Va
 
     state.send_gui_mesh(&mesh_clone);
 
+    if state.physics_world.has_part(part_id) {
+        if let Some(part) = state.parts.get(part_id) {
+            if !part.mesh().vertices.is_empty() {
+                let _ = state.physics_world.update_part_collider(part);
+            }
+        }
+    }
+
     let mut resp = json!({
+        "part_id": part_id,
         "feature_id": feature_id.to_string(),
+        "primitive_type": prim_type,
         "revision": part_rev,
+        "bounding_box": {
+            "min": scale_vec3(aabb.min, k_from_m),
+            "max": scale_vec3(aabb.max, k_from_m),
+            "dimensions": scale_vec3(aabb.dimensions(), k_from_m),
+        },
+        "volume": volume_m3 * k_from_m.powi(3),
+        "volume_m3": volume_m3,
         "length_unit": unit.as_str(),
         "units": unit.units_metadata(),
         "warnings": warnings,
@@ -949,6 +1022,7 @@ pub fn cut_hole(args: &Value, state: &mut EngineState) -> Result<Value, ServerEr
         state.resolve_length_unit(args)?
     };
     let k_to_m = unit.to_meters_factor();
+    let k_from_m = unit.from_meters_factor();
 
     let pos_val = params
         .get("position")
@@ -1047,7 +1121,7 @@ pub fn cut_hole(args: &Value, state: &mut EngineState) -> Result<Value, ServerEr
         .and_then(|v| v.as_f64())
         .map(|d| d * k_to_m);
 
-    let (feature_id, mesh_clone, part_rev, depth) = {
+    let (feature_id, aabb, volume_m3, mesh_clone, part_rev, depth) = {
         let part = state
             .parts
             .get_mut(part_id)
@@ -1061,6 +1135,10 @@ pub fn cut_hole(args: &Value, state: &mut EngineState) -> Result<Value, ServerEr
 
         let prev_dag = part.dag.clone();
         let prev_mesh = part.mesh.clone();
+        let prev_cached_mesh = part.cached_mesh.clone();
+        let prev_cached_settings = part.cached_settings.clone();
+        let prev_revision = part.revision;
+        part.ensure_imported_mesh_in_dag();
         let feature_id = part.dag.add_feature(
             FeatureOp::CutHole {
                 center,
@@ -1075,10 +1153,20 @@ pub fn cut_hole(args: &Value, state: &mut EngineState) -> Result<Value, ServerEr
         if let Err(e) = part.rebuild() {
             part.dag = prev_dag;
             part.mesh = prev_mesh;
+            part.cached_mesh = prev_cached_mesh;
+            part.cached_settings = prev_cached_settings;
+            part.revision = prev_revision;
             return Err(ServerError::Cad(e));
         }
 
-        (feature_id, part.mesh.clone(), part.revision, depth)
+        (
+            feature_id,
+            part.bounding_box(),
+            part.volume(),
+            part.mesh.clone(),
+            part.revision,
+            depth,
+        )
     };
 
     let warnings = if let Some(part) = state.parts.get(part_id) {
@@ -1089,9 +1177,28 @@ pub fn cut_hole(args: &Value, state: &mut EngineState) -> Result<Value, ServerEr
 
     state.send_gui_mesh(&mesh_clone);
 
+    if state.physics_world.has_part(part_id) {
+        if let Some(part) = state.parts.get(part_id) {
+            if !part.mesh().vertices.is_empty() {
+                let _ = state.physics_world.update_part_collider(part);
+            }
+        }
+    }
+
     let mut resp = json!({
+        "part_id": part_id,
         "feature_id": feature_id.to_string(),
         "revision": part_rev,
+        "depth": depth * k_from_m,
+        "depth_m": depth,
+        "through": through,
+        "bounding_box": {
+            "min": scale_vec3(aabb.min, k_from_m),
+            "max": scale_vec3(aabb.max, k_from_m),
+            "dimensions": scale_vec3(aabb.dimensions(), k_from_m),
+        },
+        "volume": volume_m3 * k_from_m.powi(3),
+        "volume_m3": volume_m3,
         "length_unit": unit.as_str(),
         "units": unit.units_metadata(),
         "warnings": warnings,
@@ -1118,6 +1225,7 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
     let params = args
         .get("params")
         .or_else(|| args.get("new_params"))
+        .or_else(|| args.get("parameters"))
         .unwrap_or(args);
 
     let unit = if params.get("length_unit").is_some() {
@@ -1128,7 +1236,10 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
     let k_to_m = unit.to_meters_factor();
     let k_from_m = unit.from_meters_factor();
 
-    let (aabb, mesh_clone, part_rev) = {
+    let mut extra_dims_m: Vec<f64> = Vec::new();
+    let mut wheel_rim_diameter_m: Option<f64> = None;
+
+    let (aabb, volume_m3, mesh_clone, part_rev) = {
         let part = state
             .parts
             .get_mut(part_id)
@@ -1148,6 +1259,7 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
                 let rot = parse_vec3(params, "rotation_deg")
                     .or_else(|| parse_vec3(params, "rotation_rpy_deg"))
                     .or(*rotation_deg);
+                extra_dims_m.extend_from_slice(&[new_w, new_h, new_d]);
                 FeatureOp::AddBox {
                     width: new_w,
                     height: new_h,
@@ -1164,6 +1276,7 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
                 let rot = parse_vec3(params, "rotation_deg")
                     .or_else(|| parse_vec3(params, "rotation_rpy_deg"))
                     .or(*rotation_deg);
+                extra_dims_m.extend_from_slice(&[new_r * 2.0, new_h]);
                 FeatureOp::AddCylinder {
                     radius: new_r,
                     height: new_h,
@@ -1180,6 +1293,7 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
                 let rot = parse_vec3(params, "rotation_deg")
                     .or_else(|| parse_vec3(params, "rotation_rpy_deg"))
                     .or(*rotation_deg);
+                extra_dims_m.push(new_r * 2.0);
                 FeatureOp::AddSphere {
                     radius: new_r,
                     sectors: new_sec,
@@ -1197,6 +1311,10 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
                 let rot = parse_vec3(params, "rotation_deg")
                     .or_else(|| parse_vec3(params, "rotation_rpy_deg"))
                     .or(*rotation_deg);
+                extra_dims_m.extend_from_slice(&[new_rb * 2.0, new_h]);
+                if new_rt > 0.0 {
+                    extra_dims_m.push(new_rt * 2.0);
+                }
                 FeatureOp::AddCone {
                     radius_bottom: new_rb,
                     radius_top: new_rt,
@@ -1224,6 +1342,13 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
                 let rot = parse_vec3(params, "rotation_deg")
                     .or_else(|| parse_vec3(params, "rotation_rpy_deg"))
                     .or(*rotation_deg);
+                extra_dims_m.push(new_h);
+                if let Some(w) = new_waf {
+                    extra_dims_m.push(w);
+                }
+                if let Some(r) = new_r {
+                    extra_dims_m.push(r * 2.0);
+                }
                 FeatureOp::AddPolygonPrism {
                     sides: new_sides,
                     height: new_h,
@@ -1264,6 +1389,8 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
                     .or_else(|| parse_vec3(params, "rotation_rpy_deg"))
                     .or(*rotation_deg);
 
+                extra_dims_m.extend_from_slice(&[new_m * (new_z as f64), new_fw]);
+
                 FeatureOp::AddSpurGear {
                     module: new_m,
                     teeth: new_z,
@@ -1283,17 +1410,47 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
                 let new_profile = if let Some(arr) = params.get("profile").and_then(|v| v.as_array()) {
                     let mut p = Vec::with_capacity(arr.len());
                     for item in arr {
-                        if let Some(coords) = item.as_array() {
-                            if coords.len() == 2 {
-                                if let (Some(r), Some(z)) = (coords[0].as_f64(), coords[1].as_f64()) {
-                                    p.push([r * k_to_m, z * k_to_m]);
-                                }
-                            }
+                        let coords = item.as_array().ok_or_else(|| {
+                            ServerError::InvalidArgument(
+                                "Each profile point must be a [r, z] array".to_string(),
+                            )
+                        })?;
+                        if coords.len() != 2 {
+                            return Err(ServerError::InvalidArgument(
+                                "Each profile point must have 2 elements [r, z]".to_string(),
+                            ));
                         }
+                        let r = coords[0].as_f64().ok_or_else(|| {
+                            ServerError::InvalidArgument("Profile 'r' must be a number".to_string())
+                        })?;
+                        let z = coords[1].as_f64().ok_or_else(|| {
+                            ServerError::InvalidArgument("Profile 'z' must be a number".to_string())
+                        })?;
+                        if !r.is_finite() || !z.is_finite() || r < 0.0 {
+                            return Err(ServerError::InvalidArgument(
+                                "Profile 'r' must be finite and >= 0, and 'z' must be finite".to_string(),
+                            ));
+                        }
+                        p.push([r * k_to_m, z * k_to_m]);
                     }
                     if p.len() == 2 {
                         if let Some(inner_r) = inner_r_opt {
                             let ir_m = inner_r * k_to_m;
+                            if !ir_m.is_finite() || ir_m < 0.0 {
+                                return Err(ServerError::InvalidArgument(
+                                    "Revolve 'inner_radius' must be >= 0".to_string(),
+                                ));
+                            }
+                            if ir_m >= p[0][0] || ir_m >= p[1][0] {
+                                return Err(ServerError::InvalidArgument(
+                                    "Revolve 'inner_radius' must be strictly less than outer profile radius".to_string(),
+                                ));
+                            }
+                            if (p[1][1] - p[0][1]).abs() <= 1e-12 {
+                                return Err(ServerError::InvalidArgument(
+                                    "Revolve 2-point profile with 'inner_radius' must span non-zero axial height".to_string(),
+                                ));
+                            }
                             vec![
                                 [ir_m, p[0][1]],
                                 p[0],
@@ -1301,16 +1458,32 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
                                 [ir_m, p[1][1]],
                             ]
                         } else {
-                            p
+                            return Err(ServerError::InvalidArgument(
+                                "Revolve 'profile' must contain at least 3 [r, z] points (or 2 outer points with 'inner_radius')".to_string(),
+                            ));
                         }
-                    } else if !p.is_empty() {
+                    } else if p.len() >= 3 {
                         p
                     } else {
-                        profile.clone()
+                        return Err(ServerError::InvalidArgument(
+                            "Revolve 'profile' must contain at least 3 [r, z] points".to_string(),
+                        ));
                     }
+                } else if params.get("profile").is_some() {
+                    return Err(ServerError::InvalidArgument(
+                        "Revolve 'profile' must be an array of [r, z] points".to_string(),
+                    ));
                 } else {
                     profile.clone()
                 };
+                if let (Some(max_r), Some(min_z), Some(max_z)) = (
+                    new_profile.iter().map(|p| p[0]).reduce(f64::max),
+                    new_profile.iter().map(|p| p[1]).reduce(f64::min),
+                    new_profile.iter().map(|p| p[1]).reduce(f64::max),
+                ) {
+                    extra_dims_m.push(max_r * 2.0);
+                    extra_dims_m.push((max_z - min_z).abs());
+                }
                 let new_angle = params.get("angle_deg").or_else(|| params.get("angle")).and_then(|v| v.as_f64()).unwrap_or(*angle_deg);
                 let new_segs = params.get("segments").and_then(|v| v.as_u64()).map(|s| s as usize).unwrap_or(*segments);
                 let pos = parse_vec3(params, "position").map(|p| scale_vec3(p, k_to_m)).or(*position);
@@ -1357,6 +1530,10 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
                 let rot = parse_vec3(params, "rotation_deg")
                     .or_else(|| parse_vec3(params, "rotation_rpy_deg"))
                     .or(*rotation_deg);
+
+                wheel_rim_diameter_m = Some(new_dia);
+                extra_dims_m.extend_from_slice(&[new_dia, new_w]);
+
                 FeatureOp::AddWheelRim {
                     rim_diameter: new_dia,
                     rim_width: new_w,
@@ -1383,6 +1560,7 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
                 let st = params.get("starts").and_then(|v| v.as_u64()).map(|s| s as usize).unwrap_or(*starts);
                 let rh = params.get("is_right_hand").and_then(|v| v.as_bool()).unwrap_or(*is_right_hand);
                 let pt = params.get("profile_type").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| profile_type.clone());
+                extra_dims_m.extend_from_slice(&[hr * 2.0, gr, p, h]);
                 FeatureOp::CutHelicalGroove {
                     helix_radius: hr,
                     groove_radius: gr,
@@ -1409,26 +1587,33 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
                     tool_mesh: tool_mesh.clone(),
                 }
             }
+            FeatureOp::ImportedMesh { mesh } => {
+                FeatureOp::ImportedMesh {
+                    mesh: mesh.clone(),
+                }
+            }
             FeatureOp::CutHole { center, normal, radius, depth, keyway_width, keyway_depth } => {
                 let new_center = if let Some(arr) = params.get("position").or_else(|| params.get("center")).and_then(|v| v.as_array()) {
-                    if arr.len() == 3 {
-                        [
-                            arr[0].as_f64().map(|v| v * k_to_m).unwrap_or(center[0]),
-                            arr[1].as_f64().map(|v| v * k_to_m).unwrap_or(center[1]),
-                            arr[2].as_f64().map(|v| v * k_to_m).unwrap_or(center[2]),
-                        ]
-                    } else {
-                        *center
+                    if arr.len() != 3 {
+                        return Err(ServerError::InvalidArgument(
+                            "'position'/'center' must have 3 elements".to_string(),
+                        ));
                     }
+                    [
+                        arr[0].as_f64().map(|v| v * k_to_m).unwrap_or(center[0]),
+                        arr[1].as_f64().map(|v| v * k_to_m).unwrap_or(center[1]),
+                        arr[2].as_f64().map(|v| v * k_to_m).unwrap_or(center[2]),
+                    ]
                 } else {
                     *center
                 };
                 let new_normal = if let Some(arr) = params.get("normal").or_else(|| params.get("direction")).and_then(|v| v.as_array()) {
-                    if arr.len() == 3 {
-                        [arr[0].as_f64().unwrap_or(normal[0]), arr[1].as_f64().unwrap_or(normal[1]), arr[2].as_f64().unwrap_or(normal[2])]
-                    } else {
-                        *normal
+                    if arr.len() != 3 {
+                        return Err(ServerError::InvalidArgument(
+                            "'normal'/'direction' must have 3 elements".to_string(),
+                        ));
                     }
+                    [arr[0].as_f64().unwrap_or(normal[0]), arr[1].as_f64().unwrap_or(normal[1]), arr[2].as_f64().unwrap_or(normal[2])]
                 } else {
                     *normal
                 };
@@ -1445,6 +1630,7 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
                 };
                 let new_kw = params.get("keyway_width").and_then(|v| v.as_f64()).map(|v| v * k_to_m).or(*keyway_width);
                 let new_kd = params.get("keyway_depth").and_then(|v| v.as_f64()).map(|v| v * k_to_m).or(*keyway_depth);
+                extra_dims_m.extend_from_slice(&[new_r * 2.0, new_d]);
                 FeatureOp::CutHole {
                     center: new_center,
                     normal: new_normal,
@@ -1456,6 +1642,11 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
             }
             FeatureOp::Transform { translation, rotation_deg, scale } => {
                 let t = if let Some(arr) = params.get("translation").and_then(|v| v.as_array()) {
+                    if arr.len() != 3 {
+                        return Err(ServerError::InvalidArgument(
+                            "'translation' must have 3 elements".to_string(),
+                        ));
+                    }
                     [
                         arr[0].as_f64().map(|v| v * k_to_m).unwrap_or(translation[0]),
                         arr[1].as_f64().map(|v| v * k_to_m).unwrap_or(translation[1]),
@@ -1464,12 +1655,22 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
                 } else {
                     *translation
                 };
-                let r = if let Some(arr) = params.get("rotation_deg").and_then(|v| v.as_array()) {
+                let r = if let Some(arr) = params.get("rotation_deg").or_else(|| params.get("rotation_rpy_deg")).and_then(|v| v.as_array()) {
+                    if arr.len() != 3 {
+                        return Err(ServerError::InvalidArgument(
+                            "'rotation_deg' must have 3 elements".to_string(),
+                        ));
+                    }
                     [arr[0].as_f64().unwrap_or(rotation_deg[0]), arr[1].as_f64().unwrap_or(rotation_deg[1]), arr[2].as_f64().unwrap_or(rotation_deg[2])]
                 } else {
                     *rotation_deg
                 };
                 let s = if let Some(arr) = params.get("scale").and_then(|v| v.as_array()) {
+                    if arr.len() != 3 {
+                        return Err(ServerError::InvalidArgument(
+                            "'scale' must have 3 elements".to_string(),
+                        ));
+                    }
                     [arr[0].as_f64().unwrap_or(scale[0]), arr[1].as_f64().unwrap_or(scale[1]), arr[2].as_f64().unwrap_or(scale[2])]
                 } else {
                     *scale
@@ -1484,28 +1685,55 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
 
         let prev_dag = part.dag.clone();
         let prev_mesh = part.mesh.clone();
-        part.dag.modify_feature(feature_id, updated_op)?;
+        let prev_cached_mesh = part.cached_mesh.clone();
+        let prev_cached_settings = part.cached_settings.clone();
+        let prev_revision = part.revision;
+        if let Err(e) = part.dag.modify_feature(feature_id, updated_op) {
+            part.dag = prev_dag;
+            part.mesh = prev_mesh;
+            part.cached_mesh = prev_cached_mesh;
+            part.cached_settings = prev_cached_settings;
+            part.revision = prev_revision;
+            return Err(ServerError::Cad(e));
+        }
         if let Err(e) = part.rebuild() {
             part.dag = prev_dag;
             part.mesh = prev_mesh;
+            part.cached_mesh = prev_cached_mesh;
+            part.cached_settings = prev_cached_settings;
+            part.revision = prev_revision;
             return Err(ServerError::Cad(e));
         }
 
+        // Also check if any node in the updated DAG is an AddWheelRim (so even if a non-wheel-rim node
+        // on a wheel-rim part wasn't the target, or if AddWheelRim was modified without changing rim_diameter,
+        // wheel_rim_diameter_m is populated when modifying AddWheelRim).
         let aabb = part.bounding_box();
+        let volume_m3 = part.volume();
         let mesh_clone = part.mesh.clone();
-        (aabb, mesh_clone, part.revision)
+        (aabb, volume_m3, mesh_clone, part.revision)
     };
 
     let warnings = if let Some(part) = state.parts.get(part_id) {
-        state.check_scale_sanity(part, &[], None, unit)
+        state.check_scale_sanity(part, &extra_dims_m, wheel_rim_diameter_m, unit)
     } else {
         Vec::new()
     };
 
     state.send_gui_mesh(&mesh_clone);
 
+    if state.physics_world.has_part(part_id) {
+        if let Some(part) = state.parts.get(part_id) {
+            if !part.mesh().vertices.is_empty() {
+                let _ = state.physics_world.update_part_collider(part);
+            }
+        }
+    }
+
     let dims = aabb.dimensions();
     let mut resp = json!({
+        "part_id": part_id,
+        "feature_id": feature_id.to_string(),
         "status": "updated",
         "revision": part_rev,
         "updated_bounds": [
@@ -1517,6 +1745,13 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
             aabb.max[2] * k_from_m
         ],
         "dimensions": scale_vec3(dims, k_from_m),
+        "bounding_box": {
+            "min": scale_vec3(aabb.min, k_from_m),
+            "max": scale_vec3(aabb.max, k_from_m),
+            "dimensions": scale_vec3(dims, k_from_m),
+        },
+        "volume": volume_m3 * k_from_m.powi(3),
+        "volume_m3": volume_m3,
         "length_unit": unit.as_str(),
         "units": unit.units_metadata(),
         "warnings": warnings,
@@ -1554,6 +1789,9 @@ pub fn get_feature_tree(args: &Value, state: &EngineState) -> Result<Value, Serv
         .collect();
 
     Ok(json!({
+        "part_id": part.id,
+        "revision": part.revision,
+        "features_count": scaled_nodes.len(),
         "dag": scaled_nodes,
         "length_unit": unit.as_str(),
         "units": unit.units_metadata(),
@@ -1574,62 +1812,117 @@ pub fn cut_helical_groove(args: &Value, state: &mut EngineState) -> Result<Value
         state.resolve_length_unit(args)?
     };
     let k_to_m = unit.to_meters_factor();
+    let k_from_m = unit.from_meters_factor();
 
-    let helix_radius = params
+    let helix_radius_raw = params
         .get("helix_radius")
+        .or_else(|| args.get("helix_radius"))
         .and_then(|v| v.as_f64())
-        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'helix_radius'".to_string()))?
-        * k_to_m;
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'helix_radius'".to_string()))?;
+    if !helix_radius_raw.is_finite() || helix_radius_raw <= 0.0 {
+        return Err(ServerError::InvalidArgument(
+            "Argument 'helix_radius' must be > 0".to_string(),
+        ));
+    }
+    let helix_radius = helix_radius_raw * k_to_m;
 
-    let groove_radius = params
+    let groove_radius_raw = params
         .get("groove_radius")
+        .or_else(|| args.get("groove_radius"))
         .and_then(|v| v.as_f64())
-        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'groove_radius'".to_string()))?
-        * k_to_m;
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'groove_radius'".to_string()))?;
+    if !groove_radius_raw.is_finite() || groove_radius_raw <= 0.0 {
+        return Err(ServerError::InvalidArgument(
+            "Argument 'groove_radius' must be > 0".to_string(),
+        ));
+    }
+    let groove_radius = groove_radius_raw * k_to_m;
 
-    let pitch = params
+    let pitch_raw = params
         .get("pitch")
+        .or_else(|| args.get("pitch"))
         .and_then(|v| v.as_f64())
-        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'pitch'".to_string()))?
-        * k_to_m;
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'pitch'".to_string()))?;
+    if !pitch_raw.is_finite() || pitch_raw <= 0.0 {
+        return Err(ServerError::InvalidArgument(
+            "Argument 'pitch' must be > 0".to_string(),
+        ));
+    }
+    let pitch = pitch_raw * k_to_m;
 
-    let height = params
+    let height_raw = params
         .get("height")
+        .or_else(|| args.get("height"))
         .and_then(|v| v.as_f64())
-        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'height'".to_string()))?
-        * k_to_m;
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'height'".to_string()))?;
+    if !height_raw.is_finite() || height_raw <= 0.0 {
+        return Err(ServerError::InvalidArgument(
+            "Argument 'height' must be > 0".to_string(),
+        ));
+    }
+    let height = height_raw * k_to_m;
 
-    let start_z = params
+    let explicit_start_z = params
         .get("start_z")
+        .or_else(|| args.get("start_z"))
         .and_then(|v| v.as_f64())
-        .unwrap_or(0.0)
-        * k_to_m;
-
-    let starts = params
-        .get("starts")
-        .and_then(|v| v.as_u64())
-        .map(|s| s as usize)
-        .unwrap_or(2);
-
-    let is_right_hand = params
-        .get("is_right_hand")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+        .map(|z| z * k_to_m);
+    if let Some(sz) = explicit_start_z {
+        if !sz.is_finite() {
+            return Err(ServerError::InvalidArgument(
+                "Argument 'start_z' must be a finite number".to_string(),
+            ));
+        }
+    }
 
     let profile_type = params
         .get("profile_type")
+        .or_else(|| args.get("profile_type"))
         .and_then(|v| v.as_str())
         .unwrap_or("circular")
         .to_string();
 
-    let (feature_id, mesh_clone) = {
+    let default_starts = if profile_type == "metric_60" { 1 } else { 2 };
+    let starts = params
+        .get("starts")
+        .or_else(|| args.get("starts"))
+        .and_then(|v| v.as_u64())
+        .map(|s| s as usize)
+        .unwrap_or(default_starts);
+    if starts == 0 {
+        return Err(ServerError::InvalidArgument(
+            "Argument 'starts' must be >= 1".to_string(),
+        ));
+    }
+
+    let is_right_hand = params
+        .get("is_right_hand")
+        .or_else(|| args.get("is_right_hand"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let (feature_id, aabb, volume_m3, mesh_clone, part_rev, start_z) = {
         let part = state
             .parts
             .get_mut(part_id)
             .ok_or_else(|| ServerError::PartNotFound(part_id.to_string()))?;
 
+        // When `start_z` is omitted, align the helical sweep start with the bottom face of the part
+        // (`bounding_box.min[2]`) or `-height / 2` if the part is empty (P2-T19).
+        let start_z = explicit_start_z.unwrap_or_else(|| {
+            if !part.mesh().vertices.is_empty() {
+                part.bounding_box().min[2]
+            } else {
+                -height * 0.5
+            }
+        });
+
         let prev_dag = part.dag.clone();
         let prev_mesh = part.mesh.clone();
+        let prev_cached_mesh = part.cached_mesh.clone();
+        let prev_cached_settings = part.cached_settings.clone();
+        let prev_revision = part.revision;
+        part.ensure_imported_mesh_in_dag();
         let feature_id = part.dag.add_feature(
             FeatureOp::CutHelicalGroove {
                 helix_radius,
@@ -1646,10 +1939,20 @@ pub fn cut_helical_groove(args: &Value, state: &mut EngineState) -> Result<Value
         if let Err(e) = part.rebuild() {
             part.dag = prev_dag;
             part.mesh = prev_mesh;
+            part.cached_mesh = prev_cached_mesh;
+            part.cached_settings = prev_cached_settings;
+            part.revision = prev_revision;
             return Err(ServerError::Cad(e));
         }
 
-        (feature_id, part.mesh.clone())
+        (
+            feature_id,
+            part.bounding_box(),
+            part.volume(),
+            part.mesh.clone(),
+            part.revision,
+            start_z,
+        )
     };
 
     let warnings = if let Some(part) = state.parts.get(part_id) {
@@ -1660,9 +1963,27 @@ pub fn cut_helical_groove(args: &Value, state: &mut EngineState) -> Result<Value
 
     state.send_gui_mesh(&mesh_clone);
 
+    if state.physics_world.has_part(part_id) {
+        if let Some(part) = state.parts.get(part_id) {
+            if !part.mesh().vertices.is_empty() {
+                let _ = state.physics_world.update_part_collider(part);
+            }
+        }
+    }
+
     let mut resp = json!({
+        "part_id": part_id,
         "feature_id": feature_id.to_string(),
+        "revision": part_rev,
+        "start_z": start_z * k_from_m,
         "status": "helical_groove_cut",
+        "bounding_box": {
+            "min": scale_vec3(aabb.min, k_from_m),
+            "max": scale_vec3(aabb.max, k_from_m),
+            "dimensions": scale_vec3(aabb.dimensions(), k_from_m),
+        },
+        "volume": volume_m3 * k_from_m.powi(3),
+        "volume_m3": volume_m3,
         "length_unit": unit.as_str(),
         "units": unit.units_metadata(),
         "warnings": warnings,
@@ -1689,6 +2010,9 @@ pub fn boolean_difference(args: &Value, state: &mut EngineState) -> Result<Value
         ));
     }
 
+    let unit = state.resolve_length_unit(args)?;
+    let k_from_m = unit.from_meters_factor();
+
     let tool_mesh = {
         let tool_part = state
             .parts
@@ -1697,41 +2021,78 @@ pub fn boolean_difference(args: &Value, state: &mut EngineState) -> Result<Value
         tool_part.mesh.clone()
     };
 
-    let target_part = state
-        .parts
-        .get_mut(target_part_id)
-        .ok_or_else(|| ServerError::PartNotFound(target_part_id.to_string()))?;
+    let (feature_id, vertices_count, triangles_count, aabb, volume_m3, mesh_clone, part_rev) = {
+        let target_part = state
+            .parts
+            .get_mut(target_part_id)
+            .ok_or_else(|| ServerError::PartNotFound(target_part_id.to_string()))?;
 
-    let prev_dag = target_part.dag.clone();
-    let prev_mesh = target_part.mesh.clone();
-    let feature_id = target_part.dag.add_feature(
-        FeatureOp::BooleanDifferenceMesh { tool_mesh },
-        None,
-    );
-    if let Err(e) = target_part.rebuild() {
-        target_part.dag = prev_dag;
-        target_part.mesh = prev_mesh;
-        return Err(ServerError::Cad(e));
-    }
+        let prev_dag = target_part.dag.clone();
+        let prev_mesh = target_part.mesh.clone();
+        let prev_cached_mesh = target_part.cached_mesh.clone();
+        let prev_cached_settings = target_part.cached_settings.clone();
+        let prev_revision = target_part.revision;
+        target_part.ensure_imported_mesh_in_dag();
+        let feature_id = target_part.dag.add_feature(
+            FeatureOp::BooleanDifferenceMesh { tool_mesh },
+            None,
+        );
+        if let Err(e) = target_part.rebuild() {
+            target_part.dag = prev_dag;
+            target_part.mesh = prev_mesh;
+            target_part.cached_mesh = prev_cached_mesh;
+            target_part.cached_settings = prev_cached_settings;
+            target_part.revision = prev_revision;
+            return Err(ServerError::Cad(e));
+        }
 
-    let mesh_clone = target_part.mesh.clone();
-    let unit = state.length_unit;
+        let aabb = target_part.bounding_box();
+        let volume_m3 = target_part.volume();
+        let mesh = target_part.mesh().clone();
+        let part_rev = target_part.revision;
+        (
+            feature_id,
+            mesh.vertices.len(),
+            mesh.triangle_count(),
+            aabb,
+            volume_m3,
+            mesh,
+            part_rev,
+        )
+    };
+
+    let warnings = if let Some(target_part) = state.parts.get(target_part_id) {
+        state.check_scale_sanity(target_part, &[], None, unit)
+    } else {
+        Vec::new()
+    };
+
     state.send_gui_mesh(&mesh_clone);
 
-    let _ = state.physics_world.remove_part(target_part_id);
     if let Some(target_part) = state.parts.get(target_part_id) {
         if !target_part.mesh().vertices.is_empty() {
-            let _ = state
-                .physics_world
-                .add_part(target_part, !target_part.is_fixed);
+            let _ = state.physics_world.update_part_collider(target_part);
         }
     }
 
     let mut resp = json!({
+        "part_id": target_part_id,
+        "target_part_id": target_part_id,
         "feature_id": feature_id.to_string(),
+        "revision": part_rev,
         "status": "boolean_difference_applied",
+        "vertices_count": vertices_count,
+        "triangles_count": triangles_count,
+        "bounding_box": {
+            "min": scale_vec3(aabb.min, k_from_m),
+            "max": scale_vec3(aabb.max, k_from_m),
+            "dimensions": scale_vec3(aabb.dimensions(), k_from_m),
+        },
+        "volume": volume_m3 * k_from_m.powi(3),
+        "volume_m3": volume_m3,
         "length_unit": unit.as_str(),
         "units": unit.units_metadata(),
+        "warnings": warnings,
     });
     super::requirements::attach_auto_check_if_enabled(state, Some(target_part_id), &mut resp);
     Ok(resp)
@@ -1741,6 +2102,7 @@ pub fn boolean_difference(args: &Value, state: &mut EngineState) -> Result<Value
 pub fn import_stl(args: &Value, state: &mut EngineState) -> Result<Value, ServerError> {
     let filepath = args
         .get("filepath")
+        .or_else(|| args.get("file_path"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'filepath'".to_string()))?;
 
@@ -1779,13 +2141,41 @@ pub fn import_stl(args: &Value, state: &mut EngineState) -> Result<Value, Server
 
     let mesh = mcp_cad_core::import_stl_file(path)?;
 
-    let part_id = format!("part-{}", Uuid::new_v4().simple());
+    let part_id = args
+        .get("part_id")
+        .or_else(|| args.get("id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("part-{}", Uuid::new_v4().simple()));
+
+    if part_id.eq_ignore_ascii_case("ground") || part_id.eq_ignore_ascii_case("world") {
+        return Err(ServerError::InvalidArgument(format!(
+            "Part id '{part_id}' is reserved ('ground' and 'world' are reserved static physics anchors)"
+        )));
+    }
+
+    if state.parts.contains_key(&part_id) {
+        return Err(ServerError::InvalidArgument(format!("Part with id '{}' already exists", part_id)));
+    }
+
+    let is_fixed = args.get("is_fixed").and_then(|v| v.as_bool()).unwrap_or(false);
+
     let mut part = Part::new(&part_id, &part_name, material);
+    part.is_fixed = is_fixed;
     part.mesh = mesh.clone();
+    part.ensure_imported_mesh_in_dag();
     part.bump_revision();
+
+    if !part.mesh.vertices.is_empty() {
+        let _ = state.physics_world.add_part(&part, !part.is_fixed);
+    }
 
     let warnings = state.check_scale_sanity(&part, &[], None, unit);
     let bbox = mesh.bounding_box();
+    let summary = part.summary();
+    let volume_m3 = summary.volume;
+    let mass_kg = summary.mass;
+    let part_revision = part.revision;
 
     state.send_gui_mesh(&mesh);
     state.parts.insert(part_id.clone(), part);
@@ -1793,12 +2183,19 @@ pub fn import_stl(args: &Value, state: &mut EngineState) -> Result<Value, Server
     let mut resp = json!({
         "part_id": part_id,
         "name": part_name,
+        "is_fixed": is_fixed,
+        "revision": part_revision,
         "vertices_count": mesh.vertices.len(),
         "triangles_count": mesh.indices.len(),
         "bounding_box": {
             "min": scale_vec3(bbox.min, k_from_m),
             "max": scale_vec3(bbox.max, k_from_m),
+            "dimensions": scale_vec3(bbox.dimensions(), k_from_m),
         },
+        "volume": volume_m3 * k_from_m.powi(3),
+        "volume_m3": volume_m3,
+        "mass_kg": mass_kg,
+        "mass": mass_kg,
         "status": "stl_imported",
         "length_unit": unit.as_str(),
         "units": unit.units_metadata(),
@@ -1817,21 +2214,21 @@ fn resolve_tessellation_settings(
     default_quality: &str,
 ) -> Result<(TessellationSettings, String), ServerError> {
     if let Some(c) = chord_tolerance {
-        if c <= 0.0 {
+        if !c.is_finite() || c <= 0.0 {
             return Err(ServerError::InvalidArgument(
                 "chord_tolerance must be greater than 0".to_string(),
             ));
         }
     }
     if let Some(a) = angular_tolerance_deg {
-        if a <= 0.0 {
+        if !a.is_finite() || a <= 0.0 {
             return Err(ServerError::InvalidArgument(
                 "angular_tolerance_deg must be greater than 0".to_string(),
             ));
         }
     }
     if let Some(m) = max_edge_length {
-        if m <= 0.0 {
+        if !m.is_finite() || m <= 0.0 {
             return Err(ServerError::InvalidArgument(
                 "max_edge_length must be greater than 0".to_string(),
             ));
@@ -1902,46 +2299,99 @@ pub fn export_stl(args: &Value, state: &mut EngineState) -> Result<Value, Server
         .and_then(|v| v.as_f64())
         .map(|c| c * k_to_m);
 
+    let angular_tolerance_deg = args
+        .get("angular_tolerance_deg")
+        .and_then(|v| v.as_f64());
+
+    let max_edge_length = args
+        .get("max_edge_length")
+        .and_then(|v| v.as_f64())
+        .map(|m| m * k_to_m);
+
     let (settings, quality_applied) = resolve_tessellation_settings(
         quality,
         chord_tolerance,
-        None,
-        None,
+        angular_tolerance_deg,
+        max_edge_length,
         "fine",
     )?;
 
-    let part = state
-        .parts
-        .get_mut(part_id)
-        .ok_or_else(|| ServerError::PartNotFound(part_id.to_string()))?;
+    let (triangles_count, part_revision) = {
+        let part = state
+            .parts
+            .get_mut(part_id)
+            .ok_or_else(|| ServerError::PartNotFound(part_id.to_string()))?;
 
-    if !part.dag.nodes.is_empty() {
-        part.tessellate(&settings)?;
-    }
+        if part.dag.nodes.is_empty() && part.mesh().vertices.is_empty() {
+            return Err(ServerError::InvalidArgument(
+                "Cannot export empty part mesh to STL. Add features first.".to_string(),
+            ));
+        }
 
-    if part.mesh().vertices.is_empty() {
-        return Err(ServerError::InvalidArgument(
-            "Cannot export empty part mesh to STL. Add features first.".to_string(),
-        ));
-    }
+        let prev_mesh = part.mesh.clone();
+        let prev_cached_mesh = part.cached_mesh.clone();
+        let prev_cached_settings = part.cached_settings.clone();
+        let prev_revision = part.revision;
 
-    let path = Path::new(filepath);
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
+        if !part.dag.nodes.is_empty() {
+            if let Err(e) = part.tessellate(&settings) {
+                part.mesh = prev_mesh;
+                part.cached_mesh = prev_cached_mesh;
+                part.cached_settings = prev_cached_settings;
+                part.revision = prev_revision;
+                return Err(ServerError::Cad(e));
+            }
+        }
+        part.revision = prev_revision;
+
+        if part.mesh().vertices.is_empty() {
+            part.mesh = prev_mesh;
+            part.cached_mesh = prev_cached_mesh;
+            part.cached_settings = prev_cached_settings;
+            return Err(ServerError::InvalidArgument(
+                "Cannot export empty part mesh to STL. Add features first.".to_string(),
+            ));
+        }
+
+        let path = Path::new(filepath);
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    part.mesh = prev_mesh;
+                    part.cached_mesh = prev_cached_mesh;
+                    part.cached_settings = prev_cached_settings;
+                    return Err(ServerError::Io(e));
+                }
+            }
+        }
+
+        let mesh = part.mesh();
+        let write_res = if binary {
+            write_stl_binary_file(mesh, path)
+        } else {
+            write_stl_ascii_file(mesh, &part.name, path)
+        };
+        if let Err(e) = write_res {
+            part.mesh = prev_mesh;
+            part.cached_mesh = prev_cached_mesh;
+            part.cached_settings = prev_cached_settings;
+            return Err(ServerError::Cad(e));
+        }
+
+        (part.mesh().triangle_count(), part.revision)
+    };
+
+    if state.physics_world.has_part(part_id) {
+        if let Some(part) = state.parts.get(part_id) {
+            if !part.mesh().vertices.is_empty() {
+                let _ = state.physics_world.update_part_collider(part);
+            }
         }
     }
 
-    let mesh = part.mesh();
-    if binary {
-        write_stl_binary_file(mesh, path)?;
-    } else {
-        write_stl_ascii_file(mesh, &part.name, path)?;
-    }
-
-    let triangles_count = mesh.triangle_count();
-
     Ok(json!({
+        "part_id": part_id,
+        "revision": part_revision,
         "filepath": filepath,
         "file_path": filepath,
         "triangles_count": triangles_count,
@@ -1991,20 +2441,30 @@ pub fn tessellate_part(args: &Value, state: &mut EngineState) -> Result<Value, S
         "medium",
     )?;
 
-    let (mesh_clone, volume_m3) = {
+    let (mesh_clone, volume_m3, part_revision) = {
         let part = state
             .parts
             .get_mut(part_id)
             .ok_or_else(|| ServerError::PartNotFound(part_id.to_string()))?;
 
+        let prev_revision = part.revision;
         if !part.dag.nodes.is_empty() {
             part.tessellate(&settings)?;
         }
+        part.revision = prev_revision;
 
-        (part.mesh().clone(), part.volume())
+        (part.mesh().clone(), part.volume(), part.revision)
     };
 
     state.send_gui_mesh(&mesh_clone);
+
+    if state.physics_world.has_part(part_id) {
+        if let Some(part) = state.parts.get(part_id) {
+            if !part.mesh().vertices.is_empty() {
+                let _ = state.physics_world.update_part_collider(part);
+            }
+        }
+    }
 
     let vertex_count = mesh_clone.vertices.len();
     let triangle_count = mesh_clone.triangle_count();
@@ -2012,6 +2472,7 @@ pub fn tessellate_part(args: &Value, state: &mut EngineState) -> Result<Value, S
 
     Ok(json!({
         "part_id": part_id,
+        "revision": part_revision,
         "quality_applied": quality_applied,
         "vertex_count": vertex_count,
         "vertices_count": vertex_count,
@@ -2172,18 +2633,22 @@ pub fn resolve_face_selector<'a>(
     }
 
     if let Some(id_val) = obj.get("face_id") {
-        let id = id_val.as_u64().ok_or_else(|| {
-            ServerError::InvalidArgument(
-                "Field 'face_id' in face_selector must be a non-negative integer".to_string(),
-            )
-        })? as u32;
-        let found = faces.iter().find(|f| f.id == id).ok_or_else(|| {
-            let available: Vec<u32> = faces.iter().map(|f| f.id).collect();
-            ServerError::InvalidArgument(format!(
-                "FACE_NOT_FOUND: Face not found with face_id={id}. Available face_ids: {available:?}"
-            ))
-        })?;
-        return Ok(vec![found]);
+        if let Some(id) = id_val.as_u64() {
+            let id = id as u32;
+            let found = faces.iter().find(|f| f.id == id).ok_or_else(|| {
+                let available: Vec<u32> = faces.iter().map(|f| f.id).collect();
+                ServerError::InvalidArgument(format!(
+                    "FACE_NOT_FOUND: Face not found with face_id={id}. Available face_ids: {available:?}"
+                ))
+            })?;
+            return Ok(vec![found]);
+        } else if let Some(name) = id_val.as_str() {
+            return Ok(vec![resolve_face_by_name(faces, name)?]);
+        } else {
+            return Err(ServerError::InvalidArgument(
+                "Field 'face_id' in face_selector must be a non-negative integer or face name string".to_string(),
+            ));
+        }
     }
 
     if let Some(arr_val) = obj.get("faces") {
@@ -2411,6 +2876,8 @@ pub fn validate_mesh_tool(args: &Value, state: &mut EngineState) -> Result<Value
     let area_m2 = part.surface_area();
     let mut val = serde_json::to_value(&report).map_err(ServerError::Json)?;
     if let Some(obj) = val.as_object_mut() {
+        obj.insert("part_id".to_string(), json!(part.id));
+        obj.insert("revision".to_string(), json!(part.revision));
         obj.insert("volume_m3".to_string(), json!(vol_m3));
         obj.insert("surface_area_m2".to_string(), json!(area_m2));
         obj.insert("volume".to_string(), json!(vol_m3 * k_from_m.powi(3)));
@@ -2442,6 +2909,9 @@ pub fn boolean_union(args: &Value, state: &mut EngineState) -> Result<Value, Ser
         ));
     }
 
+    let unit = state.resolve_length_unit(args)?;
+    let k_from_m = unit.from_meters_factor();
+
     let tool_mesh = {
         let tool_part = state
             .parts
@@ -2450,7 +2920,7 @@ pub fn boolean_union(args: &Value, state: &mut EngineState) -> Result<Value, Ser
         tool_part.mesh().clone()
     };
 
-    let (feature_id, vertices_count, triangles_count, mesh_clone) = {
+    let (feature_id, vertices_count, triangles_count, aabb, volume_m3, mesh_clone, part_rev) = {
         let target_part = state
             .parts
             .get_mut(target_part_id)
@@ -2458,6 +2928,10 @@ pub fn boolean_union(args: &Value, state: &mut EngineState) -> Result<Value, Ser
 
         let prev_dag = target_part.dag.clone();
         let prev_mesh = target_part.mesh.clone();
+        let prev_cached_mesh = target_part.cached_mesh.clone();
+        let prev_cached_settings = target_part.cached_settings.clone();
+        let prev_revision = target_part.revision;
+        target_part.ensure_imported_mesh_in_dag();
         let feature_id = target_part.dag.add_feature(
             FeatureOp::BooleanUnionMesh { tool_mesh },
             None,
@@ -2465,34 +2939,59 @@ pub fn boolean_union(args: &Value, state: &mut EngineState) -> Result<Value, Ser
         if let Err(e) = target_part.rebuild() {
             target_part.dag = prev_dag;
             target_part.mesh = prev_mesh;
+            target_part.cached_mesh = prev_cached_mesh;
+            target_part.cached_settings = prev_cached_settings;
+            target_part.revision = prev_revision;
             return Err(ServerError::Cad(e));
         }
 
+        let aabb = target_part.bounding_box();
+        let volume_m3 = target_part.volume();
         let mesh = target_part.mesh().clone();
-        (feature_id, mesh.vertices.len(), mesh.triangle_count(), mesh)
+        let part_rev = target_part.revision;
+        (
+            feature_id,
+            mesh.vertices.len(),
+            mesh.triangle_count(),
+            aabb,
+            volume_m3,
+            mesh,
+            part_rev,
+        )
+    };
+
+    let warnings = if let Some(target_part) = state.parts.get(target_part_id) {
+        state.check_scale_sanity(target_part, &[], None, unit)
+    } else {
+        Vec::new()
     };
 
     state.send_gui_mesh(&mesh_clone);
 
-    let _ = state.physics_world.remove_part(target_part_id);
     if let Some(target_part) = state.parts.get(target_part_id) {
         if !target_part.mesh().vertices.is_empty() {
-            let _ = state
-                .physics_world
-                .add_part(target_part, !target_part.is_fixed);
+            let _ = state.physics_world.update_part_collider(target_part);
         }
     }
 
-    let unit = state.length_unit;
-
     let mut resp = json!({
+        "part_id": target_part_id,
         "target_part_id": target_part_id,
         "feature_id": feature_id.to_string(),
+        "revision": part_rev,
         "status": "union_applied",
         "vertices_count": vertices_count,
         "triangles_count": triangles_count,
+        "bounding_box": {
+            "min": scale_vec3(aabb.min, k_from_m),
+            "max": scale_vec3(aabb.max, k_from_m),
+            "dimensions": scale_vec3(aabb.dimensions(), k_from_m),
+        },
+        "volume": volume_m3 * k_from_m.powi(3),
+        "volume_m3": volume_m3,
         "length_unit": unit.as_str(),
         "units": unit.units_metadata(),
+        "warnings": warnings,
     });
     super::requirements::attach_auto_check_if_enabled(state, Some(target_part_id), &mut resp);
     Ok(resp)
@@ -2516,6 +3015,9 @@ pub fn boolean_intersection(args: &Value, state: &mut EngineState) -> Result<Val
         ));
     }
 
+    let unit = state.resolve_length_unit(args)?;
+    let k_from_m = unit.from_meters_factor();
+
     let tool_mesh = {
         let tool_part = state
             .parts
@@ -2524,7 +3026,7 @@ pub fn boolean_intersection(args: &Value, state: &mut EngineState) -> Result<Val
         tool_part.mesh().clone()
     };
 
-    let (feature_id, vertices_count, triangles_count, mesh_clone) = {
+    let (feature_id, vertices_count, triangles_count, aabb, volume_m3, mesh_clone, part_rev) = {
         let target_part = state
             .parts
             .get_mut(target_part_id)
@@ -2532,6 +3034,10 @@ pub fn boolean_intersection(args: &Value, state: &mut EngineState) -> Result<Val
 
         let prev_dag = target_part.dag.clone();
         let prev_mesh = target_part.mesh.clone();
+        let prev_cached_mesh = target_part.cached_mesh.clone();
+        let prev_cached_settings = target_part.cached_settings.clone();
+        let prev_revision = target_part.revision;
+        target_part.ensure_imported_mesh_in_dag();
         let feature_id = target_part.dag.add_feature(
             FeatureOp::BooleanIntersectionMesh { tool_mesh },
             None,
@@ -2539,34 +3045,59 @@ pub fn boolean_intersection(args: &Value, state: &mut EngineState) -> Result<Val
         if let Err(e) = target_part.rebuild() {
             target_part.dag = prev_dag;
             target_part.mesh = prev_mesh;
+            target_part.cached_mesh = prev_cached_mesh;
+            target_part.cached_settings = prev_cached_settings;
+            target_part.revision = prev_revision;
             return Err(ServerError::Cad(e));
         }
 
+        let aabb = target_part.bounding_box();
+        let volume_m3 = target_part.volume();
         let mesh = target_part.mesh().clone();
-        (feature_id, mesh.vertices.len(), mesh.triangle_count(), mesh)
+        let part_rev = target_part.revision;
+        (
+            feature_id,
+            mesh.vertices.len(),
+            mesh.triangle_count(),
+            aabb,
+            volume_m3,
+            mesh,
+            part_rev,
+        )
+    };
+
+    let warnings = if let Some(target_part) = state.parts.get(target_part_id) {
+        state.check_scale_sanity(target_part, &[], None, unit)
+    } else {
+        Vec::new()
     };
 
     state.send_gui_mesh(&mesh_clone);
 
-    let _ = state.physics_world.remove_part(target_part_id);
     if let Some(target_part) = state.parts.get(target_part_id) {
         if !target_part.mesh().vertices.is_empty() {
-            let _ = state
-                .physics_world
-                .add_part(target_part, !target_part.is_fixed);
+            let _ = state.physics_world.update_part_collider(target_part);
         }
     }
 
-    let unit = state.length_unit;
-
     let mut resp = json!({
+        "part_id": target_part_id,
         "target_part_id": target_part_id,
         "feature_id": feature_id.to_string(),
+        "revision": part_rev,
         "status": "intersection_applied",
         "vertices_count": vertices_count,
         "triangles_count": triangles_count,
+        "bounding_box": {
+            "min": scale_vec3(aabb.min, k_from_m),
+            "max": scale_vec3(aabb.max, k_from_m),
+            "dimensions": scale_vec3(aabb.dimensions(), k_from_m),
+        },
+        "volume": volume_m3 * k_from_m.powi(3),
+        "volume_m3": volume_m3,
         "length_unit": unit.as_str(),
         "units": unit.units_metadata(),
+        "warnings": warnings,
     });
     super::requirements::attach_auto_check_if_enabled(state, Some(target_part_id), &mut resp);
     Ok(resp)
@@ -2686,7 +3217,7 @@ pub fn transform_part(args: &Value, state: &mut EngineState) -> Result<Value, Se
         translation[2] += p[2] - rsp[2];
     }
 
-    let (feature_id, aabb, volume_m3, mesh_clone) = {
+    let (feature_id, aabb, volume_m3, mesh_clone, part_rev) = {
         let part = state
             .parts
             .get_mut(part_id)
@@ -2694,6 +3225,10 @@ pub fn transform_part(args: &Value, state: &mut EngineState) -> Result<Value, Se
 
         let prev_dag = part.dag.clone();
         let prev_mesh = part.mesh.clone();
+        let prev_cached_mesh = part.cached_mesh.clone();
+        let prev_cached_settings = part.cached_settings.clone();
+        let prev_revision = part.revision;
+        part.ensure_imported_mesh_in_dag();
         let feature_id = part.dag.add_feature(
             FeatureOp::Transform {
                 translation,
@@ -2705,13 +3240,17 @@ pub fn transform_part(args: &Value, state: &mut EngineState) -> Result<Value, Se
         if let Err(e) = part.rebuild() {
             part.dag = prev_dag;
             part.mesh = prev_mesh;
+            part.cached_mesh = prev_cached_mesh;
+            part.cached_settings = prev_cached_settings;
+            part.revision = prev_revision;
             return Err(ServerError::Cad(e));
         }
 
         let aabb = part.bounding_box();
         let volume = part.volume();
         let mesh = part.mesh().clone();
-        (feature_id, aabb, volume, mesh)
+        let part_rev = part.revision;
+        (feature_id, aabb, volume, mesh, part_rev)
     };
 
     let warnings = if let Some(part) = state.parts.get(part_id) {
@@ -2722,16 +3261,16 @@ pub fn transform_part(args: &Value, state: &mut EngineState) -> Result<Value, Se
 
     state.send_gui_mesh(&mesh_clone);
 
-    let _ = state.physics_world.remove_part(part_id);
     if let Some(part) = state.parts.get(part_id) {
         if !part.mesh().vertices.is_empty() {
-            let _ = state.physics_world.add_part(part, !part.is_fixed);
+            let _ = state.physics_world.update_part_collider(part);
         }
     }
 
     let mut resp = json!({
         "part_id": part_id,
         "feature_id": feature_id.to_string(),
+        "revision": part_rev,
         "status": "transformed",
         "bounding_box": {
             "min": scale_vec3(aabb.min, k_from_m),
@@ -2955,7 +3494,11 @@ pub fn optimize_feature_tree(args: &Value, state: &mut EngineState) -> Result<Va
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
-    let (report, mesh_opt) = {
+    let unit = state.resolve_length_unit(args)?;
+    let k_from_m = unit.from_meters_factor();
+    let k_vol = k_from_m.powi(3);
+
+    let (report, mesh_opt, part_rev, vol_m3) = {
         let part = state
             .parts
             .get_mut(part_id)
@@ -2967,24 +3510,40 @@ pub fn optimize_feature_tree(args: &Value, state: &mut EngineState) -> Result<Va
         } else {
             None
         };
-        (report, mesh)
+        let rev = part.revision;
+        let v_m3 = part.volume();
+        (report, mesh, rev, v_m3)
     };
 
     if let Some(mesh_clone) = mesh_opt {
         state.send_gui_mesh(&mesh_clone);
-        let _ = state.physics_world.remove_part(part_id);
         if let Some(part) = state.parts.get(part_id) {
             if !part.mesh().vertices.is_empty() {
-                let _ = state.physics_world.add_part(part, !part.is_fixed);
+                let _ = state.physics_world.update_part_collider(part);
             }
         }
     }
 
-    let unit = state.length_unit;
     let mut val = serde_json::to_value(&report).map_err(ServerError::Json)?;
     if let Some(obj) = val.as_object_mut() {
+        obj.insert("revision".to_string(), json!(part_rev));
+        obj.insert("volume".to_string(), json!(vol_m3 * k_vol));
+        obj.insert("volume_m3".to_string(), json!(vol_m3));
         obj.insert("length_unit".to_string(), json!(unit.as_str()));
         obj.insert("units".to_string(), unit.units_metadata());
+        if let Some(eq_obj) = obj
+            .get_mut("equivalence_verification")
+            .and_then(|v| v.as_object_mut())
+        {
+            eq_obj.insert(
+                "volume_before".to_string(),
+                json!(report.equivalence_verification.volume_before_m3 * k_vol),
+            );
+            eq_obj.insert(
+                "volume_after".to_string(),
+                json!(report.equivalence_verification.volume_after_m3 * k_vol),
+            );
+        }
     }
     if apply {
         super::requirements::attach_auto_check_if_enabled(state, Some(part_id), &mut val);
@@ -3306,5 +3865,1677 @@ mod tests {
         assert!(plate_report.topology.is_watertight);
         assert_eq!(plate_report.topology.genus.round() as i32, 1);
     }
-}
 
+    #[test]
+    fn test_p2_t18_joints_preserved_on_csg_transform_and_collider_updated_on_feature_ops() {
+        let mut state = EngineState::new().expect("EngineState init");
+
+        // 1. Create rotor, follower, and cutter parts
+        create_part(
+            &json!({
+                "name": "Rotor",
+                "part_id": "rotor",
+                "material": "steel_structural_aisi1020",
+                "is_fixed": false
+            }),
+            &mut state,
+        )
+        .unwrap();
+        add_feature_primitive(
+            &json!({
+                "part_id": "rotor",
+                "primitive_type": "box",
+                "params": { "width": 100.0, "height": 100.0, "depth": 40.0 }
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        create_part(
+            &json!({
+                "name": "Follower Shaft",
+                "part_id": "follower",
+                "material": "aluminum_6061_t6",
+                "is_fixed": false
+            }),
+            &mut state,
+        )
+        .unwrap();
+        let follower_feat = add_feature_primitive(
+            &json!({
+                "part_id": "follower",
+                "primitive_type": "cylinder",
+                "params": { "radius": 20.0, "height": 60.0 }
+            }),
+            &mut state,
+        )
+        .unwrap();
+        let follower_cyl_id = follower_feat["feature_id"].as_str().unwrap().to_string();
+
+        create_part(
+            &json!({
+                "name": "Cutter Tool",
+                "part_id": "cutter",
+                "material": "steel_structural_aisi1020",
+                "is_fixed": false
+            }),
+            &mut state,
+        )
+        .unwrap();
+        add_feature_primitive(
+            &json!({
+                "part_id": "cutter",
+                "primitive_type": "box",
+                "params": { "width": 30.0, "height": 30.0, "depth": 30.0, "position": [20.0, 0.0, 0.0] }
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        // 2. Register revolute joint (with motor) and gear joint BEFORE running CSG / transform / optimize
+        physics::create_joint(
+            &json!({
+                "joint_id": "j_rev_rotor",
+                "joint_type": "revolute",
+                "part_a": "ground",
+                "part_b": "rotor",
+                "axis": [0.0, 0.0, 1.0]
+            }),
+            &mut state,
+        )
+        .unwrap();
+        physics::set_joint_motor(
+            &json!({
+                "joint_id": "j_rev_rotor",
+                "target_velocity": 6.0,
+                "max_force": 200.0
+            }),
+            &mut state,
+        )
+        .unwrap();
+        physics::create_joint(
+            &json!({
+                "joint_id": "j_gear_pair",
+                "joint_type": "gear",
+                "part_a": "rotor",
+                "part_b": "follower",
+                "ratio": 0.5
+            }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(state.physics_world.joints().len(), 2);
+
+        let rotor_mass_init = state.physics_world.part_mass("rotor").unwrap();
+
+        // 3. Run boolean_difference, boolean_union, boolean_intersection, transform_part, and optimize_feature_tree
+        //    on `rotor` and verify joints and motor remain intact at every step!
+        boolean_difference(
+            &json!({ "target_part_id": "rotor", "tool_part_id": "cutter" }),
+            &mut state,
+        )
+        .unwrap();
+        let rotor_mass_after_diff = state.physics_world.part_mass("rotor").unwrap();
+        assert!(
+            rotor_mass_after_diff < rotor_mass_init,
+            "boolean_difference must reduce rotor mass in physics_world ({rotor_mass_after_diff} vs {rotor_mass_init})"
+        );
+        assert_eq!(state.physics_world.joints().len(), 2);
+        assert!(state.physics_world.joints()["j_rev_rotor"].motor.is_some());
+
+        boolean_union(
+            &json!({ "target_part_id": "rotor", "tool_part_id": "cutter" }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(state.physics_world.joints().len(), 2);
+
+        transform_part(
+            &json!({ "part_id": "rotor", "scale": [2.0, 1.0, 1.0] }),
+            &mut state,
+        )
+        .unwrap();
+        let (_, aabb_max_scaled) = state.physics_world.part_collider_aabb("rotor").unwrap();
+        assert!(
+            aabb_max_scaled[0] > 0.09,
+            "transform_part scale [2,1,1] must update rotor collider X max in physics_world, got {}",
+            aabb_max_scaled[0]
+        );
+        assert_eq!(state.physics_world.joints().len(), 2);
+
+        boolean_intersection(
+            &json!({ "target_part_id": "rotor", "tool_part_id": "cutter" }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(state.physics_world.joints().len(), 2);
+
+        optimize_feature_tree(
+            &json!({ "part_id": "rotor", "apply": true }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(
+            state.physics_world.joints().len(),
+            2,
+            "optimize_feature_tree must preserve all attached joints"
+        );
+        assert!(state.physics_world.joints().contains_key("j_rev_rotor"));
+        assert!(state.physics_world.joints().contains_key("j_gear_pair"));
+
+        // 4. Verify geometry-modifying feature tools on `follower` (already in physics_world via j_gear_pair)
+        //    update its collider AABB and mass in `physics_world` while preserving joints.
+        let follower_mass_0 = state.physics_world.part_mass("follower").unwrap();
+
+        // 4a. modify_feature: double radius from 20 mm to 40 mm
+        modify_feature(
+            &json!({
+                "part_id": "follower",
+                "feature_id": follower_cyl_id,
+                "params": { "radius": 40.0, "height": 60.0 }
+            }),
+            &mut state,
+        )
+        .unwrap();
+        let follower_mass_1 = state.physics_world.part_mass("follower").unwrap();
+        let (f_min_1, f_max_1) = state.physics_world.part_collider_aabb("follower").unwrap();
+        assert!(
+            follower_mass_1 > follower_mass_0 * 3.5,
+            "modify_feature must update follower mass in physics_world ({follower_mass_1} vs {follower_mass_0})"
+        );
+        assert!((f_max_1[0] - f_min_1[0] - 0.08).abs() < 0.005);
+
+        // 4b. cut_hole: cut central bore R=20 mm through follower -> mass decreases
+        cut_hole(
+            &json!({
+                "part_id": "follower",
+                "position": [0.0, 0.0, 0.0],
+                "normal": [0.0, 0.0, 1.0],
+                "radius": 20.0,
+                "through": true
+            }),
+            &mut state,
+        )
+        .unwrap();
+        // Note: ConvexHull of hollow cylinder has same outer hull; switch follower to fixed (`is_fixed: true`)
+        // so it uses exact TriMesh collider whose volume/AABB reflects internal/cut features, or add outer boss:
+        add_feature_primitive(
+            &json!({
+                "part_id": "follower",
+                "primitive_type": "box",
+                "params": { "width": 120.0, "height": 20.0, "depth": 20.0 }
+            }),
+            &mut state,
+        )
+        .unwrap();
+        let (f_min_2, f_max_2) = state.physics_world.part_collider_aabb("follower").unwrap();
+        assert!(
+            (f_max_2[0] - f_min_2[0] - 0.12).abs() < 0.005,
+            "add_feature_primitive must update follower collider X span to ~0.12 m, got [{}, {}]",
+            f_min_2[0],
+            f_max_2[0]
+        );
+
+        // 4c. cut_helical_groove and tessellate_part preserve joints and keep collider valid
+        cut_helical_groove(
+            &json!({
+                "part_id": "follower",
+                "helix_radius": 40.0,
+                "groove_radius": 3.0,
+                "pitch": 20.0,
+                "height": 40.0,
+                "start_z": -20.0,
+                "starts": 1
+            }),
+            &mut state,
+        )
+        .unwrap();
+        tessellate_part(
+            &json!({ "part_id": "follower", "quality": "fine" }),
+            &mut state,
+        )
+        .unwrap();
+
+        assert_eq!(state.physics_world.joints().len(), 2);
+        assert!(state.physics_world.joints()["j_rev_rotor"].motor.is_some());
+    }
+
+    #[test]
+    fn test_p2_t19_modify_feature_rollback_and_helical_groove_auto_start_z() {
+        let mut state = EngineState::new().expect("EngineState init");
+        state.length_unit = LengthUnit::M;
+
+        // 1. Transactional rollback in modify_feature: create a box + revolve + transform part,
+        //    tessellate with "fine" so cached_mesh is populated, then attempt invalid modifications
+        //    and verify dag, mesh, cached_mesh, and revision remain 100% intact.
+        create_part(
+            &json!({
+                "name": "Rollback Target",
+                "part_id": "p_rollback",
+                "material": "steel_4140"
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        let box_feat = add_feature_primitive(
+            &json!({
+                "part_id": "p_rollback",
+                "primitive_type": "box",
+                "params": { "width": 0.08, "height": 0.06, "depth": 0.04 }
+            }),
+            &mut state,
+        )
+        .unwrap();
+        let box_feat_id = box_feat["feature_id"].as_str().unwrap().to_string();
+
+        let rev_feat = add_feature_primitive(
+            &json!({
+                "part_id": "p_rollback",
+                "primitive_type": "revolve",
+                "params": {
+                    "profile": [[0.01, -0.02], [0.02, -0.02], [0.02, 0.02], [0.01, 0.02]],
+                    "angle_deg": 360.0
+                }
+            }),
+            &mut state,
+        )
+        .unwrap();
+        let rev_feat_id = rev_feat["feature_id"].as_str().unwrap().to_string();
+
+        let tf_feat = transform_part(
+            &json!({
+                "part_id": "p_rollback",
+                "translation": [0.0, 0.0, 0.01],
+                "scale": [1.0, 1.0, 1.0]
+            }),
+            &mut state,
+        )
+        .unwrap();
+        let tf_feat_id = tf_feat["feature_id"].as_str().unwrap().to_string();
+
+        tessellate_part(
+            &json!({ "part_id": "p_rollback", "quality": "fine" }),
+            &mut state,
+        )
+        .unwrap();
+
+        let (orig_vol, orig_tri_count, orig_rev, orig_dag_json) = {
+            let p = state.parts.get("p_rollback").unwrap();
+            (
+                p.volume(),
+                p.mesh().triangle_count(),
+                p.revision,
+                serde_json::to_string(&p.dag.nodes).unwrap(),
+            )
+        };
+
+        // 1a. Negative box width -> must fail and roll back
+        assert!(modify_feature(
+            &json!({
+                "part_id": "p_rollback",
+                "feature_id": box_feat_id,
+                "params": { "width": -0.05 }
+            }),
+            &mut state,
+        )
+        .is_err());
+
+        // 1b. Empty revolve profile -> must fail and roll back (not silently keep old profile)
+        assert!(modify_feature(
+            &json!({
+                "part_id": "p_rollback",
+                "feature_id": rev_feat_id,
+                "params": { "profile": [] }
+            }),
+            &mut state,
+        )
+        .is_err());
+
+        // 1c. Self-intersecting (bowtie) revolve profile -> must fail in rebuild() and roll back
+        assert!(modify_feature(
+            &json!({
+                "part_id": "p_rollback",
+                "feature_id": rev_feat_id,
+                "params": {
+                    "profile": [[0.01, 0.0], [0.03, 0.02], [0.03, 0.0], [0.01, 0.02]]
+                }
+            }),
+            &mut state,
+        )
+        .is_err());
+
+        // 1d. Malformed 2-element scale array on Transform feature -> must return Err (no panic!) and roll back
+        assert!(modify_feature(
+            &json!({
+                "part_id": "p_rollback",
+                "feature_id": tf_feat_id,
+                "params": { "scale": [1.0, 2.0] }
+            }),
+            &mut state,
+        )
+        .is_err());
+
+        // 1e. Zero scale component on Transform feature -> must fail in rebuild() and roll back
+        assert!(modify_feature(
+            &json!({
+                "part_id": "p_rollback",
+                "feature_id": tf_feat_id,
+                "params": { "scale": [1.0, 0.0, 1.0] }
+            }),
+            &mut state,
+        )
+        .is_err());
+
+        {
+            let p = state.parts.get("p_rollback").unwrap();
+            assert!((p.volume() - orig_vol).abs() < 1e-12);
+            assert_eq!(p.mesh().triangle_count(), orig_tri_count);
+            assert_eq!(p.revision, orig_rev);
+            assert_eq!(serde_json::to_string(&p.dag.nodes).unwrap(), orig_dag_json);
+        }
+
+        // 2. Auto-alignment of omitted `start_z` to bottom of part (`bounding_box.min[2]`) in `cut_helical_groove`
+        //    (Benchmark T08 M10x1.5 hex nut workflow: height = 0.008 m centered at z=0 -> z in [-0.004, +0.004]).
+        create_part(
+            &json!({
+                "name": "M10 Hex Nut",
+                "part_id": "t08_nut_auto_z",
+                "material": "steel_4140"
+            }),
+            &mut state,
+        )
+        .unwrap();
+        add_feature_primitive(
+            &json!({
+                "part_id": "t08_nut_auto_z",
+                "primitive_type": "polygon_prism",
+                "params": {
+                    "sides": 6,
+                    "outer_radius": 0.0098,
+                    "height": 0.008,
+                    "chamfer_radius": 0.0008
+                }
+            }),
+            &mut state,
+        )
+        .unwrap();
+        cut_hole(
+            &json!({
+                "part_id": "t08_nut_auto_z",
+                "position": [0.0, 0.0, 0.0],
+                "normal": [0.0, 0.0, -1.0],
+                "radius": 0.00425,
+                "through": true
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        let groove_resp = cut_helical_groove(
+            &json!({
+                "part_id": "t08_nut_auto_z",
+                "helix_radius": 0.005,
+                "groove_radius": 0.00075,
+                "pitch": 0.0015,
+                "height": 0.008,
+                "starts": 1,
+                "profile_type": "metric_60"
+            }),
+            &mut state,
+        )
+        .expect("cut_helical_groove without start_z should succeed");
+
+        let auto_start_z = groove_resp["start_z"].as_f64().unwrap();
+        assert!(
+            (auto_start_z - (-0.004)).abs() < 1e-6,
+            "Omitted start_z must default to bottom of part (-0.004 m), got {auto_start_z}"
+        );
+
+        let nut_part = state.parts.get("t08_nut_auto_z").unwrap();
+        if let FeatureOp::CutHelicalGroove { start_z, .. } = &nut_part.dag.nodes[2].op {
+            assert!(
+                (*start_z - (-0.004)).abs() < 1e-6,
+                "DAG node start_z must be -0.004 m, got {start_z}"
+            );
+        } else {
+            panic!("Expected CutHelicalGroove at DAG node index 2");
+        }
+        assert!(!nut_part.mesh.vertices.is_empty());
+        let nut_aabb = nut_part.bounding_box();
+        assert!((nut_aabb.min[2] - (-0.004)).abs() < 1e-4);
+        assert!((nut_aabb.max[2] - 0.004).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_p2_t21_modify_feature_wheel_rim_scale_warning() {
+        let mut state = EngineState::new().expect("EngineState init");
+        // Default length_unit is "mm"
+        create_part(
+            &json!({
+                "part_id": "rim_part",
+                "name": "Car Rim",
+                "material": "aluminum_6061_t6"
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        // 1. Add WheelRim with valid diameter 400 mm (0.4 m >= 0.15 m) -> no WHEEL_RIM_SCALE warning
+        let add_res = add_feature_primitive(
+            &json!({
+                "part_id": "rim_part",
+                "primitive_type": "wheel_rim",
+                "rim_diameter": 400.0,
+                "rim_width": 200.0,
+                "hub_diameter": 120.0,
+                "spokes": 5
+            }),
+            &mut state,
+        )
+        .unwrap();
+        let feat_id = add_res["feature_id"].as_str().unwrap().to_string();
+        let add_warnings = add_res["warnings"].as_array().unwrap();
+        assert!(
+            !add_warnings
+                .iter()
+                .any(|w| w.as_str().is_some_and(|s| s.contains("WHEEL_RIM_SCALE"))),
+            "400 mm rim must not trigger WHEEL_RIM_SCALE warning, got {add_warnings:?}"
+        );
+
+        // 2. Modify rim_diameter down to 100 mm (0.10 m < 0.15 m) -> must emit WHEEL_RIM_SCALE warning
+        let mod_small = modify_feature(
+            &json!({
+                "part_id": "rim_part",
+                "feature_id": feat_id,
+                "parameters": {
+                    "rim_diameter": 100.0,
+                    "rim_width": 50.0,
+                    "hub_diameter": 35.0
+                }
+            }),
+            &mut state,
+        )
+        .unwrap();
+        let small_warnings = mod_small["warnings"].as_array().unwrap();
+        assert!(
+            small_warnings
+                .iter()
+                .any(|w| w.as_str().is_some_and(|s| s.contains("WHEEL_RIM_SCALE"))),
+            "modify_feature reducing rim_diameter to 100 mm (< 150 mm) must emit WHEEL_RIM_SCALE warning, got {small_warnings:?}"
+        );
+
+        // 3. Modify rim_diameter back up to 450 mm (0.45 m >= 0.15 m) -> WHEEL_RIM_SCALE warning must clear
+        let mod_normal = modify_feature(
+            &json!({
+                "part_id": "rim_part",
+                "feature_id": feat_id,
+                "parameters": {
+                    "rim_diameter": 450.0,
+                    "rim_width": 210.0,
+                    "hub_diameter": 130.0
+                }
+            }),
+            &mut state,
+        )
+        .unwrap();
+        let normal_warnings = mod_normal["warnings"].as_array().unwrap();
+        assert!(
+            !normal_warnings
+                .iter()
+                .any(|w| w.as_str().is_some_and(|s| s.contains("WHEEL_RIM_SCALE"))),
+            "modify_feature restoring rim_diameter to 450 mm must not emit WHEEL_RIM_SCALE warning, got {normal_warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_p2_t24_export_stl_and_tessellate_part_preserve_fea_freshness() {
+        let mut state = EngineState::new().expect("EngineState init");
+
+        // 1. Create a part and add a cylinder feature (default medium tessellation -> revision = 1)
+        create_part(
+            &json!({
+                "part_id": "shaft_p2t24",
+                "name": "Drive Shaft",
+                "material": "steel_4140"
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        let add_res = add_feature_primitive(
+            &json!({
+                "part_id": "shaft_p2t24",
+                "primitive_type": "cylinder",
+                "params": {
+                    "radius": 20.0,
+                    "height": 100.0
+                }
+            }),
+            &mut state,
+        )
+        .unwrap();
+        let feat_id = add_res["feature_id"].as_str().unwrap().to_string();
+        assert_eq!(add_res["revision"], 1);
+
+        // 2. Declare engineering requirements including min_safety_factor
+        crate::tools::requirements::set_requirements(
+            &json!({
+                "part_id": "shaft_p2t24",
+                "auto_check": true,
+                "requirements": [
+                    {
+                        "id": "req_fos",
+                        "type": "min_safety_factor",
+                        "value": 1.5
+                    },
+                    {
+                        "id": "req_mesh",
+                        "type": "mesh_valid"
+                    }
+                ]
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        // 3. Run FEA analysis -> records fea_revision = 1
+        let fea_res = crate::tools::fea::run_fea_analysis(
+            &json!({
+                "part_id": "shaft_p2t24",
+                "mesh_density": "coarse",
+                "fixed": [{"face": "cap_bottom"}],
+                "loads": [{"face": "cap_top", "force": [0.0, 0.0, 1000.0]}]
+            }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(fea_res["part_revision"], 1);
+
+        // Verify requirements PASS and get_scene_summary reports last_fea.stale == false
+        let check_before = crate::tools::requirements::check_requirements(
+            &json!({ "part_id": "shaft_p2t24" }),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(check_before["status"], "PASS");
+        assert_eq!(check_before["stale"], 0);
+
+        // 4. Call tessellate_part with "coarse", "fine", and custom chord_tolerance
+        let tess_coarse = tessellate_part(
+            &json!({ "part_id": "shaft_p2t24", "quality": "coarse" }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(tess_coarse["revision"], 1);
+
+        let tess_fine = tessellate_part(
+            &json!({ "part_id": "shaft_p2t24", "quality": "fine" }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(tess_fine["revision"], 1);
+        assert!(
+            tess_fine["triangles_count"].as_u64().unwrap()
+                > tess_coarse["triangles_count"].as_u64().unwrap()
+        );
+
+        // 5. Call export_stl (defaults to "fine" quality, then "coarse")
+        let tmp_dir = std::env::temp_dir().join(format!("mcpcad_p2t24_{}", Uuid::new_v4().simple()));
+        let stl_fine_path = tmp_dir.join("shaft_fine.stl");
+        let exp_fine = export_stl(
+            &json!({
+                "part_id": "shaft_p2t24",
+                "filepath": stl_fine_path.to_str().unwrap(),
+                "binary": true
+            }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(exp_fine["revision"], 1);
+        assert_eq!(exp_fine["quality_applied"], "fine");
+
+        let stl_coarse_path = tmp_dir.join("shaft_coarse.stl");
+        let exp_coarse = export_stl(
+            &json!({
+                "part_id": "shaft_p2t24",
+                "filepath": stl_coarse_path.to_str().unwrap(),
+                "quality": "coarse",
+                "binary": false
+            }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(exp_coarse["revision"], 1);
+        assert_eq!(exp_coarse["quality_applied"], "coarse");
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        // 6. Verify part.revision is STILL 1, check_requirements is STILL PASS (0 stale),
+        //    and get_scene_summary reports last_fea.stale == false ("FRESH")
+        assert_eq!(state.parts.get("shaft_p2t24").unwrap().revision, 1);
+
+        let check_after_export = crate::tools::requirements::check_requirements(
+            &json!({ "part_id": "shaft_p2t24" }),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(
+            check_after_export["status"], "PASS",
+            "export_stl and tessellate_part must not mark FEA requirements STALE: {check_after_export}"
+        );
+        assert_eq!(check_after_export["stale"], 0);
+        assert_eq!(check_after_export["passed"], 2);
+
+        let summary = crate::tools::metrics::get_scene_summary(&json!({}), &state).unwrap();
+        assert_eq!(summary["parts"][0]["revision"], 1);
+        assert_eq!(summary["parts"][0]["last_fea"]["stale"], false);
+        assert_eq!(summary["parts"][0]["last_fea"]["status"], "FRESH");
+
+        // 7. Modifying actual geometry via modify_feature MUST increment revision to 2 and mark FEA as STALE
+        let mod_res = modify_feature(
+            &json!({
+                "part_id": "shaft_p2t24",
+                "feature_id": feat_id,
+                "params": { "radius": 25.0, "height": 100.0 }
+            }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(mod_res["revision"], 2);
+        assert_eq!(mod_res["requirements_status"]["status"], "STALE");
+        assert_eq!(mod_res["requirements_status"]["stale"], 1);
+
+        let summary_after_mod = crate::tools::metrics::get_scene_summary(&json!({}), &state).unwrap();
+        assert_eq!(summary_after_mod["parts"][0]["revision"], 2);
+        assert_eq!(summary_after_mod["parts"][0]["last_fea"]["stale"], true);
+        assert_eq!(summary_after_mod["parts"][0]["last_fea"]["status"], "STALE");
+    }
+
+    #[test]
+    fn test_p2_t26_boolean_ops_metadata_unit_override_and_warnings() {
+        let mut state = EngineState::new().unwrap();
+
+        // Create target part (20 x 20 x 20 mm cube = 8000 mm^3 = 8e-6 m^3)
+        create_part(
+            &json!({
+                "part_id": "target_b",
+                "name": "Target",
+                "material": "steel_structural_aisi1020"
+            }),
+            &mut state,
+        )
+        .unwrap();
+        add_feature_primitive(
+            &json!({
+                "part_id": "target_b",
+                "primitive_type": "box",
+                "params": {
+                    "width": 20.0,
+                    "height": 20.0,
+                    "depth": 20.0
+                }
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        // Create tool part (10 x 10 x 10 mm cube = 1000 mm^3, shifted to [10, 0, 0] mm so it overlaps [5..10] in X -> 5 x 10 x 10 = 500 mm^3 overlap)
+        create_part(
+            &json!({
+                "part_id": "tool_b",
+                "name": "Tool",
+                "material": "steel_structural_aisi1020"
+            }),
+            &mut state,
+        )
+        .unwrap();
+        add_feature_primitive(
+            &json!({
+                "part_id": "tool_b",
+                "primitive_type": "box",
+                "params": {
+                    "width": 10.0,
+                    "height": 10.0,
+                    "depth": 10.0,
+                    "position": [10.0, 0.0, 0.0]
+                }
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        // 1. boolean_difference with per-call length_unit = "m"
+        let diff_res = boolean_difference(
+            &json!({
+                "target_part_id": "target_b",
+                "tool_part_id": "tool_b",
+                "length_unit": "m"
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        assert_eq!(diff_res["part_id"], "target_b");
+        assert_eq!(diff_res["target_part_id"], "target_b");
+        assert_eq!(diff_res["revision"], 2);
+        assert_eq!(diff_res["status"], "boolean_difference_applied");
+        assert_eq!(diff_res["length_unit"], "m");
+        assert_eq!(diff_res["units"]["volume"], "m³");
+        assert!(diff_res["vertices_count"].as_u64().unwrap() > 0);
+        assert!(diff_res["triangles_count"].as_u64().unwrap() > 0);
+        // 8000 mm^3 - 500 mm^3 = 7500 mm^3 = 7.5e-6 m^3
+        let vol_m = diff_res["volume"].as_f64().unwrap();
+        let vol_m3 = diff_res["volume_m3"].as_f64().unwrap();
+        assert!((vol_m - 7.5e-6).abs() < 1e-7, "Expected ~7.5e-6 m^3, got {vol_m}");
+        assert!((vol_m3 - 7.5e-6).abs() < 1e-7);
+        let dims_m = diff_res["bounding_box"]["dimensions"].as_array().unwrap();
+        assert!((dims_m[0].as_f64().unwrap() - 0.02).abs() < 1e-4);
+        assert!(diff_res["warnings"].as_array().unwrap().is_empty());
+
+        // 2. boolean_union in default session unit ("mm") -> restores cut + adds protruding [10..15] mm half (8500 mm^3)
+        let union_res = boolean_union(
+            &json!({
+                "target_part_id": "target_b",
+                "tool_part_id": "tool_b"
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        assert_eq!(union_res["part_id"], "target_b");
+        assert_eq!(union_res["target_part_id"], "target_b");
+        assert_eq!(union_res["revision"], 3);
+        assert_eq!(union_res["status"], "union_applied");
+        assert_eq!(union_res["length_unit"], "mm");
+        assert_eq!(union_res["units"]["volume"], "mm³");
+        let vol_mm3 = union_res["volume"].as_f64().unwrap();
+        assert!((vol_mm3 - 8500.0).abs() < 10.0, "Expected ~8500 mm^3, got {vol_mm3}");
+        let dims_mm = union_res["bounding_box"]["dimensions"].as_array().unwrap();
+        assert!((dims_mm[0].as_f64().unwrap() - 25.0).abs() < 0.1);
+        assert!(union_res["warnings"].as_array().unwrap().is_empty());
+
+        // 3. boolean_intersection with tool_b -> leaves only tool_b volume (1000 mm^3)
+        let inter_res = boolean_intersection(
+            &json!({
+                "target_part_id": "target_b",
+                "tool_part_id": "tool_b"
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        assert_eq!(inter_res["part_id"], "target_b");
+        assert_eq!(inter_res["target_part_id"], "target_b");
+        assert_eq!(inter_res["revision"], 4);
+        assert_eq!(inter_res["status"], "intersection_applied");
+        assert_eq!(inter_res["length_unit"], "mm");
+        let inter_vol_mm3 = inter_res["volume"].as_f64().unwrap();
+        assert!((inter_vol_mm3 - 1000.0).abs() < 5.0, "Expected ~1000 mm^3, got {inter_vol_mm3}");
+        let inter_dims = inter_res["bounding_box"]["dimensions"].as_array().unwrap();
+        assert!((inter_dims[0].as_f64().unwrap() - 10.0).abs() < 0.1);
+        assert!(inter_res["warnings"].is_array());
+    }
+
+    #[test]
+    fn test_p2_t27_optimize_feature_tree_revision_and_length_unit_override() {
+        let mut state = EngineState::new().expect("EngineState init");
+
+        create_part(
+            &json!({
+                "part_id": "bushing_p2t27",
+                "name": "Coaxial Bushing",
+                "material": "steel_structural_aisi1020"
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        add_feature_primitive(
+            &json!({
+                "part_id": "bushing_p2t27",
+                "primitive_type": "cylinder",
+                "params": { "radius": 30.0, "height": 50.0, "segments": 32 }
+            }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(state.parts["bushing_p2t27"].revision, 1);
+
+        // 1. Calling optimize_feature_tree on single cylinder (no rules apply) must keep revision == 1
+        let noop_res = optimize_feature_tree(
+            &json!({
+                "part_id": "bushing_p2t27",
+                "apply": true,
+                "length_unit": "m"
+            }),
+            &mut state,
+        )
+        .unwrap();
+        assert!(noop_res["applied_rules"].as_array().unwrap().is_empty());
+        assert_eq!(noop_res["revision"], 1);
+        assert_eq!(noop_res["length_unit"], "m");
+        assert_eq!(noop_res["units"]["volume"], "m³");
+        assert!((noop_res["volume"].as_f64().unwrap() - noop_res["volume_m3"].as_f64().unwrap()).abs() < 1e-12);
+        assert_eq!(state.parts["bushing_p2t27"].revision, 1);
+
+        // 2. Add coaxial through hole -> revision becomes 2
+        cut_hole(
+            &json!({
+                "part_id": "bushing_p2t27",
+                "position": [0.0, 0.0, 0.0],
+                "normal": [0.0, 0.0, 1.0],
+                "radius": 15.0,
+                "depth": 60.0
+            }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(state.parts["bushing_p2t27"].revision, 2);
+
+        // 3. Calling optimize_feature_tree(apply: true) applies R4_COAXIAL_REVOLVE_REDUCTION -> revision bumps to 3
+        let opt_res = optimize_feature_tree(
+            &json!({
+                "part_id": "bushing_p2t27",
+                "apply": true,
+                "length_unit": "mm"
+            }),
+            &mut state,
+        )
+        .unwrap();
+        assert!(!opt_res["applied_rules"].as_array().unwrap().is_empty());
+        assert_eq!(opt_res["revision"], 3);
+        assert_eq!(opt_res["length_unit"], "mm");
+        assert_eq!(opt_res["units"]["volume"], "mm³");
+        assert!(opt_res["volume"].as_f64().unwrap() > 100_000.0);
+        assert!(opt_res["equivalence_verification"]["volume_after"].as_f64().unwrap() > 100_000.0);
+        assert_eq!(state.parts["bushing_p2t27"].revision, 3);
+
+        // 4. Calling optimize_feature_tree(apply: true) a second time on already-optimized DAG keeps revision == 3
+        let opt_again = optimize_feature_tree(
+            &json!({
+                "part_id": "bushing_p2t27",
+                "apply": true
+            }),
+            &mut state,
+        )
+        .unwrap();
+        assert!(opt_again["applied_rules"].as_array().unwrap().is_empty());
+        assert_eq!(opt_again["revision"], 3);
+        assert_eq!(state.parts["bushing_p2t27"].revision, 3);
+    }
+
+    #[test]
+    fn test_p2_t29_list_parts_respects_length_unit_override_and_rejects_invalid_unit() {
+        let mut state = EngineState::new().expect("EngineState init");
+
+        create_part(
+            &json!({
+                "part_id": "block_p2t29",
+                "name": "Precision Block",
+                "material": "aluminum_6061_t6"
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        add_feature_primitive(
+            &json!({
+                "part_id": "block_p2t29",
+                "primitive_type": "box",
+                "params": { "width": 100.0, "height": 40.0, "depth": 20.0 }
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        // 1. Default session unit ("mm")
+        let res_mm = list_parts(&json!({}), &state).unwrap();
+        assert_eq!(res_mm["length_unit"], "mm");
+        assert_eq!(res_mm["units"]["length"], "mm");
+        assert_eq!(res_mm["units"]["volume"], "mm³");
+        assert_eq!(res_mm["parts_count"], 1);
+        let p_mm = &res_mm["parts"][0];
+        assert_eq!(p_mm["part_id"], "block_p2t29");
+        assert_eq!(p_mm["length_unit"], "mm");
+        assert!((p_mm["bounding_box_dimensions"][0].as_f64().unwrap() - 100.0).abs() < 1e-6);
+        assert!((p_mm["bounding_box"]["min"][0].as_f64().unwrap() - (-50.0)).abs() < 1e-6);
+        assert!((p_mm["bounding_box"]["max"][0].as_f64().unwrap() - 50.0).abs() < 1e-6);
+        assert!((p_mm["volume"].as_f64().unwrap() - 80_000.0).abs() < 1e-3);
+        assert!((p_mm["volume_m3"].as_f64().unwrap() - 8.0e-5).abs() < 1e-10);
+
+        // 2. Per-call override length_unit = "m" without mutating session length_unit
+        let res_m = list_parts(&json!({ "length_unit": "m" }), &state).unwrap();
+        assert_eq!(res_m["length_unit"], "m");
+        assert_eq!(res_m["units"]["length"], "m");
+        assert_eq!(res_m["units"]["volume"], "m³");
+        assert_eq!(res_m["parts_count"], 1);
+        let p_m = &res_m["parts"][0];
+        assert_eq!(p_m["part_id"], "block_p2t29");
+        assert_eq!(p_m["length_unit"], "m");
+        assert!((p_m["bounding_box_dimensions"][0].as_f64().unwrap() - 0.1).abs() < 1e-8);
+        assert!((p_m["bounding_box"]["min"][0].as_f64().unwrap() - (-0.05)).abs() < 1e-8);
+        assert!((p_m["bounding_box"]["max"][0].as_f64().unwrap() - 0.05).abs() < 1e-8);
+        assert!((p_m["volume"].as_f64().unwrap() - 8.0e-5).abs() < 1e-10);
+        assert!((p_m["volume_m3"].as_f64().unwrap() - 8.0e-5).abs() < 1e-10);
+        assert_eq!(state.length_unit, LengthUnit::Mm);
+
+        // 3. Invalid length_unit override must return InvalidArgument
+        let err = list_parts(&json!({ "length_unit": "inch" }), &state).unwrap_err();
+        let body = err.to_error_body();
+        assert_eq!(body.code, "INVALID_ARGUMENT");
+        assert_eq!(body.param.as_deref(), Some("length_unit"));
+    }
+
+    #[test]
+    fn test_p2_t30_import_stl_parameters_physics_registration_and_metadata() {
+        let mut state = EngineState::new().expect("EngineState init");
+
+        // 1. Create a box part and export it to STL
+        create_part(
+            &json!({
+                "part_id": "source_box",
+                "name": "Source Box",
+                "material": "steel_structural_aisi1020"
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        add_feature_primitive(
+            &json!({
+                "part_id": "source_box",
+                "primitive_type": "box",
+                "params": { "width": 50.0, "height": 30.0, "depth": 20.0 }
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        let tmp_dir = std::env::temp_dir().join(format!("mcpcad_p2t30_{}", Uuid::new_v4().simple()));
+        let stl_path = tmp_dir.join("box.stl");
+        export_stl(
+            &json!({
+                "part_id": "source_box",
+                "file_path": stl_path.to_str().unwrap(),
+                "binary": true
+            }),
+            &mut state,
+        )
+        .unwrap();
+        assert!(stl_path.exists());
+
+        // 2. Import with alias `file_path`, explicit `part_id`, `is_fixed: true`, and custom name
+        let import_res = import_stl(
+            &json!({
+                "file_path": stl_path.to_str().unwrap(),
+                "part_id": "imported_fixed_box",
+                "name": "Imported Fixed Box",
+                "is_fixed": true,
+                "material": "aluminum_6061_t6"
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        assert_eq!(import_res["part_id"], "imported_fixed_box");
+        assert_eq!(import_res["name"], "Imported Fixed Box");
+        assert_eq!(import_res["is_fixed"], true);
+        assert_eq!(import_res["status"], "stl_imported");
+        assert_eq!(import_res["revision"], 1);
+        assert_eq!(import_res["triangles_count"], 12);
+        assert_eq!(import_res["vertices_count"], 36);
+        assert_eq!(import_res["length_unit"], "mm");
+        assert_eq!(import_res["units"]["length"], "mm");
+        assert_eq!(import_res["units"]["volume"], "mm³");
+
+        // Bounding box dimensions [50, 30, 20] in mm
+        let dims = import_res["bounding_box"]["dimensions"].as_array().unwrap();
+        assert!((dims[0].as_f64().unwrap() - 50.0).abs() < 1e-4);
+        assert!((dims[1].as_f64().unwrap() - 30.0).abs() < 1e-4);
+        assert!((dims[2].as_f64().unwrap() - 20.0).abs() < 1e-4);
+
+        // Volume: 50 * 30 * 20 = 30000 mm³ = 3e-5 m³
+        let vol_mm = import_res["volume"].as_f64().unwrap();
+        let vol_m3 = import_res["volume_m3"].as_f64().unwrap();
+        assert!((vol_mm - 30_000.0).abs() < 1.0);
+        assert!((vol_m3 - 3.0e-5).abs() < 1e-9);
+
+        // Mass: Al6061 ~ 2700 kg/m3 * 3e-5 m3 ~ 0.081 kg
+        let mass_kg = import_res["mass_kg"].as_f64().unwrap();
+        assert!((mass_kg - 0.081).abs() < 1e-3);
+
+        // 3. Verify registration in state.physics_world as fixed body
+        assert!(state.physics_world.has_part("imported_fixed_box"));
+        assert_eq!(
+            state.physics_world.is_part_dynamic("imported_fixed_box").unwrap(),
+            false
+        );
+
+        // 4. Import another part with `is_fixed: false` (dynamic)
+        let dynamic_res = import_stl(
+            &json!({
+                "filepath": stl_path.to_str().unwrap(),
+                "part_id": "imported_dyn_box",
+                "is_fixed": false,
+            }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(dynamic_res["is_fixed"], false);
+        assert!(state.physics_world.has_part("imported_dyn_box"));
+        assert_eq!(
+            state.physics_world.is_part_dynamic("imported_dyn_box").unwrap(),
+            true
+        );
+
+        // 5. Duplicate part_id must fail with PART_ALREADY_EXISTS
+        let dup_err = import_stl(
+            &json!({
+                "file_path": stl_path.to_str().unwrap(),
+                "part_id": "imported_fixed_box",
+            }),
+            &mut state,
+        )
+        .unwrap_err();
+        let dup_body = dup_err.to_error_body();
+        assert_eq!(dup_body.code, "PART_ALREADY_EXISTS");
+        assert_eq!(dup_body.param.as_deref(), Some("part_id"));
+
+        // 6. Reserved ID "ground" or "world" must fail with INVALID_ARGUMENT
+        let reserved_err = import_stl(
+            &json!({
+                "file_path": stl_path.to_str().unwrap(),
+                "part_id": "Ground",
+            }),
+            &mut state,
+        )
+        .unwrap_err();
+        let res_body = reserved_err.to_error_body();
+        assert_eq!(res_body.code, "INVALID_ARGUMENT");
+        assert_eq!(res_body.param.as_deref(), Some("part_id"));
+
+        let _ = std::fs::remove_dir_all(tmp_dir);
+    }
+
+    #[test]
+    fn test_p2_t32_get_feature_tree_and_validate_mesh_metadata_and_length_unit() {
+        let mut state = EngineState::new().expect("EngineState init");
+
+        create_part(
+            &json!({
+                "part_id": "test_p2t32_part",
+                "name": "Metadata Test Part",
+                "material": "steel_structural_aisi1020"
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        add_feature_primitive(
+            &json!({
+                "part_id": "test_p2t32_part",
+                "primitive_type": "box",
+                "params": { "width": 40.0, "height": 20.0, "depth": 10.0 }
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        // 1. get_feature_tree in mm (default)
+        let tree_mm = get_feature_tree(
+            &json!({ "part_id": "test_p2t32_part" }),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(tree_mm["part_id"], "test_p2t32_part");
+        assert_eq!(tree_mm["revision"], 1);
+        assert_eq!(tree_mm["features_count"], 1);
+        assert_eq!(tree_mm["length_unit"], "mm");
+        assert_eq!(tree_mm["dag"].as_array().unwrap().len(), 1);
+
+        // 2. get_feature_tree with length_unit override: "m"
+        let tree_m = get_feature_tree(
+            &json!({ "part_id": "test_p2t32_part", "length_unit": "m" }),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(tree_m["part_id"], "test_p2t32_part");
+        assert_eq!(tree_m["revision"], 1);
+        assert_eq!(tree_m["features_count"], 1);
+        assert_eq!(tree_m["length_unit"], "m");
+
+        // 3. validate_mesh_tool in mm (default)
+        let val_mm = validate_mesh_tool(
+            &json!({ "part_id": "test_p2t32_part" }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(val_mm["part_id"], "test_p2t32_part");
+        assert_eq!(val_mm["revision"], 1);
+        assert_eq!(val_mm["length_unit"], "mm");
+        assert_eq!(val_mm["status"], "PASS");
+        assert!((val_mm["volume"].as_f64().unwrap() - 8000.0).abs() < 1e-3);
+        assert!((val_mm["volume_m3"].as_f64().unwrap() - 8.0e-6).abs() < 1e-9);
+
+        // 4. validate_mesh_tool with length_unit override: "m"
+        let val_m = validate_mesh_tool(
+            &json!({ "part_id": "test_p2t32_part", "length_unit": "m" }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(val_m["part_id"], "test_p2t32_part");
+        assert_eq!(val_m["revision"], 1);
+        assert_eq!(val_m["length_unit"], "m");
+        assert!((val_m["volume"].as_f64().unwrap() - 8.0e-6).abs() < 1e-9);
+        assert!((val_m["volume_m3"].as_f64().unwrap() - 8.0e-6).abs() < 1e-9);
+
+        // 5. Invalid length_unit returns error
+        assert!(get_feature_tree(
+            &json!({ "part_id": "test_p2t32_part", "length_unit": "invalid" }),
+            &state
+        )
+        .is_err());
+        assert!(validate_mesh_tool(
+            &json!({ "part_id": "test_p2t32_part", "length_unit": "invalid" }),
+            &mut state
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_p2_t33_transform_imported_stl_part_and_empty_dag_fallback() {
+        let mut state = EngineState::new().expect("EngineState init");
+
+        // 1. Create a reference box part (40x20x10 mm) and export it to a temporary binary STL
+        create_part(
+            &json!({
+                "part_id": "src_box",
+                "name": "Source Box",
+                "material": "aluminum_6061_t6"
+            }),
+            &mut state,
+        )
+        .unwrap();
+        add_feature_primitive(
+            &json!({
+                "part_id": "src_box",
+                "primitive_type": "box",
+                "params": { "width": 40.0, "height": 20.0, "depth": 10.0 }
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        let temp_dir = std::env::temp_dir().join(format!("mcpcad_p2t33_{}", Uuid::new_v4()));
+        let stl_path = temp_dir.join("p2t33_box.stl");
+        let stl_path_str = stl_path.to_str().unwrap();
+
+        export_stl(
+            &json!({
+                "part_id": "src_box",
+                "filepath": stl_path_str,
+                "binary": true
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        // 2. Import the STL as a new part `imp_box`
+        let imp_resp = import_stl(
+            &json!({
+                "filepath": stl_path_str,
+                "part_id": "imp_box",
+                "name": "Imported Box"
+            }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(imp_resp["part_id"], "imp_box");
+        assert_eq!(imp_resp["revision"], 1);
+        assert!((imp_resp["volume"].as_f64().unwrap() - 8000.0).abs() < 1e-2);
+
+        // 3. Apply transform_part on the imported STL part (translation + scale)
+        let tr_resp = transform_part(
+            &json!({
+                "part_id": "imp_box",
+                "translation": [100.0, -50.0, 25.0],
+                "scale": [2.0, 2.0, 2.0]
+            }),
+            &mut state,
+        )
+        .expect("transform_part on imported STL part must succeed without 'Cannot transform empty solid'");
+        assert_eq!(tr_resp["part_id"], "imp_box");
+        assert_eq!(tr_resp["status"], "transformed");
+        assert_eq!(tr_resp["revision"], 2);
+        // Scaled by 2x along all 3 axes -> volume increases by 8x (8000 * 8 = 64000 mm^3)
+        assert!((tr_resp["volume"].as_f64().unwrap() - 64000.0).abs() < 1e-1);
+        let dims = tr_resp["bounding_box"]["dimensions"].as_array().unwrap();
+        assert!((dims[0].as_f64().unwrap() - 80.0).abs() < 1e-3);
+        assert!((dims[1].as_f64().unwrap() - 40.0).abs() < 1e-3);
+        assert!((dims[2].as_f64().unwrap() - 20.0).abs() < 1e-3);
+        let min_pt = tr_resp["bounding_box"]["min"].as_array().unwrap();
+        let max_pt = tr_resp["bounding_box"]["max"].as_array().unwrap();
+        let cx = (min_pt[0].as_f64().unwrap() + max_pt[0].as_f64().unwrap()) * 0.5;
+        let cy = (min_pt[1].as_f64().unwrap() + max_pt[1].as_f64().unwrap()) * 0.5;
+        let cz = (min_pt[2].as_f64().unwrap() + max_pt[2].as_f64().unwrap()) * 0.5;
+        assert!((cx - 100.0).abs() < 1e-3);
+        assert!((cy - (-50.0)).abs() < 1e-3);
+        assert!((cz - 25.0).abs() < 1e-3);
+
+        // 4. Also verify legacy/manual Part with empty DAG (`dag.nodes.is_empty()`) and non-empty mesh
+        if let Some(p) = state.parts.get_mut("imp_box") {
+            p.dag.nodes.clear();
+            assert!(p.dag.nodes.is_empty());
+        }
+        let tr2_resp = transform_part(
+            &json!({
+                "part_id": "imp_box",
+                "translation": [10.0, 20.0, 5.0]
+            }),
+            &mut state,
+        )
+        .expect("transform_part on part with cleared DAG but non-empty mesh must auto-seed ImportedMesh");
+        assert_eq!(tr2_resp["revision"], 3);
+        let tree_resp = get_feature_tree(&json!({ "part_id": "imp_box" }), &state).unwrap();
+        assert_eq!(tree_resp["features_count"], 2);
+
+        // 5. Verify truly empty part (`dag.nodes.is_empty()` and `mesh.vertices.is_empty()`) still returns error
+        create_part(
+            &json!({
+                "part_id": "empty_part",
+                "name": "Empty Part",
+                "material": "steel_structural_aisi1020"
+            }),
+            &mut state,
+        )
+        .unwrap();
+        let empty_err = transform_part(
+            &json!({
+                "part_id": "empty_part",
+                "translation": [10.0, 0.0, 0.0]
+            }),
+            &mut state,
+        )
+        .unwrap_err();
+        assert!(
+            empty_err.to_string().contains("Cannot transform empty solid"),
+            "Expected 'Cannot transform empty solid' for truly empty part, got: {empty_err}"
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_p2_t34_get_feature_tree_scales_mesh_operands_and_face_metrics() {
+        let mut state = EngineState::new().expect("EngineState init");
+
+        // 1. Create a base cylinder (r=20 mm, h=50 mm) and a tool cylinder (r=8 mm, h=60 mm)
+        create_part(
+            &json!({
+                "part_id": "base_cyl",
+                "name": "Base Cylinder",
+                "material": "steel_structural_aisi1020"
+            }),
+            &mut state,
+        )
+        .unwrap();
+        add_feature_primitive(
+            &json!({
+                "part_id": "base_cyl",
+                "primitive_type": "cylinder",
+                "params": { "radius": 20.0, "height": 50.0, "segments": 24 }
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        create_part(
+            &json!({
+                "part_id": "tool_cyl",
+                "name": "Tool Cylinder",
+                "material": "steel_structural_aisi1020"
+            }),
+            &mut state,
+        )
+        .unwrap();
+        add_feature_primitive(
+            &json!({
+                "part_id": "tool_cyl",
+                "primitive_type": "cylinder",
+                "params": { "radius": 8.0, "height": 60.0, "segments": 24 }
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        // 2. Apply boolean_difference, boolean_union, boolean_intersection on base_cyl
+        boolean_difference(
+            &json!({
+                "target_part_id": "base_cyl",
+                "tool_part_id": "tool_cyl"
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        create_part(
+            &json!({
+                "part_id": "boss_box",
+                "name": "Boss Box",
+                "material": "steel_structural_aisi1020"
+            }),
+            &mut state,
+        )
+        .unwrap();
+        add_feature_primitive(
+            &json!({
+                "part_id": "boss_box",
+                "primitive_type": "box",
+                "params": { "width": 50.0, "height": 10.0, "depth": 10.0 }
+            }),
+            &mut state,
+        )
+        .unwrap();
+        boolean_union(
+            &json!({
+                "target_part_id": "base_cyl",
+                "tool_part_id": "boss_box"
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        create_part(
+            &json!({
+                "part_id": "clip_box",
+                "name": "Clip Box",
+                "material": "steel_structural_aisi1020"
+            }),
+            &mut state,
+        )
+        .unwrap();
+        add_feature_primitive(
+            &json!({
+                "part_id": "clip_box",
+                "primitive_type": "box",
+                "params": { "width": 60.0, "height": 60.0, "depth": 60.0 }
+            }),
+            &mut state,
+        )
+        .unwrap();
+        boolean_intersection(
+            &json!({
+                "target_part_id": "base_cyl",
+                "tool_part_id": "clip_box"
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        // 3. Query get_feature_tree in "mm" vs "m"
+        let tree_mm = get_feature_tree(
+            &json!({ "part_id": "base_cyl", "length_unit": "mm" }),
+            &state,
+        )
+        .unwrap();
+        let tree_m = get_feature_tree(
+            &json!({ "part_id": "base_cyl", "length_unit": "m" }),
+            &state,
+        )
+        .unwrap();
+
+        let dag_mm = tree_mm["dag"].as_array().unwrap();
+        let dag_m = tree_m["dag"].as_array().unwrap();
+        assert_eq!(dag_mm.len(), 4);
+        assert_eq!(dag_m.len(), 4);
+
+        // Node 1: BooleanDifferenceMesh (tool_cyl: r=8 mm / 0.008 m, h=60 mm / 0.06 m)
+        let diff_mesh_mm = &dag_mm[1]["op"]["BooleanDifferenceMesh"]["tool_mesh"];
+        let diff_mesh_m = &dag_m[1]["op"]["BooleanDifferenceMesh"]["tool_mesh"];
+        let max_z_mm = diff_mesh_mm["vertices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["position"][2].as_f64().unwrap())
+            .fold(f64::NEG_INFINITY, f64::max);
+        let max_z_m = diff_mesh_m["vertices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["position"][2].as_f64().unwrap())
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!((max_z_mm - 30.0).abs() < 1e-6);
+        assert!((max_z_m - 0.03).abs() < 1e-9);
+
+        // Check face metrics scaling on tool_mesh (area scales by 1e6, centroid/sample_point/radius scale by 1e3)
+        let faces_mm = diff_mesh_mm["faces"].as_array().unwrap();
+        let faces_m = diff_mesh_m["faces"].as_array().unwrap();
+        assert!(!faces_mm.is_empty());
+        assert_eq!(faces_mm.len(), faces_m.len());
+        for (f_mm, f_m) in faces_mm.iter().zip(faces_m.iter()) {
+            let area_mm = f_mm["area"].as_f64().unwrap();
+            let area_m = f_m["area"].as_f64().unwrap();
+            assert!((area_mm - area_m * 1e6).abs() < 1e-4);
+
+            let c_mm = f_mm["centroid"].as_array().unwrap();
+            let c_m = f_m["centroid"].as_array().unwrap();
+            for axis in 0..3 {
+                assert!(
+                    (c_mm[axis].as_f64().unwrap() - c_m[axis].as_f64().unwrap() * 1000.0).abs()
+                        < 1e-6
+                );
+            }
+
+            let s_mm = f_mm["sample_point"].as_array().unwrap();
+            let s_m = f_m["sample_point"].as_array().unwrap();
+            for axis in 0..3 {
+                assert!(
+                    (s_mm[axis].as_f64().unwrap() - s_m[axis].as_f64().unwrap() * 1000.0).abs()
+                        < 1e-6
+                );
+            }
+
+            if let (Some(r_mm), Some(r_m)) = (f_mm["radius"].as_f64(), f_m["radius"].as_f64()) {
+                assert!((r_mm - r_m * 1000.0).abs() < 1e-6);
+            }
+        }
+
+        // Node 2: BooleanUnionMesh (boss_box: width=50 mm -> max_x = 25 mm vs 0.025 m)
+        let union_max_x_mm = dag_mm[2]["op"]["BooleanUnionMesh"]["tool_mesh"]["vertices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["position"][0].as_f64().unwrap())
+            .fold(f64::NEG_INFINITY, f64::max);
+        let union_max_x_m = dag_m[2]["op"]["BooleanUnionMesh"]["tool_mesh"]["vertices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["position"][0].as_f64().unwrap())
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!((union_max_x_mm - 25.0).abs() < 1e-6);
+        assert!((union_max_x_m - 0.025).abs() < 1e-9);
+
+        // Node 3: BooleanIntersectionMesh (clip_box: width=60 mm -> max_x = 30 mm vs 0.03 m)
+        let inter_max_x_mm = dag_mm[3]["op"]["BooleanIntersectionMesh"]["tool_mesh"]["vertices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["position"][0].as_f64().unwrap())
+            .fold(f64::NEG_INFINITY, f64::max);
+        let inter_max_x_m = dag_m[3]["op"]["BooleanIntersectionMesh"]["tool_mesh"]["vertices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["position"][0].as_f64().unwrap())
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!((inter_max_x_mm - 30.0).abs() < 1e-6);
+        assert!((inter_max_x_m - 0.03).abs() < 1e-9);
+
+        // 4. Also verify ImportedMesh scaling on an imported STL part
+        let temp_dir = std::env::temp_dir().join(format!("mcpcad_p2t34_{}", Uuid::new_v4()));
+        let stl_path = temp_dir.join("p2t34_cyl.stl");
+        let stl_path_str = stl_path.to_str().unwrap();
+
+        export_stl(
+            &json!({
+                "part_id": "tool_cyl",
+                "filepath": stl_path_str,
+                "binary": true
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        import_stl(
+            &json!({
+                "filepath": stl_path_str,
+                "part_id": "imp_cyl",
+                "name": "Imported Cylinder"
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        let imp_tree_mm = get_feature_tree(
+            &json!({ "part_id": "imp_cyl", "length_unit": "mm" }),
+            &state,
+        )
+        .unwrap();
+        let imp_tree_m = get_feature_tree(
+            &json!({ "part_id": "imp_cyl", "length_unit": "m" }),
+            &state,
+        )
+        .unwrap();
+        let imp_mesh_mm = &imp_tree_mm["dag"][0]["op"]["ImportedMesh"]["mesh"];
+        let imp_mesh_m = &imp_tree_m["dag"][0]["op"]["ImportedMesh"]["mesh"];
+        let imp_max_z_mm = imp_mesh_mm["vertices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["position"][2].as_f64().unwrap())
+            .fold(f64::NEG_INFINITY, f64::max);
+        let imp_max_z_m = imp_mesh_m["vertices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["position"][2].as_f64().unwrap())
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!((imp_max_z_mm - 30.0).abs() < 1e-4);
+        assert!((imp_max_z_m - 0.03).abs() < 1e-7);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_p2_t35_feature_mutation_tools_return_part_id_and_geometric_metadata() {
+        let mut state = EngineState::new().expect("EngineState init");
+
+        create_part(
+            &json!({
+                "part_id": "shaft_p2t35",
+                "name": "Shaft P2T35",
+                "material": "steel_structural_aisi1020"
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        // 1. add_feature_primitive: returns part_id, feature_id, primitive_type, revision, bounding_box, volume, volume_m3
+        let prim_resp = add_feature_primitive(
+            &json!({
+                "part_id": "shaft_p2t35",
+                "primitive_type": "cylinder",
+                "params": { "radius": 20.0, "height": 80.0, "segments": 32 }
+            }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(prim_resp["part_id"], "shaft_p2t35");
+        assert_eq!(prim_resp["primitive_type"], "cylinder");
+        assert_eq!(prim_resp["revision"], 1);
+        let feat_id = prim_resp["feature_id"].as_str().unwrap().to_string();
+        assert!(!feat_id.is_empty());
+        assert!((prim_resp["bounding_box"]["dimensions"][2].as_f64().unwrap() - 80.0).abs() < 1e-6);
+        assert!(prim_resp["volume"].as_f64().unwrap() > 0.0);
+        assert!(prim_resp["volume_m3"].as_f64().unwrap() > 0.0);
+
+        // 2. modify_feature: returns part_id, feature_id, status, revision, bounding_box, volume, volume_m3
+        let mod_resp = modify_feature(
+            &json!({
+                "part_id": "shaft_p2t35",
+                "feature_id": feat_id,
+                "params": { "height": 100.0 }
+            }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(mod_resp["part_id"], "shaft_p2t35");
+        assert_eq!(mod_resp["feature_id"], feat_id);
+        assert_eq!(mod_resp["status"], "updated");
+        assert_eq!(mod_resp["revision"], 2);
+        assert!((mod_resp["dimensions"][2].as_f64().unwrap() - 100.0).abs() < 1e-6);
+        assert!((mod_resp["bounding_box"]["dimensions"][2].as_f64().unwrap() - 100.0).abs() < 1e-6);
+        assert!(mod_resp["volume"].as_f64().unwrap() > prim_resp["volume"].as_f64().unwrap());
+
+        // 3. cut_hole (with through: true): returns part_id, feature_id, revision, depth (in length_unit), depth_m, through, bounding_box, volume, volume_m3
+        let hole_resp = cut_hole(
+            &json!({
+                "part_id": "shaft_p2t35",
+                "position": [0.0, 0.0, 50.0],
+                "normal": [0.0, 0.0, -1.0],
+                "radius": 6.0,
+                "through": true
+            }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(hole_resp["part_id"], "shaft_p2t35");
+        assert!(hole_resp["feature_id"].as_str().is_some());
+        assert_eq!(hole_resp["revision"], 3);
+        assert_eq!(hole_resp["through"], true);
+        assert!((hole_resp["depth"].as_f64().unwrap() - 100.0).abs() < 1e-6);
+        assert!((hole_resp["depth_m"].as_f64().unwrap() - 0.1).abs() < 1e-9);
+        assert!(hole_resp["volume"].as_f64().unwrap() < mod_resp["volume"].as_f64().unwrap());
+
+        // Also verify cut_hole with length_unit: "m" scales returned `depth` in meters
+        let hole_m_resp = cut_hole(
+            &json!({
+                "part_id": "shaft_p2t35",
+                "position": [0.012, 0.0, 0.05],
+                "normal": [0.0, 0.0, -1.0],
+                "radius": 0.002,
+                "depth": 0.025,
+                "length_unit": "m"
+            }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(hole_m_resp["part_id"], "shaft_p2t35");
+        assert_eq!(hole_m_resp["through"], false);
+        assert_eq!(hole_m_resp["length_unit"], "m");
+        assert!((hole_m_resp["depth"].as_f64().unwrap() - 0.025).abs() < 1e-9);
+        assert!((hole_m_resp["depth_m"].as_f64().unwrap() - 0.025).abs() < 1e-9);
+
+        // 4. cut_helical_groove: returns part_id, feature_id, revision, start_z, bounding_box, volume, volume_m3
+        let groove_resp = cut_helical_groove(
+            &json!({
+                "part_id": "shaft_p2t35",
+                "helix_radius": 20.0,
+                "groove_radius": 1.2,
+                "pitch": 10.0,
+                "height": 40.0
+            }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(groove_resp["part_id"], "shaft_p2t35");
+        assert!(groove_resp["feature_id"].as_str().is_some());
+        assert_eq!(groove_resp["revision"], 5);
+        assert_eq!(groove_resp["status"], "helical_groove_cut");
+        assert!((groove_resp["start_z"].as_f64().unwrap() - (-50.0)).abs() < 1e-6);
+        assert!(groove_resp["bounding_box"]["dimensions"].is_array());
+        assert!(groove_resp["volume"].as_f64().unwrap() > 0.0);
+        assert!(groove_resp["volume_m3"].as_f64().unwrap() > 0.0);
+    }
+}

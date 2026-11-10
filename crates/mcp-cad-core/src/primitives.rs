@@ -3344,47 +3344,95 @@ pub fn create_wheel_rim_with_settings(
         return TriangleMesh::empty();
     }
 
+    #[inline]
+    fn safe_clamp(val: f64, lo: f64, hi: f64) -> f64 {
+        if lo <= hi {
+            val.clamp(lo, hi)
+        } else {
+            (lo + hi) * 0.5
+        }
+    }
+
     let d_rim = rim_diameter;
     let w_rim = rim_width;
     let r_bead = d_rim * 0.5;
 
+    // Proportional scale factors for small/model wheel rims (< 350 mm diameter or < 160 mm width).
+    // For full-size automotive rims (d_rim >= 0.35 m, w_rim >= 0.16 m), s_rim == 1.0 and s_width == 1.0,
+    // preserving exact geometry while scaling down clearances homothetically for small wheels.
+    let s_rim = (d_rim / 0.35).min(1.0);
+    let s_width = (w_rim / 0.16).min(1.0);
+    let s_min = s_rim.min(s_width);
+
     let d_flange = flange_diameter.unwrap_or(d_rim * 1.08).max(d_rim * 1.02);
     let r_flange = d_flange * 0.5;
 
-    let d_hub = hub_diameter.unwrap_or(d_rim * 0.35).clamp(d_rim * 0.15, d_rim * 0.65);
+    let d_hub = safe_clamp(
+        hub_diameter.unwrap_or(d_rim * 0.35),
+        d_rim * 0.15,
+        d_rim * 0.65,
+    );
     let r_hub = d_hub * 0.5;
 
-    let d_bore = hub_bore_diameter.unwrap_or(d_hub * 0.45).clamp(d_hub * 0.15, d_hub * 0.70);
+    let d_bore = safe_clamp(
+        hub_bore_diameter.unwrap_or(d_hub * 0.45),
+        d_hub * 0.15,
+        d_hub * 0.70,
+    );
     let r_bore = d_bore * 0.5;
 
-    let d_pcd = pcd_diameter.unwrap_or((d_hub + d_bore) * 0.5).clamp(d_bore + 0.015, d_hub - 0.012);
+    let d_pcd = safe_clamp(
+        pcd_diameter.unwrap_or((d_hub + d_bore) * 0.5),
+        d_bore + 0.015 * s_rim,
+        d_hub - 0.012 * s_rim,
+    );
     let r_pcd = d_pcd * 0.5;
 
     let n_bolts = bolt_holes_count.unwrap_or(5).clamp(3, 12);
-    let d_bolt = bolt_hole_diameter.unwrap_or(0.014).clamp(0.005, (r_hub - r_pcd).min(r_pcd - r_bore).max(0.008) * 1.6);
+    let d_bolt = safe_clamp(
+        bolt_hole_diameter.unwrap_or(0.014 * s_rim),
+        0.005 * s_rim,
+        (r_hub - r_pcd)
+            .min(r_pcd - r_bore)
+            .max(0.008 * s_rim)
+            * 1.6,
+    );
     let r_bolt = d_bolt * 0.5;
 
     let n_spokes = spokes_count.unwrap_or(5).max(3);
 
     let max_spoke_w = (2.0 * PI * r_hub / (n_spokes as f64)) * 0.75;
-    let w_spoke = spoke_width.unwrap_or(d_rim * 0.055).clamp(0.010, max_spoke_w);
+    let w_spoke = safe_clamp(
+        spoke_width.unwrap_or(d_rim * 0.055),
+        0.010 * s_rim,
+        max_spoke_w,
+    );
 
-    let t_spoke = spoke_thickness.unwrap_or(w_spoke * 0.65).clamp(0.008, w_rim * 0.4);
+    let t_spoke = safe_clamp(
+        spoke_thickness.unwrap_or(w_spoke * 0.65),
+        0.008 * s_width,
+        w_rim * 0.4,
+    );
 
-    let et = offset_et.unwrap_or(0.035).clamp(-w_rim * 0.4, w_rim * 0.4);
+    let et = safe_clamp(
+        offset_et.unwrap_or(0.035 * s_width),
+        -w_rim * 0.4,
+        w_rim * 0.4,
+    );
 
     // 1. Key radial & axial dimensions with safe geometric clearances
-    let t_w = (r_bead * 0.045).clamp(0.006, 0.012);
-    let drop_depth = (r_bead * 0.08).clamp(0.015, 0.035);
-    let r_well = (r_bead - drop_depth).max(r_hub + t_w + 0.015);
+    let t_w = safe_clamp(r_bead * 0.045, 0.006 * s_rim, 0.012 * s_rim);
+    let drop_depth = safe_clamp(r_bead * 0.08, 0.015 * s_rim, 0.035 * s_rim);
+    let r_well = (r_bead - drop_depth).max(r_hub + t_w + 0.015 * s_rim);
     let r_inner_barrel = r_well - t_w;
-    let r_hump = r_bead + (r_bead * 0.012).clamp(0.002, 0.005);
+    let r_hump = r_bead + safe_clamp(r_bead * 0.012, 0.002 * s_rim, 0.005 * s_rim);
 
-    let r_hub_eff = r_hub.min(r_inner_barrel * 0.78).max(r_bore + 0.018);
+    let r_hub_eff = r_hub.min(r_inner_barrel * 0.78).max(r_bore + 0.018 * s_rim);
     let r_bore_eff = r_bore.min(r_hub_eff * 0.65);
-    let r_bolt_ring = (r_hub_eff - (r_hub_eff - r_bore_eff) * 0.15).max(r_bore_eff + 0.012);
+    let r_bolt_ring = (r_hub_eff - (r_hub_eff - r_bore_eff) * 0.15).max(r_bore_eff + 0.012 * s_rim);
     let radial_band = r_bolt_ring - r_bore_eff;
-    let r_pcd_eff = r_pcd.clamp(
+    let r_pcd_eff = safe_clamp(
+        r_pcd,
         r_bore_eff + radial_band * 0.28,
         r_bolt_ring - radial_band * 0.28,
     );
@@ -3392,7 +3440,7 @@ pub fn create_wheel_rim_with_settings(
         .min(r_bolt_ring - r_pcd_eff)
         .min(r_pcd_eff * (PI / (n_bolts as f64)).sin())
         * 0.55;
-    let r_bolt_eff = r_bolt.clamp(0.002, max_r_bolt.max(0.0025));
+    let r_bolt_eff = safe_clamp(r_bolt, 0.002 * s_rim, max_r_bolt.max(0.0025 * s_rim));
 
     let q_mult = match settings.quality {
         TessellationQuality::Coarse => 1,
@@ -3412,18 +3460,28 @@ pub fn create_wheel_rim_with_settings(
     let z_well_bot = -h_w + 0.30 * w_rim;
     let z_well_top = h_w - 0.30 * w_rim;
     let max_disc_t = (z_well_top - z_well_bot) * 0.55;
-    let t_disc = t_spoke.clamp(0.010, max_disc_t.max(0.012));
-    let min_barrel_dz = (2.0 * PI * r_inner_barrel / (n_theta as f64) * 0.12).max(0.006);
-    let z_disc_center = (et - t_disc * 0.5).clamp(
+    let t_disc = safe_clamp(t_spoke, 0.010 * s_width, max_disc_t.max(0.012 * s_width));
+    let min_barrel_dz = (2.0 * PI * r_inner_barrel / (n_theta as f64) * 0.12)
+        .max(0.006 * s_min)
+        .min(((z_well_top - z_well_bot - t_disc) * 0.45).max(1e-5));
+    let z_disc_center = safe_clamp(
+        et - t_disc * 0.5,
         z_well_bot + t_disc * 0.5 + min_barrel_dz,
         z_well_top - t_disc * 0.5 - min_barrel_dz,
     );
     let z_back = z_disc_center - t_disc * 0.5;
     let z_front = z_disc_center + t_disc * 0.5;
 
-    let delta_hub = (w_spoke / (2.0 * r_hub_eff)).clamp(0.12 * d_theta_sec, 0.34 * d_theta_sec);
-    let delta_barrel =
-        (w_spoke / (2.0 * r_inner_barrel)).clamp(0.08 * d_theta_sec, 0.34 * d_theta_sec);
+    let delta_hub = safe_clamp(
+        w_spoke / (2.0 * r_hub_eff),
+        0.12 * d_theta_sec,
+        0.34 * d_theta_sec,
+    );
+    let delta_barrel = safe_clamp(
+        w_spoke / (2.0 * r_inner_barrel),
+        0.08 * d_theta_sec,
+        0.34 * d_theta_sec,
+    );
 
     let mut phi_hub = Vec::with_capacity(n_theta);
     let mut phi_barrel = Vec::with_capacity(n_theta);
@@ -3471,26 +3529,26 @@ pub fn create_wheel_rim_with_settings(
     // 3. Build stepped rim barrel profile in CCW (r, z) order
     // Segment 15 ([r_inner_barrel, z_front] -> [r_inner_barrel, z_back]) is the spoke/window attachment band.
     let barrel_pts: Vec<[f64; 2]> = vec![
-        [r_flange, -h_w],                           // 0
-        [r_flange, -h_w + 0.05 * w_rim],            // 1
-        [r_bead + 0.004, -h_w + 0.08 * w_rim],      // 2
-        [r_bead, -h_w + 0.12 * w_rim],              // 3
-        [r_bead, -h_w + 0.22 * w_rim],              // 4
-        [r_well, z_well_bot],                       // 5
-        [r_well, z_well_top],                       // 6
-        [r_hump, h_w - 0.22 * w_rim],               // 7
-        [r_bead, h_w - 0.18 * w_rim],               // 8
-        [r_bead, h_w - 0.08 * w_rim],               // 9
-        [r_flange, h_w - 0.04 * w_rim],             // 10
-        [r_flange, h_w],                            // 11
-        [r_flange - t_w, h_w],                      // 12
-        [r_bead - t_w, h_w - 0.08 * w_rim],         // 13
-        [r_inner_barrel, z_well_top],               // 14
-        [r_inner_barrel, z_front],                  // 15 (top of spoke/window band)
-        [r_inner_barrel, z_back],                   // 16 (bottom of spoke/window band)
-        [r_inner_barrel, z_well_bot],               // 17
-        [r_bead - t_w, -h_w + 0.22 * w_rim],        // 18
-        [r_flange - t_w, -h_w],                     // 19
+        [r_flange, -h_w],                                  // 0
+        [r_flange, -h_w + 0.05 * w_rim],                   // 1
+        [r_bead + 0.004 * s_rim, -h_w + 0.08 * w_rim],     // 2
+        [r_bead, -h_w + 0.12 * w_rim],                     // 3
+        [r_bead, -h_w + 0.22 * w_rim],                     // 4
+        [r_well, z_well_bot],                              // 5
+        [r_well, z_well_top],                              // 6
+        [r_hump, h_w - 0.22 * w_rim],                      // 7
+        [r_bead, h_w - 0.18 * w_rim],                      // 8
+        [r_bead, h_w - 0.08 * w_rim],                      // 9
+        [r_flange, h_w - 0.04 * w_rim],                    // 10
+        [r_flange, h_w],                                   // 11
+        [r_flange - t_w, h_w],                             // 12
+        [r_bead - t_w, h_w - 0.08 * w_rim],                // 13
+        [r_inner_barrel, z_well_top],                      // 14
+        [r_inner_barrel, z_front],                         // 15 (top of spoke/window band)
+        [r_inner_barrel, z_back],                          // 16 (bottom of spoke/window band)
+        [r_inner_barrel, z_well_bot],                      // 17
+        [r_bead - t_w, -h_w + 0.22 * w_rim],               // 18
+        [r_flange - t_w, -h_w],                            // 19
     ];
 
     let n_b_pts = barrel_pts.len();
@@ -3646,9 +3704,7 @@ pub fn create_wheel_rim_with_settings(
         let beta_min = (b as f64) * d_beta;
         let beta_max = ((b + 1) as f64) * d_beta;
         let beta_mid = 0.5 * (beta_min + beta_max);
-        let er = [beta_mid.cos(), beta_mid.sin()];
-        let et_vec = [-beta_mid.sin(), beta_mid.cos()];
-        let bolt_center = [r_pcd_eff * er[0], r_pcd_eff * er[1]];
+        let bolt_center = [r_pcd_eff * beta_mid.cos(), r_pcd_eff * beta_mid.sin()];
 
         // Record global CCW rings at r_bore_eff and r_bolt_ring
         for m in 0..k_b {
@@ -3693,11 +3749,13 @@ pub fn create_wheel_rim_with_settings(
         for j in 0..n_bolt {
             let ox = perim_loop[2 * j][0];
             let oy = perim_loop[2 * j][1];
-            let psi = -0.75 * PI + (j as f64) * 2.0 * PI / (n_bolt as f64);
-            let c_p = psi.cos();
-            let s_p = psi.sin();
-            let ix = bolt_center[0] + r_bolt_eff * (c_p * er[0] + s_p * et_vec[0]);
-            let iy = bolt_center[1] + r_bolt_eff * (c_p * er[1] + s_p * et_vec[1]);
+            let dir_x = ox - bolt_center[0];
+            let dir_y = oy - bolt_center[1];
+            let d_len = dir_x.hypot(dir_y).max(1e-12);
+            let u_x = dir_x / d_len;
+            let u_y = dir_y / d_len;
+            let ix = bolt_center[0] + r_bolt_eff * u_x;
+            let iy = bolt_center[1] + r_bolt_eff * u_y;
             hole_loop.push([ix, iy]);
             mid_loop.push([0.5 * ix + 0.5 * ox, 0.5 * iy + 0.5 * oy]);
         }
@@ -4448,6 +4506,54 @@ mod tests {
                     "Revolve {name} at {angle_deg}° signed_volume={signed_vol} differs from polygonal Pappus volume {v_pappus_poly} by {rel_err_poly}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_wheel_rim_small_diameters_and_extreme_ratios_no_panic_and_valid() {
+        // Regression test for P2-T15: previously rim_diameter < 0.1403 m panicked in f64::clamp(min, max)
+        let small_cases = [
+            (0.005, 0.0025), // 5 mm x 2.5 mm RC micro wheel
+            (0.020, 0.010),  // 20 mm x 10 mm miniature wheel
+            (0.050, 0.025),  // 50 mm x 25 mm model car wheel
+            (0.060, 0.030),  // 60 mm x 30 mm small wheel
+            (0.100, 0.050),  // 100 mm x 50 mm kart/scooter wheel
+            (0.120, 0.060),  // 120 mm x 60 mm small wheel
+            (0.140, 0.065),  // 140 mm x 65 mm threshold wheel
+        ];
+
+
+        for &(d_rim, w_rim) in &small_cases {
+            let mesh = create_wheel_rim(
+                d_rim,
+                w_rim,
+                None,
+                None,
+                None,
+                None,
+                Some(5),
+                None,
+                Some(5),
+                None,
+                None,
+                None,
+            );
+            assert!(
+                !mesh.is_empty(),
+                "Wheel rim ({d_rim} m, {w_rim} m) must not be empty"
+            );
+            // Expected genus = 1 (center bore) + 5 (bolt holes) + 5 (ventilation windows) = 11
+            let report = crate::diagnostics::validate_mesh(&mesh, Some(11));
+            assert_eq!(
+                report.status, "PASS",
+                "Wheel rim ({d_rim} m, {w_rim} m) failed validate_mesh: issues={:?}",
+                report.issues
+            );
+            assert!(report.topology.is_watertight);
+            assert_eq!(report.topology.non_manifold_edges_count, 0);
+            assert_eq!(report.topology.non_manifold_vertices_count, 0);
+            assert_eq!(report.geometry.lt_1_deg_count, 0);
+            assert!(report.geometry.lt_5_deg_ratio <= 0.01);
         }
     }
 }

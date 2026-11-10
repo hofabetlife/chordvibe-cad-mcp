@@ -66,19 +66,25 @@ export function stepKinematicsAssembly(
         }
       }
     } else if (joint.type === 'prismatic') {
-      const vel = joint.motorSpeedRpm * 0.002;
+      const vel =
+        Math.abs(joint.motorSpeedRpm) <= 25
+          ? joint.motorSpeedRpm
+          : joint.motorSpeedRpm * 0.002;
       const dPos = vel * dtSeconds;
       joint.currentAngleRad += dPos;
-      const targetPart = partMap.get(joint.partB);
+      const targetPart =
+        partMap.get(joint.partB) ||
+        (joint.partA !== 'world' ? partMap.get(joint.partA) : undefined);
       if (targetPart) {
-        targetPart.position[0] += joint.axis[0] * dPos;
-        targetPart.position[1] += joint.axis[1] * dPos;
-        targetPart.position[2] += joint.axis[2] * dPos;
-        linearVelocities[targetPart.id] = [
-          joint.axis[0] * vel,
-          joint.axis[1] * vel,
-          joint.axis[2] * vel,
-        ];
+        const axLen =
+          Math.hypot(joint.axis[0], joint.axis[1], joint.axis[2]) || 1;
+        const ux = joint.axis[0] / axLen;
+        const uy = joint.axis[1] / axLen;
+        const uz = joint.axis[2] / axLen;
+        targetPart.position[0] += ux * dPos;
+        targetPart.position[1] += uy * dPos;
+        targetPart.position[2] += uz * dPos;
+        linearVelocities[targetPart.id] = [ux * vel, uy * vel, uz * vel];
       }
     }
   }

@@ -1115,7 +1115,13 @@ pub fn attach_auto_check_if_enabled(
         _ => None,
     };
 
-    let report = evaluate_requirements_report(state, filter, state.length_unit);
+    let active_unit = resp
+        .get("length_unit")
+        .and_then(|v| v.as_str())
+        .and_then(|s| LengthUnit::parse(s).ok())
+        .unwrap_or(state.length_unit);
+
+    let report = evaluate_requirements_report(state, filter, active_unit);
     let failed_list = report["failed_requirements"].clone();
     let status_summary = json!({
         "status": report["status"],
@@ -1262,3 +1268,76 @@ pub fn check_requirements(args: &Value, state: &EngineState) -> Result<Value, Se
 
     Ok(evaluate_requirements_report(state, part_id_opt, unit))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::cad::{add_feature_primitive, create_part};
+
+    #[test]
+    fn test_p2_t30_attach_auto_check_respects_response_length_unit_override() {
+        let mut state = EngineState::new().expect("EngineState init");
+        assert_eq!(state.length_unit, LengthUnit::Mm);
+
+        create_part(
+            &json!({
+                "part_id": "bracket_auto",
+                "name": "Auto Bracket",
+                "material": "aluminum_6061_t6"
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        add_feature_primitive(
+            &json!({
+                "part_id": "bracket_auto",
+                "primitive_type": "box",
+                "params": { "width": 100.0, "height": 50.0, "depth": 20.0 }
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        // Set a requirement with auto_check: true in mm
+        set_requirements(
+            &json!({
+                "part_id": "bracket_auto",
+                "auto_check": true,
+                "requirements": [
+                    { "id": "req_bbox", "type": "bbox_max", "dims": [120.0, 60.0, 30.0] }
+                ]
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        // 1. Mutation response with length_unit = "m"
+        let mut resp_m = json!({
+            "part_id": "bracket_auto",
+            "length_unit": "m",
+        });
+        attach_auto_check_if_enabled(&state, Some("bracket_auto"), &mut resp_m);
+
+        assert!(resp_m["requirements_status"].is_object());
+        let req0 = &resp_m["requirements_status"]["requirements"][0];
+        assert_eq!(req0["id"], "req_bbox");
+        assert_eq!(req0["status"], "PASS");
+        // Measured in meters: [0.1, 0.05, 0.02]
+        let meas = req0["measured"].as_array().unwrap();
+        assert!((meas[0].as_f64().unwrap() - 0.1).abs() < 1e-6);
+        assert!((meas[1].as_f64().unwrap() - 0.05).abs() < 1e-6);
+        assert!((meas[2].as_f64().unwrap() - 0.02).abs() < 1e-6);
+
+        // 2. Mutation response with length_unit = "mm"
+        let mut resp_mm = json!({
+            "part_id": "bracket_auto",
+            "length_unit": "mm",
+        });
+        attach_auto_check_if_enabled(&state, Some("bracket_auto"), &mut resp_mm);
+        let req_mm = &resp_mm["requirements_status"]["requirements"][0];
+        let meas_mm = req_mm["measured"].as_array().unwrap();
+        assert!((meas_mm[0].as_f64().unwrap() - 100.0).abs() < 1e-3);
+    }
+}
+

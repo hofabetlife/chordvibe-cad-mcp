@@ -504,7 +504,7 @@ describe('MCP-CAD Core Geometry & Topological Verification Suite', () => {
     assert.equal(feaMeta.id, 'fea');
     assert.ok(feaMeta.label.includes('Нагрузки'));
 
-    assert.equal(FEA_QUICK_LOAD_PRESETS.length, 4);
+    assert.equal(FEA_QUICK_LOAD_PRESETS.length, 5);
     const conds = buildBoundaryConditionsFromPreset('axial_tension');
     assert.equal(conds.length, 2);
     assert.equal(conds[0].type, 'fixed');
@@ -512,6 +512,7 @@ describe('MCP-CAD Core Geometry & Topological Verification Suite', () => {
     assert.equal(conds[1].type, 'force');
     assert.deepEqual(conds[1].forceVector, [2500, 0, 0]);
   });
+
 
   it('verifies BUG-015: 28 MCP tools catalog including validate_mesh and gear joint schema parity', () => {
     assert.equal(MCP_TOOLS_CATALOG.length, 28);
@@ -1569,5 +1570,599 @@ describe('MCP-CAD Core Geometry & Topological Verification Suite', () => {
     assert.equal(mRes.response.status, 'motor_configured');
     assert.equal(mRes.response.joint_id, 'j_custom_bushing');
   });
-});
 
+  it('supports P2-T15 small wheel_rim (< 140 mm) without clamp panic and prismatic joint motor actuation', () => {
+    let state: EngineStateSnapshot = {
+      parts: [],
+      selectedPartId: '',
+      joints: [],
+      materials: [...DEFAULT_MATERIALS],
+      feaResult: null,
+      physicsFrames: [],
+      quality: 'standard',
+      renderMode: 'shaded',
+    };
+
+    for (const [rimD, rimW] of [
+      [0.05, 0.025],
+      [0.10, 0.05],
+      [0.12, 0.06],
+    ]) {
+      const partId = `small_rim_${Math.round(rimD * 1000)}mm`;
+      state = executeMcpToolOnEngineState(state, 'add_feature_primitive', {
+        part_id: partId,
+        primitive_type: 'wheel_rim',
+        params: {
+          rim_diameter: rimD,
+          rim_width: rimW,
+          bolt_holes_count: 5,
+          spokes_count: 5,
+        },
+      }).nextState;
+      const part = state.parts.find((p) => p.id === partId)!;
+      assert.equal(part.mesh.isWatertight, true, `${partId} must be watertight`);
+      assert.equal(part.mesh.boundaryEdgesCount, 0);
+      assert.equal(part.mesh.nonManifoldEdgesCount, 0);
+      assert.equal(part.mesh.eulerGenus, 11);
+    }
+
+    state = executeMcpToolOnEngineState(state, 'add_feature_primitive', {
+      part_id: 'slider_carriage',
+      primitive_type: 'box',
+      params: { width: 0.04, height: 0.04, depth: 0.04 },
+    }).nextState;
+
+    const jPrism = executeMcpToolOnEngineState(state, 'create_joint', {
+      joint_id: 'j_prism_p2_t15',
+      joint_type: 'prismatic',
+      part_a: 'ground',
+      part_b: 'slider_carriage',
+      axis: [1, 0, 0],
+      limits: [-0.5, 0.5],
+    });
+    state = jPrism.nextState;
+
+    state = executeMcpToolOnEngineState(state, 'set_joint_motor', {
+      joint_id: 'j_prism_p2_t15',
+      target_velocity: 1.5,
+      max_force: 300.0,
+    }).nextState;
+
+    const simRes = executeMcpToolOnEngineState(state, 'run_physics_simulation', {
+      duration_seconds: 0.4,
+      dt: 0.01,
+    });
+    state = simRes.nextState;
+    const sliderAfter = state.parts.find((p) => p.id === 'slider_carriage')!;
+    assert.ok(
+      sliderAfter.position[0] > 0.3,
+      `Expected slider_carriage to move > 0.3 m along +X under prismatic motor, got ${sliderAfter.position[0]}`
+    );
+
+    assert.throws(() => {
+      executeMcpToolOnEngineState(state, 'create_joint', {
+        joint_type: 'revolute',
+        part_a: 'ground',
+        part_b: 'slider_carriage',
+        limits: [45.0, -45.0],
+      });
+    }, /limits/);
+  });
+
+  it('verifies P2-T19: transactional rollback of part.dag/part.mesh in modify_feature and auto start_z alignment in cut_helical_groove', () => {
+    let state: EngineStateSnapshot = {
+      parts: [],
+      selectedPartId: '',
+      joints: [],
+      materials: [...DEFAULT_MATERIALS],
+      feaResult: null,
+      physicsFrames: [],
+      quality: 'standard',
+      renderMode: 'shaded',
+    };
+
+    // 1. Create M10x1.5 hex nut (height = 0.008 m centered at z = 0 => z in [-0.004, +0.004])
+    state = executeMcpToolOnEngineState(state, 'create_part', {
+      part_id: 'p2_t19_nut',
+      name: 'M10x1.5 Hex Nut',
+      material: 'steel_4140',
+    }).nextState;
+
+    const prismRes = executeMcpToolOnEngineState(state, 'add_feature_primitive', {
+      part_id: 'p2_t19_nut',
+      primitive_type: 'polygon_prism',
+      params: {
+        sides: 6,
+        outer_radius: 0.0098,
+        height: 0.008,
+        chamfer_radius: 0.0008,
+      },
+    });
+    state = prismRes.nextState;
+    const prismNodeId = String(prismRes.response.node_id);
+
+    state = executeMcpToolOnEngineState(state, 'cut_hole', {
+      part_id: 'p2_t19_nut',
+      position: [0, 0, 0],
+      normal: [0, 0, -1],
+      radius: 0.00425,
+      through: true,
+    }).nextState;
+
+    // 2. Call cut_helical_groove WITHOUT start_z -> must auto-align to bottom face (-0.004 m)
+    const grooveRes = executeMcpToolOnEngineState(state, 'cut_helical_groove', {
+      part_id: 'p2_t19_nut',
+      helix_radius: 0.005,
+      groove_radius: 0.00075,
+      pitch: 0.0015,
+      height: 0.008,
+      starts: 1,
+      profile_type: 'metric_60',
+    });
+    state = grooveRes.nextState;
+
+    assert.ok(
+      Math.abs(Number(grooveRes.response.start_z) - -0.004) < 1e-6,
+      `Expected omitted start_z to auto-align to -0.004 m, got ${grooveRes.response.start_z}`
+    );
+    const nutBefore = state.parts.find((p) => p.id === 'p2_t19_nut')!;
+    assert.equal(nutBefore.mesh.isWatertight, true);
+    assert.ok(
+      Math.abs(Number(nutBefore.dag[2].params.start_z) - -0.004) < 1e-6
+    );
+    const origVolume = nutBefore.mesh.volume;
+    const origDagJson = JSON.stringify(nutBefore.dag);
+
+    // 3. Attempt invalid modify_feature (negative height) using feature_id -> must throw and leave part.dag & part.mesh intact
+    assert.throws(() => {
+      executeMcpToolOnEngineState(state, 'modify_feature', {
+        part_id: 'p2_t19_nut',
+        feature_id: prismNodeId,
+        params: { height: -0.005 },
+      });
+    });
+
+    const nutAfter = state.parts.find((p) => p.id === 'p2_t19_nut')!;
+    assert.equal(nutAfter.mesh.volume, origVolume);
+    assert.equal(JSON.stringify(nutAfter.dag), origDagJson);
+  });
+
+  it('verifies P2-T26: boolean_difference/union/intersection return revision, bounding_box, volume, warnings, and respect length_unit', () => {
+    let state: EngineStateSnapshot = {
+      parts: [],
+      selectedPartId: '',
+      joints: [],
+      materials: [...DEFAULT_MATERIALS],
+      feaResult: null,
+      physicsFrames: [],
+      quality: 'standard',
+      renderMode: 'shaded',
+    };
+
+    state = executeMcpToolOnEngineState(state, 'add_feature_primitive', {
+      part_id: 'target_p2t26',
+      primitive_type: 'box',
+      params: { width: 0.02, height: 0.02, depth: 0.02 },
+    }).nextState;
+
+    state = executeMcpToolOnEngineState(state, 'add_feature_primitive', {
+      part_id: 'tool_p2t26',
+      primitive_type: 'box',
+      params: { width: 0.01, height: 0.01, depth: 0.01 },
+    }).nextState;
+
+    const diffRes = executeMcpToolOnEngineState(state, 'boolean_difference', {
+      target_part_id: 'target_p2t26',
+      tool_part_id: 'tool_p2t26',
+      length_unit: 'm',
+    });
+    state = diffRes.nextState;
+
+    assert.equal(diffRes.response.target_part_id, 'target_p2t26');
+    assert.equal(diffRes.response.part_id, 'target_p2t26');
+    assert.equal(diffRes.response.revision, 2);
+    assert.equal(diffRes.response.length_unit, 'm');
+    assert.equal(diffRes.response.units.volume, 'm^3');
+    assert.ok(diffRes.response.volume > 6.5e-6 && diffRes.response.volume < 7.5e-6);
+    assert.equal(diffRes.response.volume, diffRes.response.volume_m3);
+    assert.ok(Array.isArray(diffRes.response.bounding_box.dimensions));
+    assert.ok(Math.abs(diffRes.response.bounding_box.dimensions[0] - 0.02) < 1e-4);
+    assert.equal(diffRes.response.warnings.length, 0);
+
+    const unionRes = executeMcpToolOnEngineState(state, 'boolean_union', {
+      target_part_id: 'target_p2t26',
+      tool_part_id: 'tool_p2t26',
+      length_unit: 'mm',
+    });
+    state = unionRes.nextState;
+
+    assert.equal(unionRes.response.revision, 3);
+    assert.equal(unionRes.response.length_unit, 'mm');
+    assert.equal(unionRes.response.units.volume, 'mm^3');
+    assert.ok(Math.abs(unionRes.response.volume - 8000) < 50);
+    assert.ok(Math.abs(unionRes.response.bounding_box.dimensions[0] - 20.0) < 0.1);
+    assert.equal(unionRes.response.warnings.length, 0);
+
+    const interRes = executeMcpToolOnEngineState(state, 'boolean_intersection', {
+      target_part_id: 'target_p2t26',
+      tool_part_id: 'tool_p2t26',
+    });
+    assert.equal(interRes.response.revision, 4);
+    assert.equal(interRes.response.length_unit, 'mm');
+    assert.ok(Math.abs(interRes.response.volume - 1000) < 50);
+    assert.ok(Math.abs(interRes.response.bounding_box.dimensions[0] - 10.0) < 0.1);
+    assert.equal(interRes.response.warnings.length, 0);
+  });
+
+  it('verifies P2-T27: get_simulation_metrics_json length_unit & fea staleness, and optimize_feature_tree revision when applied_rules is empty', () => {
+    let state: EngineStateSnapshot = {
+      parts: [],
+      selectedPartId: '',
+      joints: [],
+      materials: [...DEFAULT_MATERIALS],
+      feaResult: null,
+      physicsFrames: [],
+      quality: 'standard',
+      renderMode: 'shaded',
+    };
+
+    state = executeMcpToolOnEngineState(state, 'add_feature_primitive', {
+      part_id: 'box_p2t27',
+      primitive_type: 'box',
+      params: { width: 0.1, height: 0.02, depth: 0.02 },
+    }).nextState;
+
+    state = executeMcpToolOnEngineState(state, 'run_fea_analysis', {
+      part_id: 'box_p2t27',
+      fixed_faces: ['min_x'],
+      applied_forces: [{ face: 'max_x', force_vector: [0, -200, 0] }],
+    }).nextState;
+    (state.feaResult as any).feaRevision = 1;
+
+    // 1. No-op optimize_feature_tree keeps revision == 1
+    const optNoop = executeMcpToolOnEngineState(state, 'optimize_feature_tree', {
+      part_id: 'box_p2t27',
+      apply: true,
+      length_unit: 'm',
+    });
+    state = optNoop.nextState;
+    assert.equal(optNoop.response.applied_rules.length, 0);
+    assert.equal(optNoop.response.revision, 1);
+    assert.equal(optNoop.response.length_unit, 'm');
+
+    // 2. get_simulation_metrics_json respects length_unit override and reports stale == false
+    const metricsM = executeMcpToolOnEngineState(state, 'get_simulation_metrics_json', {
+      length_unit: 'm',
+    });
+    assert.equal(metricsM.response.length_unit, 'm');
+    assert.equal(metricsM.response.fea_reports[0].fea_revision, 1);
+    assert.equal(metricsM.response.fea_reports[0].part_revision, 1);
+    assert.equal(metricsM.response.fea_reports[0].stale, false);
+    assert.equal(metricsM.response.fea_reports[0].status, 'FRESH');
+
+    // 3. Mutate part -> get_simulation_metrics_json reports stale == true
+    state = executeMcpToolOnEngineState(state, 'transform_part', {
+      part_id: 'box_p2t27',
+      translation: [0.01, 0, 0],
+    }).nextState;
+
+    const metricsMm = executeMcpToolOnEngineState(state, 'get_simulation_metrics_json', {});
+    assert.equal(metricsMm.response.length_unit, 'mm');
+    assert.equal(metricsMm.response.fea_reports[0].fea_revision, 1);
+    assert.equal(metricsMm.response.fea_reports[0].part_revision, 2);
+    assert.equal(metricsMm.response.fea_reports[0].stale, true);
+    assert.equal(metricsMm.response.fea_reports[0].status, 'STALE');
+  });
+
+  it('verifies P2-T29: list_parts respects length_unit override and rejects invalid length_unit', () => {
+    let state: EngineStateSnapshot = {
+      parts: [],
+      selectedPartId: '',
+      joints: [],
+      materials: [...DEFAULT_MATERIALS],
+      feaResult: null,
+      physicsFrames: [],
+      quality: 'standard',
+      renderMode: 'shaded',
+    };
+
+    state = executeMcpToolOnEngineState(state, 'add_feature_primitive', {
+      part_id: 'part_p2t29',
+      primitive_type: 'box',
+      params: { width: 0.1, height: 0.04, depth: 0.02 },
+    }).nextState;
+
+    const listMm = executeMcpToolOnEngineState(state, 'list_parts', {});
+    assert.equal(listMm.response.length_unit, 'mm');
+    assert.equal(listMm.response.units.volume, 'mm^3');
+    assert.equal(listMm.response.parts_count, 1);
+    assert.ok(Math.abs(listMm.response.parts[0].bounding_box_dimensions[0] - 100.0) < 1e-4);
+    assert.ok(Math.abs(listMm.response.parts[0].volume - 80000.0) < 1.0);
+
+    const listM = executeMcpToolOnEngineState(state, 'list_parts', {
+      length_unit: 'm',
+    });
+    assert.equal(listM.response.length_unit, 'm');
+    assert.equal(listM.response.units.volume, 'm^3');
+    assert.ok(Math.abs(listM.response.parts[0].bounding_box_dimensions[0] - 0.1) < 1e-6);
+    assert.ok(Math.abs(listM.response.parts[0].volume - 8.0e-5) < 1e-8);
+
+    assert.throws(() => {
+      executeMcpToolOnEngineState(state, 'list_parts', {
+        length_unit: 'inch',
+      });
+    }, /length_unit/);
+  });
+
+  it('verifies P2-T30: import_stl supports file_path alias, part_id, and is_fixed in dispatcher', () => {
+    let state: EngineStateSnapshot = {
+      parts: [],
+      selectedPartId: '',
+      joints: [],
+      materials: [...DEFAULT_MATERIALS],
+      feaResult: null,
+      physicsFrames: [],
+      quality: 'standard',
+      renderMode: 'shaded',
+    };
+
+    const imp1 = executeMcpToolOnEngineState(state, 'import_stl', {
+      file_path: 'output/bracket.stl',
+      part_id: 'fixed_imported_plate',
+      name: 'Fixed Plate',
+      is_fixed: true,
+      material: 'aluminum_6061_t6',
+    });
+
+    assert.equal(imp1.response.status, 'imported');
+    assert.equal(imp1.response.part_id, 'fixed_imported_plate');
+    assert.equal(imp1.response.file_path, 'output/bracket.stl');
+    assert.equal(imp1.response.is_fixed, true);
+
+    const importedPart = imp1.nextState.parts.find(
+      (p) => p.id === 'fixed_imported_plate',
+    );
+    assert.ok(importedPart);
+    assert.equal(importedPart?.isFixed, true);
+    assert.equal(importedPart?.name, 'Fixed Plate');
+    assert.equal(importedPart?.materialId, 'aluminum_6061_t6');
+
+    // Test with filepath alias
+    const imp2 = executeMcpToolOnEngineState(imp1.nextState, 'import_stl', {
+      filepath: 'output/sensor.stl',
+      part_id: 'dynamic_sensor',
+      is_fixed: false,
+    });
+    assert.equal(imp2.response.status, 'imported');
+    assert.equal(imp2.response.part_id, 'dynamic_sensor');
+    assert.equal(imp2.response.is_fixed, false);
+    const dynPart = imp2.nextState.parts.find((p) => p.id === 'dynamic_sensor');
+    assert.ok(dynPart);
+    assert.equal(dynPart?.isFixed, false);
+  });
+
+  it('verifies P2-T32: get_feature_tree & validate_mesh metadata and get_simulation_metrics_json gravity scaling and joints_count', () => {
+    let state: EngineStateSnapshot = {
+      parts: [],
+      selectedPartId: '',
+      joints: [],
+      materials: [...DEFAULT_MATERIALS],
+      feaResult: null,
+      physicsFrames: [],
+      quality: 'standard',
+      renderMode: 'shaded',
+    };
+
+    state = executeMcpToolOnEngineState(state, 'add_feature_primitive', {
+      part_id: 'part_p2t32',
+      primitive_type: 'box',
+      params: { width: 0.05, height: 0.03, depth: 0.02 },
+    }).nextState;
+
+    // 1. get_feature_tree metadata
+    const treeMm = executeMcpToolOnEngineState(state, 'get_feature_tree', {
+      part_id: 'part_p2t32',
+    });
+    assert.equal(treeMm.response.part_id, 'part_p2t32');
+    assert.equal(treeMm.response.revision, 1);
+    assert.equal(treeMm.response.features_count, 1);
+    assert.equal(treeMm.response.length_unit, 'mm');
+
+    const treeM = executeMcpToolOnEngineState(state, 'get_feature_tree', {
+      part_id: 'part_p2t32',
+      length_unit: 'm',
+    });
+    assert.equal(treeM.response.length_unit, 'm');
+
+    // 2. validate_mesh metadata
+    const valMm = executeMcpToolOnEngineState(state, 'validate_mesh', {
+      part_id: 'part_p2t32',
+    });
+    assert.equal(valMm.response.part_id, 'part_p2t32');
+    assert.equal(valMm.response.revision, 1);
+    assert.equal(valMm.response.length_unit, 'mm');
+    assert.equal(valMm.response.status, 'PASS');
+
+    const valM = executeMcpToolOnEngineState(state, 'validate_mesh', {
+      part_id: 'part_p2t32',
+      length_unit: 'm',
+    });
+    assert.equal(valM.response.length_unit, 'm');
+    assert.equal(valM.response.revision, 1);
+
+    // 3. get_simulation_metrics_json: gravity scaling and joints_count
+    const metricsMm = executeMcpToolOnEngineState(state, 'get_simulation_metrics_json', {});
+    assert.equal(metricsMm.response.current_metrics.joints_count, 0);
+    assert.equal(metricsMm.response.current_metrics.physics.joints_count, 0);
+    assert.equal(metricsMm.response.current_metrics.physics.gravity[1], -9810.0);
+    assert.equal(metricsMm.response.current_metrics.physics.gravity_m_s2[1], -9.81);
+
+    const metricsM = executeMcpToolOnEngineState(state, 'get_simulation_metrics_json', {
+      length_unit: 'm',
+    });
+    assert.equal(metricsM.response.current_metrics.physics.gravity[1], -9.81);
+    assert.equal(metricsM.response.current_metrics.physics.gravity_m_s2[1], -9.81);
+  });
+
+  it('verifies P2-T33: transform_part works on imported STL parts and parts with empty DAG', () => {
+    let state: EngineStateSnapshot = {
+      parts: [],
+      selectedPartId: '',
+      joints: [],
+      materials: [...DEFAULT_MATERIALS],
+      feaResult: null,
+      physicsFrames: [],
+      quality: 'standard',
+      renderMode: 'shaded',
+    };
+
+    // 1. Import an STL part
+    const imp = executeMcpToolOnEngineState(state, 'import_stl', {
+      filepath: 'output/bracket.stl',
+      part_id: 'imp_p2t33',
+      name: 'Imported Bracket',
+    });
+    state = imp.nextState;
+
+    // 2. Transform the imported STL part
+    const tr1 = executeMcpToolOnEngineState(state, 'transform_part', {
+      part_id: 'imp_p2t33',
+      translation: [0.1, -0.05, 0.02],
+      scale: [2, 2, 2],
+    });
+    assert.equal(tr1.response.status, 'transformed');
+    assert.equal(tr1.response.part_id, 'imp_p2t33');
+    assert.equal(tr1.response.revision, 2);
+    assert.ok(tr1.response.bounding_box);
+    assert.ok(Math.abs(tr1.response.volume_m3 - 0.001) < 1e-5);
+
+    // 3. Clear DAG nodes on a part with a valid mesh and verify transform_part auto-seeds ImportedMesh
+    state = {
+      ...tr1.nextState,
+      parts: tr1.nextState.parts.map((p) =>
+        p.id === 'imp_p2t33' ? { ...p, dag: [] } : p
+      ),
+    };
+    const tr2 = executeMcpToolOnEngineState(state, 'transform_part', {
+      part_id: 'imp_p2t33',
+      translation: [0.05, 0, 0],
+    });
+    assert.equal(tr2.response.status, 'transformed');
+    assert.equal(tr2.response.revision, 2);
+    assert.equal(tr2.nextState.parts[0].dag.length, 2);
+    assert.equal(tr2.nextState.parts[0].dag[0].type, 'stl_import');
+  });
+
+  it('verifies P2-T34: get_feature_tree scales embedded mesh operands (ImportedMesh and Boolean*Mesh) according to length_unit', () => {
+    let state: EngineStateSnapshot = {
+      parts: [],
+      selectedPartId: '',
+      joints: [],
+      materials: [...DEFAULT_MATERIALS],
+      feaResult: null,
+      physicsFrames: [],
+      quality: 'standard',
+      renderMode: 'shaded',
+    };
+
+    // 1. Import STL part (box 0.05 x 0.05 x 0.05 m -> 50 x 50 x 50 mm)
+    const imp = executeMcpToolOnEngineState(state, 'import_stl', {
+      filepath: 'output/bracket.stl',
+      part_id: 'imp_p2t34',
+      name: 'Imported Bracket',
+    });
+    state = imp.nextState;
+
+    // 2. Add a tool part and perform boolean_difference
+    const addTool = executeMcpToolOnEngineState(state, 'add_feature_primitive', {
+      part_id: 'tool_p2t34',
+      primitive_type: 'box',
+      params: { width: 0.02, height: 0.02, depth: 0.06 },
+    });
+    state = addTool.nextState;
+
+    const diff = executeMcpToolOnEngineState(state, 'boolean_difference', {
+      target_part_id: 'imp_p2t34',
+      tool_part_id: 'tool_p2t34',
+    });
+    state = diff.nextState;
+
+    // 3. Query get_feature_tree in mm vs m
+    const treeMm = executeMcpToolOnEngineState(state, 'get_feature_tree', {
+      part_id: 'imp_p2t34',
+      length_unit: 'mm',
+    });
+    const treeM = executeMcpToolOnEngineState(state, 'get_feature_tree', {
+      part_id: 'imp_p2t34',
+      length_unit: 'm',
+    });
+
+    const impMeshMm = treeMm.response.dag[0].params.mesh;
+    const impMeshM = treeM.response.dag[0].params.mesh;
+    assert.ok(Math.abs(impMeshMm.boundingBox.max[0] - 25.0) < 1e-4);
+    assert.ok(Math.abs(impMeshM.boundingBox.max[0] - 0.025) < 1e-6);
+
+    const toolMeshMm = treeMm.response.dag[1].params.tool_mesh;
+    const toolMeshM = treeM.response.dag[1].params.tool_mesh;
+    assert.ok(Math.abs(toolMeshMm.boundingBox.max[2] - 30.0) < 1e-4);
+    assert.ok(Math.abs(toolMeshM.boundingBox.max[2] - 0.03) < 1e-6);
+  });
+
+  it('verifies P2-T35: add_feature_primitive, cut_hole, modify_feature, and cut_helical_groove return part_id, feature_id, revision, and cut_hole depth', () => {
+    let state: EngineStateSnapshot = {
+      parts: [],
+      selectedPartId: '',
+      joints: [],
+      materials: [...DEFAULT_MATERIALS],
+      feaResult: null,
+      physicsFrames: [],
+      quality: 'standard',
+      renderMode: 'shaded',
+    };
+
+    const addRes = executeMcpToolOnEngineState(state, 'add_feature_primitive', {
+      part_id: 'part_p2t35',
+      primitive_type: 'cylinder',
+      params: { radius: 0.02, height: 0.08, segments: 24 },
+    });
+    state = addRes.nextState;
+    assert.equal(addRes.response.part_id, 'part_p2t35');
+    assert.ok(addRes.response.feature_id);
+    assert.equal(addRes.response.revision, 1);
+
+    const modRes = executeMcpToolOnEngineState(state, 'modify_feature', {
+      part_id: 'part_p2t35',
+      feature_id: addRes.response.feature_id,
+      params: { height: 0.1 },
+    });
+    state = modRes.nextState;
+    assert.equal(modRes.response.part_id, 'part_p2t35');
+    assert.equal(modRes.response.feature_id, addRes.response.feature_id);
+    assert.equal(modRes.response.revision, 2);
+
+    const holeRes = executeMcpToolOnEngineState(state, 'cut_hole', {
+      part_id: 'part_p2t35',
+      position: [0, 0, 0.05],
+      normal: [0, 0, -1],
+      radius: 0.006,
+      through: true,
+    });
+    state = holeRes.nextState;
+    assert.equal(holeRes.response.part_id, 'part_p2t35');
+    assert.ok(holeRes.response.feature_id);
+    assert.equal(holeRes.response.through, true);
+    assert.ok(Math.abs(holeRes.response.depth - 0.1) < 1e-6);
+    assert.equal(holeRes.response.revision, 3);
+
+    const grooveRes = executeMcpToolOnEngineState(state, 'cut_helical_groove', {
+      part_id: 'part_p2t35',
+      helix_radius: 0.02,
+      groove_radius: 0.001,
+      pitch: 0.01,
+      height: 0.04,
+    });
+    assert.equal(grooveRes.response.part_id, 'part_p2t35');
+    assert.ok(grooveRes.response.feature_id);
+    assert.equal(grooveRes.response.revision, 4);
+  });
+});

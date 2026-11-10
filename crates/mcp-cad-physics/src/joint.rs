@@ -100,7 +100,9 @@ impl CadJointType {
                 }
 
                 if let Some(m) = motor {
-                    builder = builder.motor_velocity(m.target_velocity as Real, m.max_force as Real);
+                    builder = builder
+                        .motor_velocity(m.target_velocity as Real, m.max_force as Real)
+                        .motor_max_force(m.max_force as Real);
                 }
 
                 let mut generic: GenericJoint = builder.build().into();
@@ -144,7 +146,9 @@ impl CadJointType {
                 }
 
                 if let Some(m) = motor {
-                    builder = builder.motor_velocity(m.target_velocity as Real, m.max_force as Real);
+                    builder = builder
+                        .motor_velocity(m.target_velocity as Real, m.max_force as Real)
+                        .motor_max_force(m.max_force as Real);
                 }
 
                 let mut generic: GenericJoint = builder.build().into();
@@ -197,7 +201,33 @@ impl CadJointType {
                 generic.set_contacts_enabled(false);
                 Ok(generic)
             }
-            CadJointType::Gear { .. } => {
+            CadJointType::Gear { ratio, axis_a, axis_b } => {
+                if motor.is_some() {
+                    return Err(PhysicsError::InvalidJointConfiguration(
+                        "Motors are not supported on Gear joints; apply motor to one of the connected Revolute joints".into(),
+                    ));
+                }
+
+                if !ratio.is_finite() || ratio.abs() < 1e-9 {
+                    return Err(PhysicsError::InvalidJointConfiguration(format!(
+                        "Gear ratio must be a non-zero finite number, got {ratio}"
+                    )));
+                }
+
+                let norm_a = (axis_a[0] * axis_a[0] + axis_a[1] * axis_a[1] + axis_a[2] * axis_a[2]).sqrt();
+                if norm_a < 1e-7 || !norm_a.is_finite() {
+                    return Err(PhysicsError::InvalidJointConfiguration(
+                        "Gear joint axis_a cannot be a zero vector".into(),
+                    ));
+                }
+
+                let norm_b = (axis_b[0] * axis_b[0] + axis_b[1] * axis_b[1] + axis_b[2] * axis_b[2]).sqrt();
+                if norm_b < 1e-7 || !norm_b.is_finite() {
+                    return Err(PhysicsError::InvalidJointConfiguration(
+                        "Gear joint axis_b cannot be a zero vector".into(),
+                    ));
+                }
+
                 let mut generic: GenericJoint = GenericJointBuilder::new(JointAxesMask::empty()).build();
                 generic.set_contacts_enabled(false);
                 Ok(generic)
@@ -218,6 +248,7 @@ impl CadJointType {
                     motor.target_velocity as Real,
                     motor.max_force as Real,
                 );
+                joint.set_motor_max_force(JointAxis::AngX, motor.max_force as Real);
                 Ok(())
             }
             CadJointType::Prismatic { .. } => {
@@ -226,6 +257,7 @@ impl CadJointType {
                     motor.target_velocity as Real,
                     motor.max_force as Real,
                 );
+                joint.set_motor_max_force(JointAxis::LinX, motor.max_force as Real);
                 Ok(())
             }
             CadJointType::Spherical { .. } | CadJointType::Fixed { .. } => {

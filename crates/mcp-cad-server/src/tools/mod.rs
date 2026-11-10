@@ -48,10 +48,16 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         // 2. list_parts
         ToolDefinition {
             name: "list_parts".to_string(),
-            description: "Lists all existing CAD parts in the engine scene. Units: bounding box dimensions in active length_unit (mm or m), volume in mm^3 or m^3 (plus volume_m3 in m^3), mass in kilograms (kg), and triangle count (dimensionless integer). Example: {}. Common errors: none (returns empty list if no parts exist). Next step: call 'query_part_geometry' to inspect named faces of a part or 'create_part' if the scene is empty.".to_string(),
+            description: "Lists all existing CAD parts in the engine scene. Units: bounding box dimensions in active length_unit ('mm' by default, or 'm'), volume in mm^3 or m^3 (plus volume_m3 in m^3), mass in kilograms (kg), and triangle count (dimensionless integer). Example: {}. Common errors: INVALID_ARGUMENT (invalid length_unit override; returns empty list if no parts exist). Next step: call 'query_part_geometry' to inspect named faces of a part or 'create_part' if the scene is empty.".to_string(),
             input_schema: json!({
                 "type": "object",
-                "properties": {}
+                "properties": {
+                    "length_unit": {
+                        "type": "string",
+                        "enum": ["mm", "m"],
+                        "description": "Optional per-call length unit override ('mm' or 'm'; defaults to session length_unit)"
+                    }
+                }
             }),
         },
         // 3. delete_part
@@ -278,6 +284,11 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     "part_id": {
                         "type": "string",
                         "description": "Target part ID"
+                    },
+                    "length_unit": {
+                        "type": "string",
+                        "enum": ["mm", "m"],
+                        "description": "Optional per-call length unit override ('mm' or 'm'; defaults to session length_unit)"
                     }
                 },
                 "required": ["part_id"]
@@ -317,11 +328,11 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     },
                     "start_z": {
                         "type": "number",
-                        "description": "Z coordinate where the helix starts in active length_unit (mm by default, or m)"
+                        "description": "Optional Z coordinate where the helix starts in active length_unit (mm by default, or m). If omitted, defaults to the bottom of the part (bounding_box.min[2], or -height/2 if empty)."
                     },
                     "starts": {
                         "type": "integer",
-                        "description": "Number of interleaved helical flutes (dimensionless integer, e.g. 2 for standard twist drill, default 2)"
+                        "description": "Number of interleaved helical flutes (dimensionless integer, e.g. 2 for standard twist drill, 1 for single-start metric_60 thread)"
                     },
                     "is_right_hand": {
                         "type": "boolean",
@@ -333,7 +344,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                         "description": "Cross-sectional cutter profile: 'circular' (default bead) or 'metric_60' (60-degree triangular metric thread profile per ISO 68-1)"
                     }
                 },
-                "required": ["part_id", "helix_radius", "groove_radius", "pitch", "height", "start_z"]
+                "required": ["part_id", "helix_radius", "groove_radius", "pitch", "height"]
             }),
         },
         // 9. boolean_difference
@@ -350,6 +361,11 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     "tool_part_id": {
                         "type": "string",
                         "description": "ID of the part whose geometry acts as the cutting tool"
+                    },
+                    "length_unit": {
+                        "type": "string",
+                        "enum": ["mm", "m"],
+                        "description": "Optional per-call length unit override ('mm' or 'm'; defaults to session length_unit)"
                     }
                 },
                 "required": ["target_part_id", "tool_part_id"]
@@ -425,11 +441,13 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     },
                     "teeth_a": {
                         "type": "number",
-                        "description": "Tooth count of gear A (dimensionless, used to compute ratio = teeth_a / teeth_b if ratio is omitted)"
+                        "exclusiveMinimum": 0.0,
+                        "description": "Positive tooth count (> 0) of gear A (dimensionless, used to compute ratio = teeth_a / teeth_b if ratio is omitted)"
                     },
                     "teeth_b": {
                         "type": "number",
-                        "description": "Tooth count of gear B (dimensionless, used to compute ratio = teeth_a / teeth_b if ratio is omitted)"
+                        "exclusiveMinimum": 0.0,
+                        "description": "Positive tooth count (> 0) of gear B (dimensionless, used to compute ratio = teeth_a / teeth_b if ratio is omitted)"
                     },
                     "limits": {
                         "type": "array",
@@ -475,11 +493,13 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "properties": {
                     "duration_seconds": {
                         "type": "number",
-                        "description": "Duration of physical simulation in seconds (s)"
+                        "exclusiveMinimum": 0.0,
+                        "description": "Duration of physical simulation in seconds (s, must be > 0)"
                     },
                     "step_size_ms": {
                         "type": "number",
-                        "description": "Discrete integration step size in milliseconds (ms, default 16.67 ms)"
+                        "exclusiveMinimum": 0.0,
+                        "description": "Discrete integration step size in milliseconds (ms, must be > 0, default 16.67 ms)"
                     }
                 },
                 "required": ["duration_seconds"]
@@ -684,7 +704,13 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             description: "Returns the comprehensive engineering metrics report across all parts, FEA reports, and physics simulations. Units: bounding boxes and trajectories in active length_unit (mm or m), volume in mm^3 or m^3, mass in kg, FEA stresses in MPa, displacements in mm, time in s/ms. Example: {}. Common errors: none. Next step: call 'get_scene_summary' for a compact overview or 'check_requirements' to verify design targets.".to_string(),
             input_schema: json!({
                 "type": "object",
-                "properties": {}
+                "properties": {
+                    "length_unit": {
+                        "type": "string",
+                        "enum": ["mm", "m"],
+                        "description": "Optional per-call length unit override ('mm' or 'm'; defaults to session length_unit)"
+                    }
+                }
             }),
         },
         // 18. open_preview_window
@@ -704,13 +730,21 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         // 19. import_stl
         ToolDefinition {
             name: "import_stl".to_string(),
-            description: "Imports an external 3D STL file (ASCII or binary) from disk into the CAD scene as a new Part. Units: STL file vertex coordinates on disk are interpreted in SI meters (m); returned bounding_box and volume are converted to active length_unit (mm or m), mass in kg. Example: {\"filepath\": \"./output/bracket.stl\", \"name\": \"Imported Bracket\", \"material\": \"steel_structural_aisi1020\"}. Common errors: IO_ERROR (file not found), UNKNOWN_MATERIAL, CAD_EVALUATION_ERROR (malformed STL). Next step: call 'validate_mesh' and 'query_part_geometry' on the imported part_id.".to_string(),
+            description: "Imports an external 3D STL file (ASCII or binary) from disk into the CAD scene as a new Part. Units: STL file vertex coordinates on disk are interpreted in SI meters (m); returned bounding_box and volume are converted to active length_unit (mm or m), mass in kg. Example: {\"filepath\": \"./output/bracket.stl\", \"part_id\": \"bracket_1\", \"is_fixed\": false, \"material\": \"steel_structural_aisi1020\"}. Common errors: IO_ERROR (file not found), UNKNOWN_MATERIAL, CAD_EVALUATION_ERROR (malformed STL), PART_ALREADY_EXISTS. Next step: call 'validate_mesh' and 'query_part_geometry' on the imported part_id.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "filepath": {
                         "type": "string",
-                        "description": "Path to the .stl file on disk"
+                        "description": "Path to the .stl file on disk (or alias 'file_path')"
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to the .stl file on disk (alias for 'filepath')"
+                    },
+                    "part_id": {
+                        "type": "string",
+                        "description": "Optional custom part identifier (default: auto-generated UUID)"
                     },
                     "name": {
                         "type": "string",
@@ -719,9 +753,17 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     "material": {
                         "type": "string",
                         "description": "Optional material identifier from registry (defaults to 'steel_structural_aisi1020')"
+                    },
+                    "is_fixed": {
+                        "type": "boolean",
+                        "description": "Whether the part is anchored/fixed in physics simulation (default: false)"
+                    },
+                    "length_unit": {
+                        "type": "string",
+                        "enum": ["mm", "m"],
+                        "description": "Optional per-call length unit override ('mm' or 'm'; defaults to session length_unit)"
                     }
-                },
-                "required": ["filepath"]
+                }
             }),
         },
         // 20. tessellate_part
@@ -802,6 +844,11 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     "tool_part_id": {
                         "type": "string",
                         "description": "ID of the tool part whose geometry will be united with the target part"
+                    },
+                    "length_unit": {
+                        "type": "string",
+                        "enum": ["mm", "m"],
+                        "description": "Optional per-call length unit override ('mm' or 'm'; defaults to session length_unit)"
                     }
                 },
                 "required": ["target_part_id", "tool_part_id"]
@@ -821,6 +868,11 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     "tool_part_id": {
                         "type": "string",
                         "description": "ID of the tool part whose geometry will be intersected with the target part"
+                    },
+                    "length_unit": {
+                        "type": "string",
+                        "enum": ["mm", "m"],
+                        "description": "Optional per-call length unit override ('mm' or 'm'; defaults to session length_unit)"
                     }
                 },
                 "required": ["target_part_id", "tool_part_id"]
@@ -967,6 +1019,11 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "Identifier of the part to validate"
                     },
+                    "length_unit": {
+                        "type": "string",
+                        "enum": ["mm", "m"],
+                        "description": "Optional per-call length unit override ('mm' or 'm'; defaults to session length_unit)"
+                    },
                     "expected_genus": {
                         "type": "integer",
                         "description": "Optional expected topological genus g = (2 - chi) / 2 (dimensionless integer, e.g. 0 for sphere/box, 1 for torus/through-hole)"
@@ -989,6 +1046,11 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     "apply": {
                         "type": "boolean",
                         "description": "Whether to apply the optimal physical execution plan to the part's DAG and rebuild its mesh (default: true)"
+                    },
+                    "length_unit": {
+                        "type": "string",
+                        "enum": ["mm", "m"],
+                        "description": "Optional per-call length unit override ('mm' or 'm'; defaults to session length_unit)"
                     }
                 },
                 "required": ["part_id"]

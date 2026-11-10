@@ -259,6 +259,11 @@ pub fn load_project(args: &Value, state: &mut EngineState) -> Result<Value, Serv
     let mut new_parts = HashMap::new();
     for p_proj in project_file.parts {
         let p_id = p_proj.id.clone();
+        if p_id.eq_ignore_ascii_case("ground") || p_id.eq_ignore_ascii_case("world") {
+            return Err(ServerError::InvalidArgument(format!(
+                "Part id '{p_id}' is reserved ('ground' and 'world' are reserved static physics anchors)"
+            )));
+        }
         let saved_revision = p_proj.revision;
         let material = match p_proj.material {
             PartMaterialRef::Full(m) => m,
@@ -287,6 +292,11 @@ pub fn load_project(args: &Value, state: &mut EngineState) -> Result<Value, Serv
             if saved_revision > 0 {
                 part.revision = saved_revision;
             }
+        } else if !part.mesh.vertices.is_empty() {
+            part.ensure_imported_mesh_in_dag();
+            if saved_revision > 0 {
+                part.revision = saved_revision;
+            }
         }
 
         new_parts.insert(p_id, part);
@@ -302,14 +312,26 @@ pub fn load_project(args: &Value, state: &mut EngineState) -> Result<Value, Serv
     }
 
     let is_world_or_ground = |id: &str| id.eq_ignore_ascii_case("ground") || id.eq_ignore_ascii_case("world");
+    let norm_part_id = |id: &str| -> String {
+        if id.eq_ignore_ascii_case("ground") {
+            "ground".to_string()
+        } else if id.eq_ignore_ascii_case("world") {
+            "world".to_string()
+        } else {
+            id.to_string()
+        }
+    };
     for joint in project_file.joints {
-        if !is_world_or_ground(&joint.part_a) && !new_parts.contains_key(&joint.part_a) {
+        let part_a = norm_part_id(&joint.part_a);
+        let part_b = norm_part_id(&joint.part_b);
+
+        if !is_world_or_ground(&part_a) && !new_parts.contains_key(&part_a) {
             return Err(ServerError::InvalidArgument(format!(
                 "Joint '{}' references non-existent part_a '{}'",
                 joint.id, joint.part_a
             )));
         }
-        if !is_world_or_ground(&joint.part_b) && !new_parts.contains_key(&joint.part_b) {
+        if !is_world_or_ground(&part_b) && !new_parts.contains_key(&part_b) {
             return Err(ServerError::InvalidArgument(format!(
                 "Joint '{}' references non-existent part_b '{}'",
                 joint.id, joint.part_b
@@ -319,8 +341,8 @@ pub fn load_project(args: &Value, state: &mut EngineState) -> Result<Value, Serv
         new_physics_world
             .add_joint(
                 joint.id,
-                &joint.part_a,
-                &joint.part_b,
+                &part_a,
+                &part_b,
                 joint.joint_type,
                 joint.motor,
             )
@@ -343,6 +365,7 @@ pub fn load_project(args: &Value, state: &mut EngineState) -> Result<Value, Serv
         state.send_gui_mesh(first_mesh);
     }
 
+    let u_str = state.length_unit.as_str();
     let k_from_m = state.length_unit.from_meters_factor();
     let mut parts_summary = Vec::new();
     let mut sorted_loaded_parts: Vec<&Part> = state.parts.values().collect();
@@ -355,8 +378,10 @@ pub fn load_project(args: &Value, state: &mut EngineState) -> Result<Value, Serv
         parts_summary.push(json!({
             "part_id": p.id,
             "name": p.name,
+            "revision": p.revision,
             "material": p.material.name,
             "volume": vol_display,
+            "volume_m3": vol_m3,
             "mass_kg": mass_kg,
             "triangles_count": p.mesh.indices.len(),
             "is_fixed": p.is_fixed,
@@ -368,20 +393,137 @@ pub fn load_project(args: &Value, state: &mut EngineState) -> Result<Value, Serv
     sorted_loaded_joints.sort_by(|a, b| a.id.cmp(&b.id));
 
     for j in sorted_loaded_joints {
-        let type_name = match &j.joint_type {
-            CadJointType::Revolute { .. } => "revolute",
-            CadJointType::Prismatic { .. } => "prismatic",
-            CadJointType::Spherical { .. } => "spherical",
-            CadJointType::Fixed { .. } => "fixed",
-            CadJointType::Gear { .. } => "gear",
-        };
-        joints_summary.push(json!({
+        let (type_name, anchor_a_opt, anchor_b_opt, axis_opt, axis_a_opt, axis_b_opt, limits_opt, limits_unit_opt, ratio_opt) =
+            match &j.joint_type {
+                CadJointType::Revolute {
+                    anchor_a,
+                    anchor_b,
+                    axis,
+                    limits,
+                } => (
+                    "revolute",
+                    Some([
+                        anchor_a[0] * k_from_m,
+                        anchor_a[1] * k_from_m,
+                        anchor_a[2] * k_from_m,
+                    ]),
+                    Some([
+                        anchor_b[0] * k_from_m,
+                        anchor_b[1] * k_from_m,
+                        anchor_b[2] * k_from_m,
+                    ]),
+                    Some(*axis),
+                    None,
+                    None,
+                    limits.map(|[min_rad, max_rad]| [min_rad.to_degrees(), max_rad.to_degrees()]),
+                    limits.map(|_| "deg"),
+                    None,
+                ),
+                CadJointType::Prismatic {
+                    anchor_a,
+                    anchor_b,
+                    axis,
+                    limits,
+                } => (
+                    "prismatic",
+                    Some([
+                        anchor_a[0] * k_from_m,
+                        anchor_a[1] * k_from_m,
+                        anchor_a[2] * k_from_m,
+                    ]),
+                    Some([
+                        anchor_b[0] * k_from_m,
+                        anchor_b[1] * k_from_m,
+                        anchor_b[2] * k_from_m,
+                    ]),
+                    Some(*axis),
+                    None,
+                    None,
+                    limits.map(|[min_m, max_m]| [min_m * k_from_m, max_m * k_from_m]),
+                    limits.map(|_| u_str),
+                    None,
+                ),
+                CadJointType::Spherical { anchor_a, anchor_b } => (
+                    "spherical",
+                    Some([
+                        anchor_a[0] * k_from_m,
+                        anchor_a[1] * k_from_m,
+                        anchor_a[2] * k_from_m,
+                    ]),
+                    Some([
+                        anchor_b[0] * k_from_m,
+                        anchor_b[1] * k_from_m,
+                        anchor_b[2] * k_from_m,
+                    ]),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                CadJointType::Fixed { anchor_a, anchor_b } => (
+                    "fixed",
+                    Some([
+                        anchor_a[0] * k_from_m,
+                        anchor_a[1] * k_from_m,
+                        anchor_a[2] * k_from_m,
+                    ]),
+                    Some([
+                        anchor_b[0] * k_from_m,
+                        anchor_b[1] * k_from_m,
+                        anchor_b[2] * k_from_m,
+                    ]),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                CadJointType::Gear {
+                    ratio,
+                    axis_a,
+                    axis_b,
+                } => (
+                    "gear",
+                    None,
+                    None,
+                    Some(*axis_a),
+                    Some(*axis_a),
+                    Some(*axis_b),
+                    None,
+                    None,
+                    Some(*ratio),
+                ),
+            };
+        let motor_json = j.motor.map(|m| {
+            json!({
+                "target_velocity": m.target_velocity,
+                "max_force": m.max_force,
+            })
+        });
+        let mut joint_obj = json!({
             "joint_id": j.id,
             "part_a": j.part_a,
             "part_b": j.part_b,
             "joint_type": type_name,
+            "anchor_a": anchor_a_opt,
+            "anchor_b": anchor_b_opt,
+            "axis": axis_opt,
+            "limits": limits_opt,
+            "limits_unit": limits_unit_opt,
+            "ratio": ratio_opt,
             "has_motor": j.motor.is_some(),
-        }));
+            "motor": motor_json,
+        });
+        if let (Some(aa), Some(ab)) = (axis_a_opt, axis_b_opt) {
+            if let Some(map) = joint_obj.as_object_mut() {
+                map.insert("axis_a".to_string(), json!(aa));
+                map.insert("axis_b".to_string(), json!(ab));
+            }
+        }
+        joints_summary.push(joint_obj);
     }
 
     Ok(json!({
@@ -612,6 +754,135 @@ mod tests {
         let body = err.to_error_body();
         assert_eq!(body.code, "PROJECT_SCHEMA_MISMATCH");
         assert_eq!(body.param.as_deref(), Some("schema_version"));
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_p2_t26_load_project_joints_limits_axis_and_ratio() {
+        let mut state = test_engine_state();
+        let al_mat = state.materials.get("aluminum_6061_t6").unwrap().clone();
+
+        for (id, x_m) in [("p_a", 0.0), ("p_b", 0.05), ("p_c", 0.10)] {
+            let mut p = Part::new(id, id, al_mat.clone());
+            p.dag.add_feature(
+                FeatureOp::AddBox {
+                    width: 0.02,
+                    height: 0.02,
+                    depth: 0.02,
+                    position: Some([x_m, 0.0, 0.0]),
+                    rotation_deg: Some([0.0, 0.0, 0.0]),
+                },
+                None,
+            );
+            p.rebuild().expect("rebuild part");
+            state.physics_world.add_part(&p, true).expect("add part");
+            state.parts.insert(p.id.clone(), p);
+        }
+
+        // 1. Revolute joint with limits [-45 deg, +90 deg] (stored in radians) and motor
+        state
+            .physics_world
+            .add_joint(
+                "j_1_rev",
+                "ground",
+                "p_a",
+                CadJointType::Revolute {
+                    anchor_a: [0.0, 0.01, 0.0],
+                    anchor_b: [0.0, 0.0, 0.0],
+                    axis: [0.0, 0.0, 1.0],
+                    limits: Some([(-45.0_f64).to_radians(), 90.0_f64.to_radians()]),
+                },
+                Some(MotorConfig::new(3.5, 25.0)),
+            )
+            .unwrap();
+
+        // 2. Prismatic joint with limits [-0.01 m, +0.025 m] -> [-10 mm, +25 mm] in default "mm"
+        state
+            .physics_world
+            .add_joint(
+                "j_2_prism",
+                "p_a",
+                "p_b",
+                CadJointType::Prismatic {
+                    anchor_a: [0.02, 0.0, 0.0],
+                    anchor_b: [-0.02, 0.0, 0.0],
+                    axis: [1.0, 0.0, 0.0],
+                    limits: Some([-0.01, 0.025]),
+                },
+                None,
+            )
+            .unwrap();
+
+        // 3. Gear joint with ratio = -2.5
+        state
+            .physics_world
+            .add_joint(
+                "j_3_gear",
+                "p_a",
+                "p_c",
+                CadJointType::Gear {
+                    ratio: -2.5,
+                    axis_a: [0.0, 0.0, 1.0],
+                    axis_b: [0.0, 0.0, 1.0],
+                },
+                None,
+            )
+            .unwrap();
+
+        let temp_dir = std::env::temp_dir().join(format!("mcpcad_p2t26_{}", uuid::Uuid::new_v4()));
+        let file_path = temp_dir.join("joints_project.json");
+        let path_str = file_path.to_str().unwrap();
+
+        save_project(&json!({ "path": path_str, "project_name": "Joints P2-T26" }), &mut state)
+            .expect("save_project");
+
+        let mut loaded_state = test_engine_state();
+        let load_res = load_project(&json!({ "path": path_str }), &mut loaded_state)
+            .expect("load_project");
+
+        let joints = load_res["joints"].as_array().expect("joints array");
+        assert_eq!(joints.len(), 3);
+
+        // j_1_rev
+        let j_rev = &joints[0];
+        assert_eq!(j_rev["joint_id"], "j_1_rev");
+        assert_eq!(j_rev["joint_type"], "revolute");
+        assert_eq!(j_rev["axis"], json!([0.0, 0.0, 1.0]));
+        assert_eq!(j_rev["anchor_a"], json!([0.0, 10.0, 0.0]));
+        assert_eq!(j_rev["limits_unit"], "deg");
+        let rev_limits = j_rev["limits"].as_array().unwrap();
+        assert!((rev_limits[0].as_f64().unwrap() - (-45.0)).abs() < 1e-6);
+        assert!((rev_limits[1].as_f64().unwrap() - 90.0).abs() < 1e-6);
+        assert!(j_rev["ratio"].is_null());
+        assert_eq!(j_rev["has_motor"], true);
+        assert_eq!(j_rev["motor"]["target_velocity"], 3.5);
+        assert_eq!(j_rev["motor"]["max_force"], 25.0);
+
+        // j_2_prism
+        let j_prism = &joints[1];
+        assert_eq!(j_prism["joint_id"], "j_2_prism");
+        assert_eq!(j_prism["joint_type"], "prismatic");
+        assert_eq!(j_prism["axis"], json!([1.0, 0.0, 0.0]));
+        assert_eq!(j_prism["anchor_a"], json!([20.0, 0.0, 0.0]));
+        assert_eq!(j_prism["anchor_b"], json!([-20.0, 0.0, 0.0]));
+        assert_eq!(j_prism["limits_unit"], "mm");
+        let prism_limits = j_prism["limits"].as_array().unwrap();
+        assert!((prism_limits[0].as_f64().unwrap() - (-10.0)).abs() < 1e-6);
+        assert!((prism_limits[1].as_f64().unwrap() - 25.0).abs() < 1e-6);
+        assert!(j_prism["ratio"].is_null());
+        assert_eq!(j_prism["has_motor"], false);
+
+        // j_3_gear
+        let j_gear = &joints[2];
+        assert_eq!(j_gear["joint_id"], "j_3_gear");
+        assert_eq!(j_gear["joint_type"], "gear");
+        assert_eq!(j_gear["axis"], json!([0.0, 0.0, 1.0]));
+        assert_eq!(j_gear["axis_a"], json!([0.0, 0.0, 1.0]));
+        assert_eq!(j_gear["axis_b"], json!([0.0, 0.0, 1.0]));
+        assert_eq!(j_gear["ratio"], -2.5);
+        assert!(j_gear["limits"].is_null());
+        assert!(j_gear["limits_unit"].is_null());
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }

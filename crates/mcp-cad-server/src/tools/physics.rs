@@ -119,12 +119,12 @@ pub fn create_joint(args: &Value, state: &mut EngineState) -> Result<Value, Serv
         .and_then(|v| v.as_str())
         .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'joint_type'".to_string()))?;
 
-    let part_a = args
+    let raw_part_a = args
         .get("part_a")
         .and_then(|v| v.as_str())
         .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'part_a'".to_string()))?;
 
-    let part_b = args
+    let raw_part_b = args
         .get("part_b")
         .and_then(|v| v.as_str())
         .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'part_b'".to_string()))?;
@@ -133,25 +133,36 @@ pub fn create_joint(args: &Value, state: &mut EngineState) -> Result<Value, Serv
     let k_to_m = unit.to_meters_factor();
 
     let is_world_or_ground = |id: &str| id.eq_ignore_ascii_case("ground") || id.eq_ignore_ascii_case("world");
+    let norm_part_id = |id: &str| -> String {
+        if id.eq_ignore_ascii_case("ground") {
+            "ground".to_string()
+        } else if id.eq_ignore_ascii_case("world") {
+            "world".to_string()
+        } else {
+            id.to_string()
+        }
+    };
+    let part_a = norm_part_id(raw_part_a);
+    let part_b = norm_part_id(raw_part_b);
 
-    if part_a.eq_ignore_ascii_case(part_b) || (is_world_or_ground(part_a) && is_world_or_ground(part_b)) {
+    if part_a.eq_ignore_ascii_case(&part_b) || (is_world_or_ground(&part_a) && is_world_or_ground(&part_b)) {
         return Err(ServerError::InvalidArgument(
             "Cannot create a joint connecting a part or ground to itself".to_string(),
         ));
     }
 
     // Verify parts exist
-    if !is_world_or_ground(part_a) && !state.parts.contains_key(part_a) {
-        return Err(ServerError::PartNotFound(part_a.to_string()));
+    if !is_world_or_ground(&part_a) && !state.parts.contains_key(&part_a) {
+        return Err(ServerError::PartNotFound(raw_part_a.to_string()));
     }
-    if !is_world_or_ground(part_b) && !state.parts.contains_key(part_b) {
-        return Err(ServerError::PartNotFound(part_b.to_string()));
+    if !is_world_or_ground(&part_b) && !state.parts.contains_key(&part_b) {
+        return Err(ServerError::PartNotFound(raw_part_b.to_string()));
     }
 
     // Ensure non-ground parts are registered into the Rapier physics world if they have geometry
-    for p_id in [part_a, part_b] {
+    for p_id in [&part_a, &part_b] {
         if !is_world_or_ground(p_id) {
-            let part = &state.parts[p_id];
+            let part = &state.parts[p_id.as_str()];
             if part.mesh.vertices.is_empty() {
                 return Err(ServerError::InvalidArgument(format!(
                     "Part '{p_id}' has no geometry (empty mesh). Add geometric features or primitives to the part before creating joints."
@@ -192,13 +203,32 @@ pub fn create_joint(args: &Value, state: &mut EngineState) -> Result<Value, Serv
         [v[0] * k_to_m, v[1] * k_to_m, v[2] * k_to_m]
     };
 
-    let raw_limits = args.get("limits").and_then(|v| v.as_array()).and_then(|arr| {
-        if arr.len() == 2 {
-            Some([arr[0].as_f64().unwrap_or(0.0), arr[1].as_f64().unwrap_or(0.0)])
-        } else {
-            None
+    let raw_limits: Option<[f64; 2]> = match args.get("limits") {
+        None => None,
+        Some(v) if v.is_null() => None,
+        Some(v) => {
+            let arr = v.as_array().ok_or_else(|| {
+                ServerError::InvalidArgument("'limits' must be an array [min, max]".into())
+            })?;
+            if arr.len() != 2 {
+                return Err(ServerError::InvalidArgument(
+                    "'limits' must contain 2 elements [min, max]".into(),
+                ));
+            }
+            let l0 = arr[0].as_f64().ok_or_else(|| {
+                ServerError::InvalidArgument("'limits[0]' must be a finite number".into())
+            })?;
+            let l1 = arr[1].as_f64().ok_or_else(|| {
+                ServerError::InvalidArgument("'limits[1]' must be a finite number".into())
+            })?;
+            if !l0.is_finite() || !l1.is_finite() {
+                return Err(ServerError::InvalidArgument(
+                    "'limits' components must be finite numbers".into(),
+                ));
+            }
+            Some([l0, l1])
         }
-    });
+    };
     let limits_unit = args.get("limits_unit").and_then(|v| v.as_str()).unwrap_or("deg");
 
     let cad_joint = match joint_type_str.to_lowercase().as_str() {
@@ -243,19 +273,52 @@ pub fn create_joint(args: &Value, state: &mut EngineState) -> Result<Value, Serv
             CadJointType::Fixed { anchor_a, anchor_b }
         }
         "gear" => {
-            let ratio = if let Some(r) = args.get("ratio").and_then(|v| v.as_f64()) {
+            let ratio = if let Some(r_val) = args.get("ratio") {
+                let r = r_val.as_f64().ok_or_else(|| {
+                    ServerError::InvalidArgument("Argument 'ratio' must be a finite number".into())
+                })?;
                 if !r.is_finite() || r.abs() < 1e-9 {
-                    return Err(ServerError::InvalidArgument("Gear ratio must be a non-zero finite number".into()));
+                    return Err(ServerError::InvalidArgument(
+                        "Gear 'ratio' must be a non-zero finite number".into(),
+                    ));
                 }
                 r
-            } else if let (Some(ta), Some(tb)) = (
-                args.get("teeth_a").and_then(|v| v.as_f64()),
-                args.get("teeth_b").and_then(|v| v.as_f64()),
-            ) {
-                if tb.abs() < 1e-6 {
-                    return Err(ServerError::InvalidArgument("teeth_b cannot be zero".into()));
+            } else if args.get("teeth_a").is_some() || args.get("teeth_b").is_some() {
+                let ta = args
+                    .get("teeth_a")
+                    .and_then(|v| v.as_f64())
+                    .ok_or_else(|| {
+                        ServerError::InvalidArgument(
+                            "Argument 'teeth_a' must be a positive finite number (> 0)".into(),
+                        )
+                    })?;
+                if !ta.is_finite() || ta <= 0.0 {
+                    return Err(ServerError::InvalidArgument(
+                        "Argument 'teeth_a' must be a positive finite number (> 0)".into(),
+                    ));
                 }
-                ta / tb
+
+                let tb = args
+                    .get("teeth_b")
+                    .and_then(|v| v.as_f64())
+                    .ok_or_else(|| {
+                        ServerError::InvalidArgument(
+                            "Argument 'teeth_b' must be a positive finite number (> 0)".into(),
+                        )
+                    })?;
+                if !tb.is_finite() || tb <= 0.0 {
+                    return Err(ServerError::InvalidArgument(
+                        "Argument 'teeth_b' must be a positive finite number (> 0)".into(),
+                    ));
+                }
+
+                let r = ta / tb;
+                if !r.is_finite() || r.abs() < 1e-9 {
+                    return Err(ServerError::InvalidArgument(
+                        "Calculated gear ratio (teeth_a / teeth_b) must be a non-zero finite number".into(),
+                    ));
+                }
+                r
             } else {
                 1.0
             };
@@ -263,6 +326,20 @@ pub fn create_joint(args: &Value, state: &mut EngineState) -> Result<Value, Serv
             let default_axis = parse_opt_vec3("axis", [0.0, 0.0, 1.0])?;
             let axis_a = parse_opt_vec3("axis_a", default_axis)?;
             let axis_b = parse_opt_vec3("axis_b", default_axis)?;
+
+            let norm_a = (axis_a[0] * axis_a[0] + axis_a[1] * axis_a[1] + axis_a[2] * axis_a[2]).sqrt();
+            if norm_a < 1e-7 || !norm_a.is_finite() {
+                return Err(ServerError::InvalidArgument(
+                    "Gear joint 'axis_a' cannot be a zero vector".into(),
+                ));
+            }
+
+            let norm_b = (axis_b[0] * axis_b[0] + axis_b[1] * axis_b[1] + axis_b[2] * axis_b[2]).sqrt();
+            if norm_b < 1e-7 || !norm_b.is_finite() {
+                return Err(ServerError::InvalidArgument(
+                    "Gear joint 'axis_b' cannot be a zero vector".into(),
+                ));
+            }
 
             CadJointType::Gear {
                 ratio,
@@ -297,7 +374,7 @@ pub fn create_joint(args: &Value, state: &mut EngineState) -> Result<Value, Serv
 
     state
         .physics_world
-        .add_joint(joint_id.clone(), part_a, part_b, cad_joint, None)?;
+        .add_joint(joint_id.clone(), &part_a, &part_b, cad_joint, None)?;
 
     Ok(json!({
         "joint_id": joint_id,
@@ -404,10 +481,22 @@ pub fn run_physics_simulation(args: &Value, state: &mut EngineState) -> Result<V
         ));
     }
 
-    let step_size_ms = args
-        .get("step_size_ms")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(16.6667);
+    let step_size_ms = match args.get("step_size_ms") {
+        None | Some(Value::Null) => 16.6667,
+        Some(v) => {
+            let s = v.as_f64().ok_or_else(|| {
+                ServerError::InvalidArgument(
+                    "Argument 'step_size_ms' must be a positive finite number (> 0)".to_string(),
+                )
+            })?;
+            if !s.is_finite() || s <= 0.0 {
+                return Err(ServerError::InvalidArgument(format!(
+                    "Argument 'step_size_ms' must be a positive finite number (> 0), got {s}"
+                )));
+            }
+            s
+        }
+    };
 
     let step_size_s = (step_size_ms / 1000.0).max(0.0001);
     let unit = state.resolve_length_unit(args)?;
@@ -624,4 +713,296 @@ mod tests {
         assert_eq!(empty_body.code, "INVALID_ARGUMENT");
         assert_eq!(empty_body.param.as_deref(), Some("joint_id"));
     }
+
+    #[test]
+    fn test_p2_t17_set_joint_motor_on_unsupported_joints_preserves_state_and_save_load() {
+        let mut state = EngineState::new().expect("EngineState init");
+        cad::create_part(
+            &json!({ "name": "GearA", "part_id": "gear_a", "material": "steel_1045" }),
+            &mut state,
+        )
+        .unwrap();
+        cad::add_feature_primitive(
+            &json!({
+                "part_id": "gear_a",
+                "primitive_type": "cylinder",
+                "params": { "radius": 10.0, "height": 20.0 }
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        cad::create_part(
+            &json!({ "name": "GearB", "part_id": "gear_b", "material": "steel_1045" }),
+            &mut state,
+        )
+        .unwrap();
+        cad::add_feature_primitive(
+            &json!({
+                "part_id": "gear_b",
+                "primitive_type": "cylinder",
+                "params": { "radius": 20.0, "height": 20.0 }
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        for (j_id, j_type) in [
+            ("j_spherical", "spherical"),
+            ("j_fixed", "fixed"),
+            ("j_gear", "gear"),
+        ] {
+            create_joint(
+                &json!({
+                    "joint_id": j_id,
+                    "joint_type": j_type,
+                    "part_a": "gear_a",
+                    "part_b": "gear_b",
+                    "ratio": 0.5
+                }),
+                &mut state,
+            )
+            .expect("create_joint should succeed");
+
+            let err = set_joint_motor(
+                &json!({
+                    "joint_id": j_id,
+                    "target_velocity": 10.0,
+                    "max_force": 50.0
+                }),
+                &mut state,
+            )
+            .expect_err("set_joint_motor must fail on spherical/fixed/gear");
+
+            let body = err.to_error_body();
+            assert_eq!(body.code, "INVALID_JOINT_CONFIGURATION");
+            assert_eq!(body.param.as_deref(), Some("joint_id"));
+            assert_eq!(
+                state.physics_world.joints()[j_id].motor,
+                None,
+                "record.motor must remain None after failed set_joint_motor on {j_id}"
+            );
+        }
+
+        // Verify get_scene_summary reports has_motor == false for all three joints
+        let summary = crate::tools::metrics::get_scene_summary(&json!({}), &state).unwrap();
+        for j_val in summary["joints"].as_array().unwrap() {
+            assert_eq!(j_val["has_motor"], false);
+            assert!(j_val["motor"].is_null());
+        }
+
+        // Verify save_project + load_project roundtrip succeeds cleanly
+        let temp_dir = std::env::temp_dir().join(format!("mcpcad_p2t17_{}", Uuid::new_v4()));
+        let proj_path = temp_dir.join("p2t17_test.json");
+        let path_str = proj_path.to_str().unwrap();
+
+        crate::tools::project::save_project(&json!({ "path": path_str }), &mut state)
+            .expect("save_project must succeed");
+        let mut loaded_state = EngineState::new().expect("EngineState init");
+        let load_res = crate::tools::project::load_project(&json!({ "path": path_str }), &mut loaded_state)
+            .expect("load_project must succeed when failed motor was not persisted");
+        assert_eq!(load_res["joints_count"], 3);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_p2_t22_gear_validation_and_step_size() {
+        let mut state = EngineState::new().expect("EngineState init");
+        cad::create_part(
+            &json!({ "name": "Gear1", "part_id": "gear_1", "material": "steel_1045" }),
+            &mut state,
+        )
+        .unwrap();
+        cad::add_feature_primitive(
+            &json!({
+                "part_id": "gear_1",
+                "primitive_type": "cylinder",
+                "params": { "radius": 0.05, "height": 0.02 }
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        cad::create_part(
+            &json!({ "name": "Gear2", "part_id": "gear_2", "material": "steel_1045" }),
+            &mut state,
+        )
+        .unwrap();
+        cad::add_feature_primitive(
+            &json!({
+                "part_id": "gear_2",
+                "primitive_type": "cylinder",
+                "params": { "radius": 0.1, "height": 0.02 }
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        // 1. Ratio = 0.0
+        let err = create_joint(
+            &json!({
+                "joint_id": "j_g_zero",
+                "joint_type": "gear",
+                "part_a": "gear_1",
+                "part_b": "gear_2",
+                "ratio": 0.0
+            }),
+            &mut state,
+        )
+        .unwrap_err();
+        let body = err.to_error_body();
+        assert_eq!(body.code, "INVALID_ARGUMENT");
+        assert_eq!(body.param.as_deref(), Some("ratio"));
+
+        // 2. teeth_a <= 0
+        let err = create_joint(
+            &json!({
+                "joint_id": "j_g_teeth_zero_a",
+                "joint_type": "gear",
+                "part_a": "gear_1",
+                "part_b": "gear_2",
+                "teeth_a": 0,
+                "teeth_b": 40
+            }),
+            &mut state,
+        )
+        .unwrap_err();
+        let body = err.to_error_body();
+        assert_eq!(body.code, "INVALID_ARGUMENT");
+        assert_eq!(body.param.as_deref(), Some("teeth_a"));
+
+        // 3. teeth_b <= 0
+        let err = create_joint(
+            &json!({
+                "joint_id": "j_g_teeth_zero_b",
+                "joint_type": "gear",
+                "part_a": "gear_1",
+                "part_b": "gear_2",
+                "teeth_a": 20,
+                "teeth_b": -5
+            }),
+            &mut state,
+        )
+        .unwrap_err();
+        let body = err.to_error_body();
+        assert_eq!(body.code, "INVALID_ARGUMENT");
+        assert_eq!(body.param.as_deref(), Some("teeth_b"));
+
+        // 4. Non-numeric teeth
+        let err = create_joint(
+            &json!({
+                "joint_id": "j_g_teeth_nan",
+                "joint_type": "gear",
+                "part_a": "gear_1",
+                "part_b": "gear_2",
+                "teeth_a": "twenty",
+                "teeth_b": 40
+            }),
+            &mut state,
+        )
+        .unwrap_err();
+        let body = err.to_error_body();
+        assert_eq!(body.code, "INVALID_ARGUMENT");
+        assert_eq!(body.param.as_deref(), Some("teeth_a"));
+
+        // 5. Zero vector axis_a
+        let err = create_joint(
+            &json!({
+                "joint_id": "j_g_axis_a_zero",
+                "joint_type": "gear",
+                "part_a": "gear_1",
+                "part_b": "gear_2",
+                "ratio": 2.0,
+                "axis_a": [0.0, 0.0, 0.0]
+            }),
+            &mut state,
+        )
+        .unwrap_err();
+        let body = err.to_error_body();
+        assert_eq!(body.code, "INVALID_ARGUMENT");
+        assert_eq!(body.param.as_deref(), Some("axis_a"));
+
+        // 6. Zero vector axis_b
+        let err = create_joint(
+            &json!({
+                "joint_id": "j_g_axis_b_zero",
+                "joint_type": "gear",
+                "part_a": "gear_1",
+                "part_b": "gear_2",
+                "ratio": 2.0,
+                "axis_b": [0.0, 0.0, 0.0]
+            }),
+            &mut state,
+        )
+        .unwrap_err();
+        let body = err.to_error_body();
+        assert_eq!(body.code, "INVALID_ARGUMENT");
+        assert_eq!(body.param.as_deref(), Some("axis_b"));
+
+        // 7. Valid teeth_a / teeth_b -> creates gear successfully
+        let res_teeth = create_joint(
+            &json!({
+                "joint_id": "j_g_teeth_ok",
+                "joint_type": "gear",
+                "part_a": "gear_1",
+                "part_b": "gear_2",
+                "teeth_a": 20,
+                "teeth_b": 40
+            }),
+            &mut state,
+        )
+        .expect("valid teeth should create gear joint");
+        assert_eq!(res_teeth["joint_id"], "j_g_teeth_ok");
+
+        // 8. step_size_ms validation in run_physics_simulation
+        let err_step_neg = run_physics_simulation(
+            &json!({
+                "duration_seconds": 0.1,
+                "step_size_ms": -1.0
+            }),
+            &mut state,
+        )
+        .unwrap_err();
+        let body = err_step_neg.to_error_body();
+        assert_eq!(body.code, "INVALID_ARGUMENT");
+        assert_eq!(body.param.as_deref(), Some("step_size_ms"));
+
+        let err_step_zero = run_physics_simulation(
+            &json!({
+                "duration_seconds": 0.1,
+                "step_size_ms": 0.0
+            }),
+            &mut state,
+        )
+        .unwrap_err();
+        let body = err_step_zero.to_error_body();
+        assert_eq!(body.code, "INVALID_ARGUMENT");
+        assert_eq!(body.param.as_deref(), Some("step_size_ms"));
+
+        let err_step_str = run_physics_simulation(
+            &json!({
+                "duration_seconds": 0.1,
+                "step_size_ms": "fast"
+            }),
+            &mut state,
+        )
+        .unwrap_err();
+        let body = err_step_str.to_error_body();
+        assert_eq!(body.code, "INVALID_ARGUMENT");
+        assert_eq!(body.param.as_deref(), Some("step_size_ms"));
+
+        // 9. Valid run_physics_simulation with valid step_size_ms
+        let sim_res = run_physics_simulation(
+            &json!({
+                "duration_seconds": 0.05,
+                "step_size_ms": 10.0
+            }),
+            &mut state,
+        )
+        .expect("valid simulation should succeed");
+        assert!(sim_res["steps_simulated"].as_u64().unwrap() > 0);
+    }
 }
+
+

@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import {
+import type {
   AngleHistogramBuckets,
   DagNode,
   DetectedPlanarFace,
@@ -7,6 +7,7 @@ import {
   MeshValidationReport,
   QualityPreset,
 } from '../types/cad';
+
 
 /**
  * Maximum permitted fraction of triangles with minimum interior angle < 5° for `status = "PASS"`.
@@ -2308,13 +2309,14 @@ export function createWheelRimMesh(
   const halfW = rimWidth * 0.5;
   const lipW = rimWidth * 0.09;
 
+  const sWidth = Math.min(1.0, rimWidth / 0.16);
   const clampedOffset = Math.min(
     halfW * 0.55,
     Math.max(-halfW * 0.55, offset)
   );
   const halfSpokeT = Math.min(
     halfW * 0.35,
-    Math.max(0.006, spokeThickness * 0.5)
+    Math.max(0.006 * sWidth, spokeThickness * 0.5)
   );
   const zFront = Math.min(halfW * 0.85, clampedOffset + halfSpokeT);
   const zBack = Math.max(-halfW * 0.85, clampedOffset - halfSpokeT);
@@ -3363,7 +3365,12 @@ export function evaluateFeatureTree(
         break;
       }
       case 'revolve': {
-        if (Array.isArray(p.profile) && p.profile.length >= 2) {
+        if (p.profile !== undefined) {
+          if (!Array.isArray(p.profile) || p.profile.length < 2) {
+            throw new Error(
+              'revolve profile must be an array of at least 2 [r, z] points'
+            );
+          }
           const angleDeg = Number(p.angle_deg ?? p.angleDeg ?? 360);
           const innerR = Number(p.inner_radius ?? p.innerRadius ?? 0);
           currentMesh = createRevolveMesh(
@@ -3384,15 +3391,19 @@ export function evaluateFeatureTree(
       case 'wheel_rim': {
         const rimD = Number(p.rim_diameter ?? p.diameter ?? 0.4572);
         const rimW = Number(p.rim_width ?? p.width ?? 0.2032);
-        const spokes = Number(p.spoke_count ?? p.spokes ?? 5);
-        const hubD = Number(p.hub_diameter ?? 0.16);
-        const hubBore = Number(p.hub_bore_diameter ?? 0.066);
+        const sRim = Math.min(1.0, rimD / 0.35);
+        const sWidth = Math.min(1.0, rimW / 0.16);
+        const spokes = Number(p.spokes_count ?? p.spoke_count ?? p.spokes ?? 5);
+        const hubD = Number(p.hub_diameter ?? rimD * 0.35);
+        const hubBore = Number(p.hub_bore_diameter ?? hubD * 0.45);
         const bolts = Number(p.bolt_holes_count ?? p.bolt_pattern ?? 5);
-        const pcd = Number(p.bolt_circle_diameter ?? 0.1143);
-        const boltHoleD = Number(p.bolt_hole_diameter ?? 0.014);
-        const flangeD = Number(p.flange_diameter ?? 0.49);
-        const spokeThickness = Number(p.spoke_thickness ?? 0.018);
-        const offset = Number(p.offset ?? 0.035);
+        const pcd = Number(
+          p.pcd_diameter ?? p.bolt_circle_diameter ?? (hubD + hubBore) * 0.5
+        );
+        const boltHoleD = Number(p.bolt_hole_diameter ?? 0.014 * sRim);
+        const flangeD = Number(p.flange_diameter ?? rimD * 1.08);
+        const spokeThickness = Number(p.spoke_thickness ?? 0.018 * sWidth);
+        const offset = Number(p.offset_et ?? p.offset ?? 0.035 * sWidth);
         currentMesh = createWheelRimMesh(
           rimD,
           rimW,
@@ -3505,6 +3516,16 @@ export function evaluateFeatureTree(
             density
           );
         }
+        break;
+      }
+      case 'stl_import': {
+        const importedMesh = p.mesh as MeshGeometryData | undefined;
+        if (importedMesh && importedMesh.vertices && importedMesh.vertices.length > 0) {
+          currentMesh = importedMesh;
+        } else if (!currentMesh) {
+          currentMesh = createBoxMesh(0.05, 0.05, 0.05, density);
+        }
+        basePrimitiveNode = node;
         break;
       }
       case 'transform': {

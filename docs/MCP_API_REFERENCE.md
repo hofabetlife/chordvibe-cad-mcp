@@ -255,7 +255,7 @@
 #### Входные параметры
 | Параметр | Тип | Обязательный | Описание |
 |---|---|---|---|
-| `name` | `string` | Да | Человекочитаемое имя детали (например, `"mounting_bracket"`) |
+| `name` | `string` | Да | Человекочитаемое имя детали (например, `"mounting_bracket"`). Идентификаторы `"ground"` и `"world"` (в любом регистре) зарезервированы под статический якорь сцены/физики и запрещены к использованию (возвращают `INVALID_ARGUMENT`) |
 | `material` | `string` | Да | Идентификатор материала из базы пресетов |
 | `is_fixed` | `boolean` | Нет | Закрепить деталь неподвижно в мировом пространстве (статическое тело с бесконечной массой для физических расчетов и кинематики, например станина или корпус редуктора). По умолчанию `false` |
 
@@ -305,10 +305,12 @@
 
 ### 2. `list_parts`
 
-Возвращает список всех активных деталей на сцене с геометрическими габаритами, объемом, расчетной массой и количеством треугольников в сетке.
+Возвращает список всех активных деталей на сцене (отсортированных по `part_id`) с геометрическими габаритами (`bounding_box`, `bounding_box_dimensions`), объёмом (`volume` в `mm³` или `m³` и `volume_m3`), расчётной массой (`mass_kg`), ревизией (`revision`), количеством конструктивных элементов (`features_count`) и треугольников в сетке (`triangles_count`).
 
 #### Входные параметры
-*Нет параметров.*
+| Параметр | Тип | Обязательный | Описание |
+|---|---|:---:|---|
+| `length_unit` | `string` | Нет | Локальное переопределение единицы длины (`"mm"` или `"m"`, по умолчанию используется единица сессии) |
 
 #### Пример запроса
 ```json
@@ -318,7 +320,9 @@
   "method": "tools/call",
   "params": {
     "name": "list_parts",
-    "arguments": {}
+    "arguments": {
+      "length_unit": "mm"
+    }
   }
 }
 ```
@@ -332,7 +336,7 @@
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"parts\": [\n    {\n      \"part_id\": \"part-a1b2c3d4e5f64789\",\n      \"name\": \"cantilever_beam\",\n      \"material\": \"steel_structural_aisi1020\",\n      \"volume_m3\": 0.001,\n      \"mass_kg\": 7.85,\n      \"triangle_count\": 12,\n      \"bounding_box\": {\n        \"min\": [-0.5, -0.025, -0.01],\n        \"max\": [0.5, 0.025, 0.01]\n      }\n    }\n  ]\n}"
+        "text": "{\n  \"parts\": [\n    {\n      \"part_id\": \"part-a1b2c3d4e5f64789\",\n      \"name\": \"cantilever_beam\",\n      \"material\": \"steel_structural_aisi1020\",\n      \"is_fixed\": false,\n      \"revision\": 2,\n      \"volume\": 1000000.0,\n      \"volume_m3\": 0.001,\n      \"mass_kg\": 7.85,\n      \"triangles_count\": 12,\n      \"vertices_count\": 8,\n      \"features_count\": 1,\n      \"bounding_box\": {\n        \"min\": [-500.0, -25.0, -10.0],\n        \"max\": [500.0, 25.0, 10.0]\n      },\n      \"bounding_box_dimensions\": [1000.0, 50.0, 20.0]\n    }\n  ],\n  \"parts_count\": 1,\n  \"length_unit\": \"mm\",\n  \"units\": {\n    \"length\": \"mm\",\n    \"volume\": \"mm3\",\n    \"mass\": \"kg\"\n  }\n}"
       }
     ]
   }
@@ -348,7 +352,7 @@
 #### Входные параметры
 | Параметр | Тип | Обязательный | Описание |
 |---|---|---|---|
-| `part_id` | `string` | Да | Уникальный идентификатор детали |
+| `part_id` | `string` | Да | Уникальный идентификатор детали. Статические якоря `"ground"` и `"world"` удалять запрещено (возвращают ошибку `INVALID_ARGUMENT`) |
 
 #### Пример запроса
 ```json
@@ -437,7 +441,7 @@
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"feature_id\": \"d7a8e2f0-1234-5678-90ab-cdef11223344\"\n}"
+        "text": "{\n  \"part_id\": \"part-a1b2c3d4e5f64789\",\n  \"feature_id\": \"d7a8e2f0-1234-5678-90ab-cdef11223344\",\n  \"primitive_type\": \"box\",\n  \"revision\": 1,\n  \"bounding_box\": {\n    \"min\": [-100.0, -25.0, -25.0],\n    \"max\": [100.0, 25.0, 25.0],\n    \"dimensions\": [200.0, 50.0, 50.0]\n  },\n  \"volume\": 500000.0,\n  \"volume_m3\": 0.0005\n}"
       }
     ]
   }
@@ -448,7 +452,7 @@
 
 ### 5. `cut_hole`
 
-Вырезает сквозное или глухое цилиндрическое отверстие вдоль заданного нормального вектора, с опциональным шпоночным пазом по стандарту DIN 6885.
+Вырезает сквозное или глухое цилиндрическое отверстие вдоль заданного нормального вектора, с опциональным шпоночным пазом по стандарту DIN 6885. Возвращает `part_id`, `feature_id`, `revision`, фактическую вычисленную глубину отверстия `depth` (в `length_unit`) и `depth_m` (в метрах СИ), флаг `through`, а также обновлённые `bounding_box`, `volume` и `volume_m3`.
 
 #### Входные параметры
 | Параметр | Тип | Обязательный | Описание |
@@ -490,7 +494,7 @@
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"feature_id\": \"f8b9c0d1-2345-6789-01bc-def223344556\"\n}"
+        "text": "{\n  \"part_id\": \"part-a1b2c3d4e5f64789\",\n  \"feature_id\": \"f8b9c0d1-2345-6789-01bc-def223344556\",\n  \"revision\": 2,\n  \"depth\": 60.0,\n  \"depth_m\": 0.06,\n  \"through\": false,\n  \"bounding_box\": {\n    \"min\": [-100.0, -25.0, -25.0],\n    \"max\": [100.0, 25.0, 25.0],\n    \"dimensions\": [200.0, 50.0, 50.0]\n  },\n  \"volume\": 494345.1,\n  \"volume_m3\": 0.0004943451\n}"
       }
     ]
   }
@@ -501,7 +505,7 @@
 
 ### 6. `modify_feature`
 
-Модифицирует численные параметры любого существующего шага в истории DAG без разрушения структуры детали.
+Модифицирует численные параметры любого существующего шага в истории DAG без разрушения структуры детали. Возвращает `part_id`, `feature_id`, `status`, `revision`, `updated_bounds`, `dimensions`, `bounding_box`, `volume` и `volume_m3`.
 
 #### Входные параметры
 | Параметр | Тип | Обязательный | Описание |
@@ -540,7 +544,7 @@
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"status\": \"updated\",\n  \"updated_bounds\": [-0.125, -0.03, -0.025, 0.125, 0.03, 0.025],\n  \"dimensions\": [0.25, 0.06, 0.05]\n}"
+        "text": "{\n  \"part_id\": \"part-a1b2c3d4e5f64789\",\n  \"feature_id\": \"d7a8e2f0-1234-5678-90ab-cdef11223344\",\n  \"status\": \"updated\",\n  \"revision\": 3,\n  \"updated_bounds\": [-0.125, -0.03, -0.025, 0.125, 0.03, 0.025],\n  \"dimensions\": [0.25, 0.06, 0.05],\n  \"bounding_box\": {\n    \"min\": [-0.125, -0.03, -0.025],\n    \"max\": [0.125, 0.03, 0.025],\n    \"dimensions\": [0.25, 0.06, 0.05]\n  },\n  \"volume\": 0.00075,\n  \"volume_m3\": 0.00075\n}"
       }
     ]
   }
@@ -551,12 +555,13 @@
 
 ### 7. `get_feature_tree`
 
-Возвращает полный упорядоченный список всех узлов истории операций DAG для анализа цепочки моделирования.
+Возвращает полный упорядоченный список всех узлов истории операций DAG для анализа цепочки моделирования, а также текущую ревизию детали `revision`. Все линейные параметры аналитических операций `FeatureOp` и вложенные меш-операнды (`BooleanDifferenceMesh`, `BooleanUnionMesh`, `BooleanIntersectionMesh`, `ImportedMesh`: координаты вершин `vertices[i].position`, центроиды `faces[i].centroid`, точки `faces[i].sample_point`, радиусы `faces[i].radius` в `length_unit` и площади `faces[i].area` в `length_unit²`) масштабируются в активную единицу длины (`mm` по умолчанию или `m`).
 
 #### Входные параметры
 | Параметр | Тип | Обязательный | Описание |
 |---|---|---|---|
 | `part_id` | `string` | Да | Идентификатор целевой детали |
+| `length_unit` | `"mm" \| "m"` | Нет | Опциональное переопределение единицы длины для этого вызова (по умолчанию используется единица сессии) |
 
 #### Пример запроса
 ```json
@@ -582,7 +587,7 @@
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"dag\": [\n    {\n      \"id\": \"d7a8e2f0-1234-5678-90ab-cdef11223344\",\n      \"name\": \"AddBox_1\",\n      \"op\": {\n        \"AddBox\": {\n          \"width\": 0.25,\n          \"height\": 0.06,\n          \"depth\": 0.05\n        }\n      },\n      \"parent_id\": null\n    }\n  ]\n}"
+        "text": "{\n  \"part_id\": \"part-a1b2c3d4e5f64789\",\n  \"revision\": 1,\n  \"dag\": [\n    {\n      \"id\": \"d7a8e2f0-1234-5678-90ab-cdef11223344\",\n      \"name\": \"AddBox_1\",\n      \"enabled\": true,\n      \"created_at\": 1700000000,\n      \"op\": {\n        \"AddBox\": {\n          \"width\": 250.0,\n          \"height\": 60.0,\n          \"depth\": 50.0,\n          \"position\": [0.0, 0.0, 0.0]\n        }\n      },\n      \"parent_id\": null\n    }\n  ],\n  \"units\": {\n    \"length\": \"mm\",\n    \"area\": \"mm2\",\n    \"volume\": \"mm3\",\n    \"angle\": \"deg\",\n    \"mass\": \"kg\",\n    \"force\": \"N\",\n    \"stress\": \"MPa\",\n    \"time\": \"s\"\n  }\n}"
       }
     ]
   }
@@ -593,7 +598,7 @@
 
 ### 8. `cut_helical_groove`
 
-Вырезает винтовые спиральные канавки (стружечные канавки сверл, теплоотводящие спирали, нарезка метрической треугольной резьбы 60° по ISO 68-1).
+Вырезает винтовые спиральные канавки (стружечные канавки сверл, теплоотводящие спирали, нарезка метрической треугольной резьбы 60° по ISO 68-1). Возвращает `part_id`, `feature_id`, `revision`, `start_z`, `status`, `bounding_box`, `volume` и `volume_m3`.
 
 #### Входные параметры
 | Параметр | Тип | Обязательный | Описание |
@@ -603,8 +608,8 @@
 | `groove_radius` | `number` | Да | Радиус сечения или глубина резьбы (м) |
 | `pitch` | `number` | Да | Осевой шаг винта (м на оборот 360°) |
 | `height` | `number` | Да | Полная осевая длина спирали (м) |
-| `start_z` | `number` | Да | Z-координата начала спирали (м) |
-| `starts` | `integer` | Нет | Число заходов резьбы/канавок (по умолчанию 2) |
+| `start_z` | `number` | Нет | Z-координата начала спирали (в активной единице `length_unit`: `mm` или `m`). Если не указана, автоматически выравнивается по нижней грани детали `bounding_box.min[2]` (или `-height / 2`, если сетка пуста) |
+| `starts` | `integer` | Нет | Число заходов резьбы/канавок (по умолчанию `1` для `metric_60` и `2` для `circular`) |
 | `is_right_hand` | `boolean` | Нет | Направление нарезки (true - правая, false - левая, по умолчанию true) |
 | `profile_type` | `string` | Нет | Профиль сечения инструмента: `"circular"` (по умолчанию) или `"metric_60"` (треугольный профиль метрической резьбы 60° по ISO 68-1) |
 
@@ -612,19 +617,20 @@
 
 ### 9. `boolean_difference`
 
-Выполняет точное аналитическое булево вычитание сетки инструмента из целевой детали (CSG Difference).
+Выполняет точное аналитическое булево вычитание сетки инструмента из целевой детали (CSG Difference). Возвращает обновлённый счётчик ревизии геометрии `revision`, габаритный бокс `bounding_box`, объём `volume` (в `mm³` или `m³`) и `volume_m3`, а также массив диагностических предупреждений масштаба `warnings`.
 
 #### Входные параметры
 | Параметр | Тип | Обязательный | Описание |
 |---|---|---|---|
 | `target_part_id` | `string` | Да | Идентификатор детали, из которой вычитается объем |
 | `tool_part_id` | `string` | Да | Идентификатор детали-инструмента |
+| `length_unit` | `"mm" \| "m"` | Нет | Опциональное переопределение единицы длины для этого вызова (по умолчанию используется единица сессии) |
 
 ---
 
 ### 10. `tessellate_part`
 
-Выполняет ленивую адаптивную тесселяцию криволинейных поверхностей детали по хорде и углу отклонения с обновлением кэша полигональной сетки.
+Выполняет ленивую адаптивную тесселяцию криволинейных поверхностей детали по хорде и углу отклонения с обновлением кэша полигональной сетки. Перевычисление полигональной сетки с другим разрешением (`coarse` / `medium` / `fine`) не изменяет параметрический DAG детали, поэтому `part.revision` остаётся неизменным, а ранее выполненные расчёты МКЭ (`run_fea_analysis`) и требования `min_safety_factor` сохраняют актуальный статус `FRESH` / `PASS`.
 
 #### Входные параметры
 | Параметр | Тип | Обязательный | Описание |
@@ -680,20 +686,20 @@
 |---|---|---|---|
 | `joint_id` (или `id`) | `string` | Нет | Пользовательский идентификатор сочленения (по умолчанию автогенерируется `joint-<uuid>`). При дублировании возвращает ошибку `JOINT_ALREADY_EXISTS` |
 | `joint_type` | `string` | Да | `"revolute"`, `"prismatic"`, `"spherical"`, `"fixed"`, `"gear"` |
-| `part_a` | `string` | Да | Идентификатор первой сопрягаемой детали (или `"ground"` / `"world"` для привязки к неподвижному пространству) |
-| `part_b` | `string` | Да | Идентификатор второй сопрягаемой детали (или `"ground"` / `"world"`) |
+| `part_a` | `string` | Да | Идентификатор первой сопрягаемой детали (или `"ground"` / `"world"` для привязки к неподвижному пространству; обрабатывается регистронезависимо) |
+| `part_b` | `string` | Да | Идентификатор второй сопрягаемой детали (или `"ground"` / `"world"`; обрабатывается регистронезависимо) |
 | `anchor_a` | `[number, number, number]` | Нет | Точка крепления `[x, y, z]` в СК детали A (м). По умолчанию `[0, 0, 0]` |
 | `anchor_b` | `[number, number, number]` | Нет | Точка крепления `[x, y, z]` в СК детали B (м). По умолчанию `[0, 0, 0]` |
 | `axis` | `[number, number, number]` | Нет | Направляющая ось `[x, y, z]` (обязательна для revolute/prismatic) |
 | `limits` | `[number, number]` | Нет | Пределы движения `[min, max]` (в радианах или метрах) |
-| `ratio` | `number` | Нет | Передаточное отношение для `joint_type: "gear"` ($i = \omega_B / \omega_A$). Отрицательное значение указывает на встречное вращение (внешнее зацепление) |
-| `teeth_a` | `integer` | Нет | Число зубьев ведущей шестерни $z_A$ (альтернатива `ratio`; рассчитывает $i = -z_A / z_B$) |
-| `teeth_b` | `integer` | Нет | Число зубьев ведомой шестерни $z_B$ (альтернатива `ratio`) |
-| `axis_a` | `[number, number, number]` | Нет | Ось вращения шестерни A (по умолчанию `[0, 0, 1]`) |
-| `axis_b` | `[number, number, number]` | Нет | Ось вращения шестерни B (по умолчанию `[0, 0, 1]`) |
+| `ratio` | `number` | Нет | Передаточное отношение для `joint_type: "gear"` ($i = \omega_B / \omega_A$). Должно быть конечным ненулевым числом ($|\text{ratio}| \ge 10^{-9}$). Отрицательное значение указывает на встречное вращение (внешнее зацепление) |
+| `teeth_a` | `number` | Нет | Число зубьев ведущей шестерни $z_A$ (альтернатива `ratio`; строго положительное число $> 0$; рассчитывает $i = -z_A / z_B$) |
+| `teeth_b` | `number` | Нет | Число зубьев ведомой шестерни $z_B$ (альтернатива `ratio`; строго положительное число $> 0$) |
+| `axis_a` | `[number, number, number]` | Нет | Ось вращения шестерни A (по умолчанию `[0, 0, 1]`; ненулевой вектор) |
+| `axis_b` | `[number, number, number]` | Нет | Ось вращения шестерни B (по умолчанию `[0, 0, 1]`; ненулевой вектор) |
 
 > **Примечание по зубчатым передачам (`"gear"`):**  
-> При создании сопряжения типа `"gear"` физический движок автоматически отключает прямой полигональный контакт между зубьями (`contacts_enabled(false)`), исключая заклинивание выпуклых оболочек colliders, и на каждом шаге времени строго синхронизирует угловые скорости шестерней согласно передаточному отношению $\omega_B = -\text{ratio} \cdot \omega_A$.
+> При создании сопряжения типа `"gear"` физический движок строго валидирует входные параметры: передаточное отношение `ratio` должно быть конечным ненулевым ($|\text{ratio}| \ge 10^{-9}$), параметры `teeth_a` и `teeth_b` должны быть строго положительными ($> 0$), а оси вращения `axis_a` и `axis_b` — ненулевыми векторами ($\|v\| \ge 10^{-7}$). При некорректных параметрах возвращается ошибка `INVALID_ARGUMENT` с указанием конкретного `param`. Движок автоматически отключает прямой полигональный контакт между зубьями (`contacts_enabled(false)`), исключая заклинивание выпуклых оболочек colliders, и на каждом шаге времени строго синхронизирует угловые скорости шестерней согласно передаточному отношению $\omega_B = -\text{ratio} \cdot \omega_A$.
 
 #### Пример запроса (вращательный шарнир на неподвижную раму)
 ```json
@@ -1075,10 +1081,13 @@
 #### Входные параметры
 | Параметр | Тип | Обязательный | Описание |
 |---|---|---|---|
-| `filepath` | `string` | Да | Путь к STL-файлу на диске |
+| `filepath` | `string` | Да (или `file_path`) | Путь к STL-файлу на диске |
+| `file_path` | `string` | Нет | Алиас параметра `filepath` |
+| `part_id` | `string` | Нет | Пользовательский уникальный идентификатор детали (по умолчанию `part-<UUID>`). Запрещены зарезервированные имена `ground` и `world`. При дублировании возвращается ошибка `PART_ALREADY_EXISTS`. |
 | `name` | `string` | Нет | Пользовательское имя детали (по умолчанию имя файла) |
 | `material` | `string` | Нет | Идентификатор материала из реестра (по умолчанию `steel_structural_aisi1020`) |
-| `length_unit` | `string` | Нет | Переопределение единицы длины для `bounding_box` в ответе (`"mm"` или `"m"`) |
+| `is_fixed` | `boolean` | Нет | Закреплена ли деталь в пространстве симуляции физики (`true` — статический `TriMesh`, `false` — динамический `ConvexHull`; по умолчанию `false`). Деталь автоматически регистрируется в `physics_world`. |
+| `length_unit` | `string` | Нет | Переопределение единицы длины в ответе (`"mm"` или `"m"`) |
 
 #### Пример запроса
 ```json
@@ -1089,9 +1098,12 @@
   "params": {
     "name": "import_stl",
     "arguments": {
-      "filepath": "./output/external_bracket.stl",
+      "file_path": "./output/external_bracket.stl",
+      "part_id": "bracket_imported",
       "name": "imported_bracket",
-      "material": "aluminum_6061_t6"
+      "material": "aluminum_6061_t6",
+      "is_fixed": true,
+      "length_unit": "mm"
     }
   }
 }
@@ -1106,7 +1118,7 @@
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"material\": \"aluminum_6061_t6\",\n  \"name\": \"imported_bracket\",\n  \"part_id\": \"part-imported-1234\",\n  \"status\": \"stl_imported\",\n  \"triangles_count\": 5420,\n  \"vertices_count\": 2712,\n  \"length_unit\": \"mm\"\n}"
+        "text": "{\n  \"part_id\": \"bracket_imported\",\n  \"name\": \"imported_bracket\",\n  \"is_fixed\": true,\n  \"revision\": 1,\n  \"triangles_count\": 5420,\n  \"vertices_count\": 2712,\n  \"bounding_box\": {\n    \"min\": [-25.0, -15.0, -10.0],\n    \"max\": [25.0, 15.0, 10.0],\n    \"dimensions\": [50.0, 30.0, 20.0]\n  },\n  \"volume\": 30000.0,\n  \"volume_m3\": 0.00003,\n  \"mass_kg\": 0.081,\n  \"mass\": 0.081,\n  \"status\": \"stl_imported\",\n  \"length_unit\": \"mm\",\n  \"units\": {\n    \"length\": \"mm\",\n    \"volume\": \"mm³\",\n    \"mass\": \"kg\"\n  },\n  \"warnings\": []\n}"
       }
     ]
   }
@@ -1117,7 +1129,7 @@
 
 ### 19. `export_stl`
 
-Экспортирует поверхностную сетку детали в файл стандартного формата STL с поддержкой адаптивной тесселяции по хорде для прецизионного производства и 3D-печати.
+Экспортирует поверхностную сетку детали в файл стандартного формата STL с поддержкой адаптивной тесселяции по хорде для прецизионного производства и 3D-печати. Не увеличивает счётчик ревизии геометрии `part.revision` и не переводит результаты МКЭ (`min_safety_factor`, `last_fea`) в статус `STALE`.
 
 > **Важно (единицы координат STL):** Координаты вершин в записываемом на диск файле `.stl` всегда сохраняются во внутренних единицах СИ — **метрах (`m`)** (в JSON-ответе возвращается `"stl_vertex_unit": "m"`). Входной параметр `chord_tolerance` интерпретируется в активной единице `length_unit` (`mm` по умолчанию).
 
@@ -1169,10 +1181,12 @@
 
 ### 20. `get_simulation_metrics_json`
 
-Возвращает полный агрегированный инженерный отчет по всей сцене: геометрические метаданные всех деталей, результаты последних МКЭ-расчетов и телеметрию физической симуляции.
+Возвращает полный агрегированный инженерный отчет по всей сцене: геометрические метаданные всех деталей (с учётом активного или переопределённого `length_unit`), результаты последних МКЭ-расчетов (включая `fea_revision`, `part_revision`, `stale` и `status`) и телеметрию физической симуляции.
 
 #### Входные параметры
-*Нет параметров.*
+| Параметр | Тип | Обязательный | Описание |
+|---|---|:---:|---|
+| `length_unit` | `"mm" \| "m"` | Нет | Опциональное переопределение единицы длины для этого вызова (по умолчанию используется единица сессии) |
 
 #### Пример запроса
 ```json
@@ -1196,7 +1210,7 @@
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"current_metrics\": {\n    \"parts_count\": 1,\n    \"parts\": [\n      {\n        \"part_id\": \"part-a1b2c3d4e5f64789\",\n        \"name\": \"cantilever_beam\",\n        \"material\": \"steel_structural_aisi1020\",\n        \"volume_m3\": 0.001,\n        \"mass_kg\": 7.85,\n        \"triangle_count\": 12,\n        \"bounding_box\": {\"min\": [-0.5, -0.025, -0.01], \"max\": [0.5, 0.025, 0.01]}\n      }\n    ],\n    \"fea_reports\": [\n      {\n        \"part_id\": \"part-a1b2c3d4e5f64789\",\n        \"verdict\": \"PASS\",\n        \"factor_of_safety\": 2.54,\n        \"max_von_mises_mpa\": 98.42,\n        \"yield_strength_mpa\": 250.0,\n        \"max_displacement_mm\": 0.184,\n        \"nodes\": 275,\n        \"elements\": 864,\n        \"time_ms\": 245\n      }\n    ],\n    \"physics\": {\n      \"accumulated_time_s\": 1.5,\n      \"gravity\": [0.0, -9.81, 0.0],\n      \"last_simulation\": {\n        \"step_count\": 90,\n        \"peak_joint_forces\": {\"joint-550e8400-e29b-41d4-a716-446655440000\": 34.2},\n        \"collisions\": []\n      }\n    }\n  }\n}"
+        "text": "{\n  \"current_metrics\": {\n    \"parts_count\": 1,\n    \"parts\": [\n      {\n        \"part_id\": \"part-a1b2c3d4e5f64789\",\n        \"name\": \"cantilever_beam\",\n        \"revision\": 1,\n        \"material\": \"steel_structural_aisi1020\",\n        \"volume\": 1000000.0,\n        \"volume_m3\": 0.001,\n        \"mass_kg\": 7.85,\n        \"triangle_count\": 12,\n        \"bounding_box\": {\"min\": [-500.0, -25.0, -10.0], \"max\": [500.0, 25.0, 10.0], \"dimensions\": [1000.0, 50.0, 20.0]}\n      }\n    ],\n    \"fea_reports\": [\n      {\n        \"part_id\": \"part-a1b2c3d4e5f64789\",\n        \"verdict\": \"PASS\",\n        \"factor_of_safety\": 2.54,\n        \"safety_factor\": 2.54,\n        \"max_von_mises_mpa\": 98.42,\n        \"yield_strength_mpa\": 250.0,\n        \"max_displacement_mm\": 0.184,\n        \"max_displacement\": 0.184,\n        \"nodes\": 275,\n        \"elements\": 864,\n        \"time_ms\": 245,\n        \"fea_revision\": 1,\n        \"part_revision\": 1,\n        \"stale\": false,\n        \"is_stale\": false,\n        \"status\": \"FRESH\"\n      }\n    ],\n    \"physics\": {\n      \"accumulated_time_s\": 1.5,\n      \"gravity\": [0.0, -9810.0, 0.0],\n      \"gravity_m_s2\": [0.0, -9.81, 0.0],\n      \"last_simulation\": {\n        \"step_count\": 90,\n        \"peak_joint_forces\": {\"joint-550e8400-e29b-41d4-a716-446655440000\": 34.2},\n        \"collisions\": []\n      }\n    }\n  },\n  \"length_unit\": \"mm\"\n}"
       }
     ]
   }
@@ -1254,13 +1268,14 @@
 
 ### 22. `boolean_union`
 
-Выполняет CSG булево объединение (Union) твердотельных сеток: объединяет форму детали-инструмента (`tool_part_id`) с целевой деталью (`target_part_id`). Добавляет узел `BooleanUnionMesh` в параметрическое дерево DAG целевой детали, пересчитывает геометрию, обновляет отображение во вьюпорте и синхронизирует физический коллайдер в Rapier3D.
+Выполняет CSG булево объединение (Union) твердотельных сеток: объединяет форму детали-инструмента (`tool_part_id`) с целевой деталью (`target_part_id`). Добавляет узел `BooleanUnionMesh` в параметрическое дерево DAG целевой детали, пересчитывает геометрию, обновляет отображение во вьюпорте, синхронизирует физический коллайдер в Rapier3D и возвращает `revision`, `bounding_box`, `volume`, `volume_m3` и `warnings`.
 
 #### Входные параметры
 | Параметр | Тип | Обязательный | Описание |
 |---|---|:---:|---|
 | `target_part_id` | `string` | **Да** | ID целевой детали, принимающей объединение |
 | `tool_part_id` | `string` | **Да** | ID детали-инструмента, чья сетка объединяется с целевой (должен отличаться от target_part_id) |
+| `length_unit` | `"mm" \| "m"` | Нет | Опциональное переопределение единицы длины для этого вызова (по умолчанию используется единица сессии) |
 
 #### Пример запроса
 ```json
@@ -1287,7 +1302,7 @@
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"target_part_id\": \"part-housing-main\",\n  \"feature_id\": \"9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d\",\n  \"status\": \"union_applied\",\n  \"vertices_count\": 842,\n  \"triangles_count\": 1680\n}"
+        "text": "{\n  \"part_id\": \"part-housing-main\",\n  \"target_part_id\": \"part-housing-main\",\n  \"feature_id\": \"9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d\",\n  \"revision\": 2,\n  \"status\": \"union_applied\",\n  \"vertices_count\": 842,\n  \"triangles_count\": 1680,\n  \"bounding_box\": {\n    \"min\": [-10.0, -10.0, -10.0],\n    \"max\": [15.0, 10.0, 10.0],\n    \"dimensions\": [25.0, 20.0, 20.0]\n  },\n  \"volume\": 8500.0,\n  \"volume_m3\": 0.0000085,\n  \"length_unit\": \"mm\",\n  \"warnings\": []\n}"
       }
     ]
   }
@@ -1298,13 +1313,14 @@
 
 ### 23. `boolean_intersection`
 
-Выполняет CSG булево пересечение (Intersection) твердотельных сеток: сохраняет только общий объем пересечения целевой детали (`target_part_id`) и инструмента (`tool_part_id`). Добавляет узел `BooleanIntersectionMesh` в параметрическое дерево DAG, перестраивает меш, обновляет вьюпорт и физический мир.
+Выполняет CSG булево пересечение (Intersection) твердотельных сеток: сохраняет только общий объем пересечения целевой детали (`target_part_id`) и инструмента (`tool_part_id`). Добавляет узел `BooleanIntersectionMesh` в параметрическое дерево DAG, перестраивает меш, обновляет вьюпорт и физический мир, возвращая `revision`, `bounding_box`, `volume`, `volume_m3` и `warnings`.
 
 #### Входные параметры
 | Параметр | Тип | Обязательный | Описание |
 |---|---|:---:|---|
 | `target_part_id` | `string` | **Да** | ID целевой детали |
 | `tool_part_id` | `string` | **Да** | ID детали-инструмента (должен отличаться от target_part_id) |
+| `length_unit` | `"mm" \| "m"` | Нет | Опциональное переопределение единицы длины для этого вызова (по умолчанию используется единица сессии) |
 
 #### Пример запроса
 ```json
@@ -1331,7 +1347,7 @@
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"target_part_id\": \"part-cylinder-base\",\n  \"feature_id\": \"1f38e4a9-82bc-4402-9988-6617a23c3a4f\",\n  \"status\": \"intersection_applied\",\n  \"vertices_count\": 512,\n  \"triangles_count\": 1020\n}"
+        "text": "{\n  \"part_id\": \"part-cylinder-base\",\n  \"target_part_id\": \"part-cylinder-base\",\n  \"feature_id\": \"1f38e4a9-82bc-4402-9988-6617a23c3a4f\",\n  \"revision\": 2,\n  \"status\": \"intersection_applied\",\n  \"vertices_count\": 512,\n  \"triangles_count\": 1020,\n  \"bounding_box\": {\n    \"min\": [-5.0, -5.0, -5.0],\n    \"max\": [5.0, 5.0, 5.0],\n    \"dimensions\": [10.0, 10.0, 10.0]\n  },\n  \"volume\": 1000.0,\n  \"volume_m3\": 0.000001,\n  \"length_unit\": \"mm\",\n  \"warnings\": []\n}"
       }
     ]
   }
@@ -1381,7 +1397,7 @@
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"part_id\": \"part-bracket-001\",\n  \"feature_id\": \"7c28a1e4-6a84-48f5-93df-f41cb87a1928\",\n  \"status\": \"transformed\",\n  \"bounding_box\": {\n    \"min\": [0.02, -0.015, 0.04],\n    \"max\": [0.08, 0.015, 0.16],\n    \"dimensions\": [0.06, 0.03, 0.12]\n  },\n  \"volume\": 0.000216\n}"
+        "text": "{\n  \"part_id\": \"part-bracket-001\",\n  \"feature_id\": \"7c28a1e4-6a84-48f5-93df-f41cb87a1928\",\n  \"revision\": 2,\n  \"status\": \"transformed\",\n  \"bounding_box\": {\n    \"min\": [0.02, -0.015, 0.04],\n    \"max\": [0.08, 0.015, 0.16],\n    \"dimensions\": [0.06, 0.03, 0.12]\n  },\n  \"volume\": 0.000216\n}"
       }
     ]
   }
@@ -1571,7 +1587,8 @@
 | Параметр | Тип | Обязательный | Описание |
 |---|---|:---:|---|
 | `part_id` | `string` | **Да** | Идентификатор оптимизируемой детали |
-| `apply` | `boolean` | Нет | Применить ли скомпилированный физический план к детали и перестроить 3D-сетку (по умолчанию `true`; при `false` работает в режиме инспекции `EXPLAIN ANALYZE` без мутации DAG) |
+| `apply` | `boolean` | Нет | Применить ли скомпилированный физический план к детали и перестроить 3D-сетку (по умолчанию `true`; при `false` работает в режиме инспекции `EXPLAIN ANALYZE` без мутации DAG; если ни одно правило не сработало, `revision` не инкрементируется) |
+| `length_unit` | `"mm" \| "m"` | Нет | Опциональное переопределение единицы длины для этого вызова (по умолчанию используется единица сессии) |
 
 #### Пример запроса
 ```json
@@ -1598,7 +1615,7 @@
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"part_id\": \"part-bushing-opt\",\n  \"status\": \"optimized\",\n  \"applied\": true,\n  \"logical_nodes_count\": 5,\n  \"physical_nodes_count\": 1,\n  \"logical_cost\": 562.4,\n  \"physical_cost\": 98.2,\n  \"cost_reduction_pct\": 82.5,\n  \"estimated_speedup_x\": 5.73,\n  \"applied_rules\": [\n    \"R2_AABB_DEAD_OP_CULLING\",\n    \"R1_TRANSFORM_FUSION\",\n    \"R4_COAXIAL_REVOLVE_REDUCTION\"\n  ],\n  \"equivalence_verification\": {\n    \"passed\": true,\n    \"volume_before_cm3\": 79.42,\n    \"volume_after_cm3\": 79.42,\n    \"volume_delta_pct\": 0.0,\n    \"watertight_before\": false,\n    \"watertight_after\": true\n  },\n  \"explain_analyze_text\": \"EXPLAIN (ANALYZE, COSTS, TOPOLOGY) FOR PART 'AI_Coaxial_Bushing_Unoptimized' ...\"\n}"
+        "text": "{\n  \"part_id\": \"part-bushing-opt\",\n  \"revision\": 6,\n  \"status\": \"optimized\",\n  \"applied\": true,\n  \"logical_nodes_count\": 5,\n  \"physical_nodes_count\": 1,\n  \"logical_cost\": 562.4,\n  \"physical_cost\": 98.2,\n  \"cost_reduction_pct\": 82.5,\n  \"estimated_speedup_x\": 5.73,\n  \"applied_rules\": [\n    \"R2_AABB_DEAD_OP_CULLING\",\n    \"R1_TRANSFORM_FUSION\",\n    \"R4_COAXIAL_REVOLVE_REDUCTION\"\n  ],\n  \"volume\": 79420.0,\n  \"volume_m3\": 0.00007942,\n  \"equivalence_verification\": {\n    \"passed\": true,\n    \"volume_before\": 79420.0,\n    \"volume_after\": 79420.0,\n    \"volume_before_cm3\": 79.42,\n    \"volume_after_cm3\": 79.42,\n    \"volume_delta_pct\": 0.0,\n    \"watertight_before\": false,\n    \"watertight_after\": true\n  },\n  \"explain_analyze_text\": \"EXPLAIN (ANALYZE, COSTS, TOPOLOGY) FOR PART 'AI_Coaxial_Bushing_Unoptimized' ...\",\n  \"length_unit\": \"mm\"\n}"
       }
     ]
   }
@@ -1732,7 +1749,7 @@
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"status\": \"loaded\",\n  \"path\": \"./output/my_assembly.json\",\n  \"schema_version\": \"1.0.0\",\n  \"project\": \"Linkage Arm Assembly\",\n  \"parts_count\": 2,\n  \"joints_count\": 1,\n  \"materials_count\": 9,\n  \"length_unit\": \"mm\",\n  \"units\": {\n    \"length\": \"mm\"\n  },\n  \"parts\": [\n    {\n      \"part_id\": \"part_base\",\n      \"name\": \"Base Plate\",\n      \"material\": \"inconel_718\",\n      \"volume\": 48000.0,\n      \"mass_kg\": 0.3931,\n      \"triangles_count\": 12,\n      \"is_fixed\": true\n    },\n    {\n      \"part_id\": \"part_arm\",\n      \"name\": \"Link Arm\",\n      \"material\": \"aluminum_6061_t6\",\n      \"volume\": 10053.09,\n      \"mass_kg\": 0.0271,\n      \"triangles_count\": 124,\n      \"is_fixed\": false\n    }\n  ],\n  \"joints\": [\n    {\n      \"joint_id\": \"joint-1\",\n      \"part_a\": \"part_base\",\n      \"part_b\": \"part_arm\",\n      \"joint_type\": \"revolute\",\n      \"has_motor\": true\n    }\n  ]\n}"
+        "text": "{\n  \"status\": \"loaded\",\n  \"path\": \"./output/my_assembly.json\",\n  \"schema_version\": \"1.0.0\",\n  \"project\": \"Linkage Arm Assembly\",\n  \"parts_count\": 2,\n  \"joints_count\": 1,\n  \"materials_count\": 9,\n  \"length_unit\": \"mm\",\n  \"units\": {\n    \"length\": \"mm\"\n  },\n  \"parts\": [\n    {\n      \"part_id\": \"part_base\",\n      \"name\": \"Base Plate\",\n      \"revision\": 1,\n      \"material\": \"inconel_718\",\n      \"volume\": 48000.0,\n      \"volume_m3\": 0.000048,\n      \"mass_kg\": 0.3931,\n      \"triangles_count\": 12,\n      \"is_fixed\": true\n    },\n    {\n      \"part_id\": \"part_arm\",\n      \"name\": \"Link Arm\",\n      \"revision\": 1,\n      \"material\": \"aluminum_6061_t6\",\n      \"volume\": 10053.09,\n      \"volume_m3\": 0.000010053,\n      \"mass_kg\": 0.0271,\n      \"triangles_count\": 124,\n      \"is_fixed\": false\n    }\n  ],\n  \"joints\": [\n    {\n      \"joint_id\": \"joint-1\",\n      \"part_a\": \"part_base\",\n      \"part_b\": \"part_arm\",\n      \"joint_type\": \"revolute\",\n      \"anchor_a\": [0.0, 20.0, 0.0],\n      \"anchor_b\": [0.0, 0.0, 0.0],\n      \"axis\": [0.0, 1.0, 0.0],\n      \"limits\": [-45.0, 90.0],\n      \"limits_unit\": \"deg\",\n      \"ratio\": null,\n      \"has_motor\": true,\n      \"motor\": {\n        \"target_velocity\": 5.0,\n        \"max_force\": 50.0\n      }\n    }\n  ]\n}"
       }
     ]
   }
@@ -1788,7 +1805,7 @@
 Сводка включает:
 - **Единицы проекта**: активный `length_unit` (`"mm"` или `"m"`) и полный словарь `"units"`.
 - **Детали (`parts`)**: `part_id`, `name`, `material`, `is_fixed`, `revision`, `features_count`, `bounding_box` и `dimensions` `[dx, dy, dz]` в активном `length_unit`, `volume` (`mm³` или `m³`) и `volume_m3`, `mass_kg`, `triangles_count`, валидность сетки (`mesh_valid`, `mesh_status`: `PASS | FAIL | WARN | EMPTY`, `is_watertight`, `is_manifold`, `open_edges_count`, `genus`), а также статус последнего расчёта МКЭ (`last_fea`: `verdict`, `factor_of_safety`, `max_von_mises_mpa`, `max_displacement_mm`, `fea_revision`, `part_revision`, `stale`, `status: "FRESH" | "STALE"`).
-- **Кинематические шарниры (`joints`)**: `joint_id`, `joint_type` (`revolute`, `prismatic`, `spherical`, `fixed`, `gear`), соединённые детали `part_a` и `part_b`, якоря `anchor_a`/`anchor_b` в активном `length_unit` и параметры мотора `motor` (`target_velocity`, `max_force`).
+- **Кинематические шарниры (`joints`)**: `joint_id`, `joint_type` (`revolute`, `prismatic`, `spherical`, `fixed`, `gear`), соединённые детали `part_a` и `part_b`, якоря `anchor_a`/`anchor_b` в активном `length_unit`, ось `axis` (для `gear` равна `axis_a`), оси вращения валов `axis_a` и `axis_b` (для `gear`), ограничения хода `limits` (`[min, max]` в `deg` для `revolute` или в активном `length_unit` для `prismatic`, иначе `null`), единица ограничений `limits_unit` (`"deg"`, `"mm"`/`"m"` или `null`), передаточное отношение `ratio` (для `gear`) и параметры мотора `motor` (`target_velocity`, `max_force`).
 - **Инженерные требования (`requirements`)**: общий статус (`PASS | FAIL | STALE | NOT_AVAILABLE`), флаг `auto_check`, счётчики `total`, `passed`, `failed`, `stale`, `not_available`, полный список проверенных требований `items` и список нарушений `failed_requirements`.
 
 #### Входные параметры

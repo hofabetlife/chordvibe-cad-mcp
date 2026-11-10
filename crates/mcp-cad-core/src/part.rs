@@ -57,9 +57,28 @@ impl Part {
         self.revision = self.revision.saturating_add(1);
     }
 
+    /// Ensures that if a part has a non-empty boundary mesh (`!self.mesh.vertices.is_empty()`)
+    /// but an empty parametric history DAG (`self.dag.nodes.is_empty()`), a synthetic root
+    /// [`crate::dag::FeatureOp::ImportedMesh`] node is seeded into `self.dag` so subsequent
+    /// operations (`transform_part`, `cut_hole`, `boolean_*`, `rebuild`, `optimize_dag`)
+    /// evaluate against the imported solid instead of failing with `Cannot ... empty solid` (P2-T33).
+    pub fn ensure_imported_mesh_in_dag(&mut self) {
+        if self.dag.nodes.is_empty() && !self.mesh.vertices.is_empty() {
+            self.dag.add_feature(
+                crate::dag::FeatureOp::ImportedMesh {
+                    mesh: self.mesh.clone(),
+                },
+                Some(format!("Imported Mesh ({})", self.name)),
+            );
+        }
+    }
+
     /// Evaluates the parametric feature tree with the specified tessellation settings lazily.
     /// Returns a cached mesh if the requested settings match the cached settings.
+    /// Does not increment `self.revision` because changing tessellation resolution (`coarse`/`medium`/`fine`)
+    /// does not modify the part's parametric DAG or structural geometry.
     pub fn tessellate(&mut self, settings: &TessellationSettings) -> Result<&TriangleMesh, CadError> {
+        self.ensure_imported_mesh_in_dag();
         if let (Some(ref _cached), Some(ref s)) = (&self.cached_mesh, &self.cached_settings) {
             if s == settings {
                 return Ok(self.cached_mesh.as_ref().unwrap());
@@ -70,7 +89,6 @@ impl Part {
         self.mesh = evaluated.clone();
         self.cached_mesh = Some(evaluated);
         self.cached_settings = Some(settings.clone());
-        self.revision = self.revision.saturating_add(1);
         Ok(self.cached_mesh.as_ref().unwrap())
     }
 
@@ -83,6 +101,7 @@ impl Part {
     /// Re-evaluates the parametric feature tree and updates the stored triangle mesh.
     /// Uses cached settings if available, otherwise defaults to `TessellationSettings::default()`.
     pub fn rebuild(&mut self) -> Result<(), CadError> {
+        self.ensure_imported_mesh_in_dag();
         let settings = self.cached_settings.clone().unwrap_or_default();
         let evaluated = self.dag.evaluate_with_settings(&settings)?;
         self.mesh = evaluated.clone();
@@ -104,6 +123,7 @@ impl Part {
         &mut self,
         apply: bool,
     ) -> Result<crate::query_optimizer::CadOptimizationReport, CadError> {
+        self.ensure_imported_mesh_in_dag();
         let settings = self.cached_settings.clone().unwrap_or_default();
         let (report, optimized_tree) = crate::query_optimizer::optimize_feature_tree_dag(
             &self.id,
@@ -113,9 +133,26 @@ impl Part {
             apply,
         )?;
         if apply {
-            self.dag = optimized_tree;
-            self.invalidate_cache();
-            self.rebuild()?;
+            let dag_changed = !report.applied_rules.is_empty() || self.dag != optimized_tree;
+            if dag_changed {
+                let prev_dag = self.dag.clone();
+                let prev_mesh = self.mesh.clone();
+                let prev_cached_mesh = self.cached_mesh.clone();
+                let prev_cached_settings = self.cached_settings.clone();
+                let prev_revision = self.revision;
+                self.dag = optimized_tree;
+                self.invalidate_cache();
+                if let Err(e) = self.rebuild() {
+                    self.dag = prev_dag;
+                    self.mesh = prev_mesh;
+                    self.cached_mesh = prev_cached_mesh;
+                    self.cached_settings = prev_cached_settings;
+                    self.revision = prev_revision;
+                    return Err(e);
+                }
+            } else if self.mesh.vertices.is_empty() && !self.dag.nodes.is_empty() {
+                let _ = self.tessellate(&settings)?;
+            }
         }
         Ok(report)
     }
@@ -250,5 +287,97 @@ mod tests {
         // Mass = 0.001 * 2700 = 2.7 kg
         let mass = part.mass();
         assert!((mass - 2.7).abs() < 1e-3);
+
+        // Re-tessellating at Coarse / Fine / Medium must not increment part.revision (P2-T24)
+        part.tessellate_quality(TessellationQuality::Coarse).unwrap();
+        assert_eq!(part.revision, 1);
+        part.tessellate_quality(TessellationQuality::Fine).unwrap();
+        assert_eq!(part.revision, 1);
+        part.tessellate(&TessellationSettings::custom(0.0002, 5.0, None)).unwrap();
+        assert_eq!(part.revision, 1);
+
+        // Calling optimize_dag(true) when no rules apply must NOT increment part.revision (P2-T27)
+        let rep_noop = part.optimize_dag(true).unwrap();
+        assert!(rep_noop.applied_rules.is_empty());
+        assert_eq!(part.revision, 1);
+    }
+
+    #[test]
+    fn test_p2_t27_optimize_dag_only_bumps_revision_when_rules_applied() {
+        let registry = MaterialRegistry::new();
+        let steel = registry.get("steel_structural_aisi1020").unwrap().clone();
+
+        let mut bushing = Part::new("bushing-p2t27", "Coaxial Bushing", steel);
+        bushing.dag.add_feature(
+            FeatureOp::AddCylinder {
+                radius: 0.04,
+                height: 0.06,
+                segments: 32,
+                position: None,
+                rotation_deg: None,
+            },
+            None,
+        );
+        bushing.rebuild().unwrap();
+        assert_eq!(bushing.revision, 1);
+
+        bushing.dag.add_feature(
+            FeatureOp::CutHole {
+                center: [0.0, 0.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                radius: 0.02,
+                depth: 0.08,
+                keyway_width: None,
+                keyway_depth: None,
+            },
+            None,
+        );
+        bushing.rebuild().unwrap();
+        assert_eq!(bushing.revision, 2);
+
+        // Dry-run optimize_dag(false) must not bump revision
+        let rep_dry = bushing.optimize_dag(false).unwrap();
+        assert!(!rep_dry.applied_rules.is_empty());
+        assert_eq!(bushing.revision, 2);
+
+        // First optimize_dag(true) applies R4_COAXIAL_REVOLVE_REDUCTION -> bumps revision from 2 to 3
+        let rep_applied = bushing.optimize_dag(true).unwrap();
+        assert!(!rep_applied.applied_rules.is_empty());
+        assert_eq!(bushing.revision, 3);
+        assert_eq!(bushing.dag.nodes.len(), 1);
+
+        // Second optimize_dag(true) on already-optimized single-node revolve has applied_rules.is_empty() -> revision stays 3
+        let rep_second = bushing.optimize_dag(true).unwrap();
+        assert!(rep_second.applied_rules.is_empty());
+        assert_eq!(bushing.revision, 3);
+    }
+
+    #[test]
+    fn test_p2_t33_ensure_imported_mesh_in_dag_allows_transform_on_mesh_only_part() {
+        let registry = MaterialRegistry::new();
+        let steel = registry.get("steel_structural_aisi1020").unwrap().clone();
+
+        let mut part = Part::new("imported-stl-1", "Imported Housing", steel);
+        part.mesh = crate::primitives::create_box(0.05, 0.04, 0.03);
+        part.bump_revision();
+        assert!(part.dag.nodes.is_empty());
+
+        // Seed imported mesh before adding Transform
+        part.ensure_imported_mesh_in_dag();
+        assert_eq!(part.dag.nodes.len(), 1);
+        part.dag.add_feature(
+            FeatureOp::Transform {
+                translation: [0.20, 0.10, -0.05],
+                rotation_deg: [0.0, 0.0, 0.0],
+                scale: [1.0, 1.0, 1.0],
+            },
+            None,
+        );
+        part.rebuild().unwrap();
+        assert_eq!(part.dag.nodes.len(), 2);
+        let center = part.bounding_box().center();
+        assert!((center[0] - 0.20).abs() < 1e-6);
+        assert!((center[1] - 0.10).abs() < 1e-6);
+        assert!((center[2] - (-0.05)).abs() < 1e-6);
     }
 }
