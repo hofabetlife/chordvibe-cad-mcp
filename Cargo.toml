@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mcp-cad-core",
+    "crates/mcp-cad-physics",
+    "crates/mcp-cad-fea",
+    "crates/mcp-cad-viewer",
+    "crates/mcp-cad-server",
+]
+
+[profile.dev]
+opt-level = 2
+
+[profile.test]
+opt-level = 2

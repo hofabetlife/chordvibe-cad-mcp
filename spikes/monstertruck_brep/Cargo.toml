@@ -1,0 +1,15 @@
+[package]
+name = "spike-monstertruck-brep"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+monstertruck-modeling = { version = "0.4.1", features = ["fillet"] }
+monstertruck-solid = "0.4.1"
+monstertruck-fillet = "0.4.1"
+monstertruck-meshing = "0.4.1"
+monstertruck-io = "0.4.1"
+mcp-cad-core = { path = "../../crates/mcp-cad-core" }
+serde_json = "1.0"

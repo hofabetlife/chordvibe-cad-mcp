@@ -1,0 +1,8 @@
+{
+  "name": "MCP-CAD Studio",
+  "description": "Windows-synchronized 3D CAD/CAE modeling and simulation suite with parametric DAG, Rapier3D kinematics, FEA stress analysis, and MCP tools dispatcher.",
+  "requestFramePermissions": [],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
