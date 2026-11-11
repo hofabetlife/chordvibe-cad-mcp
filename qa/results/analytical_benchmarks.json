@@ -14,29 +14,29 @@
     {
       "benchmark": "cylinder_fine_geometry",
       "pass": true,
-      "s_actual": 0.07852333928435996,
+      "s_actual": 0.07852333928434489,
       "s_expected": 0.07853981633974483,
-      "s_rel_err": 0.00020979238496800573,
-      "v_actual": 0.0015699725226413694,
+      "s_rel_err": 0.0002097923851598992,
+      "v_actual": 0.0015699725226406764,
       "v_expected": 0.0015707963267948969,
-      "v_rel_err": 0.00052445001269412
+      "v_rel_err": 0.0005244500131353115
     },
     {
       "benchmark": "sphere_fine_geometry",
       "pass": true,
-      "s_actual": 0.03139533245763346,
+      "s_actual": 0.03139500578473112,
       "s_expected": 0.031415926535897934,
-      "s_rel_err": 0.0006555298708425754,
-      "v_actual": 0.0005229125313479193,
+      "s_rel_err": 0.0006659281922788896,
+      "v_actual": 0.0005229026498039954,
       "v_expected": 0.0005235987755982989,
-      "v_rel_err": 0.0013106299753957564
+      "v_rel_err": 0.0013295023341260417
     },
     {
       "benchmark": "cone_frustum_fine_volume",
       "pass": true,
-      "v_actual": 0.00040819285588675593,
+      "v_actual": 0.000408192855886738,
       "v_expected": 0.00040840704496667313,
-      "v_rel_err": 0.0005244500126942793
+      "v_rel_err": 0.0005244500127382148
     },
     {
       "benchmark": "fea_cantilever_beam",

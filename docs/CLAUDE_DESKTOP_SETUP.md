@@ -13,12 +13,12 @@
    ```
 2. Сборка оптимизированного исполняемого файла сервера:
    ```powershell
-   cd c:\Users\voley\Documents\3D_MCP
+   cd c:\Users\<username>\Documents\chordvibe-cad-mcp
    cargo build --release -p mcp-cad-server
    ```
    После завершения сборки исполняемый файл будет доступен по пути:
    ```
-   c:\Users\voley\Documents\3D_MCP\target\release\mcp-cad-server.exe
+   c:\Users\<username>\Documents\chordvibe-cad-mcp\target\release\mcp-cad-server.exe
    ```
 
 ---
@@ -49,7 +49,7 @@ notepad "$env:APPDATA\Claude\claude_desktop_config.json"
 {
   "mcpServers": {
     "cad-engine": {
-      "command": "c:\\Users\\voley\\Documents\\3D_MCP\\target\\release\\mcp-cad-server.exe",
+      "command": "c:\\Users\\<username>\\Documents\\chordvibe-cad-mcp\\target\\release\\mcp-cad-server.exe",
       "args": [
         "--mode",
         "stdio"
@@ -94,22 +94,13 @@ Get-Content -Path "$env:APPDATA\Claude\logs\mcp-server-cad-engine.log" -Wait -Ta
 
 1. Полностью перезапустите приложение **Claude Desktop** (закройте окно и завершите процесс в трее).
 2. При открытии Claude в правом нижнем углу поля ввода появится иконка с молотком 🔨 (MCP Tools).
-3. Нажмите на иконку и убедитесь, что в списке отображаются все **15 инженерных инструментов**:
-   - `create_part`
-   - `list_parts`
-   - `delete_part`
-   - `add_feature_primitive`
-   - `cut_hole`
-   - `modify_feature`
-   - `get_feature_tree`
-   - `create_joint`
-   - `set_joint_motor`
-   - `run_physics_simulation`
-   - `run_fea_analysis`
-   - `get_fea_heatmap_image`
-   - `capture_viewport`
-   - `export_stl`
-   - `get_simulation_metrics_json`
+3. Нажмите на иконку и убедитесь, что в списке отображаются все **28 инженерных инструментов**:
+   - **Управление сборкой и жизненный цикл**: `create_part`, `list_parts`, `delete_part`
+   - **Параметрическое моделирование и CSG**: `add_feature_primitive`, `cut_hole`, `cut_helical_groove`, `modify_feature`, `get_feature_tree`, `boolean_difference`, `boolean_union`, `boolean_intersection`, `transform_part`
+   - **Геометрия, топология и материалы**: `tessellate_part`, `query_part_geometry`, `validate_mesh`, `define_material`, `optimize_feature_tree`, `batch_cad_operations`
+   - **Кинематика и динамика**: `create_joint`, `set_joint_motor`, `run_physics_simulation`, `get_simulation_metrics_json`
+   - **МКЭ-анализ прочности (FEA)**: `run_fea_analysis`, `get_fea_heatmap_image`
+   - **Визуализация, экспорт и импорт**: `capture_viewport`, `open_preview_window`, `export_stl`, `import_stl`
 
 ---
 
@@ -133,9 +124,9 @@ Get-Content -Path "$env:APPDATA\Claude\logs\mcp-server-cad-engine.log" -Wait -Ta
 
 ### Ошибка 1: Сервер не запускается или иконка инструментов не появляется
 - **Причина**: Неверный путь к `mcp-cad-server.exe` или файл еще не скомпилирован.
-- **Решение**: Проверьте, что файл `c:\Users\voley\Documents\3D_MCP\target\release\mcp-cad-server.exe` существует. Запустите его вручную в консоли PowerShell:
+- **Решение**: Проверьте, что файл `c:\Users\<username>\Documents\chordvibe-cad-mcp\target\release\mcp-cad-server.exe` существует. Запустите его вручную в консоли PowerShell:
   ```powershell
-  c:\Users\voley\Documents\3D_MCP\target\release\mcp-cad-server.exe --mode stdio
+  c:\Users\<username>\Documents\chordvibe-cad-mcp\target\release\mcp-cad-server.exe --mode stdio
   ```
   Если он выводит лог `Initializing MCP-CAD Engine...` в консоль и ожидает ввода — бинарник исправен.
 

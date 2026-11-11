@@ -8,10 +8,11 @@ pub mod state;
 pub mod stdio;
 pub mod tools;
 
-pub use error::ServerError;
+pub use error::{ErrorBody, ErrorEnvelope, ServerError};
 pub use protocol::{
     handle_message, handle_request, JsonRpcError, JsonRpcRequest, JsonRpcResponse, ToolCallResult,
     ToolContent, ToolDefinition,
 };
 pub use state::{EngineState, SharedState};
 pub use tools::list_tools;
+pub use tools::project::{ProjectFile, ProjectPart, SavedJoint, PROJECT_SCHEMA_VERSION};

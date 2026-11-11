@@ -263,35 +263,62 @@ pub fn compute_or_validate_normal(
 
 /// Welds coincident vertices within a spatial tolerance.
 ///
-/// Coincident vertex coordinates are mapped to grid buckets and merged into a single vertex index,
-/// reducing the vertex buffer size and rebuilding triangle indices. Degenerate triangles are removed.
+/// Coincident vertex coordinates are indexed into a 3D spatial grid of cell size `tolerance`
+/// and searched across all 27 neighboring cells `(-1..=1)^3` using exact Euclidean distance
+/// (`||p - q|| <= tolerance`), preventing false boundary splits when vertices straddle a grid cell
+/// boundary. Degenerate triangles are removed and crease-balanced vertex normals are computed.
 pub fn weld_vertices(mesh: &TriangleMesh, tolerance: f64) -> TriangleMesh {
     if mesh.vertices.is_empty() {
         return TriangleMesh::empty();
     }
 
-    let inv_tol = if tolerance > 1e-12 {
-        1.0 / tolerance
+    let tol = if tolerance.is_finite() && tolerance > 1e-12 {
+        tolerance
     } else {
-        1e6
+        1e-6
     };
+    let inv_tol = 1.0 / tol;
+    let tol_sq = tol * tol;
 
     let mut welded_vertices: Vec<Vertex> = Vec::new();
-    let mut coord_map: HashMap<(i64, i64, i64), u32> = HashMap::new();
+    let mut cell_buckets: HashMap<(i64, i64, i64), Vec<u32>> =
+        HashMap::with_capacity(mesh.vertices.len());
     let mut index_remap: Vec<u32> = Vec::with_capacity(mesh.vertices.len());
 
     for v in &mesh.vertices {
-        let key = (
-            (v.position[0] * inv_tol).round() as i64,
-            (v.position[1] * inv_tol).round() as i64,
-            (v.position[2] * inv_tol).round() as i64,
-        );
+        let p = v.position;
+        let cx = (p[0] * inv_tol).floor() as i64;
+        let cy = (p[1] * inv_tol).floor() as i64;
+        let cz = (p[2] * inv_tol).floor() as i64;
 
-        let new_idx = match coord_map.get(&key) {
-            Some(&idx) => idx,
+        let mut found_idx: Option<u32> = None;
+        let mut best_dist_sq = tol_sq;
+
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    if let Some(bucket) = cell_buckets.get(&(cx + dx, cy + dy, cz + dz)) {
+                        for &cand_idx in bucket {
+                            let cp = welded_vertices[cand_idx as usize].position;
+                            let d0 = p[0] - cp[0];
+                            let d1 = p[1] - cp[1];
+                            let d2 = p[2] - cp[2];
+                            let dist_sq = d0 * d0 + d1 * d1 + d2 * d2;
+                            if dist_sq <= best_dist_sq {
+                                best_dist_sq = dist_sq;
+                                found_idx = Some(cand_idx);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let new_idx = match found_idx {
+            Some(idx) => idx,
             None => {
                 let idx = welded_vertices.len() as u32;
-                coord_map.insert(key, idx);
+                cell_buckets.entry((cx, cy, cz)).or_default().push(idx);
                 welded_vertices.push(*v);
                 idx
             }
@@ -299,17 +326,31 @@ pub fn weld_vertices(mesh: &TriangleMesh, tolerance: f64) -> TriangleMesh {
         index_remap.push(new_idx);
     }
 
+    let has_face_ids = mesh.face_ids.len() == mesh.indices.len();
     let mut welded_indices = Vec::with_capacity(mesh.indices.len());
-    for tri in &mesh.indices {
+    let mut welded_face_ids = if has_face_ids {
+        Vec::with_capacity(mesh.indices.len())
+    } else {
+        Vec::new()
+    };
+
+    for (t_idx, tri) in mesh.indices.iter().enumerate() {
         let i0 = index_remap[tri[0] as usize];
         let i1 = index_remap[tri[1] as usize];
         let i2 = index_remap[tri[2] as usize];
         if i0 != i1 && i1 != i2 && i0 != i2 {
             welded_indices.push([i0, i1, i2]);
+            if has_face_ids {
+                welded_face_ids.push(mesh.face_ids[t_idx]);
+            }
         }
     }
 
-    let mut new_mesh = TriangleMesh::new(welded_vertices, welded_indices);
+    let mut new_mesh = if has_face_ids {
+        TriangleMesh::with_faces(welded_vertices, welded_indices, welded_face_ids, mesh.faces.clone())
+    } else {
+        TriangleMesh::new(welded_vertices, welded_indices)
+    };
     new_mesh.recompute_vertex_normals();
     new_mesh
 }
@@ -318,8 +359,9 @@ pub fn weld_vertices(mesh: &TriangleMesh, tolerance: f64) -> TriangleMesh {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use crate::diagnostics::validate_mesh;
     use crate::export_stl::{export_stl_ascii, export_stl_binary};
-    use crate::primitives::{create_box, create_cylinder};
+    use crate::primitives::{create_box, create_cylinder, create_polygon_prism};
 
     #[test]
     fn test_import_stl_binary_roundtrip() {
@@ -401,5 +443,68 @@ endsolid zero_normals
         assert_eq!(welded.vertex_count(), 8);
         assert_eq!(welded.triangle_count(), 12);
         assert!((welded.volume() - b.volume()).abs() < 1e-4);
+
+        // Each of the 8 welded cube corners must have symmetric unit normal [±1/√3, ±1/√3, ±1/√3]
+        let inv_sqrt3 = 1.0 / 3.0_f64.sqrt();
+        for v in &welded.vertices {
+            assert!((v.normal[0].abs() - inv_sqrt3).abs() < 1e-6, "Unexpected corner normal: {:?}", v.normal);
+            assert!((v.normal[1].abs() - inv_sqrt3).abs() < 1e-6, "Unexpected corner normal: {:?}", v.normal);
+            assert!((v.normal[2].abs() - inv_sqrt3).abs() < 1e-6, "Unexpected corner normal: {:?}", v.normal);
+        }
+    }
+
+    #[test]
+    fn test_weld_vertices_across_quantization_cell_boundary() {
+        let tol = 1e-4;
+        // Place shared edge vertices right across both the half-integer rounding boundary (0.5 * tol = 5e-5)
+        // and the integer floor boundary (1.0 * tol = 1e-4), separated by only 2e-15 m (<< tol).
+        let x_half_minus = 0.5 * tol - 1e-15;
+        let x_half_plus = 0.5 * tol + 1e-15;
+        let y_int_minus = 1.0 * tol - 1e-15;
+        let y_int_plus = 1.0 * tol + 1e-15;
+
+        let vertices = vec![
+            // Triangle 1
+            Vertex::new([0.0, 0.0, 0.0], [0.0, 0.0, 1.0]),
+            Vertex::new([x_half_minus, y_int_minus, 0.0], [0.0, 0.0, 1.0]),
+            Vertex::new([0.0, 1.0, 0.0], [0.0, 0.0, 1.0]),
+            // Triangle 2 sharing the vertex at (x_half, y_int, 0) and (0, 1, 0)
+            Vertex::new([x_half_plus, y_int_plus, 0.0], [0.0, 0.0, 1.0]),
+            Vertex::new([1.0, 1.0, 0.0], [0.0, 0.0, 1.0]),
+            Vertex::new([0.0, 1.0 + 1e-15, 0.0], [0.0, 0.0, 1.0]),
+        ];
+        let indices = vec![[0, 1, 2], [3, 4, 5]];
+        let mesh = TriangleMesh::new(vertices, indices);
+
+        let welded = weld_vertices(&mesh, tol);
+        assert_eq!(
+            welded.vertex_count(),
+            4,
+            "Vertices separated by 2e-15 across cell boundary must weld into 4 unique quad vertices"
+        );
+        assert_eq!(welded.triangle_count(), 2);
+        for v in &welded.vertices {
+            assert!((v.normal[2] - 1.0).abs() < 1e-9, "Flat quad normal must remain [0, 0, 1]");
+        }
+    }
+
+    #[test]
+    fn test_weld_vertices_thin_plate_and_prism_preserve_valid_normals() {
+        // 10 x 10 x 2.0 plate: face area ratio is 100 : 20 (5:1), min angle > 11°
+        let plate = create_box(10.0, 10.0, 2.0);
+        let welded_plate = weld_vertices(&plate, 1e-5);
+        assert_eq!(welded_plate.vertex_count(), 8);
+        let diag_plate = validate_mesh(&welded_plate, None);
+        assert_eq!(diag_plate.status, "PASS", "Plate issues: {:?}", diag_plate.issues);
+        assert_eq!(diag_plate.geometry.normals_vs_winding_mismatches, 0);
+
+
+        // Triangular prism with sharp 60-degree lateral edges and 90-degree caps
+        let prism = create_polygon_prism(3, 10.0, None, Some(5.0), None);
+        let welded_prism = weld_vertices(&prism, 1e-5);
+        let diag_prism = validate_mesh(&welded_prism, None);
+        assert_eq!(diag_prism.status, "PASS", "Prism issues: {:?}", diag_prism.issues);
+
+        assert_eq!(diag_prism.geometry.normals_vs_winding_mismatches, 0);
     }
 }

@@ -2,18 +2,18 @@
 
 <div align="center">
 
-[![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg?logo=rust&logoColor=white)](https://www.rust-lang.org)
-[![Platform](https://img.shields.io/badge/platform-Windows%20x64-blue.svg?logo=windows&logoColor=white)](https://www.microsoft.com/windows)
+[![Rust](https://img.shields.io/badge/rust-1.91%2B-orange.svg?logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![Platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux-blue.svg?logo=windows&logoColor=white)](https://www.microsoft.com/windows)
 [![Dependencies](https://img.shields.io/badge/dependencies-Zero%20C%2B%2B%20%2F%20Pure%20Rust-brightgreen.svg)](Cargo.toml)
 [![Protocol](https://img.shields.io/badge/MCP-2024--11--05-blueviolet.svg)](https://modelcontextprotocol.io)
-[![Tests](https://img.shields.io/badge/tests-100%25%20Passing%20(99%2F99)-success.svg)](crates/)
+[![Tests](https://img.shields.io/badge/tests-Rust%20149%2F154%20(5%20ignored)%20%7C%20TS%2025%2F26-yellow.svg)](TASKS.md)
 [![License](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-blue.svg)](LICENSE)
 
 **Первая в мире автономная инженерная среда 3D CAD/CAE на чистом Rust под Windows, спроектированная под прямое управление ИИ-агентами по протоколу Model Context Protocol (MCP).**
 
 [Быстрый старт](#-быстрый-старт-quick-start) •
 [Подключение к ИИ](#-подключение-к-популярным-ии-клиентам) •
-[Инструменты MCP](#-сводная-таблица-инструментов-mcp-26-tools) •
+[Инструменты MCP](#-сводная-таблица-инструментов-mcp-28-tools) •
 [AI-Native Возможности](#-ai-native-cad-experience) •
 [Архитектура](#-архитектура-системы) •
 [Примеры промптов](#-готовые-промпты-для-ии-агентов)
@@ -89,14 +89,14 @@ flowchart LR
 ## ⚡ Быстрый старт (Quick Start)
 
 ### Системные требования
-- **ОС**: Windows 10 или Windows 11 x64.
-- **Компилятор**: Rust $\ge 1.80$ (устанавливается через [rustup.rs](https://rustup.rs)).
-- **Видеоподсистема**: Любая видеокарта с поддержкой DirectX 12 или Vulkan (для систем без GPU автоматически подключается программный адаптер).
+- **ОС**: Windows 10 или Windows 11 x64, либо Linux (Debian / Ubuntu x86_64).
+- **Компилятор**: Rust $\ge 1.91$ (зафиксирован в [`rust-toolchain.toml`](rust-toolchain.toml); зависимости в `Cargo.lock` требуют `rustc >= 1.89`, устанавливается через [rustup.rs](https://rustup.rs)).
+- **Видеоподсистема**: Любая видеокарта с поддержкой DirectX 12 или Vulkan (для систем без GPU и контейнеров Linux автоматически подключается программный адаптер Mesa Lavapipe `WGPU_BACKEND=vulkan LIBGL_ALWAYS_SOFTWARE=1`).
 
 ### 1. Клонирование и сборка
 ```powershell
-git clone https://github.com/your-username/3D_MCP.git
-cd 3D_MCP
+git clone https://github.com/hofabetlife/chordvibe-cad-mcp.git
+cd chordvibe-cad-mcp
 cargo build --release -p mcp-cad-server
 ```
 *Исполняемый файл будет собран в `./target/release/mcp-cad-server.exe`.*
@@ -111,6 +111,18 @@ cargo run --release -p mcp-cad-server -- --mode stdio
 cargo run --release -p mcp-cad-server -- --mode sse --port 8080
 ```
 *Сервер слушает входящие SSE-соединения на `http://127.0.0.1:8080/sse` и принимает вызовы JSON-RPC через POST на `http://127.0.0.1:8080/message`.*
+
+### 4. Запуск на Linux / macOS и в Docker (Headless GPU / Lavapipe)
+Для запуска `mcp-cad-server` в серверных Linux-окружениях и CI/CD без физической видеокарты используется программный драйвер Vulkan (`mesa-vulkan-drivers` / `lavapipe`):
+```bash
+# Нативный запуск на Linux/macOS:
+chmod +x ./run_server.sh
+./run_server.sh --mode sse --port 8080
+
+# Сборка и запуск в Docker-контейнере:
+docker build -t mcp-cad-server .
+docker run --rm -p 8080:8080 mcp-cad-server
+```
 
 ---
 
@@ -129,7 +141,7 @@ cargo run --release -p mcp-cad-server -- --mode sse --port 8080
 {
   "mcpServers": {
     "cad-engine": {
-      "command": "c:\\Users\\voley\\Documents\\3D_MCP\\target\\release\\mcp-cad-server.exe",
+      "command": "C:\\Users\\<username>\\Documents\\chordvibe-cad-mcp\\target\\release\\mcp-cad-server.exe",
       "args": [
         "--mode",
         "stdio"
@@ -154,8 +166,8 @@ cargo run --release -p mcp-cad-server -- --mode sse --port 8080
 3. Заполните поля:
    - **Name**: `cad-engine`
    - **Type**: `command`
-   - **Command**: `c:\Users\voley\Documents\3D_MCP\target\release\mcp-cad-server.exe --mode stdio`
-4. Нажмите **Save**. Зеленый индикатор подтвердит доступность всех 26 инструментов.
+   - **Command**: `C:\Users\<username>\Documents\chordvibe-cad-mcp\target\release\mcp-cad-server.exe --mode stdio`
+4. Нажмите **Save**. Зеленый индикатор подтвердит доступность всех 28 инструментов.
 
 ---
 
@@ -187,41 +199,48 @@ MCP-CAD Engine спроектирован специально для преод
    - В дополнение к `boolean_difference`, добавлены `boolean_union` (объединение твердых тел) и `boolean_intersection` (пересечение с сохранением общего объема).
    - Инструмент `transform_part` позволяет масштабировать, сдвигать и ориентировать детали по углам Эйлера (Roll-Pitch-Yaw) прямо в истории построения DAG.
 
+5. **Стоимостной оптимизатор дерева операций — Cost-Based CAD Query Optimizer (`optimize_feature_tree` / `EXPLAIN ANALYZE`)**:
+   - ИИ-агенты часто строят деталь неоптимальным, но логически верным путем (последовательные поштучные `cut_hole`, цепочки мелких сдвигов `transform_part`, вычитания цилиндров вместо вращения 2D-профиля `revolve`, либо «сверление воздуха» мимо габарита детали).
+   - По аналогии с оптимизатором запросов в реляционных СУБД (PostgreSQL `EXPLAIN ANALYZE`), оптимизатор DAG отделяет **Логический план** (что хочет получить ИИ) от **Физического плана** (как дешевле и чище вычислить сетку).
+   - Применяет 5 правил алгебраической и геометрической перезаписи (`R1_TRANSFORM_FUSION`, `R2_AABB_DEAD_OP_CULLING`, `R3_DEMORGAN_CSG_BATCH`, `R4_COAXIAL_REVOLVE_REDUCTION`, `R5_ANALYTICAL_PRISM_THREAD_FUSION`), снижая вычислительную стоимость до **60–82%**, устраняя вырожденные треугольники (sliver triangles) перед МКЭ-расчетом TET4 и строго верифицируя сохранение объема ($\Delta V < 0.5\%$), AABB и замкнутости сетки (Watertight).
+
 ---
 
-## 🛠️ Сводная таблица инструментов MCP (26 Tools)
+## 🛠️ Сводная таблица инструментов MCP (28 Tools)
 
 | № | Имя инструмента | Входные параметры | Выходные данные | Назначение |
 |:---:|---|---|---|---|
-| **1** | `create_part` | `name: str`, `material: str` | `{ part_id: str }` | Создать деталь с заданным материалом |
+| **1** | `create_part` | `name: str`, `material?: str`, `part_id?: str`, `is_fixed?: bool` | `{ part_id: str }` | Создать деталь с заданным материалом и физической фиксацией |
 | **2** | `list_parts` | *(нет)* | `{ parts: [...] }` | Получить список всех деталей, габариты и массу |
 | **3** | `delete_part` | `part_id: str` | `{ status: "deleted" }` | Удалить деталь из сцены, физики и кэша |
 | **4** | `add_feature_primitive` | `part_id: str`, `primitive_type: str`, `params: obj` | `{ feature_id: str }` | Добавить примитив (`box`, `cylinder`, `sphere`, `cone`, `polygon_prism`, `spur_gear`, `revolve`, `wheel_rim`) в DAG |
 | **5** | `cut_hole` | `part_id: str`, `position: [3]`, `normal: [3]`, `radius: num`, `depth: num`, `keyway_width?: num`, `keyway_depth?: num` | `{ feature_id: str }` | Вырезать отверстие в твердом теле (опционально со шпоночным пазом DIN 6885) |
-| **6** | `modify_feature` | `part_id: str`, `feature_id: str`, `params: obj` | `{ status: "updated", dimensions: [3] }` | Изменить параметры любого шага в истории DAG |
+| **6** | `modify_feature` | `part_id: str`, `feature_id: str`, `params: obj` | `{ status: "updated", dimensions: [3] }` | Изменить параметры любого шага в истории DAG с транзакционным откатом |
 | **7** | `get_feature_tree` | `part_id: str` | `{ dag: [...] }` | Получить полную историю дерева операций детали |
 | **8** | `cut_helical_groove` | `part_id: str`, `helix_radius: num`, `groove_radius: num`, `pitch: num`, `height: num`, `start_z: num`, `profile_type?: "circular"\|"metric_60"` | `{ feature_id: str, status: "helical_groove_cut" }` | Нарезать винтовые канавки (канавки сверл или резьбу 60° по ISO 68-1) |
-| **9** | `boolean_difference` | `target_part_id: str`, `tool_part_id: str` | `{ feature_id: str, status: "boolean_difference_applied" }` | Вычесть форму инструмента из детали (CSG Difference) |
-| **10** | `boolean_union` | `target_part_id: str`, `tool_part_id: str` | `{ target_part_id: str, feature_id: str, status: "union_applied", vertices_count: int, triangles_count: int }` | Булево объединение геометрии инструмента с деталью (CSG Union) |
-| **11** | `boolean_intersection` | `target_part_id: str`, `tool_part_id: str` | `{ target_part_id: str, feature_id: str, status: "intersection_applied", vertices_count: int, triangles_count: int }` | Булево пересечение геометрии инструмента с деталью (CSG Intersection) |
+| **9** | `boolean_difference` | `target_part_id?: str` / `part_a_id?: str`, `tool_part_id?: str` / `part_b_id?: str`, `new_part_id?: str` | `{ feature_id: str, status: "boolean_difference_applied" }` | Вычесть форму инструмента из детали (3D CSG Difference) |
+| **10** | `boolean_union` | `target_part_id?: str` / `part_a_id?: str`, `tool_part_id?: str` / `part_b_id?: str`, `new_part_id?: str` | `{ target_part_id: str, feature_id: str, status: "union_applied", vertices_count: int, triangles_count: int }` | Булево объединение геометрии инструмента с деталью (3D CSG Union) |
+| **11** | `boolean_intersection` | `target_part_id?: str` / `part_a_id?: str`, `tool_part_id?: str` / `part_b_id?: str`, `new_part_id?: str` | `{ target_part_id: str, feature_id: str, status: "intersection_applied", vertices_count: int, triangles_count: int }` | Булево пересечение геометрии инструмента с деталью (3D CSG Intersection) |
 | **12** | `transform_part` | `part_id: str`, `translation?: [3]`, `rotation_deg?: [3]`, `scale?: [3]` | `{ part_id: str, feature_id: str, status: "transformed", bounding_box: obj, volume: num }` | Применить смещение, поворот RPY и масштабирование к детали в DAG |
 | **13** | `tessellate_part` | `part_id: str`, `quality?: "coarse"\|"medium"\|"fine"`, `chord_tolerance?: num`, `angular_tolerance_deg?: num`, `max_edge_length?: num` | `{ part_id: str, quality: str, vertices_count: int, triangles_count: int }` | Выполнить ленивую адаптивную тесселяцию детали с заданным качеством/допусками хорды |
 | **14** | `query_part_geometry` | `part_id: str` | `{ part_id: str, bounding_box: obj, volume: num, surface_area: num, center_of_mass: [3], faces_count: int, vertices_count: int, detected_planar_faces: [...] }` | Детальная топологическая инспекция: AABB, объем, площадь, центр масс и плоские грани |
 | **15** | `define_material` | `id: str`, `young_modulus_gpa: num`, `poisson_ratio: num`, `yield_strength_mpa: num`, `density_kg_m3: num`, `name?: str` | `{ status: "material_registered", material_id: str, properties: obj }` | Зарегистрировать кастомный материал для МКЭ прочности и расчета масс |
 | **16** | `batch_cad_operations` | `operations: [...]` | `{ success: bool, count: int, results: [...] }` | Пакетное атомарное выполнение цепочки операций без сетевых задержек roundtrip |
-| **17** | `create_joint` | `joint_type: str`, `part_a: str`, `part_b: str`, `anchor_a: [3]`, `anchor_b: [3]`, `axis?: [3]`, `limits?: [2]` | `{ joint_id: str }` | Создать сочленение (`revolute`, `prismatic`, `spherical`, `fixed`) |
+| **17** | `create_joint` | `joint_type: str`, `part_a: str`, `part_b: str`, `anchor_a?: [3]`, `anchor_b?: [3]`, `axis?: [3]`, `limits?: [2]`, `ratio?: num` | `{ joint_id: str }` | Создать сочленение (`revolute`, `prismatic`, `spherical`, `fixed`, `gear`) |
 | **18** | `set_joint_motor` | `joint_id: str`, `target_velocity: num`, `max_force: num` | `{ status: "motor_active" }` | Включить сервопривод скорости на сочленении |
 | **19** | `run_physics_simulation` | `duration_seconds: num`, `step_size_ms?: num` | `{ success: bool, steps_simulated: int, trajectory_summary: obj, peak_joint_forces: obj, collisions: [...] }` | Провести динамическую симуляцию механизма во времени |
 | **20** | `run_fea_analysis` | `part_id: str`, `mesh_density?: str`, `fixed_faces?: [str]`, `fixed_plane?: obj`, `applied_forces?: [...]` | `{ max_von_mises_mpa: num, yield_strength_mpa: num, safety_factor: num, max_displacement_mm: num, status: "PASS"\|"FAIL" }` | Выполнить 3D МКЭ-расчет прочности (TET4) |
 | **21** | `get_fea_heatmap_image` | `part_id: str`, `camera_preset?: str`, `width?: int`, `height?: int` | `{ colormap_legend: obj }` + `image/png` | Получить 3D-снимок тепловой карты напряжений по Мизесу |
-| **22** | `capture_viewport` | `camera_preset?: str`, `part_id?: str`, `width?: int`, `height?: int` | `{ camera_preset: str, format: "image/png" }` + `image/png` | Сделать оффскрин 3D-снимок сцены сборки в высоком разрешении |
+| **22** | `capture_viewport` | `camera_preset?: str`, `part_id?: str`, `width?: int`, `height?: int`, `debug_mode?: bool` | `{ camera_preset: str, format: "image/png" }` + `image/png` | Сделать оффскрин 3D-снимок сцены сборки в высоком разрешении |
 | **23** | `export_stl` | `part_id: str`, `filepath: str`, `binary?: bool`, `quality?: "coarse"\|"medium"\|"fine"`, `chord_tolerance?: num` | `{ file_path: str, triangles_count: int }` | Экспортировать деталь в файл STL с адаптивным контролем качества |
 | **24** | `get_simulation_metrics_json` | *(нет)* | `{ current_metrics: obj }` | Получить агрегированный отчет по всей сцене и расчетам |
 | **25** | `open_preview_window` | `part_id?: str` | `{ status: "preview_window_opened" }` | Открыть или сфокусировать нативное окно 3D-просмотра |
 | **26** | `import_stl` | `filepath: str`, `name?: str`, `material?: str` | `{ part_id: str, name: str, vertices_count: int, triangles_count: int, status: "stl_imported" }` | Импортировать готовую 3D-модель STL в сцену и 3D-вьюпорт |
+| **27** | `validate_mesh` | `part_id: str`, `expected_genus?: int` | `{ is_watertight: bool, boundary_edges_count: int, non_manifold_edges_count: int, euler_characteristic: int, genus: int, status: "PASS"\|"WARN"\|"FAIL", topology: obj, geometry: obj, angle_stats: obj }` | Топологическая диагностика замкнутости сетки (Watertight, эйлерова характеристика, род $g$, sliver gate) |
+| **28** | `optimize_feature_tree` | `part_id: str`, `apply?: bool` | `{ status: "optimized", applied: bool, logical_nodes_count: int, physical_nodes_count: int, cost_reduction_pct: num, explain_analyze_text: str, ... }` | Стоимостной оптимизатор дерева операций (`EXPLAIN ANALYZE`): перезапись и сжатие DAG с проверкой инвариантов |
 
 > [!TIP]
-> Полная документация с примерами JSON-RPC запросов и ответов для всех 26 инструментов представлена в документе [Справочник API инструментов MCP](docs/MCP_API_REFERENCE.md).
+> Полная документация с примерами JSON-RPC запросов и ответов для всех 28 инструментов представлена в документе [Справочник API инструментов MCP](docs/MCP_API_REFERENCE.md).
 
 ---
 
@@ -279,18 +298,33 @@ graph TD
 
 ## 🧪 Тестирование и верификация
 
-В репозитории реализован полный набор юнит-, интеграционных и верификационных тестов:
-- **Аналитическая верификация МКЭ**: Сравнение численного прогиба консольной балки под изгибом с теоретической формулой сопротивления материалов ($\delta = \frac{F L^3}{3 E I}$, совпадение с точностью до 5%).
-- **Верификация кинематики**: Тестирование степеней свободы сочленений Rapier3D, работы моторов и детекции коллизий.
-- **Сквозное E2E тестирование MCP**: Проверка обработки всех 26 инструментов и соответствия схеме MCP 2024-11-05 (17 тестов контракта, 100% Passing).
+В репозитории реализован набор юнит-, интеграционных и инвариантных тестов:
+- **Инварианты примитивов и CSG (`mcp-cad-core`)**: Проверка водонепроницаемости (`validate_mesh`), внешней ориентации нормалей, характеристики Эйлера ($\chi = 2 - 2g$), отсутствия вырожденных углов (`Sliver Gate`) и аналитических тождеств объёма.
+- **Аналитическая верификация МКЭ (`mcp-cad-fea`)**: Проверка решения 3D-задач теории упругости на тетраэдрах `TET4` методом сопряжённых градиентов (PCG).
+- **Верификация кинематики (`mcp-cad-physics`)**: Тестирование степеней свободы сочленений Rapier3D, работы моторов и детекции коллизий.
+- **Контрактное и сквозное E2E тестирование MCP (`mcp-cad-server`)**: Проверка обработки всех 28 инструментов и соответствия схеме MCP 2024-11-05 (`mcp_contract_tests`, `qa_wide_scan`, `gear_kinematic_test`).
 
-Запуск всего набора тестов:
-```powershell
-cargo test --workspace
+> [!IMPORTANT]
+> **Требуемая версия Rust и фактическое состояние тестов:**
+> - Для сборки и тестирования требуется **Rust $\ge 1.91$** (зафиксирован в [`rust-toolchain.toml`](rust-toolchain.toml)).
+> - **Rust Workspace (`cargo test --workspace --no-fail-fast`)**: 154 теста — **149 проходят, 0 падают, 5 помечены `#[ignore]`** (краевые случаи качества сетки примитивов в `primitive_invariants.rs`, задача `P0-T10`).
+> - **TypeScript / Web Studio (`npx tsx --test src/cad/cad_engine.test.ts`)**: 26 тестов — **25 проходят, 1 падает** (`AssertionError: 5 !== 4` в тесте №17 `FEA_QUICK_LOAD_PRESETS`, задача `TS-FIX-01`).
+> - **Clippy (`cargo clippy --workspace --all-targets -- -D warnings`)**: выявляет предупреждения/ошибки в `mcp-cad-core` (отслеживаются в CI и бэклоге).
+> - Актуальный источник истины по статусу тестов и задач — [`TASKS.md`](TASKS.md) и [`VERIFICATION_REPORT.md`](VERIFICATION_REPORT.md) (отчёты в каталоге `qa/` устарели).
+
+Запуск всего набора тестов (требуется **Rust $\ge 1.91$**):
+```bash
+# Windows (PowerShell):
+cargo test --workspace --no-fail-fast
+
+# Linux / Headless CI (с программным драйвером Vulkan Lavapipe):
+WGPU_BACKEND=vulkan LIBGL_ALWAYS_SOFTWARE=1 cargo test --workspace --no-fail-fast
 ```
-Проверка линтером без предупреждений:
-```powershell
-cargo clippy --workspace -- -D warnings
+Проверка линтером Clippy и тесты веб-клиента:
+```bash
+cargo clippy --workspace --all-targets -- -D warnings
+npm run lint
+npx tsx --test src/cad/cad_engine.test.ts
 ```
 
 ---
@@ -298,14 +332,14 @@ cargo clippy --workspace -- -D warnings
 ## 📂 Структура репозитория
 
 ```
-3D_MCP/
+chordvibe-cad-mcp/
 ├── Cargo.toml                    # Корневой workspace-манифест
 ├── PRD.md                        # Документ требований к продукту
 ├── PROJECT_CONTEXT.md            # Контекст и соглашения разработки
 ├── README.md                     # Главная страница (данный файл)
 ├── docs/
 │   ├── ARCHITECTURE.md           # Глубокий архитектурный обзор
-│   ├── MCP_API_REFERENCE.md      # Исчерпывающий справочник всех 26 инструментов
+│   ├── MCP_API_REFERENCE.md      # Исчерпывающий справочник всех 28 инструментов
 │   └── CLAUDE_DESKTOP_SETUP.md   # Руководство по подключению к Claude Desktop
 ├── examples/
 │   ├── bracket_design.json       # Пример проекта силового L-кронштейна

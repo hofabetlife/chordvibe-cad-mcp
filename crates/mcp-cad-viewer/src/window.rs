@@ -581,6 +581,27 @@ impl CadWindowApp {
             }
         };
 
+        #[cfg(target_os = "windows")]
+        {
+            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(handle) = window.window_handle() {
+                if let RawWindowHandle::Win32(win32) = handle.as_raw() {
+                    extern "system" {
+                        fn ShowWindow(hwnd: isize, nCmdShow: i32) -> i32;
+                        fn BringWindowToTop(hwnd: isize) -> i32;
+                        fn SetForegroundWindow(hwnd: isize) -> i32;
+                    }
+                    unsafe {
+                        const SW_SHOWNORMAL: i32 = 1;
+                        let hwnd = win32.hwnd.get();
+                        ShowWindow(hwnd, SW_SHOWNORMAL);
+                        BringWindowToTop(hwnd);
+                        SetForegroundWindow(hwnd);
+                    }
+                }
+            }
+        }
+
         let size = window.inner_size();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
@@ -1947,6 +1968,26 @@ impl ApplicationHandler<GuiEvent> for CadWindowApp {
             GuiEvent::Show => {
                 self.ensure_window(event_loop);
                 if let Some(w) = &self.window {
+                    #[cfg(target_os = "windows")]
+                    {
+                        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                        if let Ok(handle) = w.window_handle() {
+                            if let RawWindowHandle::Win32(win32) = handle.as_raw() {
+                                extern "system" {
+                                    fn ShowWindow(hwnd: isize, nCmdShow: i32) -> i32;
+                                    fn BringWindowToTop(hwnd: isize) -> i32;
+                                    fn SetForegroundWindow(hwnd: isize) -> i32;
+                                }
+                                unsafe {
+                                    const SW_SHOWNORMAL: i32 = 1;
+                                    let hwnd = win32.hwnd.get();
+                                    ShowWindow(hwnd, SW_SHOWNORMAL);
+                                    BringWindowToTop(hwnd);
+                                    SetForegroundWindow(hwnd);
+                                }
+                            }
+                        }
+                    }
                     w.focus_window();
                     w.request_redraw();
                 }

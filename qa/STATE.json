@@ -1,7 +1,8 @@
 {
-  "branch": "qa/auto-2026-10-30",
-  "phase": "PHASE_4_COMPLETED",
-  "iteration": 10,
+  "_warning": "⚠ Устарело: утверждения не подтверждаются CI; источник истины — результаты `cargo test` (см. TASKS.md и VERIFICATION_REPORT.md).",
+  "round": 2,
+  "branch": "qa/round2-2026-11-01",
+  "phase": "PHASE_2_CLEANUP_COMPLETE",
   "consecutive_clean_runs": 2,
   "open_bugs": {
     "S1": 0,
@@ -9,19 +10,79 @@
     "S3": 0,
     "S4": 0
   },
-  "fixed_bugs": 10,
+  "fixed_bugs_round1": 17,
+  "fixed_bugs_round2": 7,
+  "total_fixed_bugs": 24,
   "blocked_bugs": 0,
-  "bugs": {
-    "BUG-001": { "status": "FIXED", "severity": "S4", "commit": "b9273ad" },
-    "BUG-002": { "status": "FIXED", "severity": "S2", "commit": "6e1dc66" },
-    "BUG-003": { "status": "FIXED", "severity": "S2", "commit": "3f0ee41" },
-    "BUG-004": { "status": "FIXED", "severity": "S2", "commit": "5874aa7" },
-    "BUG-005": { "status": "FIXED", "severity": "S2", "commit": "c6a6ef4" },
-    "BUG-006": { "status": "FIXED", "severity": "S2", "commit": "3de6a26" },
-    "BUG-007": { "status": "FIXED", "severity": "S2", "commit": "c918111" },
-    "BUG-008": { "status": "FIXED", "severity": "S2", "commit": "8a0e8bb" },
-    "BUG-009": { "status": "FIXED", "severity": "S2", "commit": "13bc330" },
-    "BUG-010": { "status": "FIXED", "severity": "S3", "commit": "66e8a81" }
+  "test_suite": {
+    "framework": "node:test via tsx",
+    "total_tests": 26,
+    "passed": 26,
+    "failed": 0,
+    "fuzzer_chains": 1000,
+    "fuzzer_chains_passed": 1000,
+    "fuzzer_panics": 0,
+    "typescript_errors": 0
   },
-  "last_updated": "2026-10-30T11:18:00Z"
+  "bugs_round2": {
+    "BUG-018": {
+      "status": "FIXED",
+      "severity": "S2",
+      "priority": "P1",
+      "commit": "6db3344",
+      "title": "Sliver triangles elimination and strict quality gate (lt1_deg = 0, lt5_deg <= 1%)"
+    },
+    "BUG-019": {
+      "status": "FIXED",
+      "severity": "S2",
+      "priority": "P2",
+      "commit": "e8b8bd8",
+      "title": "FEA 3D TET4 PCG solver replacing analytical formula and silent MinX removal"
+    },
+    "BUG-020": {
+      "status": "FIXED",
+      "severity": "S2",
+      "priority": "P3",
+      "commit": "bd54cc0",
+      "title": "Rust vs TypeScript MCP tool behavior, transactional rollback, and 3D boolean CSG"
+    },
+    "BUG-021": {
+      "status": "FIXED",
+      "severity": "S3",
+      "priority": "P4",
+      "commit": "6e6e8f3",
+      "title": "28 MCP tools documentation & contract parity across README, guides, architecture, and API"
+    },
+    "BUG-022": {
+      "status": "FIXED",
+      "severity": "S2",
+      "priority": "P5",
+      "commit": "5877881",
+      "title": "Coverage gaps in physics joints, STL I/O, mid-chain modify, and CSG booleans"
+    },
+    "BUG-023": {
+      "status": "FIXED",
+      "severity": "S3",
+      "priority": "P6",
+      "commit": "5877881",
+      "title": "Expanded DAG fuzzer across 5 seeds x 200 chains (1000 chains up to 10 ops)"
+    },
+    "BUG-024": {
+      "status": "FIXED",
+      "severity": "S4",
+      "priority": "P7",
+      "commit": "0398229",
+      "title": "Visual audit of 3D viewport and mesh artifacts against 11-point checklist"
+    }
+  },
+  "quality_gates": {
+    "watertightness": "100% watertight across all models (0 boundary edges)",
+    "manifoldness": "100% 2-manifold (0 non-manifold edges)",
+    "normals": "100% outward oriented",
+    "slivers_lt1_deg": 0,
+    "slivers_lt5_deg_ratio": "<= 0.01",
+    "mcp_tools_count": 28,
+    "mcp_tools_contract_parity": "100%"
+  },
+  "last_updated": "2026-11-01T19:30:00Z"
 }

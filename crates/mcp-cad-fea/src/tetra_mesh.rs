@@ -33,14 +33,14 @@ impl MeshDensity {
         let min_dim = dims[0].min(dims[1]).min(dims[2]);
 
         match *self {
-            MeshDensity::Coarse => (max_dim / 10.0).min(min_dim / 2.0).max(1e-4),
-            MeshDensity::Medium => (max_dim / 18.0).min(min_dim / 4.0).max(1e-4),
-            MeshDensity::Fine => (max_dim / 28.0).min(min_dim / 6.0).max(1e-4),
+            MeshDensity::Coarse => (max_dim / 10.0).min(min_dim / 2.0).max(1e-5),
+            MeshDensity::Medium => (max_dim / 18.0).min(min_dim / 4.0).max(1e-5),
+            MeshDensity::Fine => (max_dim / 28.0).min(min_dim / 6.0).max(1e-5),
             MeshDensity::Custom { max_element_size } => {
                 if max_element_size > 0.0 {
                     max_element_size
                 } else {
-                    (max_dim / 18.0).min(min_dim / 4.0).max(1e-4)
+                    (max_dim / 18.0).min(min_dim / 4.0).max(1e-5)
                 }
             }
         }
@@ -113,19 +113,69 @@ impl TetElement {
     }
 }
 
-/// An unstructured 3D tetrahedral finite element mesh.
+/// Finite element polynomial interpolation order (`1` = linear `TET4`, `2` = quadratic `TET10`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum ElementOrder {
+    /// Linear 4-node tetrahedron (`TET4`, `element_order = 1`).
+    #[default]
+    Linear = 1,
+    /// Quadratic 10-node tetrahedron (`TET10`, `element_order = 2`).
+    Quadratic = 2,
+}
+
+impl ElementOrder {
+    /// Parses an integer order (`1` or `2`) into `ElementOrder`.
+    pub fn from_u8(order: u8) -> Option<Self> {
+        match order {
+            1 => Some(Self::Linear),
+            2 => Some(Self::Quadratic),
+            _ => None,
+        }
+    }
+
+    /// Returns the numeric polynomial order (`1` or `2`).
+    #[inline]
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::Linear => 1,
+            Self::Quadratic => 2,
+        }
+    }
+}
+
+/// An unstructured 3D tetrahedral finite element mesh (supporting both `TET4` and `TET10`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TetrahedralMesh {
-    /// Array of mesh nodes.
+    /// Array of mesh nodes (corner nodes followed by mid-edge nodes when converted to `TET10`).
     pub nodes: Vec<TetNode>,
-    /// Array of tetrahedral elements.
+    /// Array of 4-node corner tetrahedral elements (`TET4` connectivity).
     pub elements: Vec<TetElement>,
+    /// Optional 10-node quadratic tetrahedral connectivity (`[n0..n3, n4..n9]` per element) when `is_tet10()` is true.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tet10_elements: Vec<[usize; 10]>,
 }
 
 impl TetrahedralMesh {
-    /// Creates a new tetrahedral mesh from nodes and elements.
+    /// Creates a new linear (`TET4`) tetrahedral mesh from nodes and elements.
     pub fn new(nodes: Vec<TetNode>, elements: Vec<TetElement>) -> Self {
-        Self { nodes, elements }
+        Self {
+            nodes,
+            elements,
+            tet10_elements: Vec::new(),
+        }
+    }
+
+    /// Creates a new quadratic (`TET10`) tetrahedral mesh from nodes, corner elements, and 10-node connectivity.
+    pub fn new_tet10(
+        nodes: Vec<TetNode>,
+        elements: Vec<TetElement>,
+        tet10_elements: Vec<[usize; 10]>,
+    ) -> Self {
+        Self {
+            nodes,
+            elements,
+            tet10_elements,
+        }
     }
 
     /// Creates an empty mesh.
@@ -133,6 +183,74 @@ impl TetrahedralMesh {
         Self {
             nodes: Vec::new(),
             elements: Vec::new(),
+            tet10_elements: Vec::new(),
+        }
+    }
+
+    /// Returns `true` if this mesh carries quadratic 10-node (`TET10`) element connectivity.
+    #[inline]
+    pub fn is_tet10(&self) -> bool {
+        !self.tet10_elements.is_empty() && self.tet10_elements.len() == self.elements.len()
+    }
+
+    /// Returns the polynomial element order of the mesh (`1` for `TET4`, `2` for `TET10`).
+    #[inline]
+    pub fn element_order(&self) -> u8 {
+        if self.is_tet10() {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// Converts a linear `TET4` tetrahedral mesh into a quadratic `TET10` mesh by inserting
+    /// a shared mid-edge node at the midpoint of every unique tetrahedron edge `(u, v)`.
+    ///
+    /// Node ordering per element follows the standard `TET10` convention:
+    /// - `0..4`: corner vertices `[n0, n1, n2, n3]`
+    /// - `4..10`: mid-edge nodes `[(0,1), (1,2), (2,0), (0,3), (1,3), (2,3)]`
+    pub fn to_tet10(&self) -> Self {
+        if self.is_tet10() || self.is_empty() {
+            return self.clone();
+        }
+
+        let mut nodes = self.nodes.clone();
+        // Map canonical undirected edge (min_node, max_node) -> mid_node_id
+        let mut edge_to_mid: HashMap<(usize, usize), usize> =
+            HashMap::with_capacity(self.elements.len() * 2);
+        let mut tet10_elements = Vec::with_capacity(self.elements.len());
+
+        for elem in &self.elements {
+            let corners = elem.node_indices;
+            let mut ten = [0usize; 10];
+            ten[..4].copy_from_slice(&corners);
+
+            for (e, &(la, lb)) in crate::element::TET10_EDGE_PAIRS.iter().enumerate() {
+                let u = corners[la];
+                let v = corners[lb];
+                let key = if u < v { (u, v) } else { (v, u) };
+                let mid_id = *edge_to_mid.entry(key).or_insert_with(|| {
+                    let pu = nodes[u].position;
+                    let pv = nodes[v].position;
+                    let mid_pos = [
+                        0.5 * (pu[0] + pv[0]),
+                        0.5 * (pu[1] + pv[1]),
+                        0.5 * (pu[2] + pv[2]),
+                    ];
+                    let id = nodes.len();
+                    nodes.push(TetNode::new(id, mid_pos));
+                    id
+                });
+                ten[4 + e] = mid_id;
+            }
+
+            tet10_elements.push(ten);
+        }
+
+        Self {
+            nodes,
+            elements: self.elements.clone(),
+            tet10_elements,
         }
     }
 
@@ -203,9 +321,59 @@ impl TetrahedralMesh {
             .collect()
     }
 
+    /// Extracts the external 6-node quadratic boundary faces `([c0, c1, c2], [m01, m12, m20])`
+    /// when `self.is_tet10()` is `true`. Returns an empty vector for linear `TET4` meshes.
+    pub fn extract_surface_tet10_faces(&self) -> Vec<([usize; 3], [usize; 3])> {
+        if !self.is_tet10() {
+            return Vec::new();
+        }
+
+        let mut face_count: HashMap<[usize; 3], (usize, [usize; 3], [usize; 3])> =
+            HashMap::with_capacity(self.elements.len() * 2);
+
+        for ten in &self.tet10_elements {
+            let [n0, n1, n2, n3, m01, m12, m20, m03, m13, m23] = *ten;
+            let faces = [
+                ([n0, n1, n2], [m01, m12, m20]),
+                ([n0, n2, n3], [m20, m23, m03]),
+                ([n0, n3, n1], [m03, m13, m01]),
+                ([n1, n3, n2], [m13, m23, m12]),
+            ];
+
+            for (corners, mids) in faces {
+                let mut sorted = corners;
+                sorted.sort_unstable();
+                let entry = face_count.entry(sorted).or_insert((0, corners, mids));
+                entry.0 += 1;
+            }
+        }
+
+        face_count
+            .into_values()
+            .filter(|(count, _, _)| *count == 1)
+            .map(|(_, corners, mids)| (corners, mids))
+            .collect()
+    }
+
     /// Extracts the external triangular boundary surface faces of the tetrahedral mesh.
     /// Faces shared by exactly one tetrahedron form the exterior skin.
+    ///
+    /// For quadratic `TET10` meshes (`is_tet10() == true`), each 6-node exterior face is
+    /// subdivided into 4 conforming sub-triangles `[c0, m01, m20], [m01, c1, m12], [m20, m12, c2], [m01, m12, m20]`
+    /// so that all exterior corner and mid-edge nodes are represented on the boundary surface.
     pub fn extract_surface_triangles(&self) -> Vec<[usize; 3]> {
+        if self.is_tet10() {
+            let faces6 = self.extract_surface_tet10_faces();
+            let mut tris = Vec::with_capacity(faces6.len() * 4);
+            for ([c0, c1, c2], [m01, m12, m20]) in faces6 {
+                tris.push([c0, m01, m20]);
+                tris.push([m01, c1, m12]);
+                tris.push([m20, m12, c2]);
+                tris.push([m01, m12, m20]);
+            }
+            return tris;
+        }
+
         // Map from canonical face (sorted node indices) to original face orientation and count
         let mut face_count: HashMap<[usize; 3], (usize, [usize; 3])> = HashMap::new();
 
@@ -322,6 +490,36 @@ impl TetrahedralMesh {
             return Err(FeaError::EmptyMesh);
         }
 
+        // Pre-flight mesh topology validation (P3-T2): ensure closed watertight 2-manifold before voxelization
+        let validation = mcp_cad_core::validate_mesh(mesh, None);
+        let is_manifold = validation.topology.non_manifold_edges_count == 0
+            && validation.topology.non_manifold_vertices_count == 0;
+        if !validation.topology.is_watertight
+            || !is_manifold
+            || !validation.topology.orientation_consistent
+            || !validation.geometry.is_positive_volume
+        {
+            let message = if !validation.issues.is_empty() {
+                validation.issues.join("; ")
+            } else {
+                format!(
+                    "Surface mesh failed pre-flight topology check (watertight={}, manifold={}, orientation_consistent={}, positive_volume={})",
+                    validation.topology.is_watertight,
+                    is_manifold,
+                    validation.topology.orientation_consistent,
+                    validation.geometry.is_positive_volume
+                )
+            };
+            return Err(FeaError::InvalidSurfaceMesh {
+                message,
+                boundary_edges_count: validation.topology.boundary_edges_count,
+                non_manifold_edges_count: validation.topology.non_manifold_edges_count,
+                non_manifold_vertices_count: validation.topology.non_manifold_vertices_count,
+                inconsistent_edges_count: validation.topology.inconsistent_edges_count,
+                is_watertight: validation.topology.is_watertight,
+            });
+        }
+
         let aabb = mesh.bounding_box();
         let dims = aabb.dimensions();
         if dims[0] <= 1e-9 || dims[1] <= 1e-9 || dims[2] <= 1e-9 {
@@ -344,14 +542,37 @@ impl TetrahedralMesh {
         let ny = ((dims[1] / h).round() as usize).clamp(2, 60);
         let nz = ((dims[2] / h).round() as usize).clamp(2, 60);
 
-        let dx = dims[0] / nx as f64;
-        let dy = dims[1] / ny as f64;
-        let dz = dims[2] / nz as f64;
-
         // Check if the input mesh is a standard axis-aligned box
         if is_axis_aligned_box(mesh, &aabb) {
             return Self::from_box(aabb.min, aabb.max, nx, ny, nz);
         }
+
+        // For non-box (curved/perforated) shapes, ensure cross-sectional axes have at least 6 voxel cells
+        // so circular shafts and holes do not degenerate into a 2x2 square grid (+27% area error).
+        let min_curved_cells = match density {
+            MeshDensity::Coarse => 8,
+            MeshDensity::Medium => 12,
+            MeshDensity::Fine => 16,
+            MeshDensity::Custom { .. } => 8,
+        };
+        let max_dim = dims[0].max(dims[1]).max(dims[2]);
+        let min_dim = dims[0].min(dims[1]).min(dims[2]);
+        // An axis is a thin-plate thickness only if it is the sole minimum dimension and < 25% of max_dim.
+        let min_count = dims.iter().filter(|&&d| (d - min_dim).abs() <= 0.15 * min_dim).count();
+        let adjust_axis = |n: usize, d: f64| -> usize {
+            let is_sole_thin_axis = min_count == 1 && (d - min_dim).abs() <= 1e-9 && d < 0.25 * max_dim;
+            if is_sole_thin_axis {
+                n.max(2)
+            } else {
+                n.max(min_curved_cells).min(60)
+            }
+        };
+        let nx = adjust_axis(nx, dims[0]);
+        let ny = adjust_axis(ny, dims[1]);
+        let nz = adjust_axis(nz, dims[2]);
+        let dx = dims[0] / nx as f64;
+        let dy = dims[1] / ny as f64;
+        let dz = dims[2] / nz as f64;
 
         // For general shapes: test voxel containment using ray-triangle parity check
         let node_idx = |i: usize, j: usize, k: usize| -> usize {
@@ -668,8 +889,16 @@ pub fn refine_mesh_max_edge_length(mesh: &TriangleMesh, max_edge_len: f64) -> Tr
             }
         };
 
+        let has_face_ids =
+            current.face_ids.len() == current.indices.len() && !current.face_ids.is_empty();
         let mut new_indices = Vec::with_capacity(current.indices.len() * 4);
-        for tri in &current.indices {
+        let mut new_face_ids = if has_face_ids {
+            Vec::with_capacity(current.indices.len() * 4)
+        } else {
+            Vec::new()
+        };
+
+        for (tri_idx, tri) in current.indices.iter().enumerate() {
             let [i0, i1, i2] = *tri;
             let m01 = get_or_create_midpoint(i0, i1, &mut new_vertices);
             let m12 = get_or_create_midpoint(i1, i2, &mut new_vertices);
@@ -679,9 +908,18 @@ pub fn refine_mesh_max_edge_length(mesh: &TriangleMesh, max_edge_len: f64) -> Tr
             new_indices.push([m01, i1, m12]);
             new_indices.push([m20, m12, i2]);
             new_indices.push([m01, m12, m20]);
+
+            if has_face_ids {
+                let fid = current.face_ids[tri_idx];
+                new_face_ids.extend_from_slice(&[fid, fid, fid, fid]);
+            }
         }
 
-        current = TriangleMesh::new(new_vertices, new_indices);
+        current = if has_face_ids {
+            TriangleMesh::with_faces(new_vertices, new_indices, new_face_ids, current.faces.clone())
+        } else {
+            TriangleMesh::new(new_vertices, new_indices)
+        };
     }
 
     current

@@ -3,7 +3,7 @@
 use nalgebra::Matrix6;
 use serde::{Deserialize, Serialize};
 use crate::boundary::ResolvedBoundary;
-use crate::element::Tet4Element;
+use crate::element::{Tet10Element, Tet4Element, Vector30};
 use crate::error::FeaError;
 use crate::tetra_mesh::TetrahedralMesh;
 
@@ -41,23 +41,19 @@ pub struct CsrMatrix {
 }
 
 impl CsrMatrix {
-    /// Constructs a CSR matrix from a list of (row, col, value) triplets,
-    /// automatically sorting columns and accumulating duplicate entries.
-    pub fn from_triplets(nrows: usize, ncols: usize, triplets: &[(usize, usize, f64)]) -> Self {
-        let mut row_entries: Vec<Vec<(usize, f64)>> = vec![Vec::new(); nrows];
-        for &(r, c, val) in triplets {
-            if r < nrows && c < ncols && val.abs() > 1e-25 {
-                row_entries[r].push((c, val));
-            }
-        }
-
+    /// Constructs a CSR matrix from pre-bucketed per-row `(col, value)` entries,
+    /// sorting columns and accumulating duplicate entries.
+    pub fn from_row_entries(
+        nrows: usize,
+        ncols: usize,
+        row_entries: Vec<Vec<(usize, f64)>>,
+    ) -> Self {
         let mut row_ptr = Vec::with_capacity(nrows + 1);
         let mut col_indices = Vec::new();
         let mut values = Vec::new();
         row_ptr.push(0);
 
         for mut entries in row_entries {
-            // Sort by column index
             entries.sort_unstable_by_key(|&(col, _)| col);
 
             for (col, val) in entries {
@@ -79,6 +75,18 @@ impl CsrMatrix {
             col_indices,
             values,
         }
+    }
+
+    /// Constructs a CSR matrix from a list of (row, col, value) triplets,
+    /// automatically sorting columns and accumulating duplicate entries.
+    pub fn from_triplets(nrows: usize, ncols: usize, triplets: &[(usize, usize, f64)]) -> Self {
+        let mut row_entries: Vec<Vec<(usize, f64)>> = vec![Vec::new(); nrows];
+        for &(r, c, val) in triplets {
+            if r < nrows && c < ncols && val.abs() > 1e-25 {
+                row_entries[r].push((c, val));
+            }
+        }
+        Self::from_row_entries(nrows, ncols, row_entries)
     }
 
     /// Performs Sparse Matrix-Vector multiplication: $y = A \cdot x$.
@@ -154,10 +162,15 @@ pub fn solve_pcg(
 
     let mut ap = vec![0.0; n];
     let max_iter = options.max_iterations.max(n * 2);
+    let effective_tol = if n <= 10_000 {
+        options.tolerance.min(1e-9)
+    } else {
+        options.tolerance
+    };
 
     for iter in 0..max_iter {
         let norm_r = dot(&r, &r).sqrt();
-        if norm_r / norm_b < options.tolerance || norm_r < 1e-14 {
+        if norm_r / norm_b < effective_tol || norm_r < 1e-14 {
             return Ok(x);
         }
 
@@ -201,7 +214,7 @@ pub fn solve_pcg(
     }
 }
 
-/// Assembles the global stiffness matrix and solves for global nodal displacements: $K \cdot u = F$.
+/// Assembles the global stiffness matrix and solves for global nodal displacements: $K \cdot u = F$ (`TET4`).
 pub fn assemble_and_solve(
     mesh: &TetrahedralMesh,
     elements: &[Tet4Element],
@@ -253,8 +266,8 @@ pub fn assemble_and_solve(
         }
     }
 
-    // Assemble triplets for free DOFs
-    let mut triplets = Vec::with_capacity(elements.len() * 144);
+    // Assemble per-row entries for free DOFs
+    let mut row_entries: Vec<Vec<(usize, f64)>> = vec![Vec::with_capacity(48); num_free];
 
     for elem in elements {
         let ke = elem.stiffness_matrix(d_matrix);
@@ -268,12 +281,16 @@ pub fn assemble_and_solve(
         for a in 0..12 {
             let da = elem_dofs[a];
             if let Some(free_a) = global_to_free[da] {
+                let row_vec = &mut row_entries[free_a];
                 for b in 0..12 {
                     let db = elem_dofs[b];
                     let val = ke[(a, b)];
+                    if val.abs() <= 1e-25 {
+                        continue;
+                    }
 
                     if let Some(free_b) = global_to_free[db] {
-                        triplets.push((free_a, free_b, val));
+                        row_vec.push((free_b, val));
                     } else if let Some(&u_prescribed) = boundary.fixed_dofs.get(&db) {
                         // Prescribed displacement adjustment to RHS
                         if u_prescribed.abs() > 1e-15 {
@@ -285,7 +302,7 @@ pub fn assemble_and_solve(
         }
     }
 
-    let k_free = CsrMatrix::from_triplets(num_free, num_free, &triplets);
+    let k_free = CsrMatrix::from_row_entries(num_free, num_free, row_entries);
     let solver_opts = options.unwrap_or_default();
     let u_free = solve_pcg(&k_free, &f_free, solver_opts)?;
 
@@ -300,3 +317,202 @@ pub fn assemble_and_solve(
 
     Ok(u_full)
 }
+
+/// Assembles the global stiffness matrix and solves for global nodal displacements: $K \cdot u = F$ (`TET10`).
+pub fn assemble_and_solve_tet10(
+    mesh: &TetrahedralMesh,
+    elements: &[Tet10Element],
+    d_matrix: &Matrix6<f64>,
+    boundary: &ResolvedBoundary,
+    options: Option<SolverOptions>,
+) -> Result<Vec<f64>, FeaError> {
+    let total_nodes = mesh.node_count();
+    let total_dofs = total_nodes * 3;
+
+    if total_nodes == 0 || elements.is_empty() {
+        return Err(FeaError::EmptyMesh);
+    }
+
+    // Map unconstrained (free) DOFs to reduced system indices
+    let mut global_to_free = vec![None; total_dofs];
+    let mut free_to_global = Vec::with_capacity(total_dofs);
+    let mut num_free = 0;
+
+    for (d, slot) in global_to_free.iter_mut().enumerate().take(total_dofs) {
+        if !boundary.fixed_dofs.contains_key(&d) {
+            *slot = Some(num_free);
+            free_to_global.push(d);
+            num_free += 1;
+        }
+    }
+
+    if num_free == 0 {
+        let mut u_full = vec![0.0; total_dofs];
+        for (&d, &val) in &boundary.fixed_dofs {
+            u_full[d] = val;
+        }
+        return Ok(u_full);
+    }
+
+    // Assemble RHS force vector for free DOFs
+    let mut f_free = vec![0.0; num_free];
+    for n in 0..total_nodes {
+        let force = boundary.nodal_forces[n];
+        if let Some(f_idx) = global_to_free[3 * n] {
+            f_free[f_idx] += force[0];
+        }
+        if let Some(f_idx) = global_to_free[3 * n + 1] {
+            f_free[f_idx] += force[1];
+        }
+        if let Some(f_idx) = global_to_free[3 * n + 2] {
+            f_free[f_idx] += force[2];
+        }
+    }
+
+    // Assemble per-row entries for free DOFs
+    let mut row_entries: Vec<Vec<(usize, f64)>> = vec![Vec::with_capacity(96); num_free];
+
+    for elem in elements {
+        let ke = elem.stiffness_matrix(d_matrix);
+        let mut elem_dofs = [0usize; 30];
+        for (local_i, &global_node) in elem.node_indices.iter().enumerate() {
+            elem_dofs[3 * local_i] = 3 * global_node;
+            elem_dofs[3 * local_i + 1] = 3 * global_node + 1;
+            elem_dofs[3 * local_i + 2] = 3 * global_node + 2;
+        }
+
+        for a in 0..30 {
+            let da = elem_dofs[a];
+            if let Some(free_a) = global_to_free[da] {
+                let row_vec = &mut row_entries[free_a];
+                for b in 0..30 {
+                    let db = elem_dofs[b];
+                    let val = ke[(a, b)];
+                    if val.abs() <= 1e-25 {
+                        continue;
+                    }
+
+                    if let Some(free_b) = global_to_free[db] {
+                        row_vec.push((free_b, val));
+                    } else if let Some(&u_prescribed) = boundary.fixed_dofs.get(&db) {
+                        if u_prescribed.abs() > 1e-15 {
+                            f_free[free_a] -= val * u_prescribed;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let k_free = CsrMatrix::from_row_entries(num_free, num_free, row_entries);
+    let solver_opts = options.unwrap_or_default();
+    let u_free = solve_pcg(&k_free, &f_free, solver_opts)?;
+
+    // Reconstruct full displacement vector
+    let mut u_full = vec![0.0; total_dofs];
+    for (free_idx, &global_dof) in free_to_global.iter().enumerate() {
+        u_full[global_dof] = u_free[free_idx];
+    }
+    for (&global_dof, &val) in &boundary.fixed_dofs {
+        u_full[global_dof] = val;
+    }
+
+    Ok(u_full)
+}
+
+/// Computes the nodal support reaction force vectors $\mathbf{R}_n = (K \cdot u)_n - \mathbf{f}_n$ (in Newtons)
+/// at all constrained DOFs (`TET4`). For unconstrained (free) DOFs, the support reaction component is `0.0`.
+pub fn compute_nodal_reactions(
+    mesh: &TetrahedralMesh,
+    elements: &[Tet4Element],
+    d_matrix: &Matrix6<f64>,
+    boundary: &ResolvedBoundary,
+    u_full: &[f64],
+) -> Vec<[f64; 3]> {
+    let total_nodes = mesh.node_count();
+    let mut ku = vec![[0.0f64; 3]; total_nodes];
+
+    for elem in elements {
+        let mut u_elem = crate::element::Vector12::zeros();
+        for (local_i, &global_node) in elem.node_indices.iter().enumerate() {
+            u_elem[3 * local_i] = u_full[3 * global_node];
+            u_elem[3 * local_i + 1] = u_full[3 * global_node + 1];
+            u_elem[3 * local_i + 2] = u_full[3 * global_node + 2];
+        }
+
+        // K_e * u_e = V_e * B^T * (D * B * u_e) = V_e * B^T * sigma_e
+        let stress = elem.compute_stress(d_matrix, &u_elem);
+        let f_int = (elem.b_matrix.transpose() * stress) * elem.volume;
+
+        for (local_i, &global_node) in elem.node_indices.iter().enumerate() {
+            ku[global_node][0] += f_int[3 * local_i];
+            ku[global_node][1] += f_int[3 * local_i + 1];
+            ku[global_node][2] += f_int[3 * local_i + 2];
+        }
+    }
+
+    let mut reactions = vec![[0.0f64; 3]; total_nodes];
+    for n in 0..total_nodes {
+        for axis in 0..3 {
+            let dof = 3 * n + axis;
+            if boundary.fixed_dofs.contains_key(&dof) {
+                let f_ext = boundary
+                    .nodal_forces
+                    .get(n)
+                    .map(|f| f[axis])
+                    .unwrap_or(0.0);
+                reactions[n][axis] = ku[n][axis] - f_ext;
+            }
+        }
+    }
+
+    reactions
+}
+
+/// Computes the nodal support reaction force vectors $\mathbf{R}_n = (K \cdot u)_n - \mathbf{f}_n$ (in Newtons)
+/// at all constrained DOFs (`TET10`). For unconstrained (free) DOFs, the support reaction component is `0.0`.
+pub fn compute_nodal_reactions_tet10(
+    mesh: &TetrahedralMesh,
+    elements: &[Tet10Element],
+    d_matrix: &Matrix6<f64>,
+    boundary: &ResolvedBoundary,
+    u_full: &[f64],
+) -> Vec<[f64; 3]> {
+    let total_nodes = mesh.node_count();
+    let mut ku = vec![[0.0f64; 3]; total_nodes];
+
+    for elem in elements {
+        let mut u_elem = Vector30::zeros();
+        for (local_i, &global_node) in elem.node_indices.iter().enumerate() {
+            u_elem[3 * local_i] = u_full[3 * global_node];
+            u_elem[3 * local_i + 1] = u_full[3 * global_node + 1];
+            u_elem[3 * local_i + 2] = u_full[3 * global_node + 2];
+        }
+
+        let f_int = elem.compute_internal_forces(d_matrix, &u_elem);
+
+        for (local_i, &global_node) in elem.node_indices.iter().enumerate() {
+            ku[global_node][0] += f_int[3 * local_i];
+            ku[global_node][1] += f_int[3 * local_i + 1];
+            ku[global_node][2] += f_int[3 * local_i + 2];
+        }
+    }
+
+    let mut reactions = vec![[0.0f64; 3]; total_nodes];
+    for n in 0..total_nodes {
+        for axis in 0..3 {
+            let dof = 3 * n + axis;
+            if boundary.fixed_dofs.contains_key(&dof) {
+                let f_ext = boundary
+                    .nodal_forces
+                    .get(n)
+                    .map(|f| f[axis])
+                    .unwrap_or(0.0);
+                reactions[n][axis] = ku[n][axis] - f_ext;
+            }
+        }
+    }
+
+    reactions
+}
+

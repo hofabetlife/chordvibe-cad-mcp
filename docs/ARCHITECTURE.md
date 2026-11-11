@@ -23,18 +23,21 @@ MCP-CAD Engine спроектирован для того, чтобы дать �
 Проект разделен на 5 независимых крейтов с четко разграниченными зонами ответственности:
 
 ```
-c:\Users\voley\Documents\3D_MCP\
+C:\Users\<username>\Documents\chordvibe-cad-mcp\
 ├── Cargo.toml                    # Корневой Workspace манифест (resolver = "2")
 ├── PRD.md                        # Спецификация требований к продукту
 ├── PROJECT_CONTEXT.md            # Контекст и соглашения разработки
 ├── README.md                     # Главная страница документации
 ├── docs/                         # Техническая документация
 │   ├── ARCHITECTURE.md           # Архитектурный обзор (данный документ)
-│   ├── MCP_API_REFERENCE.md      # Полный справочник 26 инструментов MCP
+│   ├── MCP_API_REFERENCE.md      # Полный справочник 28 инструментов MCP
 │   └── CLAUDE_DESKTOP_SETUP.md   # Руководство по интеграции с Claude Desktop
 ├── examples/                     # Готовые инженерные сценарии
 │   ├── bracket_design.json       # Проект кронштейна с расчетом прочности
 │   └── crank_mechanism.json      # Проект механизма с динамикой привода
+├── src/                          # TypeScript CAD Layer & Web Studio (React + Three.js: src/cad, src/components)
+│   ├── cad/                      # TS-ядро: primitives, csg_bsp, fea_solver, kinematics, optimizer, dispatcher
+│   └── components/               # UI студии: Viewport3D, RibbonToolbar, Sidebars, OptimizerPanel
 └── crates/
     ├── mcp-cad-core/             # Геометрическое ядро, B-Rep/CSG, DAG, материалы, STL
     ├── mcp-cad-physics/          # Интеграция Rapier3D, сочленения, моторы, симуляция
@@ -102,14 +105,25 @@ pub struct EngineState {
 ## 4. Подсистемы движка
 
 ### 4.1. Геометрическое ядро (`mcp-cad-core`)
-- **Параметрический DAG (`FeatureTree`)**: Каждый шаг моделирования регистрируется в виде узла `FeatureNode` с уникальным `Uuid`. Поддерживаемые операции:
-  - `AddBox { width, height, depth }`
-  - `AddCylinder { radius, height, segments }`
-  - `AddSphere { radius, sectors, stacks }`
-  - `CutHole { center, normal, radius, depth }`
-  - `Transform { translation, rotation_deg, scale }`
-- **Пересчет геометрии (`rebuild`)**: При вызове `modify_feature` ядро заново выполняет последовательность операций DAG, гарантируя консистентность геометрии без потери топологической информации.
-- **Расчет масс-инерционных характеристик**: Автоматическое интегрирование объема по замкнутой полигональной сетке `TriangleMesh` с вычислением центра масс, массы $m = \rho \cdot V$ и тензора инерции $I_{xx}, I_{yy}, I_{zz}$.
+- **Параметрический DAG (`FeatureTree`)**: Каждый шаг моделирования регистрируется в виде узла `FeatureNode` с уникальным `Uuid`. Полный спектр поддерживаемых операций:
+  - `AddBox { width, height, depth }`: прямоугольный параллелепипед
+  - `AddCylinder { radius, height, segments }`: цилиндрическое тело
+  - `AddSphere { radius, sectors, stacks }`: сферическое тело
+  - `AddCone { radius_bottom, radius_top, height }`: прямой и усеченный конус
+  - `AddPolygonPrism { sides, outer_radius, height, chamfer_radius, ... }`: правильная призма с фасками по DIN 934
+  - `AddSpurGear { teeth, module, pressure_angle, face_width, bore_diameter, hub_diameter, keyway_width, ... }`: эвольвентное прямозубое колесо DIN 867
+  - `AddRevolve { profile_points, angle_deg }`: тело вращения произвольного 2D-контура
+  - `AddWheelRim { rim_diameter, rim_width, spoke_count, hub_diameter, bolt_holes_count, ... }`: легкосплавный колесный диск
+  - `CutHole { center, normal, radius, depth, keyway_width, keyway_depth }`: цилиндрический вырез со шпоночным пазом DIN 6885
+  - `CutHelicalGroove { helix_radius, groove_radius, pitch, height, profile_type }`: винтовая канавка и резьба ISO 68-1 60°
+  - `BooleanUnion { part_a, part_b }`: булево объединение (CSG Union)
+  - `BooleanDifference { part_a, part_b }`: булево вычитание (CSG Difference)
+  - `BooleanIntersection { part_a, part_b }`: булево пересечение (CSG Intersection)
+  - `Transform { translation, rotation_deg, scale }`: аффинное преобразование твердого тела
+  - `StlImport { filepath, scale_factor }`: импорт внешней полигональной геометрии
+- **Пересчет геометрии (`rebuild`)**: При вызове `modify_feature` ядро заново выполняет последовательность операций DAG, гарантируя транзакционный откат при некорректных параметрах и консистентность геометрии без потери топологической информации.
+- **Стоимостной оптимизатор дерева операций (`CadQueryOptimizer` / `optimize_feature_tree`)**: По аналогии с оптимизатором запросов SQL (`EXPLAIN ANALYZE`), транслирует *Логический план* ИИ-агента в оптимальный *Физический план* исполнения DAG с применением правил свертки матриц $SE(3)$ (`R1`), отсечения «мертвых» операций вне AABB (`R2`), пакетной группировки компланарных вырезов по Де Моргану (`R3`), понижения размерности 3D CSG до 2D профиля вращения `revolve` (`R4`) и слияния призмы с резьбой (`R5`).
+- **Расчет масс-инерционных характеристик**: Автоматическое интегрирование объема по теореме Остроградского-Гаусса по замкнутой полигональной сетке `TriangleMesh` с вычислением центра масс, массы $m = \rho \cdot V$ и тензора инерции $I_{xx}, I_{yy}, I_{zz}$.
 - **Инженерная база материалов (`MaterialRegistry`)**: Предустановленные константы для сплавов и полимеров:
   - `aluminum_6061_t6` ($E=68.9$ GPa, $\nu=0.33$, $\sigma_y=276$ MPa, $\rho=2700$ kg/m³)
   - `steel_structural_aisi1020` ($E=205.0$ GPa, $\nu=0.29$, $\sigma_y=250$ MPa, $\rho=7850$ kg/m³)
@@ -130,6 +144,7 @@ pub struct EngineState {
   - `Prismatic`: поступательный ползун/слайдер с направляющей осью и лимитами перемещения.
   - `Spherical`: шаровой сферический шарнир (3 степени свободы вращения).
   - `Fixed`: жесткая связка деталей.
+  - `Gear`: редукторная кинематическая пара с фиксированным передаточным отношением $\omega_2 / \omega_1 = \text{ratio}$ (включая знак для внешнего/внутреннего зацепления).
 - **Приводы (Motors)**: Плавное поддержание целевой скорости (`target_velocity`) с ограничением по пиковому моменту/силе (`max_force`).
 - **Сбор телеметрии (`SimulationSummary`)**: Дискретное интегрирование с шагом $\Delta t$, фиксация пространственных траекторий $P(t)$, ориентаций $Q(t)$, реакций в шарнирах и коллизий.
 
@@ -169,7 +184,7 @@ pub struct EngineState {
   - `initialize`: согласование версии протокола и манифеста возможностей сервера (`capabilities.tools`).
   - `notifications/initialized`: подтверждение готовности клиента.
   - `ping`: проверка доступности.
-  - `tools/list`: отдача массива из 26 строгих JSON-Schema определений инструментов.
+  - `tools/list`: отдача массива из 28 строгих JSON-Schema определений инструментов.
   - `tools/call`: исполнение указанного инструмента с аргументами.
 - **Поддерживаемые транспорты**:
   - **Stdio Loop**: Чтение строк JSON-RPC из `stdin` и немедленный сброс (`flush`) ответов в `stdout`.

@@ -405,8 +405,6 @@ fn test_joint_runtime_motor_and_reactions() {
     // Verify peak forces are recorded
     assert!(summary.peak_joint_forces.contains_key("motor_joint"));
 }
-<<<<<<< HEAD
-=======
 
 #[test]
 fn test_prismatic_joint_runtime_motor_and_disable_reenable() {
@@ -853,38 +851,4 @@ fn test_p2_t36_gravity_f64_exact_precision_and_clone() {
 
     world.set_gravity([0.0, 0.0, -9.80665]);
     assert_eq!(world.gravity(), [0.0, 0.0, -9.80665]);
-}
-
-#[test]
-fn test_investigate_fixed_joint_reaction() {
-    let mut world = PhysicsWorld::with_gravity([0.0, -9.81, 0.0]);
-
-    let base = create_test_box("base", "Fixed Base", 0.2, 0.2, 0.2);
-    world.add_part_with_options(&base, false, ColliderType::Cube, Some([0.0, 0.0, 0.0]), None).unwrap();
-
-    let beam = create_test_box("beam", "Cantilever Beam", 1.0, 0.1, 0.1);
-    world.add_part_with_options(&beam, true, ColliderType::Cube, Some([0.5, 0.0, 0.0]), None).unwrap();
-
-    let m = world.part_mass("beam").unwrap();
-    eprintln!("Beam mass m = {}", m);
-
-    let joint = CadJointType::Fixed {
-        anchor_a: [0.0, 0.0, 0.0],
-        anchor_b: [-0.5, 0.0, 0.0],
-    };
-    world.add_joint("fixed_joint", "base", "beam", joint, None).unwrap();
-
-    let dt = 1.0 / 60.0;
-    let summary = world.simulate(0.5, dt);
-    let traj = summary.trajectories.get("beam").unwrap();
-    for (i, s) in traj.samples.iter().enumerate() {
-        if i % 10 == 0 || i == traj.samples.len() - 1 {
-            eprintln!("t={:.3}: pos={:?}, linvel={:?}, angvel={:?}", s.time_s, s.position, s.linear_velocity, s.angular_velocity);
-        }
-    }
-    let reactions = summary.joint_reactions.get("fixed_joint").unwrap();
-    let last_r = reactions.last().unwrap();
-    eprintln!("Last reaction: force = {:?}, torque = {:?}", last_r.force, last_r.torque);
-    eprintln!("Expected F_y = {}, Expected T_z = {}", m * 9.81, m * 9.81 * 0.5);
-}
 }

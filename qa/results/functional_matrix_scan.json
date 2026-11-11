@@ -9,7 +9,7 @@
       "query_after_fail": true,
       "rejected_negative_box": true,
       "subsequent_op_response": {
-        "feature_id": "e39452e5-cd77-43d3-8027-d10f2f577a9d"
+        "feature_id": "03a8a644-2ebc-40b8-b812-6226fe84cec8"
       },
       "subsequent_valid_op_succeeded": true,
       "volume_preserved": 0.0010000000000000005

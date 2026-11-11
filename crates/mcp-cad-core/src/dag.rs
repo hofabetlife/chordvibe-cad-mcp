@@ -8,8 +8,8 @@ use crate::csg::{csg_difference, csg_intersection, csg_union};
 use crate::error::CadError;
 use crate::primitives::{
     create_box, create_cone, create_cylinder, create_helical_cutter_with_settings,
-    create_polygon_prism, create_revolve_with_settings, create_sphere,
-    create_spur_gear_with_settings, create_wheel_rim_with_settings, cut_hole_with_settings,
+    create_polygon_prism, create_revolve, create_sphere, create_spur_gear_with_settings,
+    create_wheel_rim_with_settings, cut_hole_with_settings,
 };
 use crate::tessellation::TessellationSettings;
 use crate::topology::TriangleMesh;
@@ -178,6 +178,10 @@ pub enum FeatureOp {
     BooleanIntersectionMesh {
         tool_mesh: TriangleMesh,
     },
+    /// Base or additive imported boundary mesh (e.g. from `import_stl`).
+    ImportedMesh {
+        mesh: TriangleMesh,
+    },
     /// Apply spatial translation, rotation (RPY degrees), and scale factors.
     Transform {
         #[serde(default)]
@@ -198,7 +202,7 @@ fn default_bolt_holes_count() -> Option<usize> {
 }
 
 fn default_bolt_hole_diameter() -> Option<f64> {
-    Some(0.014)
+    None
 }
 
 fn default_spokes_count() -> Option<usize> {
@@ -242,6 +246,89 @@ fn default_scale() -> [f64; 3] {
 }
 
 #[inline]
+pub(crate) fn resolve_radial_segments(
+    explicit_segments: usize,
+    radius: f64,
+    min_segs: usize,
+    settings: &TessellationSettings,
+) -> usize {
+    let auto_segs = settings.calculate_segments(radius);
+    if explicit_segments == 0 {
+        return auto_segs.max(min_segs);
+    }
+    let default_settings = TessellationSettings::default();
+    if *settings == default_settings {
+        explicit_segments.max(min_segs)
+    } else if explicit_segments == default_segments() {
+        auto_segs.max(min_segs)
+    } else {
+        let base_segs = default_settings.calculate_segments(radius).max(1);
+        let scaled = ((explicit_segments as f64) * (auto_segs as f64 / base_segs as f64)).round() as usize;
+        scaled.max(min_segs)
+    }
+}
+
+#[inline]
+pub(crate) fn resolve_revolve_segments(
+    explicit_segments: usize,
+    max_r: f64,
+    angle_deg: f64,
+    settings: &TessellationSettings,
+) -> usize {
+    let arc_rad = angle_deg * std::f64::consts::PI / 180.0;
+    let auto_segs = settings.calculate_segments_arc(max_r, arc_rad);
+    if explicit_segments == 0 {
+        return auto_segs.max(3);
+    }
+    let default_settings = TessellationSettings::default();
+    if *settings == default_settings {
+        explicit_segments.max(3)
+    } else if explicit_segments == default_segments() {
+        auto_segs.max(3)
+    } else {
+        let base_segs = default_settings.calculate_segments_arc(max_r, arc_rad).max(1);
+        let scaled = ((explicit_segments as f64) * (auto_segs as f64 / base_segs as f64)).round() as usize;
+        scaled.max(3)
+    }
+}
+
+#[inline]
+pub(crate) fn resolve_sphere_resolution(
+    explicit_sectors: usize,
+    explicit_stacks: usize,
+    radius: f64,
+    settings: &TessellationSettings,
+) -> (usize, usize) {
+    let (auto_sec, auto_stk) = settings.calculate_sphere_resolution(radius);
+    let default_settings = TessellationSettings::default();
+    let (def_sec, def_stk) = default_settings.calculate_sphere_resolution(radius);
+
+    let sec = if explicit_sectors == 0 {
+        auto_sec.max(3)
+    } else if *settings == default_settings {
+        explicit_sectors.max(3)
+    } else if explicit_sectors == default_sectors() {
+        auto_sec.max(3)
+    } else {
+        let scaled = ((explicit_sectors as f64) * (auto_sec as f64 / def_sec.max(1) as f64)).round() as usize;
+        scaled.max(3)
+    };
+
+    let stk = if explicit_stacks == 0 {
+        auto_stk.max(2)
+    } else if *settings == default_settings {
+        explicit_stacks.max(2)
+    } else if explicit_stacks == default_stacks() {
+        auto_stk.max(2)
+    } else {
+        let scaled = ((explicit_stacks as f64) * (auto_stk as f64 / def_stk.max(1) as f64)).round() as usize;
+        scaled.max(2)
+    };
+
+    (sec, stk)
+}
+
+#[inline]
 fn apply_pos_rot(
     mesh: &mut TriangleMesh,
     position: &Option<[f64; 3]>,
@@ -251,6 +338,92 @@ fn apply_pos_rot(
     let rot = rotation_deg.unwrap_or([0.0, 0.0, 0.0]);
     if pos != [0.0, 0.0, 0.0] || rot != [0.0, 0.0, 0.0] {
         mesh.transform(pos, rot);
+    }
+}
+
+fn normalize_feature_slug(name: &str) -> String {
+    let mut slug = String::with_capacity(name.len());
+    let mut prev_underscore = true;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            prev_underscore = false;
+        } else if !prev_underscore {
+            slug.push('_');
+            prev_underscore = true;
+        }
+    }
+    while slug.ends_with('_') {
+        slug.pop();
+    }
+    slug
+}
+
+fn push_unique_alias(aliases: &mut Vec<String>, candidate: String) {
+    if !aliases.iter().any(|a| a.eq_ignore_ascii_case(&candidate)) {
+        aliases.push(candidate);
+    }
+}
+
+fn tag_node_faces(mesh: &mut TriangleMesh, node: &FeatureNode, node_idx: usize) {
+    if mesh.faces.is_empty() {
+        return;
+    }
+    let uuid_str = node.id.to_string();
+    let idx_prefix = format!("feat_{node_idx}");
+    let slug = normalize_feature_slug(&node.name);
+
+    for face in &mut mesh.faces {
+        face.origin_feature = Some(uuid_str.clone());
+        let role = face.role.clone();
+        if node_idx == 0 {
+            face.name = role.clone();
+        } else {
+            push_unique_alias(&mut face.aliases, role.clone());
+            face.name = format!("{idx_prefix}:{role}");
+        }
+        push_unique_alias(&mut face.aliases, format!("{idx_prefix}:{role}"));
+        if !slug.is_empty() {
+            push_unique_alias(&mut face.aliases, format!("{slug}:{role}"));
+        }
+        push_unique_alias(&mut face.aliases, format!("{uuid_str}:{role}"));
+    }
+}
+
+fn tag_new_cutter_faces(
+    mesh: &mut TriangleMesh,
+    prev_max_id: u32,
+    node: &FeatureNode,
+    node_idx: usize,
+) {
+    let uuid_str = node.id.to_string();
+    let idx_prefix = format!("feat_{node_idx}");
+    let slug = normalize_feature_slug(&node.name);
+
+    for face in &mut mesh.faces {
+        if face.id <= prev_max_id {
+            continue;
+        }
+        if face.origin_feature.is_none() {
+            face.origin_feature = Some(uuid_str.clone());
+        }
+        let role = face.role.clone();
+        push_unique_alias(&mut face.aliases, role.clone());
+        push_unique_alias(&mut face.aliases, format!("{role}:{idx_prefix}"));
+        push_unique_alias(&mut face.aliases, format!("{idx_prefix}:{role}"));
+        push_unique_alias(&mut face.aliases, format!("{role}:{node_idx}"));
+        push_unique_alias(&mut face.aliases, format!("cut:{idx_prefix}:{role}"));
+        if !slug.is_empty() {
+            push_unique_alias(&mut face.aliases, format!("{role}:{slug}"));
+            push_unique_alias(&mut face.aliases, format!("{slug}:{role}"));
+        }
+        push_unique_alias(&mut face.aliases, format!("{role}:{uuid_str}"));
+        push_unique_alias(&mut face.aliases, format!("{uuid_str}:{role}"));
+
+        if role.starts_with("hole_") || role.starts_with("keyway_") || role.starts_with("helical_")
+        {
+            face.name = format!("{role}:{idx_prefix}");
+        }
     }
 }
 
@@ -316,10 +489,18 @@ impl FeatureTree {
             FeatureOp::BooleanDifferenceMesh { .. } => "Boolean Difference Mesh".to_string(),
             FeatureOp::BooleanUnionMesh { .. } => "Boolean Union Mesh".to_string(),
             FeatureOp::BooleanIntersectionMesh { .. } => "Boolean Intersection Mesh".to_string(),
+            FeatureOp::ImportedMesh { .. } => "Imported Mesh".to_string(),
             FeatureOp::Transform { .. } => "Transform".to_string(),
         };
         let node_name = name.unwrap_or(default_name);
         let node = FeatureNode::new(node_name, op);
+        let id = node.id;
+        self.nodes.push(node);
+        id
+    }
+
+    /// Appends a pre-constructed [`FeatureNode`] to the history tree, returning its unique ID.
+    pub fn add_node(&mut self, node: FeatureNode) -> Uuid {
         let id = node.id;
         self.nodes.push(node);
         id
@@ -366,11 +547,14 @@ impl FeatureTree {
     /// Evaluates the complete feature history tree with adaptive tessellation settings.
     pub fn evaluate_with_settings(&self, settings: &TessellationSettings) -> Result<TriangleMesh, CadError> {
         let mut current_mesh: Option<TriangleMesh> = None;
+        let mut active_node_idx = 0usize;
 
         for node in &self.nodes {
             if !node.enabled {
                 continue;
             }
+            let node_idx = active_node_idx;
+            active_node_idx += 1;
 
             match &node.op {
                 FeatureOp::AddBox {
@@ -380,7 +564,13 @@ impl FeatureTree {
                     position,
                     rotation_deg,
                 } => {
-                    if *width <= 0.0 || *height <= 0.0 || *depth <= 0.0 {
+                    if !width.is_finite()
+                        || !height.is_finite()
+                        || !depth.is_finite()
+                        || *width <= 0.0
+                        || *height <= 0.0
+                        || *depth <= 0.0
+                    {
                         return Err(CadError::InvalidParameter(format!(
                             "Box dimensions must be positive, got: {}x{}x{}",
                             width, height, depth
@@ -388,6 +578,7 @@ impl FeatureTree {
                     }
                     let mut box_mesh = create_box(*width, *height, *depth);
                     apply_pos_rot(&mut box_mesh, position, rotation_deg);
+                    tag_node_faces(&mut box_mesh, node, node_idx);
                     current_mesh = match current_mesh {
                         Some(m) => Some(csg_union(&m, &box_mesh)),
                         None => Some(box_mesh),
@@ -396,19 +587,20 @@ impl FeatureTree {
                 FeatureOp::AddCylinder {
                     radius,
                     height,
-                    segments: _,
+                    segments,
                     position,
                     rotation_deg,
                 } => {
-                    if *radius <= 0.0 || *height <= 0.0 {
+                    if !radius.is_finite() || !height.is_finite() || *radius <= 0.0 || *height <= 0.0 {
                         return Err(CadError::InvalidParameter(format!(
                             "Cylinder radius and height must be positive, got: r={}, h={}",
                             radius, height
                         )));
                     }
-                    let segs = settings.calculate_segments(*radius);
+                    let segs = resolve_radial_segments(*segments, *radius, 8, settings);
                     let mut cyl_mesh = create_cylinder(*radius, *height, segs);
                     apply_pos_rot(&mut cyl_mesh, position, rotation_deg);
+                    tag_node_faces(&mut cyl_mesh, node, node_idx);
                     current_mesh = match current_mesh {
                         Some(m) => Some(csg_union(&m, &cyl_mesh)),
                         None => Some(cyl_mesh),
@@ -429,11 +621,35 @@ impl FeatureTree {
                             sides
                         )));
                     }
-                    if *height <= 0.0 {
+                    if !height.is_finite() || *height <= 0.0 {
                         return Err(CadError::InvalidParameter(format!(
                             "Polygon prism height must be positive, got: {}",
                             height
                         )));
+                    }
+                    if let Some(w) = width_across_flats {
+                        if !w.is_finite() || *w <= 0.0 {
+                            return Err(CadError::InvalidParameter(format!(
+                                "Polygon prism width_across_flats must be positive, got: {}",
+                                w
+                            )));
+                        }
+                    }
+                    if let Some(r) = radius {
+                        if !r.is_finite() || *r <= 0.0 {
+                            return Err(CadError::InvalidParameter(format!(
+                                "Polygon prism radius must be positive, got: {}",
+                                r
+                            )));
+                        }
+                    }
+                    if let Some(c) = chamfer {
+                        if !c.is_finite() || *c < 0.0 {
+                            return Err(CadError::InvalidParameter(format!(
+                                "Polygon prism chamfer must be non-negative, got: {}",
+                                c
+                            )));
+                        }
                     }
                     let has_waf = width_across_flats.map(|w| w > 0.0).unwrap_or(false);
                     let has_r = radius.map(|r| r > 0.0).unwrap_or(false);
@@ -450,6 +666,7 @@ impl FeatureTree {
                         *chamfer,
                     );
                     apply_pos_rot(&mut prism_mesh, position, rotation_deg);
+                    tag_node_faces(&mut prism_mesh, node, node_idx);
                     current_mesh = match current_mesh {
                         Some(m) => Some(csg_union(&m, &prism_mesh)),
                         None => Some(prism_mesh),
@@ -457,20 +674,21 @@ impl FeatureTree {
                 }
                 FeatureOp::AddSphere {
                     radius,
-                    sectors: _,
-                    stacks: _,
+                    sectors,
+                    stacks,
                     position,
                     rotation_deg,
                 } => {
-                    if *radius <= 0.0 {
+                    if !radius.is_finite() || *radius <= 0.0 {
                         return Err(CadError::InvalidParameter(format!(
                             "Sphere radius must be positive, got: r={}",
                             radius
                         )));
                     }
-                    let (sec, stk) = settings.calculate_sphere_resolution(*radius);
+                    let (sec, stk) = resolve_sphere_resolution(*sectors, *stacks, *radius, settings);
                     let mut sph_mesh = create_sphere(*radius, sec, stk);
                     apply_pos_rot(&mut sph_mesh, position, rotation_deg);
+                    tag_node_faces(&mut sph_mesh, node, node_idx);
                     current_mesh = match current_mesh {
                         Some(m) => Some(csg_union(&m, &sph_mesh)),
                         None => Some(sph_mesh),
@@ -480,11 +698,14 @@ impl FeatureTree {
                     radius_bottom,
                     radius_top,
                     height,
-                    segments: _,
+                    segments,
                     position,
                     rotation_deg,
                 } => {
-                    if *height <= 0.0
+                    if !height.is_finite()
+                        || !radius_bottom.is_finite()
+                        || !radius_top.is_finite()
+                        || *height <= 0.0
                         || (*radius_bottom <= 0.0 && *radius_top <= 0.0)
                         || *radius_bottom < 0.0
                         || *radius_top < 0.0
@@ -495,9 +716,10 @@ impl FeatureTree {
                         )));
                     }
                     let max_r = radius_bottom.max(*radius_top);
-                    let segs = settings.calculate_segments(max_r);
+                    let segs = resolve_radial_segments(*segments, max_r, 3, settings);
                     let mut cone_mesh = create_cone(*radius_bottom, *radius_top, *height, segs);
                     apply_pos_rot(&mut cone_mesh, position, rotation_deg);
+                    tag_node_faces(&mut cone_mesh, node, node_idx);
                     current_mesh = match current_mesh {
                         Some(m) => Some(csg_union(&m, &cone_mesh)),
                         None => Some(cone_mesh),
@@ -516,7 +738,13 @@ impl FeatureTree {
                     position,
                     rotation_deg,
                 } => {
-                    if *module <= 0.0 || *teeth < 3 || *face_width <= 0.0 {
+                    if !module.is_finite()
+                        || !face_width.is_finite()
+                        || !pressure_angle_deg.is_finite()
+                        || *module <= 0.0
+                        || *teeth < 3
+                        || *face_width <= 0.0
+                    {
                         return Err(CadError::InvalidParameter(format!(
                             "Spur gear parameters invalid: module={}, teeth={}, face_width={}",
                             module, teeth, face_width
@@ -535,6 +763,7 @@ impl FeatureTree {
                         settings,
                     );
                     apply_pos_rot(&mut gear_mesh, position, rotation_deg);
+                    tag_node_faces(&mut gear_mesh, node, node_idx);
                     current_mesh = match current_mesh {
                         Some(m) => Some(csg_union(&m, &gear_mesh)),
                         None => Some(gear_mesh),
@@ -543,7 +772,7 @@ impl FeatureTree {
                 FeatureOp::AddRevolve {
                     profile,
                     angle_deg,
-                    segments: _,
+                    segments,
                     position,
                     rotation_deg,
                 } => {
@@ -552,19 +781,65 @@ impl FeatureTree {
                             "Revolve profile must contain at least 3 points [r, z]".into(),
                         ));
                     }
-                    if *angle_deg <= 0.0 || *angle_deg > 360.0 {
+                    if !angle_deg.is_finite() || *angle_deg <= 0.0 || *angle_deg > 360.0 {
                         return Err(CadError::InvalidParameter(format!(
                             "Revolve angle_deg must be in (0, 360], got: {}",
                             angle_deg
                         )));
                     }
-                    if profile.iter().any(|p| p[0] < -1e-9) {
+                    if *segments != 0 && *segments < 3 {
+                        return Err(CadError::InvalidParameter(format!(
+                            "Revolve segments must be >= 3 (or 0 for auto), got: {}",
+                            segments
+                        )));
+                    }
+                    if profile
+                        .iter()
+                        .any(|p| !p[0].is_finite() || !p[1].is_finite() || p[0] < -1e-9)
+                    {
                         return Err(CadError::InvalidParameter(
                             "Revolve profile radius r must be non-negative (r >= 0)".into(),
                         ));
                     }
-                    let mut mesh = create_revolve_with_settings(profile, *angle_deg, settings);
+                    let n_pts = profile.len();
+                    let segments_intersect_2d =
+                        |a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]| -> bool {
+                            let ccw = |p1: [f64; 2], p2: [f64; 2], p3: [f64; 2]| -> f64 {
+                                (p2[0] - p1[0]) * (p3[1] - p1[1])
+                                    - (p2[1] - p1[1]) * (p3[0] - p1[0])
+                            };
+                            let d1 = ccw(a, b, c);
+                            let d2 = ccw(a, b, d);
+                            let d3 = ccw(c, d, a);
+                            let d4 = ccw(c, d, b);
+                            ((d1 > 1e-12 && d2 < -1e-12) || (d1 < -1e-12 && d2 > 1e-12))
+                                && ((d3 > 1e-12 && d4 < -1e-12) || (d3 < -1e-12 && d4 > 1e-12))
+                        };
+                    for i in 0..n_pts {
+                        let i_next = (i + 1) % n_pts;
+                        for j in (i + 2)..n_pts {
+                            let j_next = (j + 1) % n_pts;
+                            if i == 0 && j_next == 0 {
+                                continue;
+                            }
+                            if segments_intersect_2d(
+                                profile[i],
+                                profile[i_next],
+                                profile[j],
+                                profile[j_next],
+                            ) {
+                                return Err(CadError::InvalidParameter(
+                                    "Revolve 2D profile is self-intersecting in the (r, z) plane"
+                                        .into(),
+                                ));
+                            }
+                        }
+                    }
+                    let max_r = profile.iter().map(|p| p[0].abs()).fold(0.0, f64::max);
+                    let segs = resolve_revolve_segments(*segments, max_r, *angle_deg, settings);
+                    let mut mesh = create_revolve(profile, *angle_deg, segs);
                     apply_pos_rot(&mut mesh, position, rotation_deg);
+                    tag_node_faces(&mut mesh, node, node_idx);
                     current_mesh = match current_mesh {
                         Some(m) => Some(csg_union(&m, &mesh)),
                         None => Some(mesh),
@@ -586,7 +861,11 @@ impl FeatureTree {
                     position,
                     rotation_deg,
                 } => {
-                    if *rim_diameter <= 0.0 || *rim_width <= 0.0 {
+                    if !rim_diameter.is_finite()
+                        || !rim_width.is_finite()
+                        || *rim_diameter <= 0.0
+                        || *rim_width <= 0.0
+                    {
                         return Err(CadError::InvalidParameter(format!(
                             "Wheel rim diameter and width must be positive: dia={}, width={}",
                             rim_diameter, rim_width
@@ -608,6 +887,7 @@ impl FeatureTree {
                         settings,
                     );
                     apply_pos_rot(&mut mesh, position, rotation_deg);
+                    tag_node_faces(&mut mesh, node, node_idx);
                     current_mesh = match current_mesh {
                         Some(m) => Some(csg_union(&m, &mesh)),
                         None => Some(mesh),
@@ -621,16 +901,24 @@ impl FeatureTree {
                     keyway_width,
                     keyway_depth,
                 } => {
-                    if *radius <= 0.0 || *depth <= 0.0 {
+                    if !radius.is_finite() || !depth.is_finite() || *radius <= 0.0 || *depth <= 0.0 {
                         return Err(CadError::InvalidParameter(format!(
                             "Cut hole radius and depth must be positive, got: r={}, d={}",
                             radius, depth
                         )));
                     }
+                    let norm_len_sq =
+                        normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2];
+                    if !norm_len_sq.is_finite() || norm_len_sq <= 1e-18 {
+                        return Err(CadError::InvalidParameter(
+                            "Cut hole normal must be a non-zero 3D vector".into(),
+                        ));
+                    }
                     let mesh = current_mesh.ok_or_else(|| {
                         CadError::EvaluationError("Cannot cut hole in empty solid".into())
                     })?;
-                    current_mesh = Some(cut_hole_with_settings(
+                    let prev_max_id = mesh.faces.iter().map(|f| f.id).max().unwrap_or(0);
+                    let mut out_mesh = cut_hole_with_settings(
                         &mesh,
                         *center,
                         *normal,
@@ -639,7 +927,9 @@ impl FeatureTree {
                         *keyway_width,
                         *keyway_depth,
                         settings,
-                    ));
+                    );
+                    tag_new_cutter_faces(&mut out_mesh, prev_max_id, node, node_idx);
+                    current_mesh = Some(out_mesh);
                 }
                 FeatureOp::CutHelicalGroove {
                     helix_radius,
@@ -651,15 +941,26 @@ impl FeatureTree {
                     is_right_hand,
                     profile_type,
                 } => {
-                    if *groove_radius <= 0.0 || *pitch <= 0.0 || *height <= 0.0 {
+                    if !helix_radius.is_finite()
+                        || !groove_radius.is_finite()
+                        || !pitch.is_finite()
+                        || !height.is_finite()
+                        || !start_z.is_finite()
+                        || *helix_radius <= 0.0
+                        || *groove_radius <= 0.0
+                        || *pitch <= 0.0
+                        || *height <= 0.0
+                        || *starts == 0
+                    {
                         return Err(CadError::InvalidParameter(format!(
-                            "Helical groove parameters must be positive: r_groove={}, pitch={}, height={}",
-                            groove_radius, pitch, height
+                            "Helical groove parameters must be positive: r_helix={}, r_groove={}, pitch={}, height={}, starts={}",
+                            helix_radius, groove_radius, pitch, height, starts
                         )));
                     }
                     let mesh = current_mesh.ok_or_else(|| {
                         CadError::EvaluationError("Cannot cut helical groove in empty solid".into())
                     })?;
+                    let prev_max_id = mesh.faces.iter().map(|f| f.id).max().unwrap_or(0);
                     let turns = *height / *pitch;
                     let tool = create_helical_cutter_with_settings(
                         *helix_radius,
@@ -673,31 +974,75 @@ impl FeatureTree {
                         profile_type,
                         settings,
                     );
-                    current_mesh = Some(csg_difference(&mesh, &tool));
+                    let mut out_mesh = csg_difference(&mesh, &tool);
+                    tag_new_cutter_faces(&mut out_mesh, prev_max_id, node, node_idx);
+                    current_mesh = Some(out_mesh);
                 }
                 FeatureOp::BooleanDifferenceMesh { tool_mesh } => {
                     let mesh = current_mesh.ok_or_else(|| {
                         CadError::EvaluationError("Cannot perform boolean difference on empty solid".into())
                     })?;
-                    current_mesh = Some(csg_difference(&mesh, tool_mesh));
+                    let prev_max_id = mesh.faces.iter().map(|f| f.id).max().unwrap_or(0);
+                    let mut tagged_tool = tool_mesh.clone();
+                    if tagged_tool.faces.iter().all(|f| f.origin_feature.is_none()) {
+                        tag_node_faces(&mut tagged_tool, node, node_idx);
+                    }
+                    let mut out_mesh = csg_difference(&mesh, &tagged_tool);
+                    tag_new_cutter_faces(&mut out_mesh, prev_max_id, node, node_idx);
+                    current_mesh = Some(out_mesh);
                 }
                 FeatureOp::BooleanUnionMesh { tool_mesh } => {
                     let mesh = current_mesh.ok_or_else(|| {
                         CadError::EvaluationError("Cannot perform boolean union on empty solid".into())
                     })?;
-                    current_mesh = Some(csg_union(&mesh, tool_mesh));
+                    let prev_max_id = mesh.faces.iter().map(|f| f.id).max().unwrap_or(0);
+                    let mut tagged_tool = tool_mesh.clone();
+                    if tagged_tool.faces.iter().all(|f| f.origin_feature.is_none()) {
+                        tag_node_faces(&mut tagged_tool, node, node_idx);
+                    }
+                    let mut out_mesh = csg_union(&mesh, &tagged_tool);
+                    tag_new_cutter_faces(&mut out_mesh, prev_max_id, node, node_idx);
+                    current_mesh = Some(out_mesh);
                 }
                 FeatureOp::BooleanIntersectionMesh { tool_mesh } => {
                     let mesh = current_mesh.ok_or_else(|| {
                         CadError::EvaluationError("Cannot perform boolean intersection on empty solid".into())
                     })?;
-                    current_mesh = Some(csg_intersection(&mesh, tool_mesh));
+                    let prev_max_id = mesh.faces.iter().map(|f| f.id).max().unwrap_or(0);
+                    let mut tagged_tool = tool_mesh.clone();
+                    if tagged_tool.faces.iter().all(|f| f.origin_feature.is_none()) {
+                        tag_node_faces(&mut tagged_tool, node, node_idx);
+                    }
+                    let mut out_mesh = csg_intersection(&mesh, &tagged_tool);
+                    tag_new_cutter_faces(&mut out_mesh, prev_max_id, node, node_idx);
+                    current_mesh = Some(out_mesh);
+                }
+                FeatureOp::ImportedMesh { mesh } => {
+                    if mesh.vertices.is_empty() {
+                        return Err(CadError::InvalidParameter(
+                            "ImportedMesh cannot have an empty vertex buffer".into(),
+                        ));
+                    }
+                    let mut imported = mesh.clone();
+                    if imported.faces.iter().all(|f| f.origin_feature.is_none()) {
+                        tag_node_faces(&mut imported, node, node_idx);
+                    }
+                    current_mesh = match current_mesh {
+                        Some(m) => Some(csg_union(&m, &imported)),
+                        None => Some(imported),
+                    };
                 }
                 FeatureOp::Transform { translation, rotation_deg, scale } => {
                     let mut mesh = current_mesh.ok_or_else(|| {
                         CadError::EvaluationError("Cannot transform empty solid".into())
                     })?;
-                    if scale[0] == 0.0 || scale[1] == 0.0 || scale[2] == 0.0 {
+                    if scale[0] == 0.0
+                        || scale[1] == 0.0
+                        || scale[2] == 0.0
+                        || scale.iter().any(|s| !s.is_finite())
+                        || translation.iter().any(|t| !t.is_finite())
+                        || rotation_deg.iter().any(|r| !r.is_finite())
+                    {
                         return Err(CadError::InvalidParameter("Scale components cannot be zero".into()));
                     }
                     mesh.scale(*scale);
@@ -834,5 +1179,179 @@ mod tests {
         assert!((center[0] - 10.0).abs() < 1e-4);
         assert!((center[1] - 20.0).abs() < 1e-4);
         assert!((center[2] - 30.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_tree_explicit_segments_and_resolution_honored() {
+        // 1. Cylinder: explicit segments 16 vs 64 must produce distinct triangle counts matching create_cylinder
+        let mut cyl_tree_16 = FeatureTree::new();
+        cyl_tree_16.add_feature(
+            FeatureOp::AddCylinder {
+                radius: 0.02,
+                height: 0.04,
+                segments: 16,
+                position: None,
+                rotation_deg: None,
+            },
+            None,
+        );
+        let mut cyl_tree_64 = FeatureTree::new();
+        cyl_tree_64.add_feature(
+            FeatureOp::AddCylinder {
+                radius: 0.02,
+                height: 0.04,
+                segments: 64,
+                position: None,
+                rotation_deg: None,
+            },
+            None,
+        );
+        let cyl_16 = cyl_tree_16.evaluate().unwrap();
+        let cyl_64 = cyl_tree_64.evaluate().unwrap();
+        assert_eq!(
+            cyl_16.triangle_count(),
+            create_cylinder(0.02, 0.04, 16).triangle_count()
+        );
+        assert_eq!(
+            cyl_64.triangle_count(),
+            create_cylinder(0.02, 0.04, 64).triangle_count()
+        );
+        assert!(cyl_64.triangle_count() > cyl_16.triangle_count());
+
+        // 2. Cone: explicit segments 12 vs 48
+        let mut cone_tree_12 = FeatureTree::new();
+        cone_tree_12.add_feature(
+            FeatureOp::AddCone {
+                radius_bottom: 0.03,
+                radius_top: 0.01,
+                height: 0.05,
+                segments: 12,
+                position: None,
+                rotation_deg: None,
+            },
+            None,
+        );
+        let mut cone_tree_48 = FeatureTree::new();
+        cone_tree_48.add_feature(
+            FeatureOp::AddCone {
+                radius_bottom: 0.03,
+                radius_top: 0.01,
+                height: 0.05,
+                segments: 48,
+                position: None,
+                rotation_deg: None,
+            },
+            None,
+        );
+        let cone_12 = cone_tree_12.evaluate().unwrap();
+        let cone_48 = cone_tree_48.evaluate().unwrap();
+        assert_eq!(
+            cone_12.triangle_count(),
+            create_cone(0.03, 0.01, 0.05, 12).triangle_count()
+        );
+        assert_eq!(
+            cone_48.triangle_count(),
+            create_cone(0.03, 0.01, 0.05, 48).triangle_count()
+        );
+        assert!(cone_48.triangle_count() > cone_12.triangle_count());
+
+        // 3. Sphere: explicit sectors/stacks (12, 8) vs (48, 24)
+        let mut sph_tree_low = FeatureTree::new();
+        sph_tree_low.add_feature(
+            FeatureOp::AddSphere {
+                radius: 0.025,
+                sectors: 12,
+                stacks: 8,
+                position: None,
+                rotation_deg: None,
+            },
+            None,
+        );
+        let mut sph_tree_high = FeatureTree::new();
+        sph_tree_high.add_feature(
+            FeatureOp::AddSphere {
+                radius: 0.025,
+                sectors: 48,
+                stacks: 24,
+                position: None,
+                rotation_deg: None,
+            },
+            None,
+        );
+        let sph_low = sph_tree_low.evaluate().unwrap();
+        let sph_high = sph_tree_high.evaluate().unwrap();
+        assert_eq!(
+            sph_low.triangle_count(),
+            create_sphere(0.025, 12, 8).triangle_count()
+        );
+        assert_eq!(
+            sph_high.triangle_count(),
+            create_sphere(0.025, 48, 24).triangle_count()
+        );
+        assert!(sph_high.triangle_count() > sph_low.triangle_count());
+
+        // 4. Revolve: explicit segments 12 vs 48
+        let profile = vec![[0.01, -0.02], [0.03, -0.02], [0.03, 0.02], [0.01, 0.02]];
+        let mut rev_tree_12 = FeatureTree::new();
+        rev_tree_12.add_feature(
+            FeatureOp::AddRevolve {
+                profile: profile.clone(),
+                angle_deg: 360.0,
+                segments: 12,
+                position: None,
+                rotation_deg: None,
+            },
+            None,
+        );
+        let mut rev_tree_48 = FeatureTree::new();
+        rev_tree_48.add_feature(
+            FeatureOp::AddRevolve {
+                profile: profile.clone(),
+                angle_deg: 360.0,
+                segments: 48,
+                position: None,
+                rotation_deg: None,
+            },
+            None,
+        );
+        let rev_12 = rev_tree_12.evaluate().unwrap();
+        let rev_48 = rev_tree_48.evaluate().unwrap();
+        assert_eq!(
+            rev_12.triangle_count(),
+            create_revolve(&profile, 360.0, 12).triangle_count()
+        );
+        assert_eq!(
+            rev_48.triangle_count(),
+            create_revolve(&profile, 360.0, 48).triangle_count()
+        );
+        assert!(rev_48.triangle_count() > rev_12.triangle_count());
+    }
+
+    #[test]
+    fn test_p2_t33_imported_mesh_and_transform_evaluation() {
+        let base_mesh = create_box(0.02, 0.03, 0.04);
+        let mut tree = FeatureTree::new();
+        tree.add_feature(
+            FeatureOp::ImportedMesh {
+                mesh: base_mesh.clone(),
+            },
+            Some("Imported STL Cube".into()),
+        );
+        tree.add_feature(
+            FeatureOp::Transform {
+                translation: [0.10, -0.05, 0.02],
+                rotation_deg: [0.0, 0.0, 0.0],
+                scale: [2.0, 2.0, 2.0],
+            },
+            None,
+        );
+        let evaluated = tree.evaluate().unwrap();
+        let expected_vol = (0.02 * 0.03 * 0.04) * 8.0;
+        assert!((evaluated.volume() - expected_vol).abs() < 1e-9);
+        let bbox = evaluated.bounding_box();
+        let center = bbox.center();
+        assert!((center[0] - 0.10).abs() < 1e-6);
+        assert!((center[1] - (-0.05)).abs() < 1e-6);
+        assert!((center[2] - 0.02).abs() < 1e-6);
     }
 }

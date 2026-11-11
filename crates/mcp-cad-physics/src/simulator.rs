@@ -26,6 +26,8 @@ pub struct CadJointRecord {
     pub part_b: String,
     /// CAD joint configuration type and anchors.
     pub joint_type: CadJointType,
+    /// Optional motor configuration for actuated joints.
+    pub motor: Option<MotorConfig>,
     /// Rapier impulse joint handle.
     pub handle: ImpulseJointHandle,
 }
@@ -45,6 +47,7 @@ pub struct GearConstraintRecord {
 pub struct PhysicsWorld {
     pipeline: PhysicsPipeline,
     gravity: Vector<Real>,
+    gravity_f64: [f64; 3],
     integration_parameters: IntegrationParameters,
     island_manager: IslandManager,
     broad_phase: DefaultBroadPhase,
@@ -71,6 +74,43 @@ pub struct PhysicsWorld {
 
     // Current elapsed simulation time in seconds
     current_time_s: f64,
+}
+
+impl Clone for PhysicsWorld {
+    fn clone(&self) -> Self {
+        let (collision_sender, collision_receiver) = rapier3d::crossbeam::channel::unbounded();
+        let (contact_force_sender, contact_force_receiver) =
+            rapier3d::crossbeam::channel::unbounded();
+
+        Self {
+            pipeline: PhysicsPipeline::new(),
+            gravity: self.gravity,
+            gravity_f64: self.gravity_f64,
+            integration_parameters: self.integration_parameters,
+            island_manager: self.island_manager.clone(),
+            broad_phase: self.broad_phase.clone(),
+            narrow_phase: self.narrow_phase.clone(),
+            bodies: self.bodies.clone(),
+            colliders: self.colliders.clone(),
+            impulse_joints: self.impulse_joints.clone(),
+            multibody_joints: self.multibody_joints.clone(),
+            ccd_solver: self.ccd_solver.clone(),
+
+            collision_sender,
+            collision_receiver,
+            contact_force_sender,
+            contact_force_receiver,
+
+            part_to_body: self.part_to_body.clone(),
+            body_to_part: self.body_to_part.clone(),
+            collider_to_part: self.collider_to_part.clone(),
+            part_to_colliders: self.part_to_colliders.clone(),
+            joints: self.joints.clone(),
+            gear_constraints: self.gear_constraints.clone(),
+
+            current_time_s: self.current_time_s,
+        }
+    }
 }
 
 impl Default for PhysicsWorld {
@@ -108,6 +148,7 @@ impl PhysicsWorld {
         Self {
             pipeline: PhysicsPipeline::new(),
             gravity: vector![gravity[0] as Real, gravity[1] as Real, gravity[2] as Real],
+            gravity_f64: gravity,
             integration_parameters,
             island_manager: IslandManager::new(),
             broad_phase: DefaultBroadPhase::new(),
@@ -137,15 +178,12 @@ impl PhysicsWorld {
     /// Sets the gravity acceleration vector [gx, gy, gz].
     pub fn set_gravity(&mut self, gravity: [f64; 3]) {
         self.gravity = vector![gravity[0] as Real, gravity[1] as Real, gravity[2] as Real];
+        self.gravity_f64 = gravity;
     }
 
     /// Gets the current gravity acceleration vector [gx, gy, gz].
     pub fn gravity(&self) -> [f64; 3] {
-        [
-            self.gravity.x as f64,
-            self.gravity.y as f64,
-            self.gravity.z as f64,
-        ]
+        self.gravity_f64
     }
 
     /// Current accumulated simulation time in seconds.
@@ -180,7 +218,10 @@ impl PhysicsWorld {
         initial_position: Option<[f64; 3]>,
         initial_rotation: Option<[f64; 4]>,
     ) -> Result<RigidBodyHandle, PhysicsError> {
-        if self.part_to_body.contains_key(&part.id) {
+        if self.part_to_body.contains_key(&part.id)
+            || part.id.eq_ignore_ascii_case("ground")
+            || part.id.eq_ignore_ascii_case("world")
+        {
             return Err(PhysicsError::PartAlreadyExists(part.id.clone()));
         }
 
@@ -205,8 +246,100 @@ impl PhysicsWorld {
         Ok(rb_handle)
     }
 
+    /// Updates the collider and mass properties of a CAD [`Part`] in the physics world
+    /// while preserving its [`RigidBodyHandle`] and all attached joints (`joints`,
+    /// `impulse_joints`, and `gear_constraints`).
+    ///
+    /// If the part is not yet registered in the physics world, this delegates to
+    /// [`Self::add_part`] using `!part.is_fixed` as `is_dynamic`.
+    pub fn update_part_collider(&mut self, part: &Part) -> Result<RigidBodyHandle, PhysicsError> {
+        if part.id.eq_ignore_ascii_case("ground") || part.id.eq_ignore_ascii_case("world") {
+            return Err(PhysicsError::InvalidJointConfiguration(format!(
+                "Cannot modify geometry of reserved static anchor '{}'",
+                part.id
+            )));
+        }
+        let is_dynamic = !part.is_fixed;
+        let Some(&rb_handle) = self.part_to_body.get(&part.id) else {
+            return self.add_part(part, is_dynamic);
+        };
+
+        let collider_type = if is_dynamic {
+            ColliderType::ConvexHull
+        } else {
+            ColliderType::TriMesh
+        };
+        let collider_builder = create_collider_builder(part, collider_type)?;
+
+        if let Some(old_colliders) = self.part_to_colliders.remove(&part.id) {
+            for col_h in old_colliders {
+                self.collider_to_part.remove(&col_h);
+                self.colliders.remove(
+                    col_h,
+                    &mut self.island_manager,
+                    &mut self.bodies,
+                    true,
+                );
+            }
+        }
+
+        if let Some(rb) = self.bodies.get_mut(rb_handle) {
+            let target_type = if is_dynamic {
+                RigidBodyType::Dynamic
+            } else {
+                RigidBodyType::Fixed
+            };
+            if rb.body_type() != target_type {
+                rb.set_body_type(target_type, true);
+            }
+        }
+
+        let collider_handle = self.colliders.insert_with_parent(
+            collider_builder,
+            rb_handle,
+            &mut self.bodies,
+        );
+        self.collider_to_part.insert(collider_handle, part.id.clone());
+        self.part_to_colliders
+            .entry(part.id.clone())
+            .or_default()
+            .push(collider_handle);
+
+        if let Some(rb) = self.bodies.get_mut(rb_handle) {
+            rb.recompute_mass_properties_from_colliders(&self.colliders);
+            rb.wake_up(true);
+        }
+
+        // Wake up any bodies coupled to this part via joints
+        let coupled_body_handles: Vec<RigidBodyHandle> = self
+            .joints
+            .values()
+            .filter(|rec| rec.part_a == part.id || rec.part_b == part.id)
+            .flat_map(|rec| {
+                [
+                    self.part_to_body.get(&rec.part_a).copied(),
+                    self.part_to_body.get(&rec.part_b).copied(),
+                ]
+            })
+            .flatten()
+            .collect();
+        for h in coupled_body_handles {
+            if let Some(rb) = self.bodies.get_mut(h) {
+                rb.wake_up(true);
+            }
+        }
+
+        Ok(rb_handle)
+    }
+
     /// Removes a CAD part, its colliders, and all attached joints from the world.
     pub fn remove_part(&mut self, part_id: &str) -> Result<(), PhysicsError> {
+        if part_id.eq_ignore_ascii_case("ground") || part_id.eq_ignore_ascii_case("world") {
+            return Err(PhysicsError::InvalidJointConfiguration(format!(
+                "Cannot remove reserved static anchor '{part_id}' from physics world"
+            )));
+        }
+
         let rb_handle = self
             .part_to_body
             .remove(part_id)
@@ -260,14 +393,26 @@ impl PhysicsWorld {
             return Err(PhysicsError::JointAlreadyExists(j_id));
         }
 
+        let norm_part = |id: &str| -> String {
+            if id.eq_ignore_ascii_case("ground") {
+                "ground".to_string()
+            } else if id.eq_ignore_ascii_case("world") {
+                "world".to_string()
+            } else {
+                id.to_string()
+            }
+        };
+        let norm_a = norm_part(part_a);
+        let norm_b = norm_part(part_b);
+
         let handle_a = *self
             .part_to_body
-            .get(part_a)
+            .get(&norm_a)
             .ok_or_else(|| PhysicsError::PartNotFound(part_a.to_string()))?;
 
         let handle_b = *self
             .part_to_body
-            .get(part_b)
+            .get(&norm_b)
             .ok_or_else(|| PhysicsError::PartNotFound(part_b.to_string()))?;
 
         let generic_joint = joint_type.build_generic_joint(motor)?;
@@ -279,9 +424,10 @@ impl PhysicsWorld {
             j_id.clone(),
             CadJointRecord {
                 id: j_id.clone(),
-                part_a: part_a.to_string(),
-                part_b: part_b.to_string(),
+                part_a: norm_a.clone(),
+                part_b: norm_b.clone(),
                 joint_type: joint_type.clone(),
+                motor,
                 handle: joint_handle,
             },
         );
@@ -291,8 +437,8 @@ impl PhysicsWorld {
                 j_id.clone(),
                 GearConstraintRecord {
                     id: j_id,
-                    part_a: part_a.to_string(),
-                    part_b: part_b.to_string(),
+                    part_a: norm_a,
+                    part_b: norm_b,
                     ratio: *ratio,
                     axis_a: Vector3::new(axis_a[0], axis_a[1], axis_a[2]),
                     axis_b: Vector3::new(axis_b[0], axis_b[1], axis_b[2]),
@@ -303,38 +449,77 @@ impl PhysicsWorld {
         Ok(joint_handle)
     }
 
+    /// Returns a reference to all registered CAD joints.
+    pub fn joints(&self) -> &HashMap<String, CadJointRecord> {
+        &self.joints
+    }
+
     /// Updates motor actuation on an existing joint.
     pub fn set_joint_motor(
         &mut self,
         joint_id: &str,
         motor: MotorConfig,
     ) -> Result<(), PhysicsError> {
-        let record = self
-            .joints
-            .get(joint_id)
-            .ok_or_else(|| PhysicsError::JointNotFound(joint_id.to_string()))?;
+        let (handle, joint_type) = {
+            let record = self
+                .joints
+                .get(joint_id)
+                .ok_or_else(|| PhysicsError::JointNotFound(joint_id.to_string()))?;
+            (record.handle, record.joint_type.clone())
+        };
 
-        let joint = self
-            .impulse_joints
-            .get_mut(record.handle)
-            .ok_or_else(|| PhysicsError::JointNotFound(joint_id.to_string()))?;
+        let (body1, body2) = {
+            let joint = self
+                .impulse_joints
+                .get_mut(handle)
+                .ok_or_else(|| PhysicsError::JointNotFound(joint_id.to_string()))?;
 
-        record.joint_type.apply_motor(&mut joint.data, motor)
+            joint_type.apply_motor(&mut joint.data, motor)?;
+            (joint.body1, joint.body2)
+        };
+
+        if let Some(record) = self.joints.get_mut(joint_id) {
+            record.motor = Some(motor);
+        }
+
+        for body_handle in [body1, body2] {
+            if let Some(rb) = self.bodies.get_mut(body_handle) {
+                rb.wake_up(true);
+            }
+        }
+        Ok(())
     }
 
     /// Disables motor actuation on an existing joint.
     pub fn disable_joint_motor(&mut self, joint_id: &str) -> Result<(), PhysicsError> {
-        let record = self
-            .joints
-            .get(joint_id)
-            .ok_or_else(|| PhysicsError::JointNotFound(joint_id.to_string()))?;
+        let (handle, joint_type) = {
+            let record = self
+                .joints
+                .get(joint_id)
+                .ok_or_else(|| PhysicsError::JointNotFound(joint_id.to_string()))?;
+            (record.handle, record.joint_type.clone())
+        };
 
-        let joint = self
-            .impulse_joints
-            .get_mut(record.handle)
-            .ok_or_else(|| PhysicsError::JointNotFound(joint_id.to_string()))?;
+        let (body1, body2) = {
+            let joint = self
+                .impulse_joints
+                .get_mut(handle)
+                .ok_or_else(|| PhysicsError::JointNotFound(joint_id.to_string()))?;
 
-        record.joint_type.disable_motor(&mut joint.data)
+            joint_type.disable_motor(&mut joint.data)?;
+            (joint.body1, joint.body2)
+        };
+
+        if let Some(record) = self.joints.get_mut(joint_id) {
+            record.motor = None;
+        }
+
+        for body_handle in [body1, body2] {
+            if let Some(rb) = self.bodies.get_mut(body_handle) {
+                rb.wake_up(true);
+            }
+        }
+        Ok(())
     }
 
     /// Removes a joint by identifier.
@@ -618,9 +803,16 @@ impl PhysicsWorld {
     // --- Query and inspection methods ---
 
     fn get_body(&self, part_id: &str) -> Result<&RigidBody, PhysicsError> {
+        let norm_id = if part_id.eq_ignore_ascii_case("ground") {
+            "ground"
+        } else if part_id.eq_ignore_ascii_case("world") {
+            "world"
+        } else {
+            part_id
+        };
         let handle = self
             .part_to_body
-            .get(part_id)
+            .get(norm_id)
             .ok_or_else(|| PhysicsError::PartNotFound(part_id.to_string()))?;
         self.bodies
             .get(*handle)
@@ -628,13 +820,74 @@ impl PhysicsWorld {
     }
 
     fn get_body_mut(&mut self, part_id: &str) -> Result<&mut RigidBody, PhysicsError> {
+        let norm_id = if part_id.eq_ignore_ascii_case("ground") {
+            "ground"
+        } else if part_id.eq_ignore_ascii_case("world") {
+            "world"
+        } else {
+            part_id
+        };
         let handle = self
             .part_to_body
-            .get(part_id)
+            .get(norm_id)
             .ok_or_else(|| PhysicsError::PartNotFound(part_id.to_string()))?;
         self.bodies
             .get_mut(*handle)
             .ok_or_else(|| PhysicsError::PartNotFound(part_id.to_string()))
+    }
+
+    /// Returns `true` if a part is registered in the physics world.
+    pub fn has_part(&self, part_id: &str) -> bool {
+        let norm_id = if part_id.eq_ignore_ascii_case("ground") {
+            "ground"
+        } else if part_id.eq_ignore_ascii_case("world") {
+            "world"
+        } else {
+            part_id
+        };
+        self.part_to_body.contains_key(norm_id)
+    }
+
+    /// Returns `true` if a registered part's rigid body is dynamic (movable), or `false` if fixed.
+    pub fn is_part_dynamic(&self, part_id: &str) -> Result<bool, PhysicsError> {
+        let rb = self.get_body(part_id)?;
+        Ok(rb.is_dynamic())
+    }
+
+    /// Returns the computed mass (in kg) of a registered part's rigid body.
+    pub fn part_mass(&self, part_id: &str) -> Result<f64, PhysicsError> {
+        let rb = self.get_body(part_id)?;
+        Ok(rb.mass() as f64)
+    }
+
+    /// Returns the world-space axis-aligned bounding box `([min_x, min_y, min_z], [max_x, max_y, max_z])`
+    /// in meters of all colliders attached to a registered part.
+    pub fn part_collider_aabb(&self, part_id: &str) -> Result<([f64; 3], [f64; 3]), PhysicsError> {
+        let _ = self.get_body(part_id)?;
+        let col_handles = self
+            .part_to_colliders
+            .get(part_id)
+            .ok_or_else(|| PhysicsError::PartNotFound(part_id.to_string()))?;
+        if col_handles.is_empty() {
+            return Err(PhysicsError::InvalidGeometry(
+                part_id.to_string(),
+                "Part has no colliders".to_string(),
+            ));
+        }
+        let mut min = [f64::INFINITY; 3];
+        let mut max = [f64::NEG_INFINITY; 3];
+        for &col_h in col_handles {
+            if let Some(col) = self.colliders.get(col_h) {
+                let aabb = col.compute_aabb();
+                min[0] = min[0].min(aabb.mins.x as f64);
+                min[1] = min[1].min(aabb.mins.y as f64);
+                min[2] = min[2].min(aabb.mins.z as f64);
+                max[0] = max[0].max(aabb.maxs.x as f64);
+                max[1] = max[1].max(aabb.maxs.y as f64);
+                max[2] = max[2].max(aabb.maxs.z as f64);
+            }
+        }
+        Ok((min, max))
     }
 
     /// Retrieves current 3D position [x, y, z] of a part.
@@ -661,6 +914,11 @@ impl PhysicsWorld {
         let rb = self.get_body(part_id)?;
         let lv = rb.linvel();
         Ok([lv.x as f64, lv.y as f64, lv.z as f64])
+    }
+
+    /// Retrieves current linear velocity [vx, vy, vz] of a part (alias for [`Self::part_velocity`]).
+    pub fn part_linear_velocity(&self, part_id: &str) -> Result<[f64; 3], PhysicsError> {
+        self.part_velocity(part_id)
     }
 
     /// Retrieves current angular velocity [wx, wy, wz] of a part.

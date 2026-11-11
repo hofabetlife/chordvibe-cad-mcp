@@ -1,31 +1,33 @@
 # PROJECT_CONTEXT: MCP-CAD Engine
 
-> **Единый источник правды (Single Source of Truth) для инженерных субагентов проекта.**  
-> Любая разработка, рефакторинг и добавление модулей должны соответствовать спецификациям, соглашениям и контрактам, описанным в этом документе.
+> **Единый источник правды (Single Source of Truth) для инженеров и ИИ-агентов проекта.**  
+> Любая разработка, рефакторинг, добавление инструментов и написание документации должны строго соответствовать архитектурным решениям, геометрическим инвариантам и контрактам, зафиксированным в этом документе.
 
 ---
 
 ## 1. Обзор проекта и Видение
 
-**MCP-CAD Engine** — автономная инженерная 3D CAD/CAE система на языке **Rust под Windows**, изначально спроектированная под управление искусственным интеллектом (AI Agents) через протокол **Model Context Protocol (MCP)**.
+**MCP-CAD Engine** — автономная инженерная 3D CAD/CAE система на языке **Rust**, спроектированная для управления искусственным интеллектом (LLM / AI Agents) через протокол **Model Context Protocol (MCP)** (`2024-11-05`, JSON-RPC 2.0).
 
-Система реализует замкнутый инженерный цикл ИИ-агента:
-$$\text{Проектирование (Solid DAG)} \longrightarrow \text{Симуляция динамики (Rapier3D)} \longrightarrow \text{Анализ прочности (FEA/МКЭ)} \longrightarrow \text{Визуальный аудит (WGPU)} \longrightarrow \text{Экспорт (STL)}$$
+Система реализует замкнутый верифицируемый цикл инженерного проектирования ИИ-агента:
+$$\text{Требования (Requirements)} \longrightarrow \text{Проектирование (Solid DAG)} \longrightarrow \text{Топологический аудит (Mesh Validation)} \longrightarrow \text{Анализ прочности (FEA) и Кинематики (Rapier3D)} \longrightarrow \text{Визуальный контроль (WGPU) и Экспорт (STL / Project JSON)}$$
 
 ### Ключевые возможности
-1. **Solid Modeling DAG (B-Rep / CSG)**: Параметрическое дерево построения деталей с возможностью отката и изменения параметров любого шага в истории без потери топологии.
-2. **Кинематика и физика механизмов (Rapier3D)**: Твердые тела, сочленения (Revolute, Prismatic, Spherical, Fixed), моторы, расчет реакций и телеметрии.
-3. **Линейный МКЭ-анализ (FEA Linear Elasticity)**: Автоматическая 3D тетраэдризация (TET4), расчет матрицы жесткости ($K \cdot u = F$), вычисление эквивалентных напряжений Мизеса и коэффициента запаса прочности ($FoS$).
-4. **WGPU 3D Viewport & Headless Render**: Нативное окно Windows с CAD-шейдингом и тепловыми картами деформаций/напряжений + оффскрин-рендеринг в PNG/Base64 для мультимодальных LLM.
-5. **Двойной транспорт MCP**: Поддержка `stdio` (для локального встраивания в Claude Desktop, Antigravity, Cursor) и `HTTP/SSE` (для распределенного взаимодействия через порт `8080`).
+1. **Параметрическое твердотельное моделирование (Solid Modeling DAG & CBO)**: Дерево построения деталей (`FeatureTree`) с поддержкой 8 аналитических и машиностроительных примитивов (`box`, `cylinder`, `sphere`, `cone`, `polygon_prism`, `spur_gear`, `revolve`, `wheel_rim`), вырезов (`cut_hole` со шпоночным пазом и режимом `through: true`, `cut_helical_groove` со спиральным и резьбовым профилем ISO 68-1), булевых операций CSG (`union`, `difference`, `intersection`), пространственных трансформаций (`transform_part` с выравниванием по именованным граням), редактирования истории (`modify_feature`) и стоимостного оптимизатора запросов (**Cost-Based CAD Query Optimizer**, правила `R1`–`R5`).
+2. **Топологическое именование граней (`FaceInfo`) и семантические селекторы (`FaceSelector`)**: Каждый треугольник сетки несёт идентификатор логической грани `face_id`, сохраняющийся при трансформациях и булевых операциях CSG. ИИ-агент обращается к поверхностям детали по смыслу (`"cap_top"`, `"cap_bottom"`, `"hole_wall:feat_1"`, `{"where": {"kind": "cylinder", "radius": 5.0}}`), а не по «сырым» координатам.
+3. **Слой инженерных требований и самопроверки (`Requirements Layer`)**: Декларативное задание ограничений (`bbox_max`, `bbox_min`, `mass_max`, `mesh_valid`, `min_safety_factor`, `no_interference`, `mechanism_dof`) через `set_requirements` (`auto_check: true`) и проверка запасов через `check_requirements` с отслеживанием актуальности расчётов МКЭ по ревизии детали (`part.revision`).
+4. **Линейный МКЭ-анализ прочности (FEA Linear Elasticity)**: Воксельная тетраэдризация (`TET4`, `element_order = 1`) и квадратичные 10-узловые изопараметрические тетраэдры (`TET10`, `element_order = 2`, 4-точечная квадратура Гаусса 2-го порядка, устраняющая `shear locking` при изгибе) с адаптивным измельчением поверхностных рёбер, сборка разреженной матрицы жёсткости ($K \cdot u = F$), решение методом сопряжённых градиентов (PCG), граничные условия Дирихле и Неймана (силы в `N`, давление в `MPa`, моменты в `N·m`) по именованным граням, расчёт напряжений по Мизесу ($\sigma_{vM}$) и коэффициента запаса прочности ($FoS = \sigma_y / \max \sigma_{vM}$).
+5. **Кинематика и динамика механизмов (`Rapier3D`)**: Твёрдые тела с автоматическим пересчётом массы, центра масс и тензора инерции из полигональной сетки и плотности материала $\rho$; 5 типов сочленений (`Revolute`, `Prismatic`, `Spherical`, `Fixed`, `Gear`), приводы (`set_joint_motor`), статические якоря `"ground"` / `"world"`, телеметрия траекторий, пиковых реакций и коллизий.
+6. **WGPU 3D Viewport & Headless Offscreen Render**: Оффскрин-рендеринг сцены и тепловых карт МКЭ в PNG/Base64 (`capture_viewport`, `get_fea_heatmap_image`), работающий на любой платформе (включая headless-контейнеры через программный Vulkan Lavapipe и CPU-fallback), а также нативное интерактивное 3D-окно (`winit` + `wgpu`, `open_preview_window`, `--gui`, `--stl`).
+7. **Двойной транспорт MCP и персистентность**: Поддержка `stdio` (для локального запуска в Google Antigravity, Claude Desktop, Cursor) и `HTTP/SSE` (Axum), плюс транзакционное сохранение/загрузка проектов (`save_project` / `load_project`, `schema_version = "1.0.0"`).
 
 ---
 
 ## 2. Целевая платформа и технологический стек
 
-- **Операционная система**: Windows 10/11 x64 (целевая платформа; кроссплатформенный код приветствуется).
-- **Язык разработки**: Rust (компилятор Rust $\ge 1.80$, Edition 2021).
-- **Философия зависимостей**: **Pure Rust (Zero C++ dependency)**. Сборка не должна требовать MSVC C++ SDK, CMake, Clang или внешних бинарных DLL. Все математические, геометрические, физические и графические вычисления производятся в Rust.
+- **Операционная система**: Windows 10/11 x64 (целевая десктопная платформа) и Linux x86_64 (облачная среда разработки, CI и контейнеры).
+- **Язык и тулчейн**: **Rust `1.91`** (зафиксирован в `rust-toolchain.toml` и `Dockerfile` на базе `rust:1.91-bookworm`, Edition 2021) + TypeScript/React (Vite) для веб-интерфейса предпросмотра на порту `3000`.
+- **Философия зависимостей**: **Pure Rust (Zero C++ dependency)**. Сборка не требует MSVC C++ SDK, CMake, Clang или внешних системных DLL. Все геометрические, топологические, конечно-элементные, физические и графические вычисления выполняются на чистом Rust.
 
 ---
 
@@ -33,17 +35,34 @@ $$\text{Проектирование (Solid DAG)} \longrightarrow \text{Симу
 
 Проект организован как Cargo Workspace из 5 модульных крейтов:
 
-```
-c:\Users\voley\Documents\3D_MCP/
-├── Cargo.toml                    # Корневой workspace манифест
-├── PRD.md                        # Product Requirements Document
-├── PROJECT_CONTEXT.md            # Данный контекст проекта
+```text
+mcp-cad/
+├── Cargo.toml                    # Корневой манифест workspace
+├── rust-toolchain.toml           # Фиксация компилятора Rust 1.91 (clippy, rustfmt)
+├── PROJECT_CONTEXT.md            # Единый источник правды (архитектура и принятые решения)
+├── TASKS.md                      # Актуальный бэклог задач и сводный реестр выполненных фаз
+├── docs/
+│   ├── AGENT_GUIDE.md            # Операционное руководство для ИИ-агента (<= 2 стр.)
+│   ├── MCP_API_REFERENCE.md      # Полный справочник схем и примеров всех 34 MCP-инструментов
+│   ├── UNITS.md                  # Аудит и спецификация контракта единиц измерения [DECISION-UNITS-1]
+│   ├── FACE_NAMING_DESIGN.md     # Архитектура топологического именования граней [DECISION-FACES-1..4]
+│   ├── FEA_ACCURACY.md           # Матрица базовой точности МКЭ на 4 аналитических эталонах (P3-T1, P3-T4)
+│   ├── DECISIONS.md              # Архитектурные решения уровня сервера и транспорта (ADR-001..004)
+│   ├── MIGRATION_TS_TO_RUST.md   # План консолидации TS-клиента вокруг единого Rust-бэкенда
+│   ├── BENCH_BASELINE_RUST.md    # Базовая линия 15 задач бенчмарка против нативного Rust-сервера
+│   ├── adr/0001-geometry-kernel.md # ADR выбора геометрического ядра (manifold-rust + monstertruck)
+│   ├── adr/0002-fe-mesher.md        # ADR выбора генератора сетки МКЭ (fe_snap + TET10, P3-T5)
+│   └── agent_tasks/              # Детальные отчёты о выполнении задач P0-T1..T12, P1-T1..T4, P2-T1..T40, P3-T1..T5
+├── spikes/
+│   ├── manifold_rust/            # Прототип ядра manifold-rust v0.19.2 (Pure Rust CSG + face_id)
+│   ├── monstertruck_brep/        # Прототип B-Rep ядра monstertruck v0.4.1 (fillet + ISO 10303-21 STEP)
+│   └── fe_snap/                  # Прототип boundary-conforming мешера (P3-T5: line-search + TET10)
 └── crates/
-    ├── mcp-cad-core/             # Геометрическое ядро, B-Rep/CSG примитивы, DAG, материалы, STL
-    ├── mcp-cad-physics/          # Интеграция Rapier3D, сочленения, моторы, симуляция
-    ├── mcp-cad-fea/              # Тетраэдризация (TET4), МКЭ решатель, Мизес, FoS
-    ├── mcp-cad-viewer/           # Графический пайплайн WGPU/Winit, шейдеры, offscreen снимки
-    └── mcp-cad-server/           # Точка входа (main), MCP сервер (stdio/SSE), диспетчер инструментов
+    ├── mcp-cad-core/             # Геометрическое ядро, примитивы, CSG, DAG, CBO, топология, STL
+    ├── mcp-cad-physics/          # Динамика и кинематика механизмов (Rapier3D), шарниры, моторы
+    ├── mcp-cad-fea/              # Тетраэдризация (TET4/TET10), МКЭ-решатель PCG, Мизес, FoS, ГУ по граням
+    ├── mcp-cad-viewer/           # Рендеринг WGPU/Winit, шейдеры, offscreen PNG/Base64 + CPU fallback
+    └── mcp-cad-server/           # MCP-сервер (stdio/SSE), состояние сцены, диспетчер 34 инструментов
 ```
 
 ### Граф зависимостей между крейтами
@@ -67,251 +86,272 @@ graph TD
 
 ---
 
-## 4. Спецификация подсистем (Крейты)
+## 4. Спецификация подсистем, систем координат и семантики DAG
 
-### 4.1. `crates/mcp-cad-core`
-- **Назначение**: Фундаментальные типы данных, параметрическое дерево операций, библиотека материалов, аналитическая геометрия, адаптивная тесселяция и экспорт.
-- **Основные компоненты**:
-  - `material`: Структура `Material` ($E$, $\nu$, $\sigma_y$, $\rho$), реестр встроенных материалов (`steel_structural_aisi1020`, `aluminum_6061_t6`, `titanium_grade5_ti6al4v`, `pla_filament_3dprint` и др.) и динамическая регистрация кастомных материалов (`define_material`).
-  - `topology`: Представление полигональной сетки (`TriangleMesh`: вершины, нормали, индексы граней, UV) и топологическая инспекция геометрии:
-    - Структура `GeometryInspection`: AABB (min, max, dimensions), объем, площадь поверхности, центр масс (centroid), количество полигонов и вершин, массив распознанных компланарных граней (`detected_planar_faces`).
-    - Структура `PlanarFaceInfo`: нормаль грани $[n_x, n_y, n_z]$, средневзвешенный центр грани $[x, y, z]$, площадь поверхности и количество треугольников.
-    - Алгоритм кластеризации треугольников по компланарности (нормаль $\mathbf{n}_1 \cdot \mathbf{n}_2 > 0.999$, расстояние плоскости $|\mathbf{n} \cdot \mathbf{p} - d| < 10^{-4}$) для устранения "слепоты координат" у ИИ-агентов.
-    - Методы пространственных трансформаций сетки: `transform(translation, rotation_deg)`, `translate`, `rotate_rpy_deg`, `scale`.
-  - `tessellation`: Подсистема адаптивной тесселяции аналитических и параметрических поверхностей:
-    - Пресеты качества `TessellationQuality`: `Coarse` (~0.5 мм), `Medium` (~0.1 мм, default), `Fine` (~0.02 мм) и `Custom` (пользовательские допуски).
-    - Параметры `TessellationSettings`: максимальная стрела прогиба (`chord_tolerance` $\delta$), угловой допуск (`angular_tolerance_deg` $\theta$), пределы сегментов (`min_segments`, `max_segments`) и максимальная длина ребра (`max_edge_length`).
-    - Вычисление адаптивного шага по кривизне: $N = \left\lceil \frac{\pi}{\arccos(1 - \delta / R)} \right\rceil$ с защитой от вырождения и взрыва полигонов.
-  - `dag`: Параметрическое дерево операций (`FeatureTree`, `FeatureNode`). Поддерживает добавление узлов, модификацию параметров узла, линейный/направленный пересчет геометрии и адаптивную дискретизацию через `evaluate_with_settings(settings)`:
-    - Примитивы: `AddBox`, `AddCylinder`, `AddSphere`, `AddCone`, `AddPolygonPrism`, `AddSpurGear`, `AddRevolve`, `AddWheelRim`.
-    - Модификаторы формы: `CutHole`, `CutHelicalGroove`.
-    - CSG булевы операции в DAG: `BooleanDifferenceMesh` (вычитание), `BooleanUnionMesh` (объединение), `BooleanIntersectionMesh` (пересечение).
-    - Трансформации в DAG: `Transform` (смещение `translation`, вращение `rotation_deg`, масштабирование `scale`).
-  - `primitives`: Твердотельные примитивы с аналитическими формулами и адаптивным разбиением:
-    - `create_box(width, height, depth)`: Параллелепипед с центрированием в начале координат.
-    - `create_cylinder(radius, height, segments)` / `create_cylinder_adaptive(...)`: Цилиндр вдоль оси Z с адаптивным разбиением по хорде.
-    - `create_sphere(radius, sectors, stacks)` / `create_sphere_adaptive(...)`: Сфера с меридиональным и широтным шагом по допуску хорды.
-    - `create_cone(radius_bottom, radius_top, height, segments)` / `create_cone_adaptive(...)`: Конус и усеченный конус.
-    - `create_polygon_prism(sides, height, width_across_flats, radius, chamfer)`: Правильная $N$-гранная призма (шестигранник DIN 934) с плоскими нормалями и торцевыми коническими фасками.
-    - `create_spur_gear(...)`: Эвольвентная шестерня DIN 867 / ISO 53 со ступицей, отверстием, шпоночным пазом DIN 6885 и адаптивной дискретизацией эвольвентных кривых.
-    - `create_revolve(...)`: Тело вращения из 2D-профиля $[r, z]$ вокруг оси Z с адаптивным угловым шагом.
-    - `create_wheel_rim(...)`: Автомобильный легкосплавный колесный диск (ISO/ETRTO) со ступенчатым профилем обода, закраинами, ступицей, PCD разболтовкой и вентилируемыми спицами.
-    - `create_helical_cutter(...)`: Кинематическая фреза для винтовых канавок и метрической резьбы 60° (ISO 68-1).
-    - `cut_hole(mesh, center, normal, radius, depth, keyway_width, keyway_depth)`: Сверление цилиндрических отверстий с поддержкой шпоночного паза.
-  - `csg`: Булевы операции над сетками (`Union`, `Difference`, `Intersection`).
-  - `part`: Структура `Part` с ленивой тесселяцией: кэш сетки `cached_mesh`, настройки `tessellation_settings`, метод `tessellate(settings)` с автоинвалидацией при редактировании дерева операций, инспекция `inspect_geometry()`.
-  - `export_stl`: Генератор стандартного STL формата (бинарный и ASCII), функция `export_part_stl_with_quality` для экспорта с заданным качеством (`Coarse`, `Medium`, `Fine`, `Custom`).
-  - `import_stl`: Парсер бинарных и текстовых STL файлов с оптимизацией и сшивкой вершин.
+### 4.1. Система координат примитивов и привязки (`crates/mcp-cad-core/src/primitives.rs`)
 
-### 4.2. `crates/mcp-cad-physics`
-- **Назначение**: Симуляция кинематики и динамики твердых тел на базе `rapier3d`.
-- **Основные компоненты**:
-  - `rigid_body`: Преобразование геометрии детали `Part` в `RigidBody` и `Collider` (Convex Hull, Compound или TriMesh).
-  - `mass_properties`: Расчет объема, центра масс и тензора инерции по триангулированной сетке и плотности материала $\rho$.
-  - `joints`: Менеджер кинематических сочленений (`JointManager`):
-    - `Revolute` (вращательный с осью вращения, пределами углов, мотором скорости/момента).
-    - `Prismatic` (линейный слайдер с осью движения и пределами хода).
-    - `Spherical` (шаровой шарнир).
-    - `Fixed` (жесткое закрепление).
-    - `Gear` (кинематическое зубчатое зацепление с передаточным отношением `ratio` или `teeth_a / teeth_b`, двунаправленная передача момента и угловой скорости).
-    - Поддержка привязки к неподвижному пространству через псевдо-детали `"ground"` / `"world"`.
-  - `simulation`: Цикл симуляции с фиксированным шагом ($\Delta t = 1/60$ c).
-  - `telemetry`: Сбор истории координат и ориентаций, расчет реакций в шарнирах и выявление соударений (`CollisionEvent`).
+Во всём движке принята правая система координат с вертикальной осью **$Z$ ($Z$-up)** для всех тел вращения, призм, шестерён и резьбовых/винтовых элементов.
 
-### 4.3. `crates/mcp-cad-fea`
-- **Назначение**: Конечно-элементный анализ (МКЭ / FEA) линейной статической упругости 3D деталей.
-- **Основные компоненты**:
-  - `tet_mesh`: Генератор тетраэдральной объемной сетки (TET4: 4 узла на элемент) по поверхности детали с адаптивной интеграцией:
-    - Связка `mesh_density` ("coarse", "medium", "fine") с качеством поверхностной тесселяции детали (`TessellationQuality`).
-    - Алгоритм разбиения длинных поверхностных ребер `refine_mesh_max_edge_length` для обеспечения регулярности и предотвращения вырожденных объемных элементов.
-  - `elasticity`: Матрица упругости изотропного материала $D$ (закон Гука в 3D) через модуль Юнга $E$ и коэффициент Пуассона $\nu$:
-    $$D = \frac{E}{(1+\nu)(1-2\nu)} \begin{bmatrix} 1-\nu & \nu & \nu & 0 & 0 & 0 \\ \nu & 1-\nu & \nu & 0 & 0 & 0 \\ \nu & \nu & 1-\nu & 0 & 0 & 0 \\ 0 & 0 & 0 & \frac{1-2\nu}{2} & 0 & 0 \\ 0 & 0 & 0 & 0 & \frac{1-2\nu}{2} & 0 \\ 0 & 0 & 0 & 0 & 0 & \frac{1-2\nu}{2} \end{bmatrix}$$
-  - `element`: Вычисление объема тетраэдра $V_e$, матрицы градиентов $B$ ($6 \times 12$) и элементной матрицы жесткости:
-    $$K_e = V_e B^T D B \quad (12 \times 12)$$
-  - `solver`: Сборка глобальной матрицы жесткости $K$ в разреженном формате (CSR) и решение системы $K \cdot u = F$ методом сопряженных градиентов (Conjugate Gradient) с поддержкой граничных условий (закрепления Дирихле и силы Неймана).
-  - `stress`: Вычисление тензора напряжений Коши $\sigma$, эквивалентного напряжения по Мизесу $\sigma_{vM}$ для каждого узла/элемента и запаса прочности:
-    $$FoS = \frac{\sigma_{yield}}{\max(\sigma_{vM})}$$
-  - `safety`: Ограничения по таймауту (10 сек) и максимальному количеству элементов для предотвращения зависания сервера.
+- **Локальный центр (`origin`)**: каждый примитив строится центрированным относительно локального начала координат $[0, 0, 0]$.
+- **Порядок пространственной привязки (`position` и `rotation_deg`)**: если в `add_feature_primitive` (или `modify_feature`) переданы опциональные параметры `rotation_deg: [rx, ry, rz]` (углы Эйлера Roll-Pitch-Yaw в градусах) и `position: [px, py, pz]` (в активном `length_unit`), сетка примитива сначала поворачивается вокруг $[0, 0, 0]$, а затем переносится на вектор `position`.
 
-### 4.4. `crates/mcp-cad-viewer`
-- **Назначение**: Рендеринг в реальном времени и генерация оффскрин-изображений для ИИ на `wgpu` + `winit`.
-- **Основные компоненты**:
-  - `renderer`: Инициализация WGPU адаптера, логического устройства, очереди команд и конвейера рендеринга.
-  - `camera`: Орбитальная камера (Isometric, Top, Front, Side, Free Orbit) с проекционной матрицей.
-  - `shaders`:
-    - Шейдер твердых тел (PBR/Blinn-Phong) с обводкой ребер (CAD edge wireframe).
-    - Шейдер деформированной сетки FEA с градиентной тепловой картой (синий $\to$ зеленый $\to$ желтый $\to$ красный).
-  - `offscreen`: Рендеринг в невидимый кадровый буфер (Texture format RGBA8) с возможностью сохранения в PNG и кодирования в Base64 для передачи по MCP. Поддерживает адаптивную тесселяцию детали с пресетами качества `TessellationQuality`.
-  - `window`: Нативное интерактивное 3D-окно на `winit` + WGPU с управлением камерой мышь/клавиатура и динамическим переключением качества тесселяции (клавиша `'Q'`: Coarse $\to$ Medium $\to$ Fine) на лету.
+#### Сводная таблица привязок, осей и канонических граней всех 8 примитивов
 
-### 4.5. `crates/mcp-cad-server`
-- **Назначение**: Запуск приложения, реализация протокола MCP (Model Context Protocol), маршрутизация запросов (всего 26 инженерных инструментов).
-- **Основные компоненты**:
-  - `main.rs`: Парсер аргументов CLI (`--mode stdio`, `--mode sse`, `--port 8080`, `--headless`, `--stl`, `--file`).
-  - `mcp`: Сервер протокола MCP (JSON-RPC 2.0).
-    - `stdio`: Чтение из `stdin`, ответ в `stdout`. **Внимание:** Все логи (`tracing`/`eprintln!`) пишутся строго в `stderr`.
-    - `sse`: HTTP сервер (Axum) с поддержкой Server-Sent Events на указанном порту.
-  - `tool_handlers`: Реестр и обработчики 26 инструментов MCP:
-    - Детали, топология и тесселяция: `create_part`, `list_parts`, `delete_part`, `tessellate_part`, `query_part_geometry`, `transform_part`.
-    - Моделирование (Solid DAG): `add_feature_primitive`, `cut_hole`, `cut_helical_groove`, `boolean_difference`, `boolean_union`, `boolean_intersection`, `modify_feature`, `get_feature_tree`.
-    - Библиотека материалов: `define_material`.
-    - Пакетная автоматизация: `batch_cad_operations`.
-    - Механизмы: `create_joint`, `set_joint_motor`, `run_physics_simulation`.
-    - Прочность (FEA): `run_fea_analysis`, `get_fea_heatmap_image`.
-    - Экспорт, импорт и снимки: `capture_viewport`, `export_stl` (с настраиваемым качеством `quality` и `chord_tolerance`), `import_stl`, `open_preview_window`, `get_simulation_metrics_json`.
+| `primitive_type` | Обязательные и ключевые параметры | Ориентация оси и положение `origin` $[0,0,0]$ | Диапазон локальных координат ($X, Y, Z$) | Канонические имена граней (`role` / `aliases`) |
+|---|---|---|---|---|
+| **`box`** | `width` ($w$), `height` ($h$), `depth` ($d$) | Центрирован в $[0,0,0]$: `width` вдоль $X$, `height` вдоль $Y$, `depth` вдоль $Z$ | $X \in [-w/2, +w/2]$<br>$Y \in [-h/2, +h/2]$<br>$Z \in [-d/2, +d/2]$ | `top` (`+Z`, алиасы `cap_top`, `max_z`), `bottom` (`-Z`, `cap_bottom`, `min_z`), `right` (`+X`, `max_x`), `left` (`-X`, `min_x`), `back` (`+Y`, `max_y`), `front` (`-Y`, `min_y`) |
+| **`cylinder`** | `radius` ($r$), `height` ($h$), `segments?` | Ось вращения вдоль **$Z$**, центр на середине высоты $[0,0,0]$ | $X, Y \in [-r, +r]$<br>$Z \in [-h/2, +h/2]$ | `cap_top` (`+Z`, `top`, `max_z`), `cap_bottom` (`-Z`, `bottom`, `min_z`), `side` (цилиндрическая стенка) |
+| **`cone`** | `radius_bottom` ($r_{\text{bot}}$), `radius_top?` ($r_{\text{top}}$, `0` = острый конус), `height` ($h$), `segments?` | Ось вдоль **$Z$**, центр высоты в $[0,0,0]$. **Основание `radius_bottom` лежит на $Z = -h/2$, вершина / верхний торец `radius_top` — на $Z = +h/2$** | $X, Y \in [-r_{\max}, +r_{\max}]$<br>$Z \in [-h/2, +h/2]$ | `cap_bottom` ($Z=-h/2$, если $r_{\text{bot}}>0$), `cap_top` ($Z=+h/2$, если $r_{\text{top}}>0$), `side` (коническая боковая поверхность) |
+| **`sphere`** | `radius` ($r$), `sectors?`, `stacks?` | Центр сферы в $[0,0,0]$, полюса на оси $Z$ ($\pm r$) | $X, Y, Z \in [-r, +r]$ | `surface` (алиасы `sphere_surface`, `side`) |
+| **`polygon_prism`** | `height` ($h$), `sides?` ($n \ge 3$, по умолч. `6`), `width_across_flats?` ($S$) или `radius`/`outer_radius` ($R$), `chamfer`/`chamfer_radius?` | Ось призмы вдоль **$Z$**, центрирована в $[0,0,0]$. Для правильного $n$-угольника $R = \frac{S}{2\cos(\pi/n)}$. Конические фаски 30° по DIN 934 снимаются на обоих торцах $Z = \pm h/2$ | $X, Y \in [-R, +R]$<br>$Z \in [-h/2, +h/2]$ | `cap_top` (`+Z`), `cap_bottom` (`-Z`), `side_0..side_{n-1}` (грани под ключ), при фаске: `chamfer_top_0..{n-1}`, `chamfer_bottom_0..{n-1}` |
+| **`spur_gear`** | `module` ($m$), `teeth` ($z$), `face_width` ($b$), `pressure_angle_deg?` ($20^\circ$), `bore_radius`/`bore_diameter?`, `keyway_width?`, `keyway_depth?`, `hub_diameter?`, `hub_length?` | Ось шестерни вдоль **$Z$**. Зубчатый венец центрирован в $Z \in [-b/2, +b/2]$. Делительный диаметр $d_p = m \cdot z$. При наличии ступицы (`hub_length` $L_{\text{hub}}$) она выступает в сторону $+Z$ до $Z = +b/2 + L_{\text{hub}}$; шпоночный паз ориентирован по $+X$ | $X, Y \in [-r_a, +r_a]$<br>$Z \in [-b/2, +b/2 + L_{\text{hub}}]$ | Эвольвентный профиль по DIN 867 / ISO 53 и шпоночный паз по DIN 6885 |
+| **`revolve`** | `profile`: `[[r0, z0], [r1, z1], ...]` ($r \ge 0$), `inner_radius?`, `angle_deg?` ($360^\circ$), `segments?` | Вращение 2D-контура $(r, z)$ вокруг оси **$Z$** (при `angle_deg < 360°` от $+X$ к $+Y$ с плоскими торцевыми крышками). При 2-точечном профиле и `inner_radius` автоматически замыкается в кольцевой 4-угольник | $X, Y \in [-r_{\max}, +r_{\max}]$<br>$Z \in [z_{\min}, z_{\max}]$ (как задано в `profile`) | Поверхность тела вращения |
+| **`wheel_rim`** | `rim_diameter` ($D$), `rim_width` ($W$), `flange_diameter?`, `hub_diameter?`, `hub_bore_diameter?`, `pcd_diameter?`, `bolt_holes_count?`, `bolt_hole_diameter?`, `spokes_count?`, `offset_et?` | Ось вращения диска вдоль **$Z$**, обод центрирован в $[0,0,0]$ | $X, Y \in [-D_{\text{flange}}/2, +D_{\text{flange}}/2]$<br>$Z \in [-W/2, +W/2]$ | Ступенчатый профиль обода ISO/ETRTO, центральное отверстие, разболтовка PCD и спицы |
 
 ---
 
-## 5. Внешние зависимости и совместимые версии
+### 4.2. Семантика параметрического дерева `FeatureTree` (Solid DAG, `crates/mcp-cad-core/src/dag.rs`)
 
-Все версии зависимостей согласованы для совместимости под Rust $\ge 1.80$ и Windows x64:
+Дерево операций детали (`Part::dag`) представляет собой упорядоченный список узлов `FeatureNode` (`id: Uuid`, `name: String`, `enabled: bool`, `op: FeatureOp`), вычисляемый последовательно методом `FeatureTree::evaluate_with_settings(settings)`:
+
+1. **Автоматическое булево объединение последовательных примитивов (`Add*`)**:
+   - **Первый активный примитив** (`node_idx == 0`: `AddBox`, `AddCylinder`, `AddCone`, `AddSphere`, `AddPolygonPrism`, `AddSpurGear`, `AddRevolve`, `AddWheelRim`, `ImportedMesh`) инициализирует твердотельную сетку детали `current_mesh = Some(prim_mesh)`.
+   - **Каждый следующий вызов `add_feature_primitive` на том же `part_id`** (`node_idx >= 1`) **НЕ перезаписывает** деталь, а автоматически объединяется с текущей геометрией детали через булево сложение:
+     $$\text{current\_mesh} \longleftarrow \text{csg\_union}(\text{current\_mesh}, \text{new\_primitive\_mesh})$$
+   - Если требуется создать **отдельное независимое тело** (например, второе звено механизма или деталь-инструмент для `boolean_difference` / `boolean_intersection`), необходимо сначала вызвать `create_part`.
+2. **Субтрактивные конструктивные элементы (`CutHole` и `CutHelicalGroove`)**:
+   - `cut_hole` вычитает из текущего тела детали цилиндрический резец (с опциональной призмой шпоночного паза DIN 6885) вдоль вектора `normal`/`direction`. При `"through": true` глубина сверления и точка входа автоматически рассчитываются по проекции габаритов текущей сетки детали вдоль оси отверстия с гарантированным вылетом наружу. Выжившая стенка отверстия получает каноническую грань `hole_wall:feat_k` (алиас `"hole_wall"`).
+   - `cut_helical_groove` строит кинематическую винтовую фрезу (`profile_type: "circular"` для стружечных канавок свёрл или `"metric_60"` для метрической резьбы 60° по ISO 68-1) и вычитает её через `csg_difference`. Если параметр `start_z` не передан, начало спирали **автоматически выравнивается по нижней грани детали** `part.bounding_box().min[2]` (поэтому для детали высотой $h$, центрированной в $[-h/2, +h/2]$, спираль длиной `height = h` покрывает всю высоту детали без ручного расчёта `start_z = -h/2`).
+3. **Меш-булевы операции и трансформации в DAG**:
+   - `boolean_difference`, `boolean_union`, `boolean_intersection` сохраняют снимок сетки детали-инструмента (`tool_part_id`) в узле `FeatureOp::Boolean*Mesh { tool_mesh }` целевой детали `target_part_id`.
+   - `transform_part` добавляет узел `FeatureOp::Transform { translation, rotation_deg, scale }` (включая вычисление сдвига при вращении вокруг `pivot_face` или совмещении `align_face` с `target_point`).
+   - Для деталей, загруженных из `.stl` через `import_stl`, метод `Part::ensure_imported_mesh_in_dag()` автоматически оборачивает исходную сетку в корневой узел `FeatureOp::ImportedMesh { mesh }`, обеспечивая работу `transform_part`, `cut_hole`, `cut_helical_groove` и `boolean_*` без ошибки пустого дерева.
+
+---
+
+### 4.3. Спецификация остальных подсистем
+
+#### `crates/mcp-cad-physics` (Динамика и кинематика механизмов)
+- Интеграция с `rapier3d`: автоматическое построение твёрдых тел (`RigidBodyType::Dynamic` при `!part.is_fixed` и `RigidBodyType::Fixed` при `part.is_fixed == true`) и коллайдеров (`Collider`), расчёт массы и тензора инерции по объёму сетки и плотности материала $\rho$.
+- Статические мировые якоря `"ground"` и `"world"` (регистронезависимые, защищены от удаления и переопределения в `create_part` / `delete_part`).
+- 5 типов шарниров (`CadJointType`): `Revolute` (ось, пределы углов `limits` в `deg`, мотор угловой скорости `rad/s` и момента `N·m`), `Prismatic` (ось, пределы хода `limits` в `mm`/`m`, мотор линейной скорости `m/s` и силы `N`), `Spherical`, `Fixed`, `Gear` (кинематическая зубчатая передача с отношением `ratio` или `teeth_a / teeth_b` и осями `axis_a`, `axis_b`).
+
+#### `crates/mcp-cad-fea` (Конечно-элементный анализ прочности)
+- Генератор тетраэдральной сетки `TetrahedralMesh` (`TET4` и конвертация `to_tet10()` в квадратичные 10-узловые изопараметрические тетраэдры `TET10` без дублирования mid-edge узлов, `P3-T4`) с обязательной предполётной проверкой топологии `mcp_cad_core::validate_mesh` (отклоняющей незамкнутые или неманифольдные сетки с кодом `MESH_INVALID` / `FeaError::InvalidSurfaceMesh`), предварительным измельчением длинных поверхностных треугольников (`refine_mesh_max_edge_length`) и сохранением `face_ids`.
+- Сборка глобальной разреженной матрицы жёсткости $K$ (CSR, $12\times 12$ для `TET4` и $30\times 30$ с 4-точечной квадратурой Гаусса 2-го порядка для `TET10`) по 3D закону Гука и решение СЛАУ $K \cdot u = F$ предобусловленным методом сопряжённых градиентов (PCG).
+- Граничные условия (`BoundaryConditions`): закрепления Дирихле (`fixed` по `FaceSelector`, `fixed_faces`, `fixed_plane`) и нагрузки Неймана (`loads` по `FaceSelector`: суммарная сила `force` в `N`, нормальное давление `pressure` в `MPa`, крутящий/изгибающий момент `moment` в `N·m`, либо точечные `applied_forces`; для `TET10` используются согласованные квадратичные веса 6-узловых поверхностных треугольников).
+- Пострешение и диагностика достоверности (`FeaDiagnostics`, `P3-T2`, `P3-T3`, `P3-T4`): экстраполяция напряжений из 4 точек Гаусса в 10 узлов элемента `TET10`, вычисление узловых реакций опор $\mathbf{R} = K\mathbf{u} - \mathbf{f}$ (`compute_nodal_reactions` / `compute_nodal_reactions_tet10`), проверка баланса сил (`equilibrium_error_pct`) и моментов относительно ЦМ, контроль полноты закрепления 6 мод жёсткого тела (`constrained_rigid_body_modes_ok`), выделение 1-элементной зоны сингулярности заделки (`critical_node_near_constraint`, `max_stress_excluding_constraint_zone`), статистика качества тетраэдров Лю–Джо (`element_quality: {min, mean}`), исследование сеточной сходимости и экстраполяция Ричардсона (`accuracy`) и оценка уровня доверия `confidence: "high" | "medium" | "low"`.
+
+#### `crates/mcp-cad-viewer` (WGPU & Offscreen Render)
+- Оффскрин-рендерер `OffscreenRenderer` (`capture_viewport`, `get_fea_heatmap_image`): рендерит полигональную сетку или цветовую карту напряжений МКЭ (`jet_engineering`) с выбранного ракурса (`Isometric`, `Top`, `Front`, `Right`, `Back`, `Bottom`, `Left`) и в режимах отладки (`Shaded`, `Wireframe`, `Normals`, `Backfaces`, `BoundaryEdges`) в PNG/Base64. Имеет автоматический программный fallback, если аппаратный GPU недоступен.
+- Интерактивное окно `winit` + `wgpu` (`window.rs`): запускается при передаче `--gui`, `--standalone`, `--stl <path>` или по вызову `open_preview_window`.
+
+---
+
+## 5. Принятые архитектурные и инженерные решения (Decisions & Rationale)
+
+В этом разделе собраны все фундаментальные решения, принятые и реализованные в ходе фаз **P0 (Foundation)**, **P1 (Architecture)** и **P2 (Agent ↔ System Contract)**, с подробным объяснением причин их выбора.
+
+---
+
+### 5.1. `[DECISION-UNITS-1]` Контракт единиц измерения: миллиметры (`mm`) на границе MCP, строгое СИ внутри ядра
+- **Связанные документы и задачи**: [`docs/UNITS.md`](docs/UNITS.md), `P2-T1`, `P2-T2`, `P2-T26`, `P2-T27`, `P2-T29`, `P2-T30`, `P2-T32`, `P2-T34`, `P2-T36`.
+- **Почему принято**:
+  1. ИИ-агенты (LLM) и инженеры-машиностроители по умолчанию мыслят в **миллиметрах** (`width: 100`, `radius: 5`, `module: 2`, шаг резьбы `pitch: 1.5`). Когда ранний API ожидал метры (`m`) на входе, но возвращал прогибы МКЭ в `mm` и напряжения в `MPa`, любая передача `100` (вместо `0.1`) приводила к катастрофической ошибке масштаба: линейные размеры завышались в $10^3$ раз, площадь — в $10^6$ раз, объём и масса — в $10^9$ раз (кронштейн весил 392 тонны), а изгибные напряжения в МКЭ занижались в $10^6$ раз.
+  2. В то же время внутри численных решателей (`mcp-cad-core`, `mcp-cad-fea`, `mcp-cad-physics`) переписывать уравнения упругости, плотности и динамики под миллиметры опасно из-за несогласованности производных единиц СИ ($\text{Па} = \text{Н}/\text{м}^2$, $\text{кг}/\text{м}^3$, $g = 9.81\text{ м/с}^2$) и калибровки допусков тесселяции/сварки вершин.
+- **Что именно реализовано**:
+  - **На границе MCP API (`crates/mcp-cad-server/src/tools/*.rs`)**: по умолчанию `EngineState::length_unit = LengthUnit::Mm` (`"mm"`). Все линейные входы и выходы (`width`, `height`, `depth`, `radius`, `module`, `pitch`, `position`, `translation`, `bounding_box`, `dimensions`, `center_of_mass`, `anchor_a`/`anchor_b`, `chord_tolerance`, радиусы и центроиды граней, а также узлы планов `optimize_feature_tree` и вершины меш-операндов в `get_feature_tree`) принимаются и возвращаются в `mm`, площади — в `mm²`, объёмы — в `mm³`, ускорение свободного падения `gravity` в `get_simulation_metrics_json` — в `mm/s²` с точной `f64`-разрядностью (с дублированием эталонных СИ-полей `volume_m3`, `surface_area_m2`, `mass_kg`, `gravity_m_s2`).
+  - **Фиксированные инженерные единицы**: сила — `N`, момент — `N·m`, напряжение и давление — `MPa`, модуль Юнга — `GPa`, перемещение МКЭ — `mm`, масса — `kg`, плотность — `kg/m³`, углы в CAD и пределах `limits` вращательных шарниров — `deg`, угловая скорость — `rad/s`, время — `s` (`step_size_ms` — `ms`).
+  - **Переключение и локальное переопределение**: инструмент №29 `set_units({"length_unit": "mm" | "m"})` меняет единицу сессии, а любой инструмент принимает опциональный аргумент `"length_unit": "mm" | "m"` для одиночного вызова (`state.resolve_length_unit(args)`), который также пробрасывается в `attach_auto_check_if_enabled` (`P2-T30`).
+  - **Формат `.stl` на диске**: координаты вершин внутри файлов `.stl` (`export_stl`, `import_stl`) хранятся во внутренних единицах ядра — **метрах СИ (`m`)** (`"stl_vertex_unit": "m"`), чтобы избежать двойного масштабирования при round-trip экспорте/импорте между подсистемами.
+  - **Эвристический контроль масштаба (`check_scale_sanity`)**: мутирующие инструменты возвращают массив `warnings: []`, предупреждающий агента при подозрительных размерах (`SCALE_TOO_LARGE` при габарите $> 10\text{ м}$, `SCALE_TOO_SMALL` при $< 0.1\text{ мм}$, `SCALE_EXTREME_VOLUME`, `WHEEL_RIM_SCALE` при диаметре диска $< 150\text{ мм}`).
+
+---
+
+### 5.2. `[DECISION-FACES-1..4]` Топологическое именование граней (`face_ids` / `FaceInfo`) и семантические селекторы `FaceSelector`
+- **Связанные документы и задачи**: [`docs/FACE_NAMING_DESIGN.md`](docs/FACE_NAMING_DESIGN.md), `P2-T5`, `P2-T6`, `P2-T7`, `P2-T8`, `P2-T14`.
+- **Почему принято**:
+  1. У LLM-агентов отсутствует пространственное зрение: требовать от агента вычислять мировые координаты узлов для приложения силы МКЭ или угадывать, какая грань повернутой детали соответствует `min_x` / `max_z`, приводило к ошибкам закрепления и промахам мимо поверхности детали.
+  2. Эвристический детектор `inspect_geometry` (`detected_planar_faces`) видел только плоские кластеры, не распознавал цилиндрические отверстия (`Cylinder`), конусы (`Cone`) и винтовые канавки (`Helical`), а для кольцевого торца втулки возвращал центроид `[0, 0, z]` в пустоте центрального отверстия.
+- **Что именно реализовано**:
+  - В `TriangleMesh` (`topology.rs`) добавлены параллельный массив `face_ids: Vec<u32>` (по одному ID на треугольник, `#[serde(default, skip_serializing_if = "Vec::is_empty")]`) и реестр `faces: Vec<FaceInfo>` с полями `id`, `name`, `aliases`, `role`, `kind` (`Plane`, `Cylinder`, `Cone`, `Sphere`, `Torus`, `Helical`, `Other`), `origin_feature`, `area`, `centroid`, `sample_point` (точка, гарантированно лежащая на металле грани, а не в пустоте отверстия!), `normal_or_axis`, `radius`, `triangles_count`.
+  - **Двухуровневая схема имён**: базовый примитив (`node_idx == 0`) получает короткие имена (`"top"`, `"bottom"`, `"cap_top"`, `"cap_bottom"`, `"side"`, `"left"`, `"right"`, `"front"`, `"back"`) и квалифицированные алиасы (`"feat_0:cap_top"`, `"<uuid>:cap_top"`). Вырезы (`cut_hole`, `cut_helical_groove`, `boolean_difference`) маркируют новые внутренние поверхности как `"hole_wall:feat_k"` (с коротким алиасом `"hole_wall"`, если отверстие одно) и `"cut:feat_k:<role>"`.
+  - **Сохранение сквозь CSG и постобработку (`csg.rs`)**: `CsgPolygon` хранит `face_id`; в `BspNode::polygons_from_mesh` слияние соседних треугольников в квад, в `optimize_coplanar_delaunay_edges` перевороты рёбер и в `smooth_coplanar_interior_vertices` сглаживание **строго запрещены через границу разных `face_id`**, благодаря чему границы конструктивных граней остаются геометрически точными.
+  - **Проекционная привязка МКЭ (`crates/mcp-cad-fea/src/boundary.rs`)**: поскольку воксельная сетка `TET4` имеет ступенчатую границу, метод `match_surface_nodes_and_weights` проецирует внешние узлы тетра-сетки на треугольники выбранной CAD-грани (`point_to_triangle_distance_3d` в пределах шага сетки) и распределяет узловые силы пропорционально грузовой площади, сохраняя главный вектор силы с относительной точностью $< 10^{-9}$.
+
+---
+
+### 5.3. `[DECISION-ERRORS]` Двухуровневый контракт ошибок MCP и структурированный `ErrorEnvelope`
+- **Связанные документы и задачи**: [`docs/MCP_API_REFERENCE.md`](docs/MCP_API_REFERENCE.md), `P0-T4`, `P2-T3`, `P2-T11`, `P2-T16`, `P2-T22`, `P2-T23`.
+- **Почему принято**:
+  1. По спецификации MCP `2024-11-05` возврат протокольной ошибки JSON-RPC (`error: {code: -32602}`) при ошибке бизнес-логики инструмента заставляет некоторые MCP-клиенты (Claude Desktop, Antigravity) считать сам канал связи неисправным или скрывать тело ответа от LLM.
+  2. Простая текстовая строка ошибки не давала агенту однозначного указания, какой именно аргумент невалиден и какие идентификаторы (`part_id`, `face`, `primitive_type`) реально доступны в текущей сессии.
+- **Что именно реализовано**:
+  - Верхнеуровневое поле JSON-RPC `"error"` (`-32700`..`-32603`) используется **только** для синтаксических и протокольных нарушений JSON-RPC до вызова диспетчера инструментов.
+  - Все ошибки выполнения инструментов (`ServerError`) возвращаются в успешном JSON-RPC конверте с флагом **`result.isError = true`** и JSON-строкой `ErrorEnvelope` в `result.content[0].text`:
+    ```json
+    {
+      "error": {
+        "code": "PART_NOT_FOUND",
+        "message": "Part not found: shaft_pin",
+        "param": "part_id",
+        "hint": "Part 'shaft_pin' was not found. Available parts: [part-1]. Inspect parts via 'list_parts' or create it with 'create_part'.",
+        "retryable": false,
+        "details": { "part_id": "shaft_pin", "available_parts": ["part-1"] }
+      }
+    }
+    ```
+  - Внедрено **36 стабильных машиночитаемых кодов** (`PART_NOT_FOUND`, `FEATURE_NOT_FOUND`, `JOINT_NOT_FOUND`, `FACE_NOT_FOUND`, `AMBIGUOUS_FACE_SELECTOR`, `INVALID_ARGUMENT`, `FEA_UNCONSTRAINED`, `FEA_NO_LOADS`, `PROJECT_SCHEMA_MISMATCH` и др.) с автоматическим заполнением списка существующих деталей (`available_parts`), граней (`available_faces`) и пресетов материалов (`builtin_materials`).
+
+---
+
+### 5.4. `[DECISION-REQUIREMENTS-REVISION]` Слой инженерных требований, счётчик ревизий `Part::revision` и защита от ложного `STALE`
+- **Связанные задачи**: `P2-T9`, `P2-T24`, `P2-T27`, `P2-T30`.
+- **Почему принято**:
+  1. ИИ-агенты склонны пропускать ручную перепроверку массы, габаритов и запаса прочности после модификации параметров детали. Декларативный инструмент `set_requirements` с флагом `auto_check: true` перекладывает контроль инвариантов на сам сервер: каждый мутирующий вызов автоматически дописывает `requirements_status: {passed, failed, stale}` в свой JSON-ответ.
+  2. Автоматически перезапускать 3D МКЭ (`run_fea_analysis`) после каждого чиха в DAG нельзя из-за высокой вычислительной стоимости (сотни миллисекунд — секунды). Вместо этого в `Part` введён монотонный счётчик `revision: u64`, а в `EngineState` сохраняется ревизия детали на момент последнего расчёта МКЭ (`last_fea_revisions`). Если геометрия детали изменилась (`part.revision != fea_revision`), требование `min_safety_factor` и сводка `get_scene_summary.last_fea` мгновенно переходят в статус **`STALE`**, сигнализируя агенту о необходимости перезапустить `run_fea_analysis`.
+  3. **Защита от ложного устаревания (`P2-T24`, `P2-T27`)**: обнаружено, что смена разрешения триангуляции в `export_stl` (который по умолчанию рендерит сетку с качеством `"fine"`) или `tessellate_part`, а также вызов `optimize_feature_tree(apply: true)`, когда ни одно правило оптимизации не сработало (`applied_rules.is_empty()`), не меняют параметрическую геометрию детали. Поэтому `Part::tessellate` и холостой `Part::optimize_dag` **не инкрементируют `part.revision`**, сохраняя результаты МКЭ в актуальном статусе `FRESH` / `PASS`.
+
+---
+
+### 5.5. `[DECISION-TRANSACTIONAL-STATE]` Атомарная транзакционность мутаций, сохранение шарниров при редактировании геометрии и персистентность
+- **Связанные задачи**: `P0-T11`, `P2-T4`, `P2-T12`, `P2-T15`, `P2-T17`, `P2-T18`, `P2-T19`, `P2-T23`, `P2-T33`.
+- **Почему принято и что реализовано**:
+  1. **Полный транзакционный откат при ошибках (`P2-T12`, `P2-T17`, `P2-T19`, `P2-T24`)**:
+     - В `batch_cad_operations` при сбое любого шага состояние сцены откатывается целиком, включая клонированный физический мир `state.physics_world.clone()` (`PhysicsWorld: Clone`).
+     - В `modify_feature`, `optimize_feature_tree`, `tessellate_part` и `export_stl` перед пересборкой сохраняется снимок `(dag, mesh, cached_mesh, cached_settings, revision)`: если `rebuild()` или валидация параметров завершается ошибкой, деталь остаётся в 100% консистентном предыдущем состоянии.
+     - В `PhysicsWorld::set_joint_motor` запись `record.motor` обновляется строго после успешного применения мотора к шарниру Rapier3D (`apply_motor`), а установка мотора на `CadJointType::Gear`, `Fixed` и `Spherical` отклоняется с `INVALID_JOINT_CONFIGURATION`.
+  2. **Обновление коллайдеров на месте без потери шарниров (`PhysicsWorld::update_part_collider`, `P2-T18`)**:
+     - Ранее при выполнении `boolean_*`, `transform_part` или `optimize_feature_tree` деталь перерегистрировалась в физическом мире через `remove_part` + `add_part`, что побочным эффектом уничтожало все привязанные к ней шарниры (`joints`) и зубчатые передачи (`gear_constraints`), а при вызове `add_feature_primitive` / `cut_hole` / `modify_feature` коллайдер в `physics_world` вообще не обновлялся.
+     - Реализован метод `PhysicsWorld::update_part_collider(&mut self, part: &Part)`, который пересоздаёт `Collider` и пересчитывает массу и тензор инерции непосредственно на существующем `RigidBodyHandle`, сохраняя все шарниры, приводы и флаг неподвижности `!part.is_fixed`.
+  3. **Персистентность без раздувания файлов (`save_project` / `load_project`, `P2-T4`)**:
+     - Файл проекта (`schema_version = "1.0.0"`) сохраняет единицы измерения, кастомные материалы, параметрические деревья `FeatureTree` деталей, требования и шарниры с моторами, но **не сериализует полигональные сетки процедурных деталей** (`mesh` восстанавливается детерминированно через `part.rebuild()` при `load_project`). Исключение сделано только для импортированных STL-деталей через узел `FeatureOp::ImportedMesh` (`P2-T33`).
+
+---
+
+### 5.6. `[DECISION-MESH-QUALITY-CBO]` Геометрические инварианты примитивов, двухфазная постобработка CSG и барьерные правила CBO (`R1`–`R5`)
+- **Связанные задачи**: `P0-T1`..`P0-T10`, `P2-T15`, `P2-T20`, `P2-T23`, `P2-T25`, `P2-T28`, `P2-T31`.
+- **Почему принято и что реализовано**:
+  1. **Ориентация крышек и избавление от игольчатых треугольников (`Sliver Triangles`, `< 1°` и `< 5°`)**:
+     - Исправлен обход колец в `add_bridged_ring_strip_2d` и `add_halving_ring_transition_2d` (`P0-T1`), гарантирующий внешние нормали ($\mathbf{n}\cdot(\pm\mathbf{Z}) > 0$) и положительный объём `signed_volume() > 0`.
+     - Внедрено конформное геометрическое разрежение колец 2-к-1 (и 3-к-1 для нечётного числа сегментов) к полюсам конусов (`create_cone`), торцевым крышкам неполных тел вращения (`create_revolve` с точками Штейнера Бойера–Уотсона и флипами Делоне) и коническим фаскам многогранных призм (`create_polygon_prism`), а также точная радиальная проекция O-grid вокруг болтовых отверстий и пропорциональное масштабирование зазоров `safe_clamp` для малых колёсных дисков (`create_wheel_rim`, `P0-T5`, `P0-T6`, `P0-T10`, `P2-T15`, `P2-T23`).
+  2. **Двухфазная постобработка BSP-CSG (`crates/mcp-cad-core/src/csg.rs`, `P0-T7`)**:
+     - Классическое разбиение полигонов плоскостями BSP порождает избыточные коллинеарные вершины и узкие клинья на касательных пересечениях (например, `cut_hole`). Реализован конвейер `optimize_csg_mesh_quality` (слияние копланарных треугольников одной грани в выпуклые квады до клиппинга, коалесценция нетронутых поддеревьев, удаление избыточных вершин на рёбрах через 1-ring ear-clipping и Link-Condition edge collapse, вставка точек Штейнера в вееры к дугам отверстий и флипы Делоне), обеспечивающий выполнение тождеств объёма $V(A \cup B) + V(A \cap B) = V(A) + V(B)$ с точностью $< 1\%$ и `t_junctions_count == 0`.
+  3. **Корректность правил перезаписи Cost-Based Query Optimizer (`crates/mcp-cad-core/src/query_optimizer.rs`, `P0-T9`, `P2-T20`, `P2-T25`, `P2-T28`, `P2-T31`)**:
+     - В правилах `R1` (свёртка трансформаций и проталкивание сдвига в корневой примитив, включая `AddSpurGear` и `AddWheelRim`), `R2` (отсечение непересекающихся по AABB вырезов и дубликатов отверстий), `R3` (пакетная группировка вычитаний по Де Моргану), `R4` (замена соосного цилиндра и сквозного отверстия на однопроходный кольцевой `AddRevolve`) и `R5` (слияние шестигранной призмы, отверстия и резьбы) введено понятие **барьерных узлов (`Transform`, аддитивных `Add*`, `BooleanUnionMesh`, `BooleanIntersectionMesh`)**: оптимизатор никогда не переносит и не группирует вычитания (`CutHole`) через промежуточную трансформацию или добавленную бобышку.
+     - Оценка `estimate_primitive_aabb` учитывает точный описанный радиус $N$-угольника $R = \frac{w}{2\cos(\pi/\text{sides})}$, габариты шестерён/ободов со ступицами и матрицу поворота Эйлера `rotation_deg`.
+     - Любой физический план принимается только после верификации: `validate_mesh == PASS`, сохранение рода поверхности `genus_before == genus_after` и расхождение объёма $\Delta V / V \le 1\%$.
+
+---
+
+### 5.7. `[DECISION-KERNEL-ADR0001]` Выбор целевого геометрического ядра и консолидация архитектуры `TS -> Rust`
+- **Связанные документы и задачи**: [`docs/adr/0001-geometry-kernel.md`](docs/adr/0001-geometry-kernel.md), [`docs/MIGRATION_TS_TO_RUST.md`](docs/MIGRATION_TS_TO_RUST.md), [`docs/BENCH_BASELINE_RUST.md`](docs/BENCH_BASELINE_RUST.md), [`agent_prompts/P1_kernel_migration.md`](agent_prompts/P1_kernel_migration.md), `P1-T1`..`P1-T4`.
+- **Почему принято**:
+  1. На сложных многошаговых пересечениях криволинейных сеток (например, внутренняя метрическая резьба гайки М10 `cut_helical_groove` в `T08_hex_nut_m10` или цепочка `union + difference` на фланцевой втулке) текущий BSP-CSG (`csg.rs`) чувствителен к почти копланарным граням и может оставлять открытые граничные рёбра (`open_boundary_edges > 0`) при времени выполнения ~940 мс.
+  2. Экспериментальная проверка 4 кандидатов в изолированных спайках (`spikes/manifold_rust` и `spikes/monstertruck_brep`) доказала:
+     - **`manifold-rust v0.19.2` (Pure Rust порт Manifold, `Apache-2.0`)** работает в **37–188 раз быстрее** текущего BSP-CSG (`5–25 мс` против `940 мс`), математически гарантирует замкнутое 2-многообразие (`open_edges = 0`, `is_watertight = true` как на фланцевой втулке, так и на резьбе гайки М10 `T08` за `18.87 мс`) и нативно переносит `MeshGLP::face_id` с погрешностью площади граней `0.0000%`.
+     - **`monstertruck v0.4.1` (Pure Rust B-Rep)** отлично подходит для аналитического экспорта в стандарт **ISO 10303-21 STEP** (`monstertruck-step`, `1.25 мс`), но его триангулятор `monstertruck-meshing` сбрасывает `FaceID` и генерирует 11.7% игольчатых треугольников.
+  3. Поэтому утверждена **гибридная Pure-Rust стратегия**: `manifold-rust v0.19.2` как основное ядро булевых операций и сквозного переноса `face_ids` (пакет задач `P1-K1..P1-K5` в `agent_prompts/P1_kernel_migration.md`) + опциональный `monstertruck-step` (`P1-K6`) для экспорта аналитического дерева в формат STEP.
+
+---
+
+### 5.8. `[DECISION-AGENT-UX]` Самодостаточность контекста ИИ-агента в Antigravity / Claude Desktop (по итогам ревью работы агента)
+- **Контекст (проблема из практики)**: При подключении `mcp-cad-server` в Google Antigravity внешний ИИ-агент тратил шаги на чтение исходных файлов проекта (`primitives.rs`, `dag.rs`, `main.rs`) по трём причинам и сталкивался с двумя блокерами:
+  1. **Причина 1 (`primitives.rs`)**: В кратких инструкциях не было таблицы координатных привязок примитивов (где $Z=0$, центрированы ли цилиндр и конус в $[-h/2, +h/2]$, где основание `radius_bottom` и вершина `radius_top` конуса).
+  2. **Причина 2 (`dag.rs`)**: Не было явно сказано, что последовательные вызовы `add_feature_primitive` на одной детали автоматически объединяются через `csg_union`, а не перезаписывают друг друга.
+  3. **Причина 3 и Блокер 1 (`main.rs` / `open_preview_window`)**: При стандартном запуске MCP по `stdio` без флага `--gui` вызов `open_preview_window` возвращал отказ `"status": "headless"`, вынуждая агента искать в `main.rs` обходной CLI-флаг `--stl <path>`.
+  4. **Блокер 2 (`validate_mesh` на сверле `cut_helical_groove`)**: Строгий порог `Sliver quality gate` (`min_angle < 1°` или `> 1%` треугольников `< 5°`) помечал полностью водонепроницаемую производственную геометрию спирального сверла как `status: "FAIL"`, блокируя конвейер агента.
+- **Принятое решение**:
+  1. Зафиксировать полную таблицу систем координат примитивов и семантику `FeatureTree` (авто-`csg_union` для `add_feature_primitive`, авто-`csg_difference` для `cut_hole` и `cut_helical_groove`) непосредственно в `PROJECT_CONTEXT.md` (разделы 4.1–4.2), `docs/AGENT_GUIDE.md`, `initialize.instructions` (`protocol.rs`) и в задачах `P2-T37..P2-T39` в `TASKS.md`.
+  2. Реализовать в `open_preview_window` (`P2-T37`) автоматический экспорт временного STL и порождение фонового GUI-процесса `mcp-cad-server --stl <path>` при вызове из headless `stdio`-сессии.
+  3. Разделить в `validate_mesh` (`P2-T38`) фатальные нарушения топологии тела (`FAIL`: дыры, не-многообразие, самопересечения, вырожденный объём) и предупреждения об узких треугольниках на острых кромках винтовых канавок (`WARN` при `is_watertight == true` и `self_intersections == 0`).
+
+---
+
+## 6. Внешние зависимости и совместимые версии
 
 | Crate | Версия | Область применения |
 |---|---|---|
-| `nalgebra` | `^0.33` | Линейная алгебра, векторы, матрицы, МКЭ расчеты |
-| `rapier3d` | `^0.22` | Pure-Rust физический движок твердых тел и кинематики |
-| `wgpu` | `^22.0` | Кроссплатформенный графический API (DirectX 12 / Vulkan под Windows) |
-| `winit` | `^0.30` | Оконная система и цикл событий |
+| `nalgebra` | `^0.33` | Линейная алгебра, векторы, матрицы вращения Эйлера, МКЭ-расчёты |
+| `rapier3d` | `^0.22` | Pure-Rust физический движок твёрдых тел, коллайдеров и шарниров |
+| `wgpu` | `^22.0` | Кроссплатформенный графический API (DX12 / Vulkan / Lavapipe) |
+| `winit` | `^0.30` | Нативное окно предпросмотра 3D-сцены и цикл событий |
 | `tokio` | `^1.40` | Асинхронный рантайм (`features = ["full"]`) |
 | `axum` | `^0.7` | HTTP/SSE сервер для сетевого режима MCP |
-| `serde` | `^1.0` | Сериализация/десериализация (`features = ["derive"]`) |
-| `serde_json` | `^1.0` | Парсинг и генерация JSON-RPC сообщений MCP |
-| `image` | `^0.25` | Кодирование снимков в PNG формат (`features = ["png"]`) |
-| `base64` | `^0.22` | Кодирование снимков в Base64 для передачи агенту |
-| `thiserror` | `^1.0` | Строго типизированные ошибки в библиотечных крейтах |
-| `anyhow` | `^1.0` | Универсальная обработка ошибок в бинарном крейте `server` |
-| `tracing` | `^0.3` | Структурированное логирование |
-| `tracing-subscriber` | `^0.3` | Вывод логов (строго в `stderr`!) |
-| `uuid` | `^1.10` | Генерация уникальных ID деталей, узлов DAG и сочленений (`v4`) |
-| `bytemuck` | `^1.18` | Безопасная передача вершинных данных в буферы WGPU |
+| `serde` / `serde_json` | `^1.0` | Сериализация JSON-RPC 2.0, деревьев DAG и файлов проектов |
+| `image` / `base64` | `^0.25` / `^0.22` | Кодирование оффскрин-снимков в PNG и Base64 для мультимодальных LLM |
+| `thiserror` / `anyhow` | `^1.0` | Типизированные ошибки в библиотечных крейтах и `ErrorEnvelope` на сервере |
+| `tracing` / `tracing-subscriber` | `^0.1` / `^0.3` | Структурированное логирование (строго в `stderr`!) |
+| `uuid` | `^1.10` | Стабильные идентификаторы узлов DAG (`v4`) |
 
 ---
 
-## 6. Конвенции и правила кодирования
+## 7. Конвенции кодирования и стандарты верификации
 
-### 6.1. Безопасность кода
-- В библиотечных крейтах (`core`, `physics`, `fea`) включается атрибут:
-  ```rust
-  #![deny(unsafe_code)]
-  ```
-- Использование `unsafe` запрещено, за исключением вызовов графических драйверов WGPU в крейте `viewer`, где это жестко необходимо и должно быть изолировано и задокументировано в комментариях `// SAFETY: ...`.
-
-### 6.2. Обработка ошибок (No Panics)
-- Запрещены неконтролируемые вызовы `.unwrap()` и `.expect()` в коде обработчиков инструментов MCP и расчетных циклов.
-- Все функции возвращают `Result<T, CadError>` или эквивалентные типы.
-- Любая ошибка в параметрах моделирования или расчете МКЭ должна возвращаться агенту в виде понятного структурированного JSON-ответа с описанием причины, а не приводить к аварийному завершению процесса.
-
-### 6.3. Логирование и Stdio
-- **Критическое правило для MCP `stdio` режима**: `stdout` используется **исключительно** для протокола JSON-RPC 2.0.
-- Запрещено использование `println!`, `print!` или логирование через `tracing` в `stdout`.
-- Все логгеры и диагностика должны инициализироваться с направлением в `std::io::stderr`.
-
-### 6.4. Стандарты тестирования
-- Каждый модуль сопровождается исчерпывающими юнит- и интеграционными тестами (`#[cfg(test)]`).
-- **Актуальный статус тестов**: **99 тестов во всех 5 крейтах workspace (100% Passing)**:
-  - `mcp-cad-core`: 35 юнит-тестов + 14 тестов DAG + 6 тестов адаптивной тесселяции = **55 тестов**.
-  - `mcp-cad-fea`: 5 юнит-тестов + 6 интеграционных тестов (включая аналитическую верификацию балки, осевое растяжение и адаптивный пайплайн) = **11 тестов**.
-  - `mcp-cad-physics`: 6 интеграционных тестов кинематики и соударений = **6 тестов**.
-  - `mcp-cad-viewer`: 9 интеграционных тестов рендеринга и тепловых карт = **9 тестов**.
-  - `mcp-cad-server`: 17 сквозных тестов MCP контрактов JSON-RPC + 1 интеграционный кинематический тест редуктора = **18 тестов**.
-- **Верификационные тесты МКЭ (`mcp-cad-fea`)**: сравнение численных результатов расчета консольной балки под изгибом с теоретической формулой сопротивления материалов ($\delta = \frac{F L^3}{3 E I}$, погрешность не более 5-10% на средней сетке).
-- **Тесты кинематики (`mcp-cad-physics`)**: верификация сохранения степеней свободы шарниров и детекции коллизий.
-- Интеграционные тесты проверяют корректность выполнения всех 26 инструментов MCP через вызовы диспетчера.
-- Команда проверки:
-  ```powershell
-  cargo test --workspace
-  cargo clippy --workspace --all-targets -- -D warnings
-  ```
-
-### 6.5. Git-культура (Conventional Commits)
-Все коммиты должны следовать стандарту Conventional Commits:
-- `feat(core): add feature tree DAG and parametric box primitive`
-- `feat(fea): implement linear elasticity stiffness matrix assembly`
-- `feat(physics): integrate Rapier3D revolute and prismatic joints`
-- `fix(viewer): correct offscreen framebuffer stride on Windows DX12`
-- `test(fea): add cantilever beam analytical verification test`
-- `docs: update MCP tool API reference and quickstart`
+1. **Безопасность и отсутствие паник (`No Panics`)**:
+   - В библиотечных крейтах запрещены неконтролируемые `.unwrap()` / `.expect()` и `f64::clamp` с невалидированными границами `min > max` (используется `safe_clamp` и проверка `is_finite()`).
+   - Любая ошибка параметров возвращается как `Result<T, CadError / ServerError>` и преобразуется в структурированный JSON `ErrorEnvelope`.
+2. **Чистота потока `stdout` в режиме `stdio`**:
+   - В режиме `--mode stdio` поток `stdout` используется **исключительно** для сообщений JSON-RPC 2.0. Любой вывод логов (`tracing`, `eprintln!`) направляется строго в `std::io::stderr`.
+3. **Статус автоматического тестирования (100% PASS, 0 warnings)**:
+   - **Rust Workspace (`cargo test --workspace --no-fail-fast`) — 250 тестов (100% PASS)**:
+     - `mcp-cad-core`: **99 тестов** (юнит-тесты примитивов, топологии, CBO `R1`–`R5`, плюс интеграционные суиты `primitive_invariants`, `csg_invariants`, `dag_tests`, `tessellation_tests`);
+     - `mcp-cad-server`: **104 теста** (`52` юнит-теста модулей `cad`, `fea`, `physics`, `metrics`, `project`, `requirements`, `error` + `52` сквозных контрактных теста в `tests/mcp_contract_tests.rs`);
+     - `mcp-cad-fea`: **25 тестов** (включая юнит-тесты `element` и `convergence`, аналитические эталоны изгиба консоли, осевого растяжения, нагружения именованных граней, предполётной проверки `MESH_INVALID` / баланса реакций опор `P3-T2`, исследования сеточной сходимости и экстраполяции Ричардсона `P3-T3`, квадратичного элемента `TET10` `P3-T4`, и суит `fea_benchmarks.rs` по `docs/FEA_ACCURACY.md`);
+     - `mcp-cad-physics`: **12 тестов** (шарниры, моторы, зубчатые пары, сохранение связей при `update_part_collider`, защита `"ground"`/`"world"`, точность `f64` в `gravity()`);
+     - `mcp-cad-viewer`: **10 тестов** (оффскрин-рендеринг и тепловые карты МКЭ).
+   - **TypeScript Suite (`npx tsx --test src/cad/cad_engine.test.ts`) — 39 тестов (100% PASS)**, `npm run lint` (`tsc --noEmit`) — 0 ошибок.
+   - **Линтер Rust (`cargo clippy --workspace --all-targets -- -D warnings`) — 0 ошибок, 0 предупреждений** (блокирующий гейт в `.github/workflows/ci.yml`).
 
 ---
 
-## 7. Спецификация контрактов инструментов MCP (Tools API, 26 инструментов)
+## 8. Спецификация контрактов всех 34 инструментов MCP (Tools API)
 
-Ниже зафиксированы схемы всех 26 инструментов для обеспечения консистентности между субагентами:
+Полные JSON-схемы и примеры запросов/ответов приведены в [`docs/MCP_API_REFERENCE.md`](docs/MCP_API_REFERENCE.md). Все линейные размеры по умолчанию принимаются и возвращаются в **`mm`** (`[DECISION-UNITS-1]`).
 
-| Имя инструмента | Входные параметры | Выходные данные | Описание |
-|---|---|---|---|
-| `create_part` | `name: String`, `material: String`, `is_fixed?: bool` | `{ part_id: String, is_fixed: bool }` | Создать деталь (с опциональным закреплением в мировом пространстве) |
-| `list_parts` | *(нет)* | `{ parts: Vec<PartSummary> }` | Список всех деталей |
-| `delete_part` | `part_id: String` | `{ status: "deleted" }` | Удалить деталь |
-| `add_feature_primitive` | `part_id`, `primitive_type`, `params` | `{ feature_id: String }` | Добавить примитив в DAG (box, cylinder, sphere, cone, polygon_prism, spur_gear, revolve, wheel_rim) |
-| `cut_hole` | `part_id`, `position`, `normal`, `radius`, `depth`, `keyway_width?`, `keyway_depth?` | `{ feature_id: String }` | Вырезать цилиндрическое отверстие с опциональным шпоночным пазом |
-| `cut_helical_groove` | `part_id`, `helix_radius`, `groove_radius`, `pitch`, `height`, `starts`, `profile_type?` | `{ feature_id: String }` | Винтовая канавка или метрическая резьба 60° (ISO 68-1) |
-| `boolean_difference` | `target_part_id`, `tool_part_id` | `{ feature_id: String }` | Булево вычитание сетки инструмента из целевой детали |
-| `boolean_union` | `target_part_id: String`, `tool_part_id: String` | `{ target_part_id: String, feature_id: String, status: "union_applied", vertices_count: usize, triangles_count: usize }` | Булево объединение геометрии инструмента с целевой деталью (CSG Union) |
-| `boolean_intersection` | `target_part_id: String`, `tool_part_id: String` | `{ target_part_id: String, feature_id: String, status: "intersection_applied", vertices_count: usize, triangles_count: usize }` | Булево пересечение геометрии инструмента с целевой деталью (CSG Intersection) |
-| `transform_part` | `part_id: String`, `translation?: [f64; 3]`, `rotation_deg?: [f64; 3]`, `scale?: [f64; 3]` | `{ part_id: String, feature_id: String, status: "transformed", bounding_box: Object, volume: f64 }` | Пространственная трансформация (смещение, вращение RPY, масштаб) в DAG детали |
-| `modify_feature` | `part_id: String`, `feature_id: String`, `params: Object` | `{ status: "updated", dimensions: ... }` | Изменить шаг в истории |
-| `get_feature_tree` | `part_id: String` | `{ dag: Vec<FeatureNodeView> }` | Получить дерево операций |
-| `tessellate_part` | `part_id: String`, `quality?: "coarse"\|"medium"\|"fine"`, `chord_tolerance?: f64`, `angular_tolerance_deg?: f64`, `max_edge_length?: f64` | `{ part_id: String, quality: String, vertices_count: usize, triangles_count: usize }` | Выполнить ленивую адаптивную тесселяцию детали с заданными допусками |
-| `query_part_geometry` | `part_id: String` | `{ part_id: String, bounding_box: Object, volume: f64, surface_area: f64, center_of_mass: [f64; 3], faces_count: usize, vertices_count: usize, detected_planar_faces: Vec<PlanarFaceInfo> }` | Инспекция топологии: AABB, объем, площадь, центр масс, полигоны и компланарные грани |
-| `define_material` | `id: String`, `young_modulus_gpa: f64`, `poisson_ratio: f64`, `yield_strength_mpa: f64`, `density_kg_m3: f64`, `name?: String` | `{ status: "material_registered", material_id: String, properties: Object }` | Регистрация кастомного инженерного материала для МКЭ и расчета масс |
-| `batch_cad_operations` | `operations: Vec<{ tool: String, params: Object }>` | `{ success: bool, count: usize, results: Vec<Value> }` | Пакетное атомарное выполнение цепочки операций без задержек roundtrip |
-| `create_joint` | `joint_type`, `part_a`, `part_b`, `anchor_a?`, `anchor_b?`, `axis?`, `axis_a?`, `axis_b?`, `ratio?`, `teeth_a?`, `teeth_b?`, `limits?` | `{ joint_id: String }` | Создать сочленение (revolute, prismatic, spherical, fixed, gear; поддержка `"ground"`/`"world"`) |
-| `set_joint_motor` | `joint_id: String`, `target_velocity: f32`, `max_force: f32` | `{ status: "motor_active" }` | Включить привод |
-| `run_physics_simulation` | `duration_seconds: f32`, `step_size_ms: f32` | `{ success: bool, trajectory: Object, peak_forces: Object, collisions: Vec }` | Симуляция динамики с автоматической отправкой кадров анимации в превью-окно |
-| `run_fea_analysis` | `part_id`, `mesh_density`, `fixed_faces`, `applied_forces` | `{ max_von_mises_mpa: f32, yield_mpa: f32, safety_factor: f32, max_disp_mm: f32, status: "PASS"\|"FAIL" }` | МКЭ расчет |
-| `get_fea_heatmap_image` | `part_id: String`, `camera_preset: String` | `{ image_base64: String, legend: Object }` | Снимок тепловой карты |
-| `capture_viewport` | `camera_preset: String`, `width: u32`, `height: u32` | `{ image_base64: String }` | Скриншот 3D сцены |
-| `open_preview_window` | `part_id: Option<String>` | `{ status: "opened", mode: ... }` | Открыть/сфокусировать нативное окно 3D превью с циклическим воспроизведением анимации (клавиша `P`) |
-| `import_stl` | `filepath: String`, `name: Option<String>`, `material: Option<String>` | `{ part_id: String, name: String, vertices_count: usize, triangles_count: usize, status: "stl_imported" }` | Импорт STL файла в деталь и вывод во вьюпорт |
-| `export_stl` | `part_id: String`, `filepath: String`, `binary?: bool`, `quality?: "coarse"\|"medium"\|"fine"`, `chord_tolerance?: f64` | `{ file_path: String, triangles_count: u32 }` | Экспорт в STL с контролем качества тесселяции |
-| `get_simulation_metrics_json` | *(нет)* | `{ current_metrics: Object }` | Полный инженерный отчет |
-
----
-
-## 8. Порядок реализации и контрольные точки (Milestones)
-
-1. **Фаза 1: Workspace & Core (Фундамент)**
-   - Инициализация `Cargo.toml` workspace и структуры крейтов.
-   - Базовые структуры данных `Part`, `Material`, `TriangleMesh`.
-   - DAG параметрического дерева и базовые примитивы.
-   - Модульные тесты геометрии и STL экспорта.
-2. **Фаза 2: WGPU Viewer & Offscreen Capture**
-   - Графический конвейер WGPU, буферы вершин/индексов, базовый шейдер.
-   - Орбитальная камера и проекция.
-   - Модуль захвата кадра в PNG/Base64.
-3. **Фаза 3: Физика механизмов (Rapier3D)**
-   - Модуль физических твердых тел и коллайдеров.
-   - Шарниры (Revolute, Prismatic, Spherical, Fixed) и приводы.
-   - Сборщик телеметрии симуляции.
-4. **Фаза 4: МКЭ Модуль прочности (Pure-Rust FEA)**
-   - Генератор тетраэдральной сетки (TET4).
-   - Сборка матрицы жесткости $K$ и разреженный решатель $K u = F$.
-   - Вычисление Мизеса и коэффициента запаса (FoS).
-   - Шейдер тепловой карты напряжений в WGPU.
-5. **Фаза 5: MCP Server & Интеграция**
-   - Маршрутизация JSON-RPC по stdio и HTTP/SSE.
-   - Полная связка инструментов со всеми модулями.
-   - Верификационные сквозные тесты (End-to-End).
+| № | Инструмент | Группа | Назначение и ключевые особенности контракта |
+|---:|---|---|---|
+| 1 | `create_part` | Детали | Создаёт деталь (`name`, `material`, опц. `part_id`, `is_fixed`). Поддерживает канонические алиасы материалов (`Al6061-T6`, `Ti-6Al-4V`, `steel_1045` и др.). Запрещает ID `"ground"` / `"world"` |
+| 2 | `list_parts` | Детали | Возвращает отсортированный список деталей (`part_id`, `revision`, `bounding_box`, `volume`, `volume_m3`, `mass_kg`, `features_count`, `triangles_count`) с учётом `length_unit` |
+| 3 | `delete_part` | Детали | Удаляет деталь из сцены, `physics_world` и кэша МКЭ, возвращая `status`, `part_id` и `deleted_part_id` (статические якоря `"ground"`/`"world"` защищены от удаления) |
+| 4 | `add_feature_primitive` | Solid DAG | Добавляет примитив (`box`, `cylinder`, `sphere`, `cone`, `polygon_prism`, `spur_gear`, `revolve`, `wheel_rim`). Первый узел создаёт тело, последующие автоматически объединяются через `csg_union`. Возвращает `part_id`, `feature_id`, `primitive_type`, `revision`, `bounding_box`, `volume`, `warnings` |
+| 5 | `cut_hole` | Solid DAG | Вырезает цилиндрическое отверстие вдоль `normal`/`direction` (`radius` или `diameter`, `depth` или `"through": true`, опц. шпоночный паз `keyway_width`/`keyway_depth`). Маркирует стенку как `hole_wall:feat_N` |
+| 6 | `modify_feature` | Solid DAG | Транзакционно изменяет параметры узла `feature_id` и пересобирает DAG (при ошибке выполняет полный откат состояния детали) |
+| 7 | `get_feature_tree` | Solid DAG | Возвращает `part_id`, `revision`, `features_count` и список узлов `dag` с параметрами и меш-операндами, масштабированными в `length_unit` |
+| 8 | `cut_helical_groove` | Solid DAG | Вырезает винтовую канавку сверла (`circular`) или метрическую резьбу 60° (`metric_60`). При опущенном `start_z` автоматически выравнивает начало по `bounding_box.min[2]` |
+| 9 | `boolean_difference` | CSG | Булево вычитание `tool_part_id` из `target_part_id` с сохранением именованных граней (`cut:feat_N:<role>`) и обновлением коллайдера |
+| 10 | `tessellate_part` | Топология | Адаптивная тесселяция детали (`coarse`, `medium`, `fine` или `chord_tolerance`). Не инкрементирует `part.revision` и не делает результаты МКЭ `STALE` |
+| 11 | `create_joint` | Физика | Создаёт шарнир (`revolute`, `prismatic`, `spherical`, `fixed`, `gear`) с опциональным пользовательским `joint_id`, пределами `limits` (`deg` или `mm`/`m`) и поддержкой `"ground"`/`"world"` |
+| 12 | `set_joint_motor` | Физика | Настраивает привод (`target_velocity`, `max_force >= 0`) для `revolute` и `prismatic` с пробуждением тел `wake_up(true)` |
+| 13 | `run_physics_simulation` | Физика | Выполняет шаг динамики Rapier3D (`duration_seconds`, `step_size_ms > 0`), возвращая траектории, пиковые реакции в шарнирах и коллизии |
+| 14 | `run_fea_analysis` | МКЭ (FEA) | Статический расчёт упругости (`TET4` при `element_order = 1`, `TET10` при `element_order = 2`) с предполётной проверкой `validate_mesh` (`MESH_INVALID`). Принимает граничные условия по именованным граням `fixed` и `loads` (`force`, `pressure`, `moment`), опциональное исследование сеточной сходимости (`convergence_study: true`, `levels`, `max_seconds`), возвращает `max_von_mises_mpa`, `max_stress_excluding_constraint_zone_mpa`, `safety_factor`, `max_displacement_mm`, `element_order`, `verdict`, `confidence`, блок `diagnostics` и блок `accuracy` (сходимость и экстраполяция Ричардсона `P3-T3`) |
+| 15 | `get_fea_heatmap_image` | МКЭ / Рендер | Оффскрин-рендер деформированной сетки с тепловой картой напряжений по Мизесу в PNG/Base64 и легендой `colormap_legend` |
+| 16 | `capture_viewport` | Визуализация | Оффскрин-рендер детали или всей сцены в PNG/Base64 (с выбором `camera_preset` и `debug_mode`: `Shaded`, `Wireframe`, `Normals`, `Backfaces`, `BoundaryEdges`) |
+| 17 | `open_preview_window` | Визуализация | Открывает или фокусирует нативное интерактивное 3D-окно WGPU для детали или анимации симуляции |
+| 18 | `import_stl` | Импорт/Экспорт | Импортирует бинарный или ASCII `.stl` (`filepath`/`file_path`, опц. `part_id`, `is_fixed`, `material`), сваривает вершины (`weld_vertices` по 27 ячейкам) и регистрирует тело в `physics_world` |
+| 19 | `export_stl` | Импорт/Экспорт | Экспортирует деталь в `.stl` (координаты вершин в метрах СИ `m`) с заданным качеством тесселяции без инвалидации ревизии МКЭ |
+| 20 | `get_simulation_metrics_json` | Метрики | Полный инженерный отчёт по всем деталям, физическому миру (`gravity` в активных единицах, `joints_count`) и отчётам МКЭ (со статусом `FRESH`/`STALE`) |
+| 21 | `query_part_geometry` | Топология | Инспекция AABB, объёма, площади, центра масс и реестра именованных граней `faces` с поддержкой фильтрации через `face_selector` / `where` |
+| 22 | `boolean_union` | CSG | Булево объединение `tool_part_id` с `target_part_id` |
+| 23 | `boolean_intersection` | CSG | Булево пересечение `tool_part_id` с `target_part_id` |
+| 24 | `transform_part` | Solid DAG | Пространственная трансформация (`translation`, `rotation_deg`, `scale`) или выравнивание по именованным граням (`pivot_face`, `align_face`) |
+| 25 | `define_material` | Материалы | Регистрация пользовательского материала (`id`, `young_modulus_gpa`, `poisson_ratio`, `yield_strength_mpa`, `density_kg_m3`) |
+| 26 | `batch_cad_operations` | Автоматизация | Пакетное транзакционное выполнение цепочки инструментов с полным откатом состояния и `physics_world` при ошибке на любом шаге |
+| 27 | `validate_mesh` | Топология | 12-точечная топологическая и геометрическая диагностика сетки (`is_watertight`, `is_manifold`, `euler_characteristic`, `genus`, `sliver_triangles`, `t_junctions`, `self_intersections`) |
+| 28 | `optimize_feature_tree` | Оптимизатор | Cost-Based CAD Query Optimizer (`EXPLAIN ANALYZE`): перезапись DAG по правилам `R1`–`R5` с проверкой топологической и объёмной эквивалентности и масштабированием `logical_plan.dag`, `physical_plan.dag` и `candidate_plans[i].dag` в `length_unit` |
+| 29 | `set_units` | Единицы | Переключение активной единицы длины сессии (`"mm"` или `"m"`) |
+| 30 | `save_project` | Проект | Сохранение состояния сцены (материалы, DAG деталей, шарниры с моторами, требования, единицы) в версионированный JSON (`schema_version = "1.0.0"`) |
+| 31 | `load_project` | Проект | Транзакционная загрузка проекта из JSON с пересборкой сеток из DAG и восстановлением физического мира |
+| 32 | `set_requirements` | Требования | Декларация инженерных требований к детали или сцене (`bbox_max`, `bbox_min`, `mass_max`, `mesh_valid`, `min_safety_factor`) и включение `auto_check: true` |
+| 33 | `check_requirements` | Требования | Проверка всех зарегистрированных требований с возвратом измеренных значений, запасов `margin`, вердиктов `PASS`/`FAIL`/`STALE` и подсказок `hint` |
+| 34 | `get_scene_summary` | Сводка сцены | Компактная текстовая и JSON-сводка всей сцены для первого обращения ИИ-агента (единицы, детали, валидность сеток, статус FEA, шарниры и требования) |
 
 ---
 
-## 9. Комплекс инженерной верификации (5 тестовых деталей)
+## 9. Эталонные модели инженерной верификации (`./output/*.stl`)
 
-Система верифицирована автономным тестированием с участием субагентов-моделлеров и субагентов-разработчиков:
-
-1. **Сверло (Drill Bit Ø10 мм)**:
-   - Цилиндрический хвостовик $L=30$ мм, рабочая часть $L=60$ мм, 2-заходные спиральные канавки (`cut_helical_groove`, шаг 50 мм, правый винт DIN 338), коническая вершина 118° (`cone`).
-   - Файл: `./output/drill_bit.stl` (19 991 полигон, 40.8 г).
-2. **Шестигранная гайка М10 (Hex Nut DIN 934)**:
-   - Призма под ключ $S=17$ мм, высота $m=8.4$ мм с нативными коническими фасками 30° (`polygon_prism`), центральное отверстие Ø8.5 мм (`cut_hole`) и метрическая резьба 60° по ISO 68-1 с шагом $P=1.5$ мм (`cut_helical_groove` с `profile_type: "metric_60"`).
-   - Файл: `./output/nut_m10.stl` (25 716 полигонов, 15.4 г).
-3. **Прямозубая шестерня (Spur Gear m=2, z=20 DIN 867)**:
-   - Эвольвентный венец $m=2.0$ мм, $z=20$, $\alpha=20^\circ$, $b=15$ мм, ступица Ø22 мм, отверстие под вал Ø12 мм со шпоночным пазом DIN 6885 ($4 \times 1.8$ мм) и 4 облегчающих отверстия Ø3.5 мм (`spur_gear` + `boolean_difference`). FEA-анализ: $FoS = 5.63$ при $F = 500$ Н.
-   - Файл: `./output/spur_gear.stl` (23 172 полигона, 135.4 г).
-4. **Автомобильный легкосплавный диск (Car Wheel Rim R16 5x112)**:
-   - Ступенчатый обод R16 (Ø406 мм, закраины Ø430 мм, ширина 180 мм), вылет ET+35, центральное отверстие Ø66.6 мм, разболтовка PCD 5x112 (5 отверстий Ø14 мм), 5 спиц с окнами охлаждения суппорта (`wheel_rim`).
-   - Файл: `./output/car_rim.stl` (31 629 полигонов, 7.89 кг).
-5. **Электрическая лампочка A60 с цоколем E27 (Lightbulb IEC 60061-1)**:
-   - Стеклянная грушевидная колба A60 (Ø60 мм, высота 80 мм) через 2D-профиль вращения (`revolve`), резьбовой цоколь E27 (Ø27 мм, длина 27 мм, резьба 5 витков с шагом 3.62 мм) и донный контактный пятачок Ø11 мм с изолятором.
-   - Файл: `./output/lightbulb_e27.stl` (72 028 полигонов, 391 г).
+1. **Спиральное сверло (Drill Bit Ø10 мм, DIN 338)** — `cylinder` + 2-заходный `cut_helical_groove` (шаг 50 мм) + коническая вершина `cone` 118° (`./output/drill_bit.stl`).
+2. **Шестигранная гайка М10 (Hex Nut DIN 934)** — `polygon_prism` ($S=17$ мм, $h=8.4$ мм, фаски 30°) + центральное отверстие `cut_hole` Ø8.5 мм + метрическая резьба ISO 68-1 `cut_helical_groove` ($P=1.5$ мм, `profile_type: "metric_60"`) (`./output/nut_m10.stl`).
+3. **Прямозубая шестерня (Spur Gear $m=2$, $z=20$, DIN 867)** — `spur_gear` ($b=15$ мм, ступица Ø22 мм, отверстие Ø12 мм со шпоночным пазом DIN 6885 $4 \times 1.8$ мм) + 4 облегчающих отверстия; МКЭ-анализ $FoS = 5.63$ при $F = 500$ Н (`./output/spur_gear.stl`).
+4. **Автомобильный легкосплавный диск (Car Wheel Rim R16 5×112)** — `wheel_rim` (обод Ø406 мм, закраины Ø430 мм, ширина 180 мм, вылет ET+35, ЦО Ø66.6 мм, PCD 5×112, 5 спиц) (`./output/car_rim.stl`).
+5. **Электрическая лампочка A60 с цоколем E27 (Lightbulb IEC 60061-1)** — грушевидная колба `revolve` + резьбовой цоколь E27 с `cut_helical_groove` (`./output/lightbulb_e27.stl`).

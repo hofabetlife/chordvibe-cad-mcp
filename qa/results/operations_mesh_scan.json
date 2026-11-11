@@ -9,7 +9,7 @@
       "operation": "cut_hole_through_box",
       "orientation_consistent": true,
       "self_intersections": 0,
-      "signed_volume": 0.0003719069936296748,
+      "signed_volume": 0.0003719069936296798,
       "status": "PASS",
       "t_junctions": 0,
       "watertight": true
@@ -22,7 +22,7 @@
       "operation": "cut_hole_blind_box",
       "orientation_consistent": true,
       "self_intersections": 0,
-      "signed_volume": 0.00037893024522225974,
+      "signed_volume": 0.00037893024522226137,
       "status": "PASS",
       "t_junctions": 0,
       "watertight": true
@@ -52,26 +52,30 @@
       "watertight": true
     },
     {
-      "boundary_edges": 934,
-      "genus": 177.5,
+      "boundary_edges": 961,
+      "genus": 167.5,
       "issues": [
-        "Mesh is not watertight: 934 boundary edges (holes), 0 non-manifold edges",
-        "Found 1 self-intersecting non-adjacent triangle pairs",
-        "Euler genus mismatch: computed 177.5 (round 178), expected 0"
+        "Mesh is not watertight: 961 boundary edges (holes), 0 non-manifold edges",
+        "Found 24 self-intersecting non-adjacent triangle pairs",
+        "Sliver quality gate failed: 1900 needle triangles with min angle < 1° (min_angle=0.0004°)",
+        "Sliver quality gate failed: 33.49% of triangles (4034/12045) have min angle < 5° (threshold 1.00%)",
+        "Euler genus mismatch: computed 167.5 (round 168), expected 0"
       ],
       "operation": "cut_helical_groove_circular",
       "orientation_consistent": true,
-      "self_intersections": 1,
+      "self_intersections": 24,
       "status": "FAIL",
       "t_junctions": 0,
       "watertight": false
     },
     {
-      "boundary_edges": 96,
-      "genus": 16.0,
+      "boundary_edges": 413,
+      "genus": 67.0,
       "issues": [
-        "Mesh is not watertight: 96 boundary edges (holes), 0 non-manifold edges",
-        "Euler genus mismatch: computed 16.0 (round 16), expected 0"
+        "Mesh is not watertight: 413 boundary edges (holes), 0 non-manifold edges",
+        "Sliver quality gate failed: 1382 needle triangles with min angle < 1° (min_angle=0.0510°)",
+        "Sliver quality gate failed: 35.09% of triangles (3641/10375) have min angle < 5° (threshold 1.00%)",
+        "Euler genus mismatch: computed 67.0 (round 67), expected 0"
       ],
       "operation": "cut_helical_groove_metric_60",
       "orientation_consistent": true,
@@ -131,20 +135,35 @@
       "operation": "chain_box_two_holes_genus2",
       "validation": {
         "angle_stats": {
-          "median_angle_deg": 5.513269928609819,
-          "min_angle_deg": 0.005636943501654595,
-          "p5_angle_deg": 0.161287958136188
+          "histogram": {
+            "deg_15_to_30": 50,
+            "deg_1_to_5": 7,
+            "deg_30_to_45": 4506,
+            "deg_45_to_60": 11,
+            "deg_5_to_15": 148,
+            "lt_1_deg": 0
+          },
+          "median_angle_deg": 38.79025157977224,
+          "min_angle_deg": 3.135922499852452,
+          "p5_angle_deg": 35.971138355831975
         },
         "geometry": {
           "coplanar_overlaps_count": 0,
           "degenerate_triangles_count": 0,
-          "duplicate_vertices_count": 11397,
+          "duplicate_vertices_count": 11807,
           "is_positive_volume": true,
-          "max_aspect_ratio": 200986.2754871183,
+          "lt_1_deg_count": 0,
+          "lt_1_deg_ratio": 0.0,
+          "lt_5_deg_count": 7,
+          "lt_5_deg_ratio": 0.0014824227022448115,
+          "max_aspect_ratio": 43.01644989515312,
+          "median_aspect_ratio": 1.231782644662398,
+          "min_aspect_ratio": 1.0087223669170218,
           "normals_vs_winding_mismatches": 0,
+          "p5_aspect_ratio": 1.2317826446623967,
           "self_intersections_count": 0,
-          "signed_volume": 0.0009101023853222048,
-          "sliver_triangles_count": 2177,
+          "signed_volume": 0.0009101025788472524,
+          "sliver_triangles_count": 7,
           "t_junctions_count": 0
         },
         "issues": [],
@@ -159,13 +178,13 @@
           "non_manifold_edges_count": 0,
           "non_manifold_vertices_count": 0,
           "orientation_consistent": true,
-          "triangles_count": 4558,
-          "unique_edges_count": 6837,
-          "welded_vertices_count": 2277
+          "triangles_count": 4722,
+          "unique_edges_count": 7083,
+          "welded_vertices_count": 2359
         },
         "warnings": [
-          "Notice: 2177 sliver triangles detected (min angle < 5° or aspect ratio > 100)",
-          "Notice: 11397 un-welded duplicate vertices found (CAD split normals)"
+          "Notice: 7 sliver triangles detected (min angle < 5° or aspect ratio > 100)",
+          "Notice: 11807 un-welded duplicate vertices found (CAD split normals)"
         ]
       }
     }

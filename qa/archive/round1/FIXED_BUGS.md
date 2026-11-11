@@ -1,0 +1,180 @@
+# MCP-CAD Engine: Round 1 Resolved Bugs (BUG-001 .. BUG-017)
+
+| ID | Sev | Title | Component | Status | Commit | Verified |
+|---|---|---|---|---|---|---|
+| BUG-001 | S4 | ARCHITECTURE.md indicates 15 tools instead of 26 | docs | FIXED | `b9273ad` | 2026-10-30 |
+| BUG-002 | S2 | spur_gear: collinear origin-fan degenerate triangles and non-watertight CSG hub/bore/keyway | core/primitives | FIXED | `6e1dc66` | 2026-10-30 |
+| BUG-003 | S2 | revolve: partial revolution (<360 deg) end-caps have inverted triangle winding | core/primitives | FIXED | `3f0ee41` | 2026-10-30 |
+| BUG-004 | S2 | wheel_rim: non-watertight mesh with protruding spokes and 17956 boundary edges | core/primitives | FIXED | `5874aa7` | 2026-10-30 |
+| BUG-005 | S2 | polygon_prism: chamfer fails watertightness on 6/8 sides, is ignored on 3/4 sides, sides < 3 not rejected | core/primitives & dag | FIXED | `c6a6ef4` | 2026-10-30 |
+| BUG-006 | S2 | csg: BSP boolean operations and cut_hole drop small triangles and leave T-junction boundary edges | core/csg | FIXED | `3de6a26` | 2026-10-30 |
+| BUG-007 | S2 | topology: TriangleMesh::scale with negative scale factor inverts winding and produces negative signed volume | core/topology | FIXED | `c918111` | 2026-10-30 |
+| BUG-008 | S2 | cad tools: failed rebuild leaves invalid FeatureNode in part DAG, poisoning subsequent operations | server/tools/cad | FIXED | `8a0e8bb` | 2026-10-30 |
+| BUG-009 | S2 | batch_cad_operations: partial failure does not roll back state mutations from earlier steps | server/tools/cad | FIXED | `13bc330` | 2026-10-30 |
+| BUG-010 | S3 | open_preview_window: does not validate part_id existence when running in headless mode | server/tools/render | FIXED | `66e8a81` | 2026-10-30 |
+| BUG-011 | S2 | optimize_feature_tree (CBO) is missing from Rust crates/mcp-cad-core & mcp-cad-server | core & server | FIXED | `current` | 2026-11-01 |
+| BUG-012 | S3 | list_tools() omits validate_mesh and optimize_feature_tree (26 vs 28 tools discrepancy) | server/tools/mod | FIXED | `current` | 2026-11-01 |
+| BUG-013 | S4 | Documentation inconsistency: references to 26 tools vs 28 tools across README and ARCHITECTURE | docs | FIXED | `current` | 2026-11-01 |
+| BUG-014 | S3 | TypeScript compilation errors in mcp-cad-studio (NativeBridgeStatus, titleRu, QualityPreset) | web/typescript | FIXED | `current` | 2026-10-31 |
+| BUG-015 | S3 | server/tools: JSON Schema desynchronization in create_joint and create_part | server/tools | FIXED | `0d41f00` | 2026-11-01 |
+| BUG-016 | S2 | revolve profile self-intersection & r<0 validation, wheel_rim winding, and weldTolerance | core/primitives | FIXED | `208cf2a` | 2026-11-01 |
+| BUG-017 | S2 | fea/solver: unconstrained model rejection and Hooke axial tension decomposition | fea/solver | FIXED | `02e932b` | 2026-11-01 |
+
+---
+
+## BUG-001 [S4][FIXED] ARCHITECTURE.md: устаревшее упоминание 15 инструментов вместо 26
+- **Коммит**: `b9273ad fix(docs): update tool count to 26 in ARCHITECTURE.md [BUG-001]`
+- **Причина**: Документация не была синхронизирована с фактическим реестром 26 инструментов Model Context Protocol.
+- **Исправление**: В `docs/ARCHITECTURE.md` и в docstring `crates/mcp-cad-server/src/tools/mod.rs` обновлены ссылки с 15/20 на 26 инструментов.
+- **Верификация**: `test_wide_scan_functional_matrix_26_tools` и `test_mcp_tools_list` подтвердили наличие и работоспособность всех 26 инструментов.
+
+---
+
+## BUG-002 [S2][FIXED] spur_gear: вырожденные коллинеарные треугольники и негерметичность со ступицей/шпонпазом
+- **Коммит**: `6e1dc66 fix(core): construct watertight manifold spur gear with hub, bore, and keyway [BUG-002]`
+- **Причина**: Веерная триангуляция от `[0, 0]` на радиальных линиях ножки зуба при $r_f < r_b$ создавала вырожденные коллинеарные треугольники. Использование несшитого CSG для ступицы и шпоночного паза создавало тысячи граничных ребер и T-junctions.
+- **Исправление**: 
+  - Реализован концентрический триангулятор торцевых крышек зубчатого венца от $r_f$ к $r_{hub}$ или $r_{bore}$ без лучевой сингулярности.
+  - Построена единая согласованная топологическая сетка венца, цилиндрической ступицы, центрального отверстия и шпоночного паза стандарта DIN 6885 без несшитых булевых операций.
+- **Верификация**:
+  - `spur_gear_teeth_8_plain`: status PASS, watertight, 0 degenerates, genus 0.
+  - `spur_gear_teeth_20_with_hub_bore_keyway`: status PASS, watertight, genus 1, Euler $\chi=0$, volume $>0$.
+  - Визуальный аудит 5 режимов: `spur_gear_shaded.png`, `spur_gear_wireframe.png`, `spur_gear_normals.png`, `spur_gear_backfaces.png`, `spur_gear_boundary_edges.png` подтвердил 0 дыр и 0 артефактов.
+
+---
+
+## BUG-003 [S2][FIXED] revolve: инвертированная ориентация треугольников торцевых крышек частичного вращения
+- **Коммит**: `3f0ee41 fix(core): fix partial revolve end-cap winding and analytical normals [BUG-003]`
+- **Причина**: Порядок обхода вершин стартовой и конечной плоских торцевых крышек в `create_revolve` имел неверный порядок обхода `[i0, i2, i1]` vs `[i0, i1, i2]`.
+- **Исправление**: Исправлен порядок обхода на торцевых крышках $0^\circ$ и $\theta_{\text{end}}$, вычислены точные аналитические нормали для плоских крышек вдоль нормали секущей плоскости.
+- **Верификация**:
+  - `revolve_curved_90deg`: status PASS, watertight: true, boundary_edges: 0, inverted_edges: 0, genus: 0.
+  - `revolve_curved_180deg`: status PASS, watertight: true, boundary_edges: 0, inverted_edges: 0, genus: 0.
+  - Визуальный аудит 5 режимов: `revolve_partial_shaded.png`, `revolve_partial_wireframe.png`, `revolve_partial_normals.png`, `revolve_partial_backfaces.png`, `revolve_partial_boundary_edges.png`.
+
+---
+
+## BUG-004 [S2][FIXED] wheel_rim: негерметичный меш колесного диска с выступающими спицами
+- **Коммит**: `5874aa7 fix(core): build unified watertight manifold wheel rim mesh [BUG-004]`
+- **Причина**: Наружный радиус спиц $r_{spoke\_outer}$ превышал радиус монтажного ручья $r_{well}$, из-за чего спицы протыкали профиль обода наружу. Композиция обода, спиц и ступицы производилась несшитым CSG, порождая 17956 boundary edges.
+- **Исправление**: Реализован единый топологический генератор колесного диска: обод построен методом вращения замкнутого профиля с полкой и закраинами, спицы ограничены внутренним радиусом обода $r_{inner} = r_{well} - t_w$, ступица и посадочные отверстия под болты соединены в водонепроницаемый B-Rep меш.
+- **Верификация**:
+  - `wheel_rim_18x8`: status PASS, watertight: true, boundary_edges: 0, non_manifold_edges: 0, self_intersections: 0.
+  - Визуальный аудит 5 режимов: `wheel_rim_shaded.png`, `wheel_rim_wireframe.png`, `wheel_rim_normals.png`, `wheel_rim_backfaces.png`, `wheel_rim_boundary_edges.png`.
+
+---
+
+## BUG-005 [S2][FIXED] polygon_prism: фаска (chamfer) и валидация числа граней
+- **Коммит**: `c6a6ef4 fix(core): build watertight chamfered polygon prism and reject sides < 3 [BUG-005]`
+- **Причина**: Построение фаски через булево пересечение цилиндрического тела приводило к потере мелких фасеток и возникновению дыр на 6/8-гранниках, а на 3/4-гранниках фаска игнорировалась. В DAG отсутствовала валидация `sides >= 3`.
+- **Исправление**: 
+  - Написан прямой аналитический генератор призмы с конической фаской под $30^\circ$ (по стандарту DIN 934 для гаек и болтов), соединяющий фасеточные боковые грани с наклонными трапециями фаски и концентрическими крышками.
+  - В `FeatureOp::AddPolygonPrism` добавлена жесткая проверка `sides >= 3`, возвращающая `CadError::InvalidParameter`.
+- **Верификация**:
+  - `polygon_prism_3sides_chamfer_0.002`: status PASS, watertight, genus 0.
+  - `polygon_prism_4sides_chamfer_0.002`: status PASS, watertight, genus 0.
+  - `polygon_prism_6sides_chamfer_0.002`: status PASS, watertight, genus 0.
+  - `polygon_prism_8sides_chamfer_0.002`: status PASS, watertight, genus 0.
+  - Тест валидации `sides = 2` корректно возвращает ошибку.
+
+---
+
+## BUG-006 [S2][FIXED] csg: булевы операции и вырезы отверстий/канавок
+- **Коммит**: `3de6a26 fix(core): eliminate T-junctions and non-manifold slits in CSG booleans [BUG-006]`
+- **Причина**: Порог отсечения вырожденных треугольников `cross.norm_squared() > 1e-16` в метрах ($10^{-8}\text{ м}^2$) ошибочно удалял валидные треугольники площадью $<0.005\text{ мм}^2$. Не выполнялось сшивание коллинеарных вершин на ребрах пересечения (T-junctions).
+- **Исправление**:
+  - Настроен адаптивный эпсилон-порог площади с учетом геометрического масштаба детали.
+  - Добавлено автоматическое разбиение смежных ребер в точках пересечения (T-junction edge subdivision) до $N=4000$ вершин.
+  - Для выреза отверстий со шпоночным пазом `cut_hole_with_settings` построен герметичный конформный резец с небольшим запасом по высоте для предотвращения копланарных артефактов.
+- **Верификация**:
+  - CSG-цепочка двух отверстий со шпоночным пазом (genus 2): status PASS, watertight: true, boundary_edges: 0, non_manifold_edges: 0, t_junctions: 0.
+  - Визуальный аудит 5 режимов: `csg_chain_two_holes_shaded.png`, `csg_chain_two_holes_wireframe.png`, `csg_chain_two_holes_normals.png`, `csg_chain_two_holes_backfaces.png`, `csg_chain_two_holes_boundary_edges.png`.
+
+---
+
+## BUG-007 [S2][FIXED] topology: инверсия обхода вершин при отрицательном масштабе
+- **Коммит**: `c918111 fix(core): preserve outward winding and normals under negative scale [BUG-007]`
+- **Причина**: При отрицательном определителе матрицы масштабирования $\det(S) = s_x s_y s_z < 0$ порядок обхода вершин сохранялся прежним, в результате чего нормали граней выворачивались внутрь, а знаковый объем становился отрицательным.
+- **Исправление**: В `TriangleMesh::scale` добавлена смена порядка обхода треугольников `indices[i].swap(1, 2)` при $\det(S) < 0$, что сохраняет внешнюю ориентацию нормалей и положительный объем.
+- **Верификация**: `test_bug_007_negative_scale_preserves_outward_winding` подтвердил: `signed_volume = +0.001 > 0`, 0 перевернутых граней, статус PASS.
+
+---
+
+## BUG-008 [S2][FIXED] cad tools: откат узла DAG при ошибке пересчета геометрии
+- **Коммит**: `8a0e8bb fix(server): roll back DAG node on failed part rebuild [BUG-008]`
+- **Причина**: При неудачном `part.rebuild()` добавленный узел оставался в `part.dag.nodes`, делая деталь неработоспособной для всех последующих операций.
+- **Исправление**: Во всех функциях модификации детали (`add_feature_primitive`, `cut_hole`, `modify_feature`, `cut_helical_groove`, `boolean_difference`, `boolean_union`, `boolean_intersection`, `transform_part`) сохраняется предварительный снимок `prev_dag` и `prev_mesh`. В случае ошибки `rebuild()` деталь мгновенно восстанавливается к исходному состоянию.
+- **Верификация**: `test_bug_008_dag_rollback_on_failed_rebuild` подтвердил чистый откат и работоспособность детали после сбойной операции.
+
+---
+
+## BUG-009 [S2][FIXED] batch_cad_operations: атомарный откат состояния пакета операций
+- **Коммит**: `13bc330 fix(server): make batch_cad_operations atomic on failure [BUG-009]`
+- **Причина**: Если одна из операций внутри `batch_cad_operations` завершалась с ошибкой, созданные предыдущими шагами детали и материалы оставались в `state`, нарушая принцип атомарности.
+- **Исправление**: Сохраняется полный снимок коллекций `state.parts`, `state.materials`, `state.last_fea_reports`, `state.last_fea_meshes`, `state.last_simulation` перед началом выполнения пакета. При любой ошибке в цикле все коллекции восстанавливаются из снимка до возврата ошибки клиенту.
+- **Верификация**: `test_bug_009_batch_operations_atomic_rollback` подтвердил, что промежуточно созданные детали полностью удаляются при ошибке последующих шагов пакета.
+
+---
+
+## BUG-010 [S3][FIXED] open_preview_window и capture_viewport: строгая валидация аргументов
+- **Коммит**: `66e8a81 fix(server): validate part_id in headless open_preview_window and dimensions in capture_viewport [BUG-010]`
+- **Причина**: `open_preview_window` в headless-режиме возвращал `Ok({"status": "headless"})` даже для несуществующего `part_id`, а `capture_viewport` не проверял `width > 0 && height > 0`.
+- **Исправление**: 
+  - `open_preview_window` проверяет наличие `part_id` в `state.parts` перед ветвлением по режиму работы (headless / GUI). Если деталь отсутствует — возвращается `ServerError::PartNotFound`.
+  - `capture_viewport` валидирует `width > 0 && height > 0`, возвращая `ServerError::InvalidArgument` при нулевых габаритах.
+- **Верификация**: `test_bug_010_viewport_and_preview_validation` подтвердил возврат корректных ошибок.
+
+---
+
+## BUG-011 [S2][FIXED] core & server: `optimize_feature_tree` портирован в Rust-крейты
+- **Компонент**: `crates/mcp-cad-core/src/query_optimizer.rs`, `crates/mcp-cad-core/src/part.rs`, `crates/mcp-cad-server/src/tools/cad.rs`
+- **Причина**: Оптимизатор графа операций (Cost-Based Optimizer) с правилами R1–R5 и соответствующий инструмент MCP были реализованы на клиенте в TypeScript (`src/cad/query_optimizer.ts`, `src/cad/mcp_dispatcher.ts`), но не портированы в `crates/mcp-cad-core` и `crates/mcp-cad-server`.
+- **Исправление**: Реализован модуль `crates/mcp-cad-core/src/query_optimizer.rs` с правилами `R1_TRANSFORM_FUSION`, `R2_AABB_DEAD_OP_CULLING`, `R3_DEMORGAN_CSG_BATCH`, `R4_COAXIAL_REVOLVE_REDUCTION`, `R5_ANALYTICAL_PRISM_THREAD_FUSION`, методом `part.optimize_dag(apply)` и обработчиком `cad::optimize_feature_tree` в `crates/mcp-cad-server`.
+- **Верификация**: Юнит-тесты `test_r4_coaxial_bushing_cylinder_hole_to_revolve`, `test_r2_aabb_dead_op_culling_and_r1_transform_fusion`, `test_r5_prism_thread_fusion` и контрактный тест `test_mcp_optimize_feature_tree_cbo` подтверждают сохранение объема ($\Delta V < 0.5\%$) и топологических инвариантов.
+
+---
+
+## BUG-012 [S3][FIXED] server: `list_tools()` экспортирует все 28 инструментов (`validate_mesh` и `optimize_feature_tree`)
+- **Компонент**: `crates/mcp-cad-server/src/tools/mod.rs`
+- **Причина**: Функция `list_tools()` возвращала 26 инструментов, опуская инструмент №27 `validate_mesh` и инструмент №28 `optimize_feature_tree`.
+- **Исправление**: В `list_tools()` добавлены полные JSON-Schema определения для `validate_mesh` (Tool #27) и `optimize_feature_tree` (Tool #28), а в `dispatch_tool()` подключен маршрут `"optimize_feature_tree"`.
+- **Верификация**: `test_mcp_tools_list` проверяет `assert_eq!(tools.len(), 28)` и наличие всех 28 инструментов.
+
+---
+
+## BUG-013 [S4][FIXED] docs: синхронизировано количество инструментов (28 Tools)
+- **Компонент**: `README.md`, `docs/ARCHITECTURE.md`, `PROJECT_CONTEXT.md`, `qa/COVERAGE.md`
+- **Причина**: В разных разделах документации упоминалось 26 либо 28 инструментов.
+- **Исправление**: Все упоминания в `README.md`, `docs/ARCHITECTURE.md`, `PROJECT_CONTEXT.md` и `qa/COVERAGE.md` унифицированы на 28 инструментов.
+
+---
+
+## BUG-014 [S3][FIXED] web/typescript: ошибки типов tsc --noEmit в mcp-cad-studio
+- **Компонент**: `src/App.tsx`, `src/types/cad.ts`, `src/cad/native_bridge.ts`
+- **Причина**: Несовпадение типов `NativeBridgeStatus`, свойства `titleRu`, расширение допустимых значений `QualityPreset` (`fine`), отсутствие `@types/node`.
+- **Исправление**: Экспортирован `NativeBridgeStatus`, добавлены типы, скорректированы вызовы, установлен `@types/node`.
+- **Верификация**: `tsc --noEmit` и `npm run build` завершаются с кодом 0 (0 ошибок).
+
+---
+
+## BUG-015 [S3][FIXED] server/tools: рассинхронизация JSON Schema в `create_joint` и `create_part`
+- **Компонент**: `crates/mcp-cad-server/src/tools/mod.rs`, `crates/mcp-cad-server/src/tools/physics.rs`
+- **Симптом**: `tools/list` объявлял `enum: ["revolute", "prismatic", "fixed", "spherical"]` для `create_joint` (без `"gear"`) и требовал обязательные `anchor_a`/`anchor_b` даже для зубчатой передачи (`gear`); `create_part` не содержал `is_fixed` в `input_schema`.
+- **Исправление**: Добавлен `"gear"`, `axis_a`, `axis_b`, `ratio`, `teeth_a`, `teeth_b` в схему `create_joint`, сделаны `anchor_a`/`anchor_b` опциональными, добавлен `is_fixed` в схему `create_part`.
+- **Верификация**: `test_bug015_create_joint_and_create_part_schema_contract` и тест 18 в `src/cad/cad_engine.test.ts`.
+
+---
+
+## BUG-016 [S2][FIXED] core/primitives: отсутствие валидации самопересечений и `r < 0` в `revolve`, инвертированный обход `wheel_rim` в TS-ядре и завышенный `weldTolerance`
+- **Компонент**: `crates/mcp-cad-server/src/tools/cad.rs`, `src/cad/primitives.ts`, `src/cad/mcp_dispatcher.ts`
+- **Симптом**: `revolve` принимал $r < 0$, $\theta > 360^\circ$ и самопересекающиеся контуры; `createWheelRimMesh` строил контур с отрицательным объемом; `weldTolerance = 1e-5` м схлопывал мелкие вершины.
+- **Исправление**: Добавлена предвалидация $r \ge 0$, $\theta \in (0, 360]$ и пересечений контура; внешняя ориентация в `MeshBuilder`; `weldTolerance = 1e-6` м.
+- **Верификация**: `test_bug016_revolve_boundary_and_self_intersection_validation` и тест 19 в `src/cad/cad_engine.test.ts`.
+
+---
+
+## BUG-017 [S2][FIXED] fea/solver: отсутствие проверки закрепления (Rigid Body Motion) и декомпозиции осевого растяжения Гука в TS FEA-решателе
+- **Компонент**: `src/cad/fea_solver.ts`, `src/cad/mcp_dispatcher.ts`
+- **Симптом**: Отсутствие ошибки незакрепленного тела; нулевая сила давала `minVonMises = Infinity`; осевая нагрузка рассчитывалась по изгибной формуле.
+- **Исправление**: Проверка закреплений с возвратом явной ошибки Rigid Body Motion; нулевой отклик при нулевой силе; декомпозиция силы на осевую составляющую Гука ($\Delta L = \frac{FL}{EA}$) и поперечный изгиб.
+- **Верификация**: Тест 20 в `src/cad/cad_engine.test.ts` (ошибка $0.00\%$).

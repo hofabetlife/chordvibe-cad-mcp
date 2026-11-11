@@ -168,6 +168,36 @@ impl ToolCallResult {
     }
 }
 
+/// Concise agent operating instructions returned in the MCP `initialize` response (`instructions` field).
+/// Summarizes the full guide in `docs/AGENT_GUIDE.md` (~1480 characters).
+pub const AGENT_INSTRUCTIONS: &str = "\
+MCP-CAD Agent Guide (full text: SKILL.md, docs/AGENT_GUIDE.md, docs/MCP_API_REFERENCE.md, docs/UNITS.md):
+1. COORDINATE CONVENTIONS & PRIMITIVE ORIGINS:
+   - Origin is [0, 0, 0]. Z is the primary axis of revolution/height.
+   - All 3D primitives are CENTERED along Z in [-height/2, +height/2] (box, cylinder, cone, polygon_prism, spur_gear, wheel_rim).
+   - 'box': X in [-width/2, +width/2], Y in [-height/2, +height/2], Z in [-depth/2, +depth/2].
+   - 'cylinder': XY radius x^2+y^2 <= radius^2, Z in [-height/2, +height/2]. Caps at Z = -height/2 ('cap_bottom') and +height/2 ('cap_top').
+   - 'cone': Z in [-height/2, +height/2]. Base radius_bottom is at Z = -height/2, apex radius_top is at Z = +height/2.
+   - 'polygon_prism': regular N-gon in XY with outer_radius (or width_across_flats), Z in [-height/2, +height/2], optional chamfer_radius.
+   - 'spur_gear': centered along Z in [-face_width/2, +face_width/2] with central bore and keyway.
+   - 'revolve': 2D profile [r, z] revolved around Z-axis.
+2. DAG SEMANTICS (FeatureTree):
+   - First 'add_feature_primitive' creates the root base body.
+   - Subsequent 'add_feature_primitive' calls on the same part_id AUTOMATICALLY perform 'csg_union' (they do NOT overwrite the part).
+   - 'cut_hole' and 'cut_helical_groove' AUTOMATICALLY perform 'csg_difference'.
+3. SPECIALIZED ENGINEERING TOOLS:
+   - 'cut_hole': cylindrical drilling with optional DIN 6885 keyway ('keyway_width', 'keyway_depth') and 'through: true'.
+   - 'cut_helical_groove': flutes and threads with 'profile_type': 'circular' (twist drills) or 'metric_60' (ISO 68-1 threads); auto-aligns start_z with bounding_box.min[2].
+   - 'spur_gear': standard DIN 867 involute spur gear with hub and keyway.
+   - 'wheel_rim': 5-spoke automotive wheel rim with central hub bore and PCD bolt circle.
+4. GUI VS HEADLESS:
+   - 'capture_viewport': renders offscreen Base64 PNG for AI agent perception (fast, works in headless CLI/container).
+   - 'open_preview_window': interactive 3D WGPU desktop viewer for user. When called in stdio session without --gui, automatically exports live STL and spawns 'mcp-cad-server --stl <path>'.
+   - DO NOT read Rust source code files in crates/ — all coordinate systems and API behaviors are fully defined here.
+5. UNITS & WORKFLOW:
+   - Default length_unit is 'mm' (force: N, moment: N*m, stress: MPa, Young's modulus: GPa, mass: kg, angles: deg). STL on disk uses meters (m).
+   - Declare requirements via 'set_requirements' (auto_check: true) -> Build ('add_feature_primitive', 'cut_hole') -> 'validate_mesh' -> FEA ('run_fea_analysis') -> 'save_project'.";
+
 /// Dispatches an MCP request and returns the optional JSON-RPC response.
 pub async fn handle_request(req: JsonRpcRequest, state: &SharedState) -> Option<JsonRpcResponse> {
     let id = req.id.clone();
@@ -175,6 +205,13 @@ pub async fn handle_request(req: JsonRpcRequest, state: &SharedState) -> Option<
 
     match req.method.as_str() {
         "initialize" => {
+            let (length_unit, units) = {
+                let engine = state.read();
+                (
+                    engine.length_unit.as_str(),
+                    engine.length_unit.units_metadata(),
+                )
+            };
             let result = json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": {
@@ -183,7 +220,10 @@ pub async fn handle_request(req: JsonRpcRequest, state: &SharedState) -> Option<
                 "serverInfo": {
                     "name": "mcp-cad-engine",
                     "version": "0.1.0"
-                }
+                },
+                "instructions": AGENT_INSTRUCTIONS,
+                "length_unit": length_unit,
+                "units": units
             });
             Some(JsonRpcResponse::success(id, result))
         }
@@ -214,14 +254,18 @@ pub async fn handle_request(req: JsonRpcRequest, state: &SharedState) -> Option<
                 }
             };
 
-            let call_res = {
+            let tool_result = {
                 let mut engine = state.write();
-                dispatch_tool(tool_name, &arguments, &mut engine)
-            };
-
-            let tool_result = match call_res {
-                Ok(res) => res,
-                Err(err) => ToolCallResult::error(err.to_string()),
+                let call_res = dispatch_tool(tool_name, &arguments, &mut engine);
+                match call_res {
+                    Ok(res) => res,
+                    Err(err) => {
+                        let mut existing_parts: Vec<String> = engine.parts.keys().cloned().collect();
+                        existing_parts.sort();
+                        let error_body = err.to_error_body_with_parts(Some(&existing_parts));
+                        ToolCallResult::error(error_body.to_json_string())
+                    }
+                }
             };
 
             let res_value = match serde_json::to_value(&tool_result) {

@@ -51,7 +51,7 @@ async fn test_gear_kinematic_simulation_and_preview() {
                 "arguments": {
                     "part_id": base_id,
                     "primitive_type": "box",
-                    "params": { "width": 0.20, "height": 0.10, "depth": 0.02 }
+                    "params": { "width": 200.0, "height": 100.0, "depth": 20.0 }
                 }
             }
         }),
@@ -89,10 +89,10 @@ async fn test_gear_kinematic_simulation_and_preview() {
                     "part_id": gear1_id,
                     "primitive_type": "spur_gear",
                     "params": {
-                        "module": 0.002,
+                        "module": 2.0,
                         "teeth": 20,
                         "pressure_angle_deg": 20.0,
-                        "face_width": 0.010
+                        "face_width": 10.0
                     }
                 }
             }
@@ -133,10 +133,10 @@ async fn test_gear_kinematic_simulation_and_preview() {
                     "part_id": gear2_id,
                     "primitive_type": "spur_gear",
                     "params": {
-                        "module": 0.002,
+                        "module": 2.0,
                         "teeth": 40,
                         "pressure_angle_deg": 20.0,
-                        "face_width": 0.010
+                        "face_width": 10.0
                     }
                 }
             }
@@ -154,7 +154,7 @@ async fn test_gear_kinematic_simulation_and_preview() {
                 "name": "transform_part",
                 "arguments": {
                     "part_id": gear2_id,
-                    "translation": [0.06, 0.0, 0.0],
+                    "translation": [60.0, 0.0, 0.0],
                     "rotation_deg": [0.0, 0.0, 4.5]
                 }
             }
@@ -174,7 +174,7 @@ async fn test_gear_kinematic_simulation_and_preview() {
                     "joint_type": "revolute",
                     "part_a": base_id,
                     "part_b": gear1_id,
-                    "anchor_a": [0.0, 0.0, 0.02],
+                    "anchor_a": [0.0, 0.0, 20.0],
                     "anchor_b": [0.0, 0.0, 0.0],
                     "axis": [0.0, 0.0, 1.0]
                 }
@@ -198,8 +198,8 @@ async fn test_gear_kinematic_simulation_and_preview() {
                     "joint_type": "revolute",
                     "part_a": base_id,
                     "part_b": gear2_id,
-                    "anchor_a": [0.06, 0.0, 0.02],
-                    "anchor_b": [0.06, 0.0, 0.0],
+                    "anchor_a": [60.0, 0.0, 20.0],
+                    "anchor_b": [60.0, 0.0, 0.0],
                     "axis": [0.0, 0.0, 1.0]
                 }
             }
