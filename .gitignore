@@ -1,25 +1,9 @@
-# Rust build artifacts
-target/
-*.log
-
-# AI Studio environment & temporary artifacts
-.aistudio/
-.playwright-cli/
-metadata.json
-
-# Web Studio interface files (environment-specific runner)
 node_modules/
-dist/
+target/
 build/
+dist/
 coverage/
-src/
-server.ts
-index.html
-vite.config.ts
-tsconfig*.json
-package.json
-package-lock.json
-bun.lock
-scripts/
-.env*
 .DS_Store
+*.log
+.env*
+!.env.example
