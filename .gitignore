@@ -7,3 +7,7 @@ coverage/
 *.log
 .env*
 !.env.example
+.aistudio/
+.vite/
+output/
+crates/*/output/
