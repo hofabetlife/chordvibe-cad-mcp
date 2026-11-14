@@ -78,7 +78,10 @@ export interface AngleHistogramBuckets {
 export interface MeshValidationReport {
   partId: string;
   status: 'PASS' | 'WARN' | 'FAIL';
+  issues?: string[];
   warnings: string[];
+  isValidSolid?: boolean;
+  feaReady?: boolean;
   rawVerticesCount: number;
   weldedVerticesCount: number;
   trianglesCount: number;

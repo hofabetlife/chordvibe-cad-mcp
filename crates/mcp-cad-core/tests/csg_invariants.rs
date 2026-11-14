@@ -600,3 +600,90 @@ fn p2_t7_rebuild_determinism_of_face_ids_and_names() {
     assert_eq!(eval1.faces, eval2.faces, "faces registry must be 100% deterministic across rebuilds");
 }
 
+#[test]
+fn p3_t12_flanged_bushing_union_and_difference_watertight() {
+    use mcp_cad_core::diagnostics::validate_mesh_strict;
+    use std::f64::consts::PI;
+
+    let cyl = create_cylinder(15.0, 50.0, 64);
+    let hole = create_cylinder(10.0, 52.0, 64);
+    let expected_vol = PI * (15.0_f64.powi(2) - 10.0_f64.powi(2)) * 50.0
+        + (40.0 * 40.0 - PI * 15.0_f64.powi(2)) * 10.0;
+
+    for (label, z_offset) in [
+        ("centered_flange", 0.0),
+        ("shifted_flange", -15.0),
+        ("bottom_coplanar_flange", -20.0),
+    ] {
+        let mut flange = create_box(40.0, 40.0, 10.0);
+        if z_offset != 0.0 {
+            flange.translate([0.0, 0.0, z_offset]);
+        }
+
+        let u = csg_union(&cyl, &flange);
+        let rep_u = validate_mesh_strict(&u, Some(0));
+        assert_eq!(
+            rep_u.status, "PASS",
+            "{label} [union]: strict validation failed: issues={:?}, boundary={}, non_man={}, lt_5={:.2}%",
+            rep_u.issues,
+            rep_u.topology.boundary_edges_count,
+            rep_u.topology.non_manifold_edges_count,
+            rep_u.geometry.lt_5_deg_ratio * 100.0
+        );
+        assert!(rep_u.topology.is_watertight);
+        assert_eq!(rep_u.topology.boundary_edges_count, 0);
+        assert_eq!(rep_u.topology.non_manifold_edges_count, 0);
+
+        let bushing = csg_difference(&u, &hole);
+        let rep = validate_mesh_strict(&bushing, Some(1));
+        assert_eq!(
+            rep.status, "PASS",
+            "{label} [bushing]: strict validation failed: issues={:?}, boundary={}, non_man={}, lt_5={:.2}%",
+            rep.issues,
+            rep.topology.boundary_edges_count,
+            rep.topology.non_manifold_edges_count,
+            rep.geometry.lt_5_deg_ratio * 100.0
+        );
+        assert!(rep.topology.is_watertight);
+        assert_eq!(rep.topology.boundary_edges_count, 0);
+        assert_eq!(rep.topology.non_manifold_edges_count, 0);
+        assert_eq!(rep.topology.euler_characteristic, 0);
+        assert!((rep.topology.genus - 1.0).abs() < 1e-12);
+        assert_eq!(rep.geometry.t_junctions_count, 0);
+
+        let vol_err = (bushing.signed_volume() - expected_vol).abs() / expected_vol;
+        assert!(
+            vol_err < 0.005,
+            "{label}: volume {} differs from analytical {expected_vol} by {:.4}%",
+            bushing.signed_volume(),
+            vol_err * 100.0
+        );
+    }
+
+    // Also verify pure BSP-CSG path on untagged meshes (matching ADR-0001 / P1-T3 benchmark setup)
+    let mut cyl_raw = cyl.clone();
+    cyl_raw.face_ids.clear();
+    cyl_raw.faces.clear();
+    let mut flange_raw = create_box(40.0, 40.0, 10.0);
+    flange_raw.translate([0.0, 0.0, -15.0]);
+    flange_raw.face_ids.clear();
+    flange_raw.faces.clear();
+    let mut hole_raw = hole.clone();
+    hole_raw.face_ids.clear();
+    hole_raw.faces.clear();
+
+    let u_raw = csg_union(&cyl_raw, &flange_raw);
+    let diff_raw = csg_difference(&u_raw, &hole_raw);
+    let rep_raw = validate_mesh_strict(&diff_raw, Some(1));
+    assert_eq!(
+        rep_raw.status, "PASS",
+        "raw_untagged [bushing]: strict validation failed: issues={:?}",
+        rep_raw.issues
+    );
+    assert!(rep_raw.topology.is_watertight);
+    assert_eq!(rep_raw.topology.boundary_edges_count, 0);
+    assert_eq!(rep_raw.topology.non_manifold_edges_count, 0);
+    assert!((rep_raw.topology.genus - 1.0).abs() < 1e-12);
+}
+
+

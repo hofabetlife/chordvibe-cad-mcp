@@ -88,8 +88,8 @@ pub fn get_simulation_metrics_json(args: &Value, state: &EngineState) -> Result<
 }
 
 /// 34. `get_scene_summary`: Returns a compact, one-call scene overview for AI agents entering a new context:
-/// project units, parts (id, name, bounding box, volume, mass, mesh validity, latest FEA FoS/verdict/staleness),
-/// kinematic joints, and declared engineering requirements with their verification status.
+///     project units, parts (id, name, bounding box, volume, mass, mesh validity, latest FEA FoS/verdict/staleness),
+///     kinematic joints, and declared engineering requirements with their verification status.
 pub fn get_scene_summary(args: &Value, state: &EngineState) -> Result<Value, ServerError> {
     let unit = state.resolve_length_unit(args)?;
     let k_from_m = unit.from_meters_factor();

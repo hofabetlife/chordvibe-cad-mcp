@@ -840,6 +840,813 @@ fn test_p2_t23_reserved_ground_world_and_normalization() {
     assert_eq!(j2_rec.part_a, "world");
 }
 
+#[test]
+fn test_p2_t36_gravity_f64_exact_precision_and_clone() {
+    let mut world = PhysicsWorld::new();
+    assert_eq!(world.gravity(), [0.0, -9.81, 0.0]);
+    assert_eq!(world.gravity()[1] * 1000.0, -9810.0);
 
+    let cloned = world.clone();
+    assert_eq!(cloned.gravity(), [0.0, -9.81, 0.0]);
+
+    world.set_gravity([0.0, 0.0, -9.80665]);
+    assert_eq!(world.gravity(), [0.0, 0.0, -9.80665]);
+}
+
+#[test]
+fn test_p3_t6_static_cantilever_beam_load_case_and_newton_third_law() {
+    use mcp_cad_physics::LoadCaseSelector;
+
+    let g = 9.81_f64;
+    let mut world = PhysicsWorld::with_gravity([0.0, -g, 0.0]);
+
+    // Fixed support block (`is_fixed = true`, added with `is_dynamic = false`)
+    let mut wall = create_test_box("wall_support", "Wall Support", 0.05, 0.10, 0.10);
+    wall.is_fixed = true;
+    world.add_part(&wall, false).unwrap();
+
+    // Horizontal cantilever beam of length L = 0.20 m along +X, cross-section 0.02 m x 0.02 m.
+    // `create_box(L, W, H)` is centered at [0,0,0]; translate its mesh by [+L/2, 0, 0] so the
+    // root face is at x = 0 and the center of mass is at [L/2, 0, 0] = [0.10, 0, 0] m.
+    let length_m = 0.20_f64;
+    let width_m = 0.02_f64;
+    let height_m = 0.02_f64;
+    let mut beam = create_test_box("cantilever_beam", "Cantilever Beam", length_m, width_m, height_m);
+    for v in &mut beam.mesh.vertices {
+        v.position[0] += length_m * 0.5;
+    }
+    world.add_part(&beam, true).unwrap();
+
+    let mass_kg = world.part_mass("cantilever_beam").unwrap();
+    let expected_force_y = mass_kg * g;
+    let expected_torque_z = mass_kg * g * (length_m * 0.5);
+
+    // Connect fixed wall (`part_a`) to cantilever beam (`part_b`) at root anchor [0, 0, 0]
+    world
+        .add_joint(
+            "root_weld",
+            "wall_support",
+            "cantilever_beam",
+            CadJointType::Fixed {
+                anchor_a: [0.0, 0.0, 0.0],
+                anchor_b: [0.0, 0.0, 0.0],
+            },
+            None,
+        )
+        .unwrap();
+
+    let dt = 1.0 / 240.0;
+    let summary = world.simulate(0.5, dt);
+
+    // Extract load case on the cantilever beam (`PeakForce`, `PeakTorque`, and `AtTime(0.4)`)
+    for selector in [
+        LoadCaseSelector::PeakForce,
+        LoadCaseSelector::PeakTorque,
+        LoadCaseSelector::AtTime(0.4),
+    ] {
+        let beam_lc = world
+            .extract_part_load_case(&summary, "cantilever_beam", selector)
+            .expect("extract_part_load_case for cantilever_beam");
+
+        assert_eq!(beam_lc.joints.len(), 1);
+        let j_beam = &beam_lc.joints[0];
+        assert_eq!(j_beam.joint_id, "root_weld");
+        assert_eq!(j_beam.role, "part_b");
+        assert_eq!(j_beam.connected_part_id, "wall_support");
+        assert_eq!(j_beam.anchor_local, [0.0, 0.0, 0.0]);
+
+        // 1. Reaction force F_y ≈ +m*g supporting the beam against -Y gravity (within 1%)
+        let force_rel_err = (j_beam.force[1] - expected_force_y).abs() / expected_force_y;
+        assert!(
+            force_rel_err < 0.01,
+            "Selector {:?}: expected F_y ≈ {:.4} N (m*g), got F = {:?} (rel_err = {:.4})",
+            selector,
+            expected_force_y,
+            j_beam.force,
+            force_rel_err
+        );
+        assert!(j_beam.force[0].abs() < 1e-3 * expected_force_y);
+        assert!(j_beam.force[2].abs() < 1e-3 * expected_force_y);
+
+        // 2. Reaction torque at root anchor [0,0,0]: T_z ≈ +m*g*L/2 counteracting gravity moment (within 1%)
+        let torque_rel_err = (j_beam.torque[2] - expected_torque_z).abs() / expected_torque_z;
+        assert!(
+            torque_rel_err < 0.01,
+            "Selector {:?}: expected T_z ≈ {:.5} N*m (m*g*L/2), got T = {:?} (rel_err = {:.4})",
+            selector,
+            expected_torque_z,
+            j_beam.torque,
+            torque_rel_err
+        );
+
+        // 3. Dynamic equilibrium residual must be small (< 1% of m*g)
+        assert!(
+            beam_lc.equilibrium_residual_force_norm < 0.01 * expected_force_y,
+            "Selector {:?}: expected small force equilibrium residual, got {:.6} N",
+            selector,
+            beam_lc.equilibrium_residual_force_norm
+        );
+        assert!(
+            beam_lc.equilibrium_residual_torque_norm < 0.01 * expected_torque_z,
+            "Selector {:?}: expected small torque equilibrium residual, got {:.6} N*m",
+            selector,
+            beam_lc.equilibrium_residual_torque_norm
+        );
+    }
+
+    // 4. Verify Newton's 3rd Law between `wall_support` (`part_a`) and `cantilever_beam` (`part_b`)
+    let beam_at_t = world
+        .extract_part_load_case(&summary, "cantilever_beam", LoadCaseSelector::AtTime(0.4))
+        .unwrap();
+    let wall_at_t = world
+        .extract_part_load_case(&summary, "wall_support", LoadCaseSelector::AtTime(0.4))
+        .unwrap();
+    let jb = &beam_at_t.joints[0];
+    let jw = &wall_at_t.joints[0];
+    for axis in 0..3 {
+        assert!(
+            (jb.force_world[axis] + jw.force_world[axis]).abs() < 1e-9,
+            "Newton 3rd law violated for force axis {axis}: beam={:?}, wall={:?}",
+            jb.force_world,
+            jw.force_world
+        );
+        assert!(
+            (jb.torque_world[axis] + jw.torque_world[axis]).abs() < 1e-9,
+            "Newton 3rd law violated for torque axis {axis}: beam={:?}, wall={:?}",
+            jb.torque_world,
+            jw.torque_world
+        );
+    }
+}
+
+#[test]
+fn test_p3_t6_rotating_rod_centripetal_reaction_force_in_local_frame() {
+    use mcp_cad_physics::LoadCaseSelector;
+
+    // Zero gravity so the only force is the centripetal reaction force at the revolute pivot
+    let mut world = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
+
+    // Rod of length L = 0.20 m along +X with root at x = 0 and COM at r_c = L/2 = 0.10 m
+    let length_m = 0.20_f64;
+    let r_c = length_m * 0.5;
+    let mut rod = create_test_box("rotating_rod", "Rotating Rod", length_m, 0.02, 0.02);
+    for v in &mut rod.mesh.vertices {
+        v.position[0] += r_c;
+    }
+    world.add_part(&rod, true).unwrap();
+
+    let mass_kg = world.part_mass("rotating_rod").unwrap();
+
+    // Revolute joint about +Z at anchor [0, 0, 0]
+    world
+        .add_joint(
+            "pivot_z",
+            "ground",
+            "rotating_rod",
+            CadJointType::Revolute {
+                anchor_a: [0.0, 0.0, 0.0],
+                anchor_b: [0.0, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                limits: None,
+            },
+            None,
+        )
+        .unwrap();
+
+    // Initial angular velocity omega = 10 rad/s about +Z and consistent COM linear velocity
+    // v_com = omega x r_com = [0, omega * r_c, 0]
+    let omega = 10.0_f64;
+    world
+        .set_part_angular_velocity("rotating_rod", [0.0, 0.0, omega])
+        .unwrap();
+    world
+        .set_part_velocity("rotating_rod", [0.0, omega * r_c, 0.0])
+        .unwrap();
+
+    let expected_centripetal_force = mass_kg * omega * omega * r_c;
+
+    let dt = 1.0 / 240.0;
+    let summary = world.simulate(0.25, dt);
+
+    // At t = 0.20 s, the rod has rotated by ~2.0 radians (~114.6 degrees) in world space,
+    // yet in the rod's LOCAL coordinate frame the centripetal force must still point along -X!
+    let rod_lc = world
+        .extract_part_load_case(&summary, "rotating_rod", LoadCaseSelector::AtTime(0.20))
+        .expect("extract_part_load_case for rotating_rod");
+
+    assert_eq!(rod_lc.joints.len(), 1);
+    let j_rod = &rod_lc.joints[0];
+    assert_eq!(j_rod.joint_id, "pivot_z");
+    assert_eq!(j_rod.anchor_local, [0.0, 0.0, 0.0]);
+
+    // 1. Magnitude of reaction force F ≈ m * omega^2 * r_c (within 2% discrete integrator tolerance)
+    let f_mag_rel_err =
+        (j_rod.force_magnitude - expected_centripetal_force).abs() / expected_centripetal_force;
+    assert!(
+        f_mag_rel_err < 0.02,
+        "Expected centripetal force magnitude ≈ {:.4} N (m*omega^2*r_c), got {:.4} N (rel_err = {:.4})",
+        expected_centripetal_force,
+        j_rod.force_magnitude,
+        f_mag_rel_err
+    );
+
+    // 2. In the rod's local frame, the pivot pulls the rod inward along -X (F_x ≈ -m * omega^2 * r_c)
+    let fx_rel_err =
+        (j_rod.force[0] - (-expected_centripetal_force)).abs() / expected_centripetal_force;
+    assert!(
+        fx_rel_err < 0.02,
+        "Expected local F_x ≈ {:.4} N, got local force = {:?} (world force = {:?})",
+        -expected_centripetal_force,
+        j_rod.force,
+        j_rod.force_world
+    );
+    assert!(
+        j_rod.force[1].abs() < 0.02 * expected_centripetal_force,
+        "Expected negligible local tangential force F_y, got {:?}",
+        j_rod.force
+    );
+
+    // 3. Free revolute axis Z transmits zero reaction torque
+    assert!(
+        j_rod.torque_magnitude < 1e-6,
+        "Expected zero reaction torque on frictionless revolute joint in planar motion, got {:?}",
+        j_rod.torque
+    );
+
+    // 4. Local COM centripetal acceleration a_x ≈ -omega^2 * r_c and small equilibrium residual
+    let expected_ax = -omega * omega * r_c;
+    let ax_rel_err = (rod_lc.inertia.linear_acceleration[0] - expected_ax).abs() / expected_ax.abs();
+    assert!(
+        ax_rel_err < 0.02,
+        "Expected local centripetal acceleration a_x ≈ {:.4} m/s^2, got {:?}",
+        expected_ax,
+        rod_lc.inertia.linear_acceleration
+    );
+    assert!(
+        rod_lc.equilibrium_residual_force_norm < 0.02 * expected_centripetal_force,
+        "Expected small dynamic force equilibrium residual, got {:.6} N (vec = {:?})",
+        rod_lc.equilibrium_residual_force_norm,
+        rod_lc.equilibrium_residual_force
+    );
+}
+
+#[test]
+fn test_p3_t9_analyze_mechanism_benchmarks() {
+    // 1. One body on Revolute to ground -> 1 DOF
+    {
+        let mut world = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
+        let rod = create_test_cylinder("pendulum", "Pendulum", 0.01, 0.2);
+        world.add_part(&rod, true).expect("rod added");
+        world
+            .add_joint(
+                "j_rev",
+                "ground",
+                "pendulum",
+                CadJointType::Revolute {
+                    anchor_a: [0.0, 0.0, 0.0],
+                    anchor_b: [0.0, 0.0, -0.1],
+                    axis: [0.0, 0.0, 1.0],
+                    limits: None,
+                },
+                None,
+            )
+            .expect("joint added");
+
+        let rep = world.analyze_mechanism(None, None).expect("analysis");
+        assert_eq!(rep.dof_numeric, 1, "Revolute to ground must have DOF=1");
+        assert_eq!(rep.dof_grubler, 1);
+        assert_eq!(rep.redundant_constraints, 0);
+        assert_eq!(rep.moving_parts, vec!["pendulum"]);
+        assert!(rep.floating_parts.is_empty());
+        assert!(rep.unconnected_parts.is_empty());
+    }
+
+    // 2. Fixed joint to ground -> 0 DOF (locks all 6 degrees of freedom)
+    {
+        let mut world = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
+        let bracket = create_test_box("bracket", "Bracket", 0.1, 0.1, 0.1);
+        world.add_part(&bracket, true).expect("bracket added");
+        world
+            .add_joint(
+                "j_fix",
+                "ground",
+                "bracket",
+                CadJointType::Fixed {
+                    anchor_a: [0.0, 0.0, 0.0],
+                    anchor_b: [0.0, 0.0, 0.0],
+                },
+                None,
+            )
+            .expect("joint added");
+
+        let rep = world.analyze_mechanism(None, None).expect("analysis");
+        assert_eq!(rep.dof_numeric, 0, "Fixed to ground must have DOF=0");
+        assert_eq!(rep.dof_grubler, 0);
+        assert_eq!(rep.redundant_constraints, 0);
+        assert!(rep.warnings.iter().any(|w| w.contains("DOF=0")));
+    }
+
+    // 3. Spherical joint to ground -> 3 DOFs (ball-and-socket rotation)
+    {
+        let mut world = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
+        let ball = create_test_sphere("ball", "Ball", 0.05);
+        world.add_part(&ball, true).expect("ball added");
+        world
+            .add_joint(
+                "j_sph",
+                "ground",
+                "ball",
+                CadJointType::Spherical {
+                    anchor_a: [0.0, 0.0, 0.0],
+                    anchor_b: [0.0, 0.0, -0.05],
+                },
+                None,
+            )
+            .expect("joint added");
+
+        let rep = world.analyze_mechanism(None, None).expect("analysis");
+        assert_eq!(rep.dof_numeric, 3, "Spherical to ground must have DOF=3");
+        assert_eq!(rep.dof_grubler, 3);
+        assert_eq!(rep.redundant_constraints, 0);
+    }
+
+    // 4. Free body (no joints) -> 6 DOFs
+    {
+        let mut world = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
+        let floater = create_test_box("floater", "Floater", 0.2, 0.2, 0.2);
+        world.add_part(&floater, true).expect("floater added");
+
+        let rep = world.analyze_mechanism(None, None).expect("analysis");
+        assert_eq!(rep.dof_numeric, 6, "Free body must have DOF=6");
+        assert_eq!(rep.dof_grubler, 6);
+        assert_eq!(rep.redundant_constraints, 0);
+        assert_eq!(rep.unconnected_parts, vec!["floater"]);
+        assert_eq!(rep.floating_parts, vec!["floater"]);
+        assert!(rep.warnings.iter().any(|w| w.contains("свободные детали")));
+    }
+
+    // 5. Planar four-bar linkage (ground + 3 moving bodies, 4 revolute joints)
+    // Spatial Grübler: 6*(4-1) - 4*5 = 18 - 20 = -2
+    // Numerical rank: 17, DOF = 18 - 17 = 1, redundant_constraints = 3
+    {
+        let mut world = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
+        let crank = create_test_cylinder("crank", "Crank", 0.01, 0.05);
+        let coupler = create_test_cylinder("coupler", "Coupler", 0.01, 0.20);
+        let rocker = create_test_cylinder("rocker", "Rocker", 0.01, 0.05);
+
+        world
+            .add_part_with_options(&crank, true, ColliderType::ConvexHull, Some([0.0, 0.025, 0.0]), None)
+            .expect("crank added");
+        world
+            .add_part_with_options(&coupler, true, ColliderType::ConvexHull, Some([0.10, 0.05, 0.0]), None)
+            .expect("coupler added");
+        world
+            .add_part_with_options(&rocker, true, ColliderType::ConvexHull, Some([0.20, 0.025, 0.0]), None)
+            .expect("rocker added");
+
+        // j1: ground -> crank at A (0,0,0)
+        world
+            .add_joint(
+                "j1_ground_crank",
+                "ground",
+                "crank",
+                CadJointType::Revolute {
+                    anchor_a: [0.0, 0.0, 0.0],
+                    anchor_b: [0.0, -0.025, 0.0],
+                    axis: [0.0, 0.0, 1.0],
+                    limits: None,
+                },
+                None,
+            )
+            .expect("j1");
+
+        // j2: crank -> coupler at B (0, 0.05, 0)
+        world
+            .add_joint(
+                "j2_crank_coupler",
+                "crank",
+                "coupler",
+                CadJointType::Revolute {
+                    anchor_a: [0.0, 0.025, 0.0],
+                    anchor_b: [-0.10, 0.0, 0.0],
+                    axis: [0.0, 0.0, 1.0],
+                    limits: None,
+                },
+                None,
+            )
+            .expect("j2");
+
+        // j3: coupler -> rocker at C (0.20, 0.05, 0)
+        world
+            .add_joint(
+                "j3_coupler_rocker",
+                "coupler",
+                "rocker",
+                CadJointType::Revolute {
+                    anchor_a: [0.10, 0.0, 0.0],
+                    anchor_b: [0.0, 0.025, 0.0],
+                    axis: [0.0, 0.0, 1.0],
+                    limits: None,
+                },
+                None,
+            )
+            .expect("j3");
+
+        // j4: rocker -> ground at D (0.20, 0, 0)
+        world
+            .add_joint(
+                "j4_rocker_ground",
+                "rocker",
+                "ground",
+                CadJointType::Revolute {
+                    anchor_a: [0.0, -0.025, 0.0],
+                    anchor_b: [0.20, 0.0, 0.0],
+                    axis: [0.0, 0.0, 1.0],
+                    limits: None,
+                },
+                None,
+            )
+            .expect("j4");
+
+        let rep = world.analyze_mechanism(None, None).expect("four-bar analysis");
+        assert_eq!(rep.moving_parts.len(), 3);
+        assert_eq!(rep.jacobian_rows, 20);
+        assert_eq!(rep.jacobian_cols, 18);
+        assert_eq!(rep.jacobian_rank, 17, "Planar 4-bar Jacobian rank must be 17");
+        assert_eq!(rep.dof_numeric, 1, "Planar 4-bar numeric DOF must be 1");
+        assert_eq!(rep.dof_grubler, -2, "Planar 4-bar spatial Grübler DOF must be -2");
+        assert_eq!(rep.redundant_constraints, 3, "Planar 4-bar redundant constraints must be 3");
+        assert!(rep.floating_parts.is_empty());
+        assert!(rep.unconnected_parts.is_empty());
+    }
+
+    // 6. Slider-crank mechanism (4 bodies: ground, crank, rod, slider; 3 revolute + 1 prismatic)
+    // Spatial Grübler: 6*(4-1) - (3*5 + 1*5) = 18 - 20 = -2
+    // Numerical rank: 17, DOF = 18 - 17 = 1, redundant_constraints = 3
+    {
+        let mut world = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
+        let crank = create_test_cylinder("sc_crank", "Crank", 0.01, 0.04);
+        let conrod = create_test_cylinder("sc_rod", "Connecting Rod", 0.01, 0.12);
+        let slider = create_test_box("sc_slider", "Slider", 0.04, 0.04, 0.04);
+
+        // Crank at (0, 0.02, 0)
+        world
+            .add_part_with_options(&crank, true, ColliderType::ConvexHull, Some([0.0, 0.02, 0.0]), None)
+            .expect("crank");
+        // Slider at (0.10, 0.0, 0)
+        world
+            .add_part_with_options(&slider, true, ColliderType::ConvexHull, Some([0.10, 0.0, 0.0]), None)
+            .expect("slider");
+        // ConRod center at (0.05, 0.02, 0)
+        world
+            .add_part_with_options(&conrod, true, ColliderType::ConvexHull, Some([0.05, 0.02, 0.0]), None)
+            .expect("conrod");
+
+        // j1: ground -> crank (revolute at (0,0,0) along Z)
+        world
+            .add_joint(
+                "j1_sc_rev",
+                "ground",
+                "sc_crank",
+                CadJointType::Revolute {
+                    anchor_a: [0.0, 0.0, 0.0],
+                    anchor_b: [0.0, -0.02, 0.0],
+                    axis: [0.0, 0.0, 1.0],
+                    limits: None,
+                },
+                None,
+            )
+            .expect("j1");
+
+        // j2: crank -> rod (revolute at (0, 0.04, 0) along Z)
+        world
+            .add_joint(
+                "j2_sc_rev",
+                "sc_crank",
+                "sc_rod",
+                CadJointType::Revolute {
+                    anchor_a: [0.0, 0.02, 0.0],
+                    anchor_b: [-0.05, 0.02, 0.0],
+                    axis: [0.0, 0.0, 1.0],
+                    limits: None,
+                },
+                None,
+            )
+            .expect("j2");
+
+        // j3: rod -> slider (revolute at (0.10, 0, 0) along Z)
+        world
+            .add_joint(
+                "j3_sc_rev",
+                "sc_rod",
+                "sc_slider",
+                CadJointType::Revolute {
+                    anchor_a: [0.05, -0.02, 0.0],
+                    anchor_b: [0.0, 0.0, 0.0],
+                    axis: [0.0, 0.0, 1.0],
+                    limits: None,
+                },
+                None,
+            )
+            .expect("j3");
+
+        // j4: slider -> ground (prismatic along X axis [1, 0, 0])
+        world
+            .add_joint(
+                "j4_sc_prism",
+                "sc_slider",
+                "ground",
+                CadJointType::Prismatic {
+                    anchor_a: [0.0, 0.0, 0.0],
+                    anchor_b: [0.0, 0.0, 0.0],
+                    axis: [1.0, 0.0, 0.0],
+                    limits: None,
+                },
+                None,
+            )
+            .expect("j4");
+
+        let rep = world.analyze_mechanism(None, None).expect("slider-crank analysis");
+        assert_eq!(rep.moving_parts.len(), 3);
+        assert_eq!(rep.jacobian_rows, 20);
+        assert_eq!(rep.jacobian_cols, 18);
+        assert_eq!(rep.jacobian_rank, 17, "Slider-crank Jacobian rank must be 17");
+        assert_eq!(rep.dof_numeric, 1, "Slider-crank numeric DOF must be 1");
+        assert_eq!(rep.dof_grubler, -2, "Slider-crank spatial Grübler DOF must be -2");
+        assert_eq!(rep.redundant_constraints, 3, "Slider-crank redundant constraints must be 3");
+    }
+
+    // 7. Two wheels on Revolute + Gear constraint -> 1 DOF
+    // Spatial Grübler: 6*(3-1) - (5 + 5 + 1) = 12 - 11 = 1
+    // Numerical rank: 11, DOF = 12 - 11 = 1, redundant_constraints = 0
+    {
+        let mut world = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
+        let wheel1 = create_test_cylinder("w1", "Wheel 1", 0.03, 0.02);
+        let wheel2 = create_test_cylinder("w2", "Wheel 2", 0.06, 0.02);
+
+        world
+            .add_part_with_options(&wheel1, true, ColliderType::ConvexHull, Some([0.0, 0.0, 0.0]), None)
+            .expect("w1");
+        world
+            .add_part_with_options(&wheel2, true, ColliderType::ConvexHull, Some([0.09, 0.0, 0.0]), None)
+            .expect("w2");
+
+        world
+            .add_joint(
+                "j_w1_rev",
+                "ground",
+                "w1",
+                CadJointType::Revolute {
+                    anchor_a: [0.0, 0.0, 0.0],
+                    anchor_b: [0.0, 0.0, 0.0],
+                    axis: [0.0, 0.0, 1.0],
+                    limits: None,
+                },
+                None,
+            )
+            .expect("w1 rev");
+
+        world
+            .add_joint(
+                "j_w2_rev",
+                "ground",
+                "w2",
+                CadJointType::Revolute {
+                    anchor_a: [0.09, 0.0, 0.0],
+                    anchor_b: [0.0, 0.0, 0.0],
+                    axis: [0.0, 0.0, 1.0],
+                    limits: None,
+                },
+                None,
+            )
+            .expect("w2 rev");
+
+        world
+            .add_joint(
+                "j_gear_w1_w2",
+                "w1",
+                "w2",
+                CadJointType::Gear {
+                    ratio: 2.0,
+                    axis_a: [0.0, 0.0, 1.0],
+                    axis_b: [0.0, 0.0, 1.0],
+                },
+                None,
+            )
+            .expect("gear joint");
+
+        let rep = world.analyze_mechanism(None, None).expect("gear analysis");
+        assert_eq!(rep.moving_parts.len(), 2);
+        assert_eq!(rep.jacobian_rows, 11);
+        assert_eq!(rep.jacobian_cols, 12);
+        assert_eq!(rep.jacobian_rank, 11);
+        assert_eq!(rep.dof_numeric, 1, "Two geared wheels must have DOF=1");
+        assert_eq!(rep.dof_grubler, 1, "Two geared wheels Grübler DOF must be 1");
+        assert_eq!(rep.redundant_constraints, 0);
+    }
+}
+
+#[test]
+fn test_p3_t10_check_interference_overlapping_and_disjoint_boxes_and_ignore_adjacent() {
+    let mut world = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
+
+    // Box A: 0.10 x 0.10 x 0.10 m centered at [0.0, 0.0, 0.0] -> x in [-0.05, +0.05]
+    let box_a = create_test_box("box_a", "Box A", 0.10, 0.10, 0.10);
+    // Box B: 0.10 x 0.10 x 0.10 m centered at [0.06, 0.0, 0.0] -> x in [+0.01, +0.11]
+    // Analytical overlap with Box A: x in [0.01, 0.05] (0.04 m), y in [-0.05, 0.05] (0.10 m), z in [-0.05, 0.05] (0.10 m)
+    // Analytical intersection_volume = 0.04 * 0.10 * 0.10 = 0.0004 m^3, penetration_depth = 0.04 m.
+    let box_b = create_test_box("box_b", "Box B", 0.10, 0.10, 0.10);
+    // Box C: 0.10 x 0.10 x 0.10 m centered at [0.25, 0.0, 0.0] -> x in [0.20, 0.30]
+    // Analytical clearance from Box A: 0.20 - 0.05 = 0.15 m; from Box B: 0.20 - 0.11 = 0.09 m.
+    let box_c = create_test_box("box_c", "Box C", 0.10, 0.10, 0.10);
+
+    world
+        .add_part_with_options(&box_a, true, ColliderType::ConvexHull, Some([0.0, 0.0, 0.0]), None)
+        .expect("add box_a");
+    world
+        .add_part_with_options(&box_b, true, ColliderType::ConvexHull, Some([0.06, 0.0, 0.0]), None)
+        .expect("add box_b");
+    world
+        .add_part_with_options(&box_c, true, ColliderType::ConvexHull, Some([0.25, 0.0, 0.0]), None)
+        .expect("add box_c");
+
+    let report = world
+        .check_interference(None, false, None)
+        .expect("check_interference");
+
+    assert_eq!(report.status, "FAIL");
+    assert_eq!(report.candidate_pairs_count, 3);
+    assert_eq!(report.evaluated_pairs_count, 3);
+    assert_eq!(report.interfering_pairs_count, 1);
+
+    let pair_ab = report
+        .pairs
+        .iter()
+        .find(|p| p.a == "box_a" && p.b == "box_b")
+        .expect("pair box_a <-> box_b");
+    assert!(pair_ab.intersects);
+    let vol_ab = pair_ab.intersection_volume.expect("intersection_volume");
+    let expected_vol = 0.0004_f64;
+    let vol_rel_err = (vol_ab - expected_vol).abs() / expected_vol;
+    assert!(
+        vol_rel_err <= 0.01,
+        "Expected intersection_volume = {expected_vol} m^3 within 1%, got {vol_ab} (rel_err = {vol_rel_err})"
+    );
+    let depth_ab = pair_ab.penetration_depth.expect("penetration_depth");
+    assert!(
+        (depth_ab - 0.04).abs() <= 1e-4,
+        "Expected penetration_depth = 0.04 m, got {depth_ab}"
+    );
+    assert!(pair_ab.clearance.is_none());
+
+    let pair_ac = report
+        .pairs
+        .iter()
+        .find(|p| p.a == "box_a" && p.b == "box_c")
+        .expect("pair box_a <-> box_c");
+    assert!(!pair_ac.intersects);
+    assert!(pair_ac.intersection_volume.is_none());
+    let clr_ac = pair_ac.clearance.expect("clearance box_a <-> box_c");
+    assert!(
+        (clr_ac - 0.15).abs() <= 1e-6,
+        "Expected clearance 0.15 m between box_a and box_c, got {clr_ac}"
+    );
+
+    let pair_bc = report
+        .pairs
+        .iter()
+        .find(|p| p.a == "box_b" && p.b == "box_c")
+        .expect("pair box_b <-> box_c");
+    assert!(!pair_bc.intersects);
+    let clr_bc = pair_bc.clearance.expect("clearance box_b <-> box_c");
+    assert!(
+        (clr_bc - 0.09).abs() <= 1e-6,
+        "Expected clearance 0.09 m between box_b and box_c, got {clr_bc}"
+    );
+    assert!(
+        (report.min_clearance.expect("min_clearance") - 0.09).abs() <= 1e-6,
+        "Expected global min_clearance = 0.09 m"
+    );
+
+    // Connect box_a and box_b by a revolute joint and verify ignore_adjacent = true skips (box_a, box_b)
+    world
+        .add_joint(
+            "j_ab",
+            "box_a",
+            "box_b",
+            CadJointType::Revolute {
+                anchor_a: [0.03, 0.0, 0.0],
+                anchor_b: [-0.03, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                limits: None,
+            },
+            None,
+        )
+        .expect("add joint j_ab");
+
+    let report_ignore = world
+        .check_interference(None, true, None)
+        .expect("check_interference with ignore_adjacent = true");
+    assert_eq!(report_ignore.status, "PASS");
+    assert_eq!(report_ignore.candidate_pairs_count, 3);
+    assert_eq!(report_ignore.skipped_adjacent_pairs_count, 1);
+    assert_eq!(report_ignore.evaluated_pairs_count, 2);
+    assert_eq!(report_ignore.interfering_pairs_count, 0);
+}
+
+#[test]
+fn test_p3_t10_sweep_joint_hinged_arm_hitting_fixed_wall() {
+    let mut world = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
+
+    // Hinged arm: length L = 0.10 m along +X (x in [0.0, 0.10]), width w = 0.01 m (y in [-0.005, 0.005]), depth 0.01 m.
+    let mut arm = create_test_box("arm", "Hinged Arm", 0.10, 0.01, 0.01);
+    for v in &mut arm.mesh.vertices {
+        v.position[0] += 0.05;
+    }
+    world.add_part(&arm, true).expect("add arm");
+
+    // Fixed wall at y in [0.05, 0.07], x in [0.02, 0.12], z in [-0.02, 0.02]
+    let mut wall = create_test_box("wall", "Fixed Wall", 0.10, 0.02, 0.04);
+    wall.is_fixed = true;
+    for v in &mut wall.mesh.vertices {
+        v.position[0] += 0.07;
+        v.position[1] += 0.06;
+    }
+    world.add_part(&wall, false).expect("add wall");
+
+    world
+        .add_joint(
+            "j_hinge",
+            "ground",
+            "arm",
+            CadJointType::Revolute {
+                anchor_a: [0.0, 0.0, 0.0],
+                anchor_b: [0.0, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                limits: None,
+            },
+            None,
+        )
+        .expect("add j_hinge");
+
+    // Analytical first-contact angle theta*:
+    // Upper tip of arm at (x=0.10, y=0.005) has y(theta) = 0.10*sin(theta) + 0.005*cos(theta) = 0.05 m
+    // => theta* ≈ 27.49 deg.
+    // With steps = 90 over [0, 90 deg] (step_size = 1.0 deg), step 27 (27 deg) is clear and step 28 (28 deg) collides.
+    let from_rad = 0.0_f64;
+    let to_rad = std::f64::consts::FRAC_PI_2;
+    let steps = 90usize;
+    let step_size_rad = (to_rad - from_rad) / (steps as f64);
+
+    let sweep = world
+        .sweep_joint("j_hinge", from_rad, to_rad, steps, false)
+        .expect("sweep_joint");
+
+    assert_eq!(sweep.status, "FAIL");
+    assert!(sweep.collision_detected);
+    assert_eq!(sweep.samples.len(), 91);
+
+    let analytical_theta_rad = 27.492_f64.to_radians();
+    let detected_rad = sweep.first_collision_value.expect("first_collision_value");
+    assert!(
+        (detected_rad - analytical_theta_rad).abs() <= step_size_rad,
+        "Detected collision angle {:.2} deg must be within step size (1.0 deg) of analytical {:.2} deg",
+        detected_rad.to_degrees(),
+        analytical_theta_rad.to_degrees()
+    );
+    assert_eq!(sweep.first_collision_step, Some(28));
+    assert!(!sweep.first_collision_pairs.is_empty());
+    assert!(sweep.min_clearance.expect("min_clearance") > 0.0);
+    assert_eq!(sweep.min_clearance_step, Some(27));
+}
+
+#[test]
+fn test_p3_t10_benchmark_check_interference_10_parts_45_pairs() {
+    let mut world = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
+
+    // 10 parts arranged in 3D space (some overlapping, most separated) -> 10 * 9 / 2 = 45 pairs
+    for i in 0..10 {
+        let part_id = format!("part_{i:02}");
+        let b = create_test_box(&part_id, &part_id, 0.05, 0.05, 0.05);
+        // Parts 0 and 1 overlap slightly (dx = 0.03 < 0.05); parts 2..9 are spaced by 0.10 m
+        let x = if i == 1 { 0.03 } else { (i as f64) * 0.10 };
+        let y = ((i % 3) as f64) * 0.02;
+        world
+            .add_part_with_options(&b, true, ColliderType::ConvexHull, Some([x, y, 0.0]), None)
+            .expect("add bench part");
+    }
+
+    let report = world
+        .check_interference(None, false, None)
+        .expect("benchmark 10 parts");
+    assert_eq!(report.candidate_pairs_count, 45);
+    assert_eq!(report.evaluated_pairs_count, 45);
+    assert_eq!(report.interfering_pairs_count, 1);
+    assert!(
+        report.elapsed_ms < 250.0,
+        "10-part (45-pair) interference check took {:.3} ms (expected < 250 ms)",
+        report.elapsed_ms
+    );
+}
 
 

@@ -594,7 +594,16 @@ pub fn polygons_to_mesh(polygons: &[CsgPolygon]) -> TriangleMesh {
     // 3. Subdivide polygon boundary edges at any collinear canonical vertices (T-junction prevention)
     let col_eps = (diag * 6e-5).max(2e-7);
     let col_eps_sq = col_eps * col_eps;
-    let num_canon = canon_pos.len();
+    let col_cell = (col_eps * 4.0).max(cell_size);
+    let mut col_grid: HashMap<(i64, i64, i64), Vec<u32>> = HashMap::with_capacity(canon_pos.len());
+    for (cid, p) in canon_pos.iter().enumerate() {
+        let key = (
+            (p.x / col_cell).floor() as i64,
+            (p.y / col_cell).floor() as i64,
+            (p.z / col_cell).floor() as i64,
+        );
+        col_grid.entry(key).or_default().push(cid as u32);
+    }
 
     let mut tris: Vec<([u32; 3], Vector3<f64>, u32)> = Vec::new();
 
@@ -626,8 +635,37 @@ pub fn polygons_to_mesh(polygons: &[CsgPolygon]) -> TriangleMesh {
             let seg_max_z = pa.z.max(pb.z) + col_eps;
 
             let mut splits: Vec<(f64, u32)> = Vec::new();
-            if num_canon <= 4000 {
-                for mid in 0..(num_canon as u32) {
+            let steps = ((ab_len_sq.sqrt() / col_cell).ceil() as usize).max(1);
+            let mut visited_cells: Vec<(i64, i64, i64)> = Vec::with_capacity(steps + 2);
+            for s_idx in 0..=steps {
+                let frac = (s_idx as f64) / (steps as f64);
+                let pt = pa + ab * frac;
+                let cx = (pt.x / col_cell).floor() as i64;
+                let cy = (pt.y / col_cell).floor() as i64;
+                let cz = (pt.z / col_cell).floor() as i64;
+                if visited_cells.last().copied() != Some((cx, cy, cz)) {
+                    visited_cells.push((cx, cy, cz));
+                }
+            }
+            let mut checked_neighborhood: Vec<(i64, i64, i64)> =
+                Vec::with_capacity(visited_cells.len() * 27);
+            for (cx, cy, cz) in visited_cells {
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        for dz in -1..=1 {
+                            checked_neighborhood.push((cx + dx, cy + dy, cz + dz));
+                        }
+                    }
+                }
+            }
+            checked_neighborhood.sort_unstable();
+            checked_neighborhood.dedup();
+
+            for cell_key in checked_neighborhood {
+                let Some(bucket) = col_grid.get(&cell_key) else {
+                    continue;
+                };
+                for &mid in bucket {
                     if mid == u || mid == v {
                         continue;
                     }
@@ -654,6 +692,7 @@ pub fn polygons_to_mesh(polygons: &[CsgPolygon]) -> TriangleMesh {
 
             if !splits.is_empty() {
                 splits.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                splits.dedup_by_key(|&mut (_, mid)| mid);
                 for (_, mid) in splits {
                     if subdivided.last().copied() != Some(mid) {
                         subdivided.push(mid);
@@ -1159,6 +1198,8 @@ fn optimize_coplanar_delaunay_edges(
     }
 }
 
+type EarClippedTriangle = ([u32; 3], Vector3<f64>, u32);
+
 ///// Ear-clips a closed 3D planar polygon loop `ring` with unit normal `n_plane` into `ring.len() - 2`
 /// triangles using greedy max-min-angle ear selection, ensuring no duplicate edges or T-junctions.
 #[allow(clippy::too_many_arguments)]
@@ -1172,12 +1213,12 @@ fn ear_clip_planar_ring_maxmin(
     ignore_verts: &[u32],
     t_eps: f64,
     t_eps_sq: f64,
-) -> Option<Vec<([u32; 3], Vector3<f64>, u32)>> {
+) -> Option<Vec<EarClippedTriangle>> {
     if ring.len() < 3 {
         return None;
     }
     let mut cur: Vec<u32> = ring.to_vec();
-    let mut out: Vec<([u32; 3], Vector3<f64>, u32)> = Vec::with_capacity(ring.len() - 2);
+    let mut out: Vec<EarClippedTriangle> = Vec::with_capacity(ring.len() - 2);
 
     while cur.len() > 3 {
         let m = cur.len();
@@ -1273,7 +1314,7 @@ fn ear_clip_planar_ring_maxmin(
 fn try_remove_vertex_ear_clip(
     v: u32,
     inc: &[usize],
-    tris: &[([u32; 3], Vector3<f64>, u32)],
+    tris: &[EarClippedTriangle],
     canon_pos: &[Vector3<f64>],
     edge_tris_map: &HashMap<(u32, u32), Vec<usize>>,
     active_verts: &[u32],
@@ -1282,7 +1323,7 @@ fn try_remove_vertex_ear_clip(
     sliver_rad: f64,
     t_eps: f64,
     t_eps_sq: f64,
-) -> Option<Vec<([u32; 3], Vector3<f64>, u32)>> {
+) -> Option<Vec<EarClippedTriangle>> {
     if inc.len() < 3 || inc.len() > 16 {
         return None;
     }
@@ -1657,7 +1698,9 @@ fn collapse_redundant_and_sliver_vertices(
                 continue;
             }
 
-            if !is_purely_coplanar && min_before >= 15.0_f64.to_radians() {
+            if (!is_purely_coplanar && min_before >= 15.0_f64.to_radians())
+                || (is_purely_coplanar && outer >= 1 && min_before >= 10.0_f64.to_radians())
+            {
                 continue;
             }
 
@@ -1891,9 +1934,19 @@ fn refine_coplanar_sliver_fans_and_edges(
     let t_eps_sq = t_eps * t_eps;
     let target_rad = 5.05_f64.to_radians();
 
-    for _iter in 0..32 {
+    let mut unrefinable_tris: HashSet<[u32; 3]> = HashSet::new();
+
+    for iter in 0..96 {
+        if iter >= 8 && iter % 4 == 0 && !has_sliver_above_budget(tris, canon_pos) {
+            break;
+        }
         let mut worst: Option<(usize, f64)> = None;
         for (idx, (t, _, _)) in tris.iter().enumerate() {
+            let mut key = *t;
+            key.sort_unstable();
+            if unrefinable_tris.contains(&key) {
+                continue;
+            }
             let ang = min_triangle_angle_rad(
                 canon_pos[t[0] as usize],
                 canon_pos[t[1] as usize],
@@ -1928,6 +1981,11 @@ fn refine_coplanar_sliver_fans_and_edges(
         }
         let c_apex = seed_tri[apex_local];
         let p_c = canon_pos[c_apex as usize];
+        let plane_verts: Vec<u32> = active_verts
+            .iter()
+            .copied()
+            .filter(|&av| (canon_pos[av as usize] - p_c).dot(&seed_n).abs() <= t_eps * 2.5)
+            .collect();
 
         let mut fan_candidates: Vec<(usize, u32, u32)> = Vec::new();
         for (ti, &(t, nt, fid_t)) in tris.iter().enumerate() {
@@ -2053,7 +2111,7 @@ fn refine_coplanar_sliver_fans_and_edges(
                                         s_pt,
                                         pa,
                                         &loop_v,
-                                        &active_verts,
+                                        &plane_verts,
                                         canon_pos,
                                         t_eps,
                                         t_eps_sq,
@@ -2203,7 +2261,9 @@ fn refine_coplanar_sliver_fans_and_edges(
         }
 
         if !modified {
-            break;
+            let mut key = seed_tri;
+            key.sort_unstable();
+            unrefinable_tris.insert(key);
         }
     }
 }
@@ -2364,7 +2424,7 @@ fn repair_manifold_triangles(
 ) {
     let split_tol_sq = (diag * 2e-4).max(1e-7).powi(2);
     let cycle_tol_sq = (diag * 2e-3).max(1e-6).powi(2);
-    let max_passes = if tris.len() > 2000 { 2 } else { 8 };
+    let max_passes = 8;
 
     for _pass in 0..max_passes {
         // 1. Remove degenerate or exact duplicate triangles
@@ -2453,14 +2513,18 @@ fn repair_manifold_triangles(
             let e1 = (t[1], t[2]);
             let e2 = (t[2], t[0]);
 
-            let u0 = edge_counts.get(&e0).copied().unwrap_or(0)
-                + edge_counts.get(&(e0.1, e0.0)).copied().unwrap_or(0);
-            let u1 = edge_counts.get(&e1).copied().unwrap_or(0)
-                + edge_counts.get(&(e1.1, e1.0)).copied().unwrap_or(0);
-            let u2 = edge_counts.get(&e2).copied().unwrap_or(0)
-                + edge_counts.get(&(e2.1, e2.0)).copied().unwrap_or(0);
+            let c0 = edge_counts.get(&e0).copied().unwrap_or(0);
+            let c1 = edge_counts.get(&e1).copied().unwrap_or(0);
+            let c2 = edge_counts.get(&e2).copied().unwrap_or(0);
+            let u0 = c0 + edge_counts.get(&(e0.1, e0.0)).copied().unwrap_or(0);
+            let u1 = c1 + edge_counts.get(&(e1.1, e1.0)).copied().unwrap_or(0);
+            let u2 = c2 + edge_counts.get(&(e2.1, e2.0)).copied().unwrap_or(0);
 
-            if u0 != 2 && u1 != 2 && u2 != 2 && (u0 >= 3 || u1 >= 3 || u2 >= 3) {
+            let is_isolated_fin = u0 != 2 && u1 != 2 && u2 != 2 && (u0 >= 3 || u1 >= 3 || u2 >= 3);
+            let is_dup_flap = ((c0 >= 2 && u0 >= 3) || (c1 >= 2 && u1 >= 3) || (c2 >= 2 && u2 >= 3))
+                && (u0 == 1 || u1 == 1 || u2 == 1);
+
+            if is_isolated_fin || is_dup_flap {
                 *edge_counts.entry(e0).or_insert(1) -= 1;
                 *edge_counts.entry(e1).or_insert(1) -= 1;
                 *edge_counts.entry(e2).or_insert(1) -= 1;
@@ -2774,6 +2838,7 @@ fn merge_csg_face_registries(
     for fb in &b.faces {
         let mut f = fb.clone();
         f.id = fb.id + id_offset;
+        f.aliases.retain(|al| !al.starts_with("helix_meta:"));
 
         if is_difference {
             if f.kind == FaceKind::Plane {
@@ -2834,7 +2899,9 @@ fn merge_csg_face_registries(
                 push_unique_alias(&mut f.aliases, format!("cut:{orig_name}"));
                 push_unique_alias(&mut f.aliases, format!("cut:{orig_role}"));
                 for al in &fb.aliases {
-                    push_unique_alias(&mut f.aliases, format!("cut:{al}"));
+                    if !al.starts_with("helix_meta:") {
+                        push_unique_alias(&mut f.aliases, format!("cut:{al}"));
+                    }
                 }
                 if fb.kind == FaceKind::Cylinder && orig_role == "side" {
                     push_unique_alias(&mut f.aliases, "hole_wall".to_string());
@@ -2871,6 +2938,1184 @@ fn merge_csg_face_registries(
     (id_offset, combined)
 }
 
+#[derive(Debug, Clone)]
+struct HelicalGrooveParams {
+    helix_radius: f64,
+    groove_radius: f64,
+    pitch: f64,
+    start_z: f64,
+    starts: usize,
+    is_right_hand: bool,
+    turns: f64,
+    is_metric_60: bool,
+}
+
+impl HelicalGrooveParams {
+    fn from_cutter_mesh(b: &TriangleMesh) -> Option<Self> {
+        let f0 = b.faces.first()?;
+        let meta = f0.aliases.iter().find(|al| al.starts_with("helix_meta:"))?;
+        let parts: Vec<&str> = meta.split(':').collect();
+        if parts.len() < 10 {
+            return None;
+        }
+        let helix_radius = parts[1].parse::<f64>().ok()?;
+        let groove_radius = parts[2].parse::<f64>().ok()?;
+        let pitch = parts[3].parse::<f64>().ok()?;
+        let _height = parts[4].parse::<f64>().ok()?;
+        let start_z = parts[5].parse::<f64>().ok()?;
+        let starts = parts[6].parse::<usize>().ok()?.max(1);
+        let is_right_hand = parts[7] == "1";
+        let turns = parts[8].parse::<f64>().ok()?;
+        let is_metric_60 = parts[9].eq_ignore_ascii_case("metric_60");
+        if pitch <= 1e-9 || groove_radius <= 1e-9 || turns <= 0.0 {
+            return None;
+        }
+        Some(Self {
+            helix_radius,
+            groove_radius,
+            pitch,
+            start_z,
+            starts,
+            is_right_hand,
+            turns,
+            is_metric_60,
+        })
+    }
+
+    /// Computes the perpendicular distance `d_perp` in the normal plane `(e_r, e_b)` of the helix
+    /// from cylindrical point `(r_ref, theta, z)` to the nearest active turn among all starts.
+    fn min_perp_distance(&self, r_ref: f64, theta: f64, z: f64) -> f64 {
+        use std::f64::consts::PI;
+        let two_pi = 2.0 * PI;
+        let s = if self.is_right_hand { 1.0 } else { -1.0 };
+        let c = self.pitch / two_pi;
+        let h_len = (r_ref * r_ref + c * c).sqrt().max(1e-12);
+        let cos_psi = (r_ref / h_len).clamp(0.1, 1.0);
+        let t_max = two_pi * self.turns;
+
+        let m_center = ((z - self.start_z) / self.pitch).round() as i64;
+        let mut best_d = f64::INFINITY;
+
+        for start_idx in 0..self.starts {
+            let phi_0 = (start_idx as f64) * two_pi / (self.starts as f64);
+            let mut base_t = (theta - phi_0) * s % two_pi;
+            if base_t < 0.0 {
+                base_t += two_pi;
+            }
+            for dm in -2..=2 {
+                let m = m_center + dm;
+                let t_m = base_t + (m as f64) * two_pi;
+                if t_m >= 0.0 && t_m <= t_max {
+                    let z_m = self.start_z + (t_m / two_pi) * self.pitch;
+                    let d = (z - z_m).abs() * cos_psi;
+                    if d < best_d {
+                        best_d = d;
+                    }
+                } else {
+                    let t_c = t_m.clamp(0.0, t_max);
+                    let theta_c = phi_0 + s * t_c;
+                    let z_c = self.start_z + (t_c / two_pi) * self.pitch;
+                    let d_ang = 2.0 * r_ref * (0.5 * (theta - theta_c)).sin().abs();
+                    let dz = z - z_c;
+                    let d = (d_ang * d_ang + dz * dz).sqrt();
+                    if d < best_d {
+                        best_d = d;
+                    }
+                }
+            }
+        }
+        best_d
+    }
+
+    /// Evaluates positive radial indentation depth at `(r_ref, theta, z)`.
+    fn radial_depth(&self, r_ref: f64, theta: f64, z: f64, max_depth_cap: f64) -> f64 {
+        use std::f64::consts::PI;
+        let d_perp = self.min_perp_distance(r_ref, theta, z);
+        if self.is_metric_60 {
+            let tan30 = (PI / 6.0).tan();
+            let w = (self.groove_radius * tan30).min(0.45 * self.pitch);
+            if d_perp >= w || w <= 1e-12 {
+                return 0.0;
+            }
+            let h_eff = (w / tan30).min(max_depth_cap);
+            let u = 1.0 - (d_perp / w);
+            // Smooth ISO 68-1 root truncation (avoids sharp 0-width root crease)
+            let trunc = 0.85 * h_eff;
+            (h_eff * u).min(trunc)
+        } else {
+            let w = self.groove_radius.min(0.45 * self.pitch * (self.starts as f64));
+            if d_perp >= w || w <= 1e-12 {
+                return 0.0;
+            }
+            let depth_max = self.groove_radius.min(max_depth_cap);
+            let q = d_perp / w;
+            depth_max * (1.0 - q * q)
+        }
+    }
+}
+
+/// Emits a quad `(p0, p1, p2, p3)` split along its shorter 3D diagonal, assigning each emitted
+/// triangle's exact unit geometric normal `(b - a) x (c - a)` so `normals_vs_winding_mismatches == 0`.
+#[inline]
+fn push_quad_exact_normals(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<[u32; 3]>,
+    p0: [f64; 3],
+    p1: [f64; 3],
+    p2: [f64; 3],
+    p3: [f64; 3],
+) {
+    let mut emit_tri = |a: [f64; 3], b: [f64; 3], c: [f64; 3]| {
+        let va = Vector3::new(a[0], a[1], a[2]);
+        let vb = Vector3::new(b[0], b[1], b[2]);
+        let vc = Vector3::new(c[0], c[1], c[2]);
+        let n_vec = (vb - va).cross(&(vc - va));
+        let n_len = n_vec.norm();
+        let n = if n_len > 1e-15 {
+            [n_vec.x / n_len, n_vec.y / n_len, n_vec.z / n_len]
+        } else {
+            [0.0, 0.0, 1.0]
+        };
+        let base = vertices.len() as u32;
+        vertices.push(Vertex::new(a, n));
+        vertices.push(Vertex::new(b, n));
+        vertices.push(Vertex::new(c, n));
+        indices.push([base, base + 1, base + 2]);
+    };
+
+    let d02_sq = (p0[0] - p2[0]).powi(2) + (p0[1] - p2[1]).powi(2) + (p0[2] - p2[2]).powi(2);
+    let d13_sq = (p1[0] - p3[0]).powi(2) + (p1[1] - p3[1]).powi(2) + (p1[2] - p3[2]).powi(2);
+    if d02_sq <= d13_sq * 1.000001 {
+        emit_tri(p0, p1, p2);
+        emit_tri(p0, p2, p3);
+    } else {
+        emit_tri(p0, p1, p3);
+        emit_tri(p1, p2, p3);
+    }
+}
+
+/// Extracts a single simple closed 2D loop `[x, y]` from open boundary half-edges at `z ≈ z_target`,
+/// ordered CCW in the XY plane and rotated so vertex `0` has the smallest angle in `[0, 2*PI)`.
+fn trace_ccw_rim_loop_2d(
+    open_edges: &[(u32, u32)],
+    canon_pos: &[[f64; 3]],
+) -> Option<Vec<[f64; 2]>> {
+    use std::f64::consts::PI;
+    if open_edges.len() < 3 {
+        return None;
+    }
+    let mut next_map: HashMap<u32, u32> = HashMap::with_capacity(open_edges.len());
+    let mut in_deg: HashMap<u32, usize> = HashMap::with_capacity(open_edges.len());
+    for &(u, v) in open_edges {
+        if next_map.insert(u, v).is_some() {
+            return None;
+        }
+        *in_deg.entry(v).or_insert(0) += 1;
+    }
+    if next_map.len() != open_edges.len() || in_deg.values().any(|&c| c != 1) {
+        return None;
+    }
+
+    let start_u = open_edges[0].0;
+    let mut cycle: Vec<[f64; 2]> = Vec::with_capacity(open_edges.len());
+    let mut curr = start_u;
+    for _ in 0..open_edges.len() {
+        let p = canon_pos[curr as usize];
+        cycle.push([p[0], p[1]]);
+        curr = *next_map.get(&curr)?;
+        if curr == start_u {
+            break;
+        }
+    }
+    if curr != start_u || cycle.len() != open_edges.len() {
+        return None;
+    }
+
+    let mut area2 = 0.0;
+    for i in 0..cycle.len() {
+        let a = cycle[i];
+        let b = cycle[(i + 1) % cycle.len()];
+        area2 += a[0] * b[1] - b[0] * a[1];
+    }
+    if area2.abs() <= 1e-18 {
+        return None;
+    }
+    if area2 < 0.0 {
+        cycle.reverse();
+    }
+
+    let two_pi = 2.0 * PI;
+    let pos_angle = |p: [f64; 2]| -> f64 {
+        let mut a = p[1].atan2(p[0]);
+        if a < -1e-9 {
+            a += two_pi;
+        } else if a < 0.0 {
+            a = 0.0;
+        }
+        a
+    };
+
+    let mut best_idx = 0usize;
+    let mut best_ang = f64::INFINITY;
+    for (idx, &p) in cycle.iter().enumerate() {
+        let ang = pos_angle(p);
+        if ang < best_ang {
+            best_ang = ang;
+            best_idx = idx;
+        }
+    }
+    cycle.rotate_left(best_idx);
+
+    // Verify star-shaped monotone CCW angles around origin
+    for i in 0..cycle.len() {
+        let a = cycle[i];
+        let b = cycle[(i + 1) % cycle.len()];
+        let cross = a[0] * b[1] - a[1] * b[0];
+        if cross <= 1e-16 * (a[0] * a[0] + a[1] * a[1]).max(1e-12) {
+            return None;
+        }
+    }
+    Some(cycle)
+}
+
+type CoaxialShellTri = ([f64; 3], [f64; 3], [f64; 3], [f64; 3], u32);
+type CoaxialOuterShell = (
+    Vec<CoaxialShellTri>,
+    Vec<[f64; 2]>,
+    Vec<[f64; 2]>,
+    f64,
+    f64,
+);
+
+/// Extracts the outer shell triangles and top/bottom CCW rim loops of a coaxial solid `a`
+/// after excluding `excluded_fids` (such as `cap_top`, `cap_bottom`, `hole_wall`, `helical_groove`).
+fn extract_coaxial_outer_shell(
+    a: &TriangleMesh,
+    excluded_fids: &[u32],
+    min_allowed_shell_radius: f64,
+) -> Option<CoaxialOuterShell> {
+    if a.vertices.is_empty() || a.indices.is_empty() || a.face_ids.len() != a.indices.len() {
+        return None;
+    }
+    let mut z_min = f64::INFINITY;
+    let mut z_max = f64::NEG_INFINITY;
+    for v in &a.vertices {
+        z_min = z_min.min(v.position[2]);
+        z_max = z_max.max(v.position[2]);
+    }
+    let z_span = z_max - z_min;
+    if z_span <= 1e-9 {
+        return None;
+    }
+    let z_tol = (z_span * 1e-5).max(1e-8);
+    let weld_tol = (z_span * 1e-7).max(1e-9);
+    let inv_weld = 1.0 / weld_tol;
+
+    let mut shell_tris: Vec<CoaxialShellTri> = Vec::new();
+    let mut canon_map: HashMap<(i64, i64, i64), u32> = HashMap::new();
+    let mut canon_pos: Vec<[f64; 3]> = Vec::new();
+    let mut canon_tris: Vec<[u32; 3]> = Vec::new();
+
+    let mut get_cid = |p: [f64; 3]| -> u32 {
+        let key = (
+            (p[0] * inv_weld).round() as i64,
+            (p[1] * inv_weld).round() as i64,
+            (p[2] * inv_weld).round() as i64,
+        );
+        if let Some(&cid) = canon_map.get(&key) {
+            cid
+        } else {
+            let cid = canon_pos.len() as u32;
+            canon_pos.push(p);
+            canon_map.insert(key, cid);
+            cid
+        }
+    };
+
+    for (t_idx, tri) in a.indices.iter().enumerate() {
+        let fid = a.face_ids[t_idx];
+        if excluded_fids.contains(&fid) {
+            continue;
+        }
+        let v0 = &a.vertices[tri[0] as usize];
+        let v1 = &a.vertices[tri[1] as usize];
+        let v2 = &a.vertices[tri[2] as usize];
+        for p in [v0.position, v1.position, v2.position] {
+            let r = p[0].hypot(p[1]);
+            if r < min_allowed_shell_radius {
+                return None;
+            }
+        }
+        let c0 = get_cid(v0.position);
+        let c1 = get_cid(v1.position);
+        let c2 = get_cid(v2.position);
+        if c0 == c1 || c1 == c2 || c2 == c0 {
+            continue;
+        }
+        shell_tris.push((v0.position, v1.position, v2.position, v0.normal, fid));
+        canon_tris.push([c0, c1, c2]);
+    }
+
+    if shell_tris.is_empty() {
+        return None;
+    }
+
+    let mut half_edges: HashMap<(u32, u32), usize> = HashMap::with_capacity(canon_tris.len() * 3);
+    for ct in &canon_tris {
+        for e in 0..3 {
+            let u = ct[e];
+            let v = ct[(e + 1) % 3];
+            *half_edges.entry((u, v)).or_insert(0) += 1;
+        }
+    }
+
+    let mut top_open: Vec<(u32, u32)> = Vec::new();
+    let mut bot_open: Vec<(u32, u32)> = Vec::new();
+    for (&(u, v), &cnt) in &half_edges {
+        if cnt != 1 {
+            return None;
+        }
+        let rev_cnt = half_edges.get(&(v, u)).copied().unwrap_or(0);
+        if rev_cnt == 0 {
+            let pu = canon_pos[u as usize];
+            let pv = canon_pos[v as usize];
+            if (pu[2] - z_max).abs() <= z_tol && (pv[2] - z_max).abs() <= z_tol {
+                top_open.push((v, u));
+            } else if (pu[2] - z_min).abs() <= z_tol && (pv[2] - z_min).abs() <= z_tol {
+                bot_open.push((u, v));
+            } else {
+                return None;
+            }
+        }
+    }
+
+    let top_ring = trace_ccw_rim_loop_2d(&top_open, &canon_pos)?;
+    let bot_ring = trace_ccw_rim_loop_2d(&bot_open, &canon_pos)?;
+    if top_ring.len() != bot_ring.len() || top_ring.len() < 6 {
+        return None;
+    }
+
+    Some((shell_tris, top_ring, bot_ring, z_min, z_max))
+}
+
+/// Emits a planar annulus cap at `z_val` connecting an `M`-vertex `outer_ring` to a `K = M * 2^p` vertex
+/// circular inner bore of radius `r_bore` using `p` 1-to-2 inward doubling transitions followed by
+/// concentric ring bridging. Returns the `K` inner bore `[x, y]` vertices and their angles `theta_u`.
+#[allow(clippy::too_many_arguments)]
+fn emit_doubled_and_bridged_annulus_cap(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<[u32; 3]>,
+    face_ids: &mut Vec<u32>,
+    cap_fid: u32,
+    outer_ring: &[[f64; 2]],
+    r_bore: f64,
+    doublings: usize,
+    z_val: f64,
+    is_top: bool,
+) -> (Vec<[f64; 2]>, Vec<f64>) {
+    let start_tris = indices.len();
+    let mut curr_ring: Vec<[f64; 2]> = outer_ring.to_vec();
+
+    for _step in 0..doublings {
+        let m = curr_ring.len();
+        let mut sub_pts: Vec<[f64; 2]> = Vec::with_capacity(2 * m);
+        let mut r_sum = 0.0;
+        for j in 0..m {
+            let p0 = curr_ring[j];
+            let p1 = curr_ring[(j + 1) % m];
+            let pm = [0.5 * (p0[0] + p1[0]), 0.5 * (p0[1] + p1[1])];
+            r_sum += p0[0].hypot(p0[1]) + pm[0].hypot(pm[1]);
+            sub_pts.push(p0);
+            sub_pts.push(pm);
+        }
+        let r_avg = r_sum / ((2 * m) as f64);
+        let next_ring: Vec<[f64; 2]> = sub_pts
+            .iter()
+            .map(|p| {
+                let r_p = p[0].hypot(p[1]);
+                let th = p[1].atan2(p[0]);
+                let r_circ = 0.5 * r_p + 0.5 * r_avg;
+                let r_next = r_circ - 0.42 * (r_circ - r_bore);
+                [r_next * th.cos(), r_next * th.sin()]
+            })
+            .collect();
+        crate::primitives::add_doubling_ring_transition_2d(
+            vertices,
+            indices,
+            &curr_ring,
+            &next_ring,
+            z_val,
+            is_top,
+        );
+        curr_ring = next_ring;
+    }
+
+    let k = curr_ring.len();
+    let mut thetas: Vec<f64> = Vec::with_capacity(k);
+    let mut inner_ring: Vec<[f64; 2]> = Vec::with_capacity(k);
+    for p in &curr_ring {
+        let th = p[1].atan2(p[0]);
+        thetas.push(th);
+        inner_ring.push([r_bore * th.cos(), r_bore * th.sin()]);
+    }
+
+    crate::primitives::add_bridged_ring_strip_2d(
+        vertices,
+        indices,
+        &curr_ring,
+        &inner_ring,
+        z_val,
+        is_top,
+    );
+    face_ids.resize(indices.len(), cap_fid);
+    let _ = start_tris;
+    (inner_ring, thetas)
+}
+
+/// Coaxial fast-path for cutting a Z-axis through-hole (`cut_hole`) in a prismatic/cylindrical solid
+/// whose outer shell lies strictly outside `r_bore`. Preserves the outer shell 100% untouched.
+fn try_cut_coaxial_through_bore(
+    a: &TriangleMesh,
+    b: &TriangleMesh,
+    id_offset: u32,
+    combined_faces: &[FaceInfo],
+) -> Option<TriangleMesh> {
+    if b.faces.iter().any(|f| f.role == "keyway_wall") {
+        return None;
+    }
+    let b_hole_wall = b.faces.iter().find(|f| {
+        (f.role == "hole_wall" || (f.role == "side" && b.faces.len() == 3 && a.faces.len() > 3))
+            && f.kind == FaceKind::Cylinder
+            && f.normal_or_axis[2].abs() > 0.999
+    })?;
+    let r_bore = b_hole_wall.radius?;
+    if r_bore <= 1e-9 {
+        return None;
+    }
+
+    // Verify tool b is centered at X=0, Y=0 and spans beyond a's Z bounds
+    let a_aabb = a.bounding_box();
+    let b_aabb = b.bounding_box();
+    let b_cx = 0.5 * (b_aabb.min[0] + b_aabb.max[0]);
+    let b_cy = 0.5 * (b_aabb.min[1] + b_aabb.max[1]);
+    if b_cx.hypot(b_cy) > r_bore * 1e-4
+        || b_aabb.min[2] > a_aabb.min[2] - 1e-6
+        || b_aabb.max[2] < a_aabb.max[2] + 1e-6
+    {
+        return None;
+    }
+
+    let cap_top_f = a.faces.iter().find(|f| {
+        f.role == "cap_top" && f.kind == FaceKind::Plane && f.normal_or_axis[2] > 0.999
+    })?;
+    let cap_bot_f = a.faces.iter().find(|f| {
+        f.role == "cap_bottom" && f.kind == FaceKind::Plane && f.normal_or_axis[2] < -0.999
+    })?;
+    if a.faces
+        .iter()
+        .any(|f| f.role == "hole_wall" || f.kind == FaceKind::Helical)
+    {
+        return None;
+    }
+
+    let excluded = [cap_top_f.id, cap_bot_f.id];
+    let (shell_tris, top_outer_ring, bot_outer_ring, z_min, z_max) =
+        extract_coaxial_outer_shell(a, &excluded, r_bore * 1.12)?;
+
+    let m = top_outer_ring.len();
+    let mut doublings = 0usize;
+    while (m << doublings) < 24 && doublings < 3 {
+        doublings += 1;
+    }
+
+    let mut vertices: Vec<Vertex> = Vec::with_capacity(shell_tris.len() * 3 + 512);
+    let mut indices: Vec<[u32; 3]> = Vec::with_capacity(shell_tris.len() + 256);
+    let mut face_ids: Vec<u32> = Vec::with_capacity(shell_tris.len() + 256);
+
+    for (p0, p1, p2, n, fid) in shell_tris {
+        let base = vertices.len() as u32;
+        vertices.push(Vertex::new(p0, n));
+        vertices.push(Vertex::new(p1, n));
+        vertices.push(Vertex::new(p2, n));
+        indices.push([base, base + 1, base + 2]);
+        face_ids.push(fid);
+    }
+
+    let (top_bore_ring, _) = emit_doubled_and_bridged_annulus_cap(
+        &mut vertices,
+        &mut indices,
+        &mut face_ids,
+        cap_top_f.id,
+        &top_outer_ring,
+        r_bore,
+        doublings,
+        z_max,
+        true,
+    );
+    let (bot_bore_ring, _) = emit_doubled_and_bridged_annulus_cap(
+        &mut vertices,
+        &mut indices,
+        &mut face_ids,
+        cap_bot_f.id,
+        &bot_outer_ring,
+        r_bore,
+        doublings,
+        z_min,
+        false,
+    );
+
+    let k = top_bore_ring.len();
+    let hole_wall_fid = b_hole_wall.id + id_offset;
+    let height = z_max - z_min;
+    let chord = (2.0 * std::f64::consts::PI * r_bore / (k as f64)).max(1e-6);
+    let n_z = ((height / (chord * 1.25)).ceil() as usize).clamp(2, 64);
+
+    for v in 0..n_z {
+        let t0 = (v as f64) / (n_z as f64);
+        let t1 = ((v + 1) as f64) / (n_z as f64);
+        let z0 = z_min + t0 * height;
+        let z1 = z_min + t1 * height;
+        for u in 0..k {
+            let u_next = (u + 1) % k;
+            let p_bot_i = [
+                bot_bore_ring[u][0] + (top_bore_ring[u][0] - bot_bore_ring[u][0]) * t0,
+                bot_bore_ring[u][1] + (top_bore_ring[u][1] - bot_bore_ring[u][1]) * t0,
+                z0,
+            ];
+            let p_bot_next = [
+                bot_bore_ring[u_next][0]
+                    + (top_bore_ring[u_next][0] - bot_bore_ring[u_next][0]) * t0,
+                bot_bore_ring[u_next][1]
+                    + (top_bore_ring[u_next][1] - bot_bore_ring[u_next][1]) * t0,
+                z0,
+            ];
+            let p_top_i = [
+                bot_bore_ring[u][0] + (top_bore_ring[u][0] - bot_bore_ring[u][0]) * t1,
+                bot_bore_ring[u][1] + (top_bore_ring[u][1] - bot_bore_ring[u][1]) * t1,
+                z1,
+            ];
+            let p_top_next = [
+                bot_bore_ring[u_next][0]
+                    + (top_bore_ring[u_next][0] - bot_bore_ring[u_next][0]) * t1,
+                bot_bore_ring[u_next][1]
+                    + (top_bore_ring[u_next][1] - bot_bore_ring[u_next][1]) * t1,
+                z1,
+            ];
+            push_quad_exact_normals(
+                &mut vertices,
+                &mut indices,
+                p_top_i,
+                p_top_next,
+                p_bot_next,
+                p_bot_i,
+            );
+            face_ids.push(hole_wall_fid);
+            face_ids.push(hole_wall_fid);
+        }
+    }
+
+    let mut mesh = TriangleMesh::with_faces(vertices, indices, face_ids, combined_faces.to_vec());
+    mesh.recompute_face_registry();
+    Some(mesh)
+}
+
+/// Emits a coaxial cone wall from an ordered CCW `base_ring` at `z_bot` up to `z_top` with 2-to-1
+/// vertex halving near sharp cone apexes (`radius_top <= 1e-12`).
+#[allow(clippy::too_many_arguments)]
+fn emit_cone_from_base_ring(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<[u32; 3]>,
+    face_ids: &mut Vec<u32>,
+    cone_side_fid: u32,
+    cone_top_cap_fid: Option<u32>,
+    base_ring: &[[f64; 2]],
+    radius_bottom: f64,
+    radius_top: f64,
+    z_bot: f64,
+    z_top: f64,
+) {
+    use std::f64::consts::PI;
+    let segs = base_ring.len();
+    if segs < 6 || z_top <= z_bot + 1e-12 {
+        return;
+    }
+    let height = z_top - z_bot;
+    let dr = radius_bottom - radius_top;
+    let slant = (height * height + dr * dr).sqrt();
+    let max_r = radius_bottom.max(radius_top);
+    let base_chord = (2.0 * max_r * (PI / (segs as f64)).sin()).max(1e-6);
+    let n_z = ((slant / (base_chord * 1.25)).ceil() as usize).clamp(4, 48);
+
+    if radius_top <= 1e-12 {
+        let mut curr_segs = segs;
+        let mut prev_ring: Vec<[f64; 3]> = base_ring
+            .iter()
+            .map(|p| [p[0], p[1], z_bot])
+            .collect();
+
+        for k in 1..n_z {
+            let t = (k as f64) / (n_z as f64);
+            let r_curr = radius_bottom * (1.0 - t);
+            let z_curr = z_bot + t * height;
+            let chord_curr = 2.0 * PI * r_curr / (curr_segs as f64);
+            let step_len = slant / (n_z as f64);
+
+            if curr_segs >= 12 && curr_segs.is_multiple_of(2) && chord_curr < step_len * 0.55 {
+                let half_segs = curr_segs / 2;
+                let next_ring: Vec<[f64; 3]> = (0..half_segs)
+                    .map(|j| {
+                        let p_ref = prev_ring[2 * j];
+                        let th = p_ref[1].atan2(p_ref[0]);
+                        [r_curr * th.cos(), r_curr * th.sin(), z_curr]
+                    })
+                    .collect();
+                for j in 0..half_segs {
+                    let j_next = (j + 1) % half_segs;
+                    let o0 = prev_ring[2 * j];
+                    let o1 = prev_ring[2 * j + 1];
+                    let o2 = prev_ring[(2 * j + 2) % curr_segs];
+                    let i0 = next_ring[j];
+                    let i1 = next_ring[j_next];
+                    for (a, b, c) in [(o0, o1, i0), (o1, i1, i0), (o1, o2, i1)] {
+                        let va = Vector3::new(a[0], a[1], a[2]);
+                        let vb = Vector3::new(b[0], b[1], b[2]);
+                        let vc = Vector3::new(c[0], c[1], c[2]);
+                        let nv = (vb - va).cross(&(vc - va));
+                        let nl = nv.norm().max(1e-15);
+                        let norm = [nv.x / nl, nv.y / nl, nv.z / nl];
+                        let base = vertices.len() as u32;
+                        vertices.push(Vertex::new(a, norm));
+                        vertices.push(Vertex::new(b, norm));
+                        vertices.push(Vertex::new(c, norm));
+                        indices.push([base, base + 1, base + 2]);
+                        face_ids.push(cone_side_fid);
+                    }
+                }
+                curr_segs = half_segs;
+                prev_ring = next_ring;
+            } else {
+                let next_ring: Vec<[f64; 3]> = (0..curr_segs)
+                    .map(|i| {
+                        let p_ref = prev_ring[i];
+                        let th = p_ref[1].atan2(p_ref[0]);
+                        [r_curr * th.cos(), r_curr * th.sin(), z_curr]
+                    })
+                    .collect();
+                for i in 0..curr_segs {
+                    let next = (i + 1) % curr_segs;
+                    push_quad_exact_normals(
+                        vertices,
+                        indices,
+                        prev_ring[i],
+                        prev_ring[next],
+                        next_ring[next],
+                        next_ring[i],
+                    );
+                    face_ids.push(cone_side_fid);
+                    face_ids.push(cone_side_fid);
+                }
+                prev_ring = next_ring;
+            }
+        }
+
+        let apex = [0.0, 0.0, z_top];
+        for i in 0..curr_segs {
+            let next = (i + 1) % curr_segs;
+            let a = prev_ring[i];
+            let b = prev_ring[next];
+            let va = Vector3::new(a[0], a[1], a[2]);
+            let vb = Vector3::new(b[0], b[1], b[2]);
+            let vc = Vector3::new(apex[0], apex[1], apex[2]);
+            let nv = (vb - va).cross(&(vc - va));
+            let nl = nv.norm().max(1e-15);
+            let norm = [nv.x / nl, nv.y / nl, nv.z / nl];
+            let base = vertices.len() as u32;
+            vertices.push(Vertex::new(a, norm));
+            vertices.push(Vertex::new(b, norm));
+            vertices.push(Vertex::new(apex, norm));
+            indices.push([base, base + 1, base + 2]);
+            face_ids.push(cone_side_fid);
+        }
+    } else {
+        let mut prev_ring: Vec<[f64; 3]> = base_ring
+            .iter()
+            .map(|p| [p[0], p[1], z_bot])
+            .collect();
+        for k in 1..=n_z {
+            let t = (k as f64) / (n_z as f64);
+            let r_curr = radius_bottom + (radius_top - radius_bottom) * t;
+            let z_curr = z_bot + t * height;
+            let next_ring: Vec<[f64; 3]> = base_ring
+                .iter()
+                .map(|p| {
+                    let th = p[1].atan2(p[0]);
+                    [r_curr * th.cos(), r_curr * th.sin(), z_curr]
+                })
+                .collect();
+            for i in 0..segs {
+                let next = (i + 1) % segs;
+                push_quad_exact_normals(
+                    vertices,
+                    indices,
+                    prev_ring[i],
+                    prev_ring[next],
+                    next_ring[next],
+                    next_ring[i],
+                );
+                face_ids.push(cone_side_fid);
+                face_ids.push(cone_side_fid);
+            }
+            prev_ring = next_ring;
+        }
+        if let Some(top_fid) = cone_top_cap_fid {
+            let top_ring_2d: Vec<[f64; 2]> = base_ring
+                .iter()
+                .map(|p| {
+                    let th = p[1].atan2(p[0]);
+                    [radius_top * th.cos(), radius_top * th.sin()]
+                })
+                .collect();
+            crate::primitives::add_subdivided_disk_cap_2d(
+                vertices,
+                indices,
+                &top_ring_2d,
+                [0.0, 0.0],
+                z_top,
+                true,
+            );
+            face_ids.resize(indices.len(), top_fid);
+        }
+    }
+}
+
+/// Coaxial fast-path for `csg_union` when attaching a coaxial Z-axis `Cone` `b` onto the circular
+/// top cap of a coaxial cylindrical (plain or helically fluted) body `a`.
+fn try_union_coaxial_cone(
+    a: &TriangleMesh,
+    b: &TriangleMesh,
+    id_offset: u32,
+    combined_faces: &[FaceInfo],
+) -> Option<TriangleMesh> {
+    let b_cone_f = b
+        .faces
+        .iter()
+        .find(|f| f.kind == FaceKind::Cone && f.normal_or_axis[2].abs() > 0.999)?;
+    let b_bot_f = b.faces.iter().find(|f| {
+        f.role == "cap_bottom" && f.kind == FaceKind::Plane && f.normal_or_axis[2] < -0.999
+    })?;
+    let r_cone_bot = b_bot_f.radius.or(b_cone_f.radius)?;
+    let b_top_f = b
+        .faces
+        .iter()
+        .find(|f| f.role == "cap_top" && f.kind == FaceKind::Plane && f.normal_or_axis[2] > 0.999);
+    let r_cone_top = b_top_f.and_then(|f| f.radius).unwrap_or(0.0);
+
+    let a_top_f = a.faces.iter().find(|f| {
+        f.role == "cap_top" && f.kind == FaceKind::Plane && f.normal_or_axis[2] > 0.999
+    })?;
+    let a_bot_f = a.faces.iter().find(|f| {
+        f.role == "cap_bottom" && f.kind == FaceKind::Plane && f.normal_or_axis[2] < -0.999
+    })?;
+    if a.faces.iter().any(|f| f.role == "hole_wall") {
+        return None;
+    }
+
+    let a_aabb = a.bounding_box();
+    let b_aabb = b.bounding_box();
+    let z_seam = a_aabb.max[2];
+    if (b_aabb.min[2] - z_seam).abs() > (r_cone_bot * 1e-4).max(1e-6)
+        || b_aabb.max[2] <= z_seam + 1e-6
+    {
+        return None;
+    }
+
+    let excluded = [a_top_f.id, a_bot_f.id];
+    let (_, top_rim, _, _, z_cyl_max) =
+        extract_coaxial_outer_shell(a, &excluded, r_cone_bot * 0.15)?;
+    let avg_r: f64 =
+        top_rim.iter().map(|p| p[0].hypot(p[1])).sum::<f64>() / (top_rim.len() as f64);
+    if (avg_r - r_cone_bot).abs() > r_cone_bot * 1e-3 {
+        return None;
+    }
+
+    let mut vertices: Vec<Vertex> = Vec::with_capacity(a.vertices.len() + b.vertices.len());
+    let mut indices: Vec<[u32; 3]> = Vec::with_capacity(a.indices.len() + b.indices.len());
+    let mut face_ids: Vec<u32> = Vec::with_capacity(a.indices.len() + b.indices.len());
+
+    // Keep all triangles of `a` except `cap_top`
+    for (t_idx, tri) in a.indices.iter().enumerate() {
+        let fid = a.face_ids[t_idx];
+        if fid == a_top_f.id {
+            continue;
+        }
+        let v0 = &a.vertices[tri[0] as usize];
+        let v1 = &a.vertices[tri[1] as usize];
+        let v2 = &a.vertices[tri[2] as usize];
+        let base = vertices.len() as u32;
+        vertices.push(*v0);
+        vertices.push(*v1);
+        vertices.push(*v2);
+        indices.push([base, base + 1, base + 2]);
+        face_ids.push(fid);
+    }
+
+    let cone_side_fid = b_cone_f.id + id_offset;
+    let cone_top_fid = b_top_f.map(|f| f.id + id_offset);
+    emit_cone_from_base_ring(
+        &mut vertices,
+        &mut indices,
+        &mut face_ids,
+        cone_side_fid,
+        cone_top_fid,
+        &top_rim,
+        r_cone_bot,
+        r_cone_top,
+        z_cyl_max,
+        b_aabb.max[2],
+    );
+
+    let mut mesh = TriangleMesh::with_faces(vertices, indices, face_ids, combined_faces.to_vec());
+    mesh.recompute_face_registry();
+    Some(mesh)
+}
+
+/// Analytical coaxial helical groove & thread cutter (`cut_helical_groove`) handling:
+/// - Subcase 1: Internal helical thread/groove on a coaxial bored solid (e.g. `T08_hex_nut_m10`, `test_dag_polygon_prism_hex_nut_model`)
+/// - Subcase 2: External helical flute/thread on a coaxial cylinder or cylinder+cone (`test_dag_helical_groove_drill_bit_model`, `DRILL_CONE`, `qa_wide_scan`)
+fn try_cut_coaxial_helical_groove(
+    a: &TriangleMesh,
+    b: &TriangleMesh,
+    id_offset: u32,
+    combined_faces: &[FaceInfo],
+) -> Option<TriangleMesh> {
+    use std::f64::consts::PI;
+    let params = HelicalGrooveParams::from_cutter_mesh(b)?;
+    let helical_fid = b.faces.first().map(|f| f.id + id_offset).unwrap_or(1 + id_offset);
+
+    // Subcase 1: Internal helical thread/groove on a coaxial bored solid (has `hole_wall`)
+    if let Some(hole_wall_f) = a.faces.iter().find(|f| {
+        f.role == "hole_wall" && f.kind == FaceKind::Cylinder && f.normal_or_axis[2].abs() > 0.999
+    }) {
+        let r_bore = hole_wall_f.radius?;
+        if (params.helix_radius - r_bore).abs() <= params.groove_radius * 1.6 {
+            let cap_top_f = a.faces.iter().find(|f| {
+                f.role == "cap_top" && f.kind == FaceKind::Plane && f.normal_or_axis[2] > 0.999
+            })?;
+            let cap_bot_f = a.faces.iter().find(|f| {
+                f.role == "cap_bottom" && f.kind == FaceKind::Plane && f.normal_or_axis[2] < -0.999
+            })?;
+
+            let mut excluded = vec![cap_top_f.id, cap_bot_f.id, hole_wall_f.id];
+            for f in &a.faces {
+                if f.kind == FaceKind::Helical || f.role.starts_with("helical_") {
+                    excluded.push(f.id);
+                }
+            }
+
+            let max_thread_r = r_bore + params.groove_radius;
+            let (shell_tris, top_outer_ring, bot_outer_ring, z_min, z_max) =
+                extract_coaxial_outer_shell(a, &excluded, max_thread_r * 1.05)?;
+
+            let m = top_outer_ring.len();
+            let mut doublings = 0usize;
+            while (m << doublings) < 48 && doublings < 3 {
+                doublings += 1;
+            }
+
+            let mut vertices: Vec<Vertex> = Vec::with_capacity(shell_tris.len() * 3 + 4096);
+            let mut indices: Vec<[u32; 3]> = Vec::with_capacity(shell_tris.len() + 2048);
+            let mut face_ids: Vec<u32> = Vec::with_capacity(shell_tris.len() + 2048);
+
+            for (p0, p1, p2, n, fid) in shell_tris {
+                let base = vertices.len() as u32;
+                vertices.push(Vertex::new(p0, n));
+                vertices.push(Vertex::new(p1, n));
+                vertices.push(Vertex::new(p2, n));
+                indices.push([base, base + 1, base + 2]);
+                face_ids.push(fid);
+            }
+
+            let (top_bore_ring, thetas) = emit_doubled_and_bridged_annulus_cap(
+                &mut vertices,
+                &mut indices,
+                &mut face_ids,
+                cap_top_f.id,
+                &top_outer_ring,
+                r_bore,
+                doublings,
+                z_max,
+                true,
+            );
+            let (bot_bore_ring, _) = emit_doubled_and_bridged_annulus_cap(
+                &mut vertices,
+                &mut indices,
+                &mut face_ids,
+                cap_bot_f.id,
+                &bot_outer_ring,
+                r_bore,
+                doublings,
+                z_min,
+                false,
+            );
+
+            let k = thetas.len();
+            let z_span = z_max - z_min;
+            let ds = (2.0 * PI * r_bore / (k as f64)).max(1e-6);
+            let nz_min = ((z_span / (1.5 * ds)).ceil() as usize).max(12);
+            let nz_max = ((z_span / (0.28 * ds)).floor() as usize).max(nz_min);
+            let nz_target = ((z_span / params.pitch) * 8.0).round() as usize;
+            let n_z = nz_target.clamp(nz_min, nz_max);
+
+            let min_shell_r = top_outer_ring
+                .iter()
+                .map(|p| p[0].hypot(p[1]))
+                .fold(f64::INFINITY, f64::min);
+            let max_depth_cap = (min_shell_r - r_bore) * 0.55;
+
+            let mut rings_3d: Vec<Vec<[f64; 3]>> = Vec::with_capacity(n_z + 1);
+            let mut ring_has_groove: Vec<Vec<bool>> = Vec::with_capacity(n_z + 1);
+
+            for v in 0..=n_z {
+                let t = (v as f64) / (n_z as f64);
+                let z = z_min + t * z_span;
+                // Smooth 1-step chamfer lead-in/out at v=0 (z_min) and v=n_z (z_max) so cap rings are exact circles
+                let axial_taper = if v == 0 || v == n_z {
+                    0.0
+                } else if v == 1 || v == n_z - 1 {
+                    0.65
+                } else {
+                    1.0
+                };
+                let mut row_pts: Vec<[f64; 3]> = Vec::with_capacity(k);
+                let mut row_groove: Vec<bool> = Vec::with_capacity(k);
+
+                for u in 0..k {
+                    if v == 0 {
+                        row_pts.push([bot_bore_ring[u][0], bot_bore_ring[u][1], z_min]);
+                        row_groove.push(false);
+                    } else if v == n_z {
+                        row_pts.push([top_bore_ring[u][0], top_bore_ring[u][1], z_max]);
+                        row_groove.push(false);
+                    } else {
+                        let th = thetas[u];
+                        let dr = params.radial_depth(r_bore, th, z, max_depth_cap) * axial_taper;
+                        let r_pt = r_bore + dr;
+                        row_pts.push([r_pt * th.cos(), r_pt * th.sin(), z]);
+                        row_groove.push(dr > 1e-9);
+                    }
+                }
+                rings_3d.push(row_pts);
+                ring_has_groove.push(row_groove);
+            }
+
+            for v in 0..n_z {
+                for u in 0..k {
+                    let u_next = (u + 1) % k;
+                    let p_bot_i = rings_3d[v][u];
+                    let p_bot_next = rings_3d[v][u_next];
+                    let p_top_i = rings_3d[v + 1][u];
+                    let p_top_next = rings_3d[v + 1][u_next];
+                    push_quad_exact_normals(
+                        &mut vertices,
+                        &mut indices,
+                        p_top_i,
+                        p_top_next,
+                        p_bot_next,
+                        p_bot_i,
+                    );
+                    let is_groove = ring_has_groove[v][u]
+                        || ring_has_groove[v][u_next]
+                        || ring_has_groove[v + 1][u]
+                        || ring_has_groove[v + 1][u_next];
+                    let fid = if is_groove { helical_fid } else { hole_wall_f.id };
+                    face_ids.push(fid);
+                    face_ids.push(fid);
+                }
+            }
+
+            let mut mesh =
+                TriangleMesh::with_faces(vertices, indices, face_ids, combined_faces.to_vec());
+            mesh.recompute_face_registry();
+            return Some(mesh);
+        }
+    }
+
+    // Subcase 2: External helical flute / thread on a coaxial cylinder (optionally topped by a coaxial cone)
+    let cyl_side_f = a.faces.iter().find(|f| {
+        f.role == "side" && f.kind == FaceKind::Cylinder && f.normal_or_axis[2].abs() > 0.999
+    })?;
+    let r_cyl = cyl_side_f.radius?;
+    if (params.helix_radius - r_cyl).abs() > params.groove_radius * 1.6 {
+        return None;
+    }
+    if a.faces
+        .iter()
+        .any(|f| f.role == "hole_wall" || f.role.starts_with("side_"))
+    {
+        return None;
+    }
+
+    let cap_bot_f = a.faces.iter().find(|f| {
+        f.role == "cap_bottom" && f.kind == FaceKind::Plane && f.normal_or_axis[2] < -0.999
+    })?;
+    let cap_top_f = a.faces.iter().find(|f| {
+        f.role == "cap_top" && f.kind == FaceKind::Plane && f.normal_or_axis[2] > 0.999
+    });
+    let cone_side_f = a
+        .faces
+        .iter()
+        .find(|f| f.kind == FaceKind::Cone && f.normal_or_axis[2].abs() > 0.999);
+
+    let a_aabb = a.bounding_box();
+    let z_min = a_aabb.min[2];
+    let z_max = a_aabb.max[2];
+
+    // Determine z_cyl_max (top of cylindrical section, before optional cone)
+    let mut z_cyl_max = z_max;
+    if cone_side_f.is_some() {
+        let mut max_cyl_z = f64::NEG_INFINITY;
+        for (t_idx, tri) in a.indices.iter().enumerate() {
+            if a.face_ids[t_idx] == cyl_side_f.id {
+                for &vi in tri {
+                    max_cyl_z = max_cyl_z.max(a.vertices[vi as usize].position[2]);
+                }
+            }
+        }
+        if max_cyl_z > z_min + 1e-6 && max_cyl_z < z_max - 1e-6 {
+            z_cyl_max = max_cyl_z;
+        }
+    }
+
+    let k = 48usize;
+    let cyl_height = z_cyl_max - z_min;
+    if cyl_height <= 1e-9 {
+        return None;
+    }
+    let ds = (2.0 * PI * r_cyl / (k as f64)).max(1e-6);
+    let nz_min = ((cyl_height / (1.4 * ds)).ceil() as usize).max(12);
+    let nz_max = ((cyl_height / (0.28 * ds)).floor() as usize).max(nz_min);
+    let nz_target = ((cyl_height / params.pitch) * 10.0).round() as usize;
+    let n_z = nz_target.clamp(nz_min, nz_max);
+
+    let root_min_r = (r_cyl * 0.35).max(params.helix_radius - params.groove_radius);
+    let max_depth_cap = (r_cyl - root_min_r).max(params.groove_radius * 0.25);
+
+    let base_circle_2d: Vec<[f64; 2]> = (0..k)
+        .map(|u| {
+            let th = (u as f64) * 2.0 * PI / (k as f64);
+            [r_cyl * th.cos(), r_cyl * th.sin()]
+        })
+        .collect();
+
+    let mut vertices: Vec<Vertex> = Vec::with_capacity((k * n_z + 256) * 4);
+    let mut indices: Vec<[u32; 3]> = Vec::with_capacity(k * n_z * 2 + 512);
+    let mut face_ids: Vec<u32> = Vec::with_capacity(k * n_z * 2 + 512);
+
+    // 1. Bottom cap at z_min
+    crate::primitives::add_subdivided_disk_cap_2d(
+        &mut vertices,
+        &mut indices,
+        &base_circle_2d,
+        [0.0, 0.0],
+        z_min,
+        false,
+    );
+    face_ids.resize(indices.len(), cap_bot_f.id);
+
+    // 2. Top cap at z_cyl_max (if no cone on top) or coaxial cone from z_cyl_max to z_max
+    if let Some(cone_f) = cone_side_f {
+        let r_cone_top = cap_top_f.and_then(|f| f.radius).unwrap_or(0.0);
+        emit_cone_from_base_ring(
+            &mut vertices,
+            &mut indices,
+            &mut face_ids,
+            cone_f.id,
+            cap_top_f.map(|f| f.id),
+            &base_circle_2d,
+            r_cyl,
+            r_cone_top,
+            z_cyl_max,
+            z_max,
+        );
+    } else {
+        let top_f = cap_top_f?;
+        crate::primitives::add_subdivided_disk_cap_2d(
+            &mut vertices,
+            &mut indices,
+            &base_circle_2d,
+            [0.0, 0.0],
+            z_cyl_max,
+            true,
+        );
+        face_ids.resize(indices.len(), top_f.id);
+    }
+
+    // 3. Fluted / threaded cylindrical side wall from z_min to z_cyl_max
+    let mut rings_3d: Vec<Vec<[f64; 3]>> = Vec::with_capacity(n_z + 1);
+    let mut ring_has_groove: Vec<Vec<bool>> = Vec::with_capacity(n_z + 1);
+
+    for v in 0..=n_z {
+        let t = (v as f64) / (n_z as f64);
+        let z = z_min + t * cyl_height;
+        let axial_taper = if v == 0 || v == n_z {
+            0.0
+        } else if v == 1 || v == n_z - 1 {
+            0.65
+        } else {
+            1.0
+        };
+        let mut row_pts: Vec<[f64; 3]> = Vec::with_capacity(k);
+        let mut row_groove: Vec<bool> = Vec::with_capacity(k);
+
+        for (u, base_pt) in base_circle_2d.iter().enumerate().take(k) {
+            if v == 0 {
+                row_pts.push([base_pt[0], base_pt[1], z_min]);
+                row_groove.push(false);
+            } else if v == n_z {
+                row_pts.push([base_pt[0], base_pt[1], z_cyl_max]);
+                row_groove.push(false);
+            } else {
+                let th = (u as f64) * 2.0 * PI / (k as f64);
+                let dr = params.radial_depth(r_cyl, th, z, max_depth_cap) * axial_taper;
+                let r_pt = (r_cyl - dr).max(r_cyl * 0.25);
+                row_pts.push([r_pt * th.cos(), r_pt * th.sin(), z]);
+                row_groove.push(dr > 1e-9);
+            }
+        }
+        rings_3d.push(row_pts);
+        ring_has_groove.push(row_groove);
+    }
+
+    for v in 0..n_z {
+        for u in 0..k {
+            let u_next = (u + 1) % k;
+            let p_bot_i = rings_3d[v][u];
+            let p_bot_next = rings_3d[v][u_next];
+            let p_top_i = rings_3d[v + 1][u];
+            let p_top_next = rings_3d[v + 1][u_next];
+            push_quad_exact_normals(
+                &mut vertices,
+                &mut indices,
+                p_top_i,
+                p_bot_i,
+                p_bot_next,
+                p_top_next,
+            );
+            let is_groove = ring_has_groove[v][u]
+                || ring_has_groove[v][u_next]
+                || ring_has_groove[v + 1][u]
+                || ring_has_groove[v + 1][u_next];
+            let fid = if is_groove { helical_fid } else { cyl_side_f.id };
+            face_ids.push(fid);
+            face_ids.push(fid);
+        }
+    }
+
+    let mut mesh = TriangleMesh::with_faces(vertices, indices, face_ids, combined_faces.to_vec());
+    mesh.recompute_face_registry();
+    Some(mesh)
+}
+
 /// Computes Boolean Union of two meshes: A ∪ B.
 pub fn csg_union(a: &TriangleMesh, b: &TriangleMesh) -> TriangleMesh {
     if a.indices.is_empty() {
@@ -2881,6 +4126,10 @@ pub fn csg_union(a: &TriangleMesh, b: &TriangleMesh) -> TriangleMesh {
     }
 
     let (id_offset, combined_faces) = merge_csg_face_registries(a, b, false);
+    if let Some(coaxial_cone) = try_union_coaxial_cone(a, b, id_offset, &combined_faces) {
+        return coaxial_cone;
+    }
+
     let a_polys = BspNode::polygons_from_mesh(a);
     let mut b_polys = BspNode::polygons_from_mesh(b);
     if id_offset > 0 {
@@ -2921,6 +4170,13 @@ pub fn csg_difference(a: &TriangleMesh, b: &TriangleMesh) -> TriangleMesh {
     }
 
     let (id_offset, combined_faces) = merge_csg_face_registries(a, b, true);
+    if let Some(helical_mesh) = try_cut_coaxial_helical_groove(a, b, id_offset, &combined_faces) {
+        return helical_mesh;
+    }
+    if let Some(bored_mesh) = try_cut_coaxial_through_bore(a, b, id_offset, &combined_faces) {
+        return bored_mesh;
+    }
+
     let mut a_polys = BspNode::polygons_from_mesh(a);
     let mut b_polys = BspNode::polygons_from_mesh(b);
     if id_offset > 0 {

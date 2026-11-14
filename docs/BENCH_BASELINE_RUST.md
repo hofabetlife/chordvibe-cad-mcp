@@ -19,8 +19,8 @@ Running the exact same 15 tasks from `bench/tasks.json` against the **real Rust 
 | :--- | :--- | :---: | :---: |
 | **Claimed in `bench/README.md`** | TypeScript mock (`src/cad/mcp_dispatcher.ts`) | `15 / 15` | `100.0%` |
 | **Mode 1: Strict As-Is** | `bench/tasks.json` steps sent verbatim over JSON-RPC to Rust `mcp-cad-server` | **`0 / 15`** | **`0.0%`** |
-| **Mode 2: With `create_part` Pre-Init** | Explicit `create_part` injected before `task.steps` (with material ID mapping), `task.steps` sent verbatim | **`2 / 15`** | **`13.3%`** |
-| **Mode 3: Schema-Bridged Diagnostic** | Tool argument schema differences bridged (`through` $\to$ `depth`, `outer_radius` $\to$ `radius`, `inner_radius` $\to$ 4-pt profile, `joint_id` extraction), keeping all numbers/units from `bench/tasks.json` untouched | **`6 / 15`** | **`40.0%`** |
+| **Mode 2: With `create_part` Pre-Init** | Explicit `create_part` injected before `task.steps` (with material ID mapping), `task.steps` sent verbatim | **`2 / 15`** *(initial P1-T2)* $\to$ **`7 / 15`** *(after P2-T13 & P3-T11)* | **`13.3%`** $\to$ **`46.7%`** |
+| **Mode 3: Schema-Bridged Diagnostic** | Tool argument schema differences bridged (`through` $\to$ `depth`, `outer_radius` $\to$ `radius`, `inner_radius` $\to$ 4-pt profile, `joint_id` extraction), keeping all numbers/units from `bench/tasks.json` untouched | **`6 / 15`** *(initial P1-T2)* $\to$ **`7 / 15`** *(after P3-T11: `T08_hex_nut_m10` PASS, `is_watertight = true`, `genus = 1`)* | **`40.0%`** $\to$ **`46.7%`** |
 
 ### Fact-Check of Claims in `bench/README.md`
 
@@ -105,7 +105,7 @@ Why did `T05`, `T06`, `T07`, `T08`, `T10`, `T13`, `T14`, `T15` fail on tool argu
 | `T05_boolean_perforated_block` | `csg_boolean` | **PASS** | `2/2` | `true` | `0.0000%` | `dims=[0.1000,0.1000,0.0500] m vs [0.1000,0.1000,0.0500] m (g=Some(1) vs 1)` | `OK` |
 | `T06_kirsch_plate_600x200x10` | `csg_boolean` | **PASS** | `2/2` | `true` | `0.0000%` | `dims=[0.6000,0.2000,0.0100] m vs [0.6000,0.2000,0.0100] m (g=Some(1) vs 1)` | `OK` |
 | `T07_annular_bushing_revolve` | `mechanical_feature` | **PASS** | `1/1` | `true` | `0.0000%` | `dims=[0.0700,0.0700,0.0800] m vs [0.0700,0.0700,0.0800] m (g=Some(1) vs 1)` | `OK` |
-| `T08_hex_nut_m10` | `mechanical_feature` | **FAIL** | `3/3` | `false` | `0.0006%` | `dims=[0.0185,0.0185,0.0080] m vs [0.0185,0.0185,0.0080] m (g=Some(68) vs 1)` | `mesh is not watertight; genus=Some(68) != expected=1` |
+| `T08_hex_nut_m10` | `mechanical_feature` | **PASS** *(fixed in `P3-T11`)* | `3/3` | `true` | `0.0006%` | `dims=[0.0196,0.0170,0.0080] m vs [0.0196,0.0170,0.0080] m (g=Some(1) vs 1)` | `OK (watertight=true, boundary_edges=0, lt_5_deg=0.00%)` |
 | `T09_spur_gear_z20_m2` | `mechanical_feature` | **FAIL** | `1/1` | `true` | `99900.0000%` | `dims=[44.0000,44.0000,0.0250] m vs [0.0440,0.0440,0.0250] m (g=Some(1) vs 1)` | `dim_err=99900.00% > tol=2.00% (actual=[44.0000,44.0000,0.0250], expected=[0.0440,0.0440,0.0250])` |
 | `T10_two_hole_mounting_plate` | `csg_boolean` | **PASS** | `3/3` | `true` | `0.0000%` | `dims=[0.2400,0.0800,0.0160] m vs [0.2400,0.0800,0.0160] m (g=Some(2) vs 2)` | `OK` |
 | `T11_axial_bar_fea_cycle` | `fea_analysis` | **FAIL** | `5/5` | `true` | `0.0000%` | `sigma=21.30 vs 20.50 MPa (err=3.93%), disp=0.1020 vs 0.1000 mm (err=2.00%), sf=11.73 vs 12.20, status=PASS vs SAFE` | `FEA sigma_err=3.93% > tol=1.00%; disp_err=2.00% > tol=1.00%` |

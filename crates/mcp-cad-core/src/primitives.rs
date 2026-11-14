@@ -128,7 +128,7 @@ pub fn create_box(width: f64, height: f64, depth: f64) -> TriangleMesh {
 
 /// Splits a quad `(p0, p1, p2, p3)` along its shorter diagonal to maximize minimum interior angle.
 #[inline]
-fn push_quad_shortest_diag(
+pub(crate) fn push_quad_shortest_diag(
     vertices: &mut Vec<Vertex>,
     indices: &mut Vec<[u32; 3]>,
     p0: [f64; 3],
@@ -156,7 +156,7 @@ fn push_quad_shortest_diag(
 
 /// Connects two equal-count planar 2D rings `ring_a` and `ring_b` at height `z_val` using intermediate
 /// concentric rings so radial step size matches circumferential chord length (eliminating cap slivers).
-fn add_bridged_ring_strip_2d(
+pub(crate) fn add_bridged_ring_strip_2d(
     vertices: &mut Vec<Vertex>,
     indices: &mut Vec<[u32; 3]>,
     ring_a: &[[f64; 2]],
@@ -222,7 +222,7 @@ fn add_bridged_ring_strip_2d(
 
 /// 2-to-1 vertex halving transition between an `outer_ring` of `2*k` vertices and an `inner_ring` of `k` vertices.
 /// Emits 3 well-shaped triangles per pair of outer segments.
-fn add_halving_ring_transition_2d(
+pub(crate) fn add_halving_ring_transition_2d(
     vertices: &mut Vec<Vertex>,
     indices: &mut Vec<[u32; 3]>,
     outer_ring: &[[f64; 2]],
@@ -262,9 +262,51 @@ fn add_halving_ring_transition_2d(
     }
 }
 
+/// 1-to-2 vertex doubling transition between an `outer_ring` of `m` vertices and an `inner_ring` of `2*m` vertices.
+/// Emits 3 well-shaped triangles per outer segment without splitting the outer segment edge.
+pub(crate) fn add_doubling_ring_transition_2d(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<[u32; 3]>,
+    outer_ring: &[[f64; 2]],
+    inner_ring: &[[f64; 2]],
+    z_val: f64,
+    is_top: bool,
+) {
+    let m = outer_ring.len();
+    if inner_ring.len() != 2 * m || m < 3 {
+        return;
+    }
+    let nz = if is_top { 1.0 } else { -1.0 };
+    let normal = [0.0, 0.0, nz];
+
+    let mut push_tri = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| {
+        let base = vertices.len() as u32;
+        vertices.push(Vertex::new([a[0], a[1], z_val], normal));
+        vertices.push(Vertex::new([b[0], b[1], z_val], normal));
+        vertices.push(Vertex::new([c[0], c[1], z_val], normal));
+        if is_top {
+            indices.push([base, base + 1, base + 2]);
+        } else {
+            indices.push([base, base + 2, base + 1]);
+        }
+    };
+
+    for j in 0..m {
+        let j_next = (j + 1) % m;
+        let o0 = outer_ring[j];
+        let o1 = outer_ring[j_next];
+        let i0 = inner_ring[2 * j];
+        let i1 = inner_ring[2 * j + 1];
+        let i2 = inner_ring[2 * j_next];
+        push_tri(o0, o1, i1);
+        push_tri(o0, i1, i0);
+        push_tri(i1, o1, i2);
+    }
+}
+
 /// Triangulates a planar disk cap bounded by `outer_ring` around `center` at height `z_val`
 /// using concentric rings and 2-to-1 vertex halving so the central fan has at most 8–16 segments.
-fn add_subdivided_disk_cap_2d(
+pub(crate) fn add_subdivided_disk_cap_2d(
     vertices: &mut Vec<Vertex>,
     indices: &mut Vec<[u32; 3]>,
     outer_ring: &[[f64; 2]],
@@ -1955,6 +1997,15 @@ pub fn create_helical_cutter_with_settings(
     }
 
     let face_ids = vec![1; all_indices.len()];
+    let profile_tag = if profile_type.eq_ignore_ascii_case("metric_60") {
+        "metric_60"
+    } else {
+        "circular"
+    };
+    let rh_flag = if is_right_hand { 1 } else { 0 };
+    let meta_alias = format!(
+        "helix_meta:{helix_radius:.12e}:{groove_radius:.12e}:{pitch:.12e}:{height:.12e}:{start_z:.12e}:{num_starts}:{rh_flag}:{effective_turns:.12e}:{profile_tag}:{steps_per_turn}"
+    );
     let faces = vec![FaceInfo::new_descriptor(
         1,
         "helical_groove",
@@ -1962,6 +2013,7 @@ pub fn create_helical_cutter_with_settings(
             "thread".to_string(),
             "flute".to_string(),
             "groove".to_string(),
+            meta_alias,
         ],
         FaceKind::Helical,
         [0.0, 0.0, 1.0],

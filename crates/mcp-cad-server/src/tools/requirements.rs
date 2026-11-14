@@ -76,7 +76,7 @@ pub enum RequirementKind {
         pairs: Option<Vec<[String; 2]>>,
     },
 
-    /// Mechanism mobility / degrees of freedom check (returns `NOT_AVAILABLE` until P3-T9).
+    /// Mechanism mobility / degrees of freedom check (`analyze_mechanism`).
     #[serde(rename = "mechanism_dof")]
     MechanismDof { expected: i32 },
 }
@@ -372,32 +372,226 @@ fn evaluate_single_requirement(
     let scope_label = effective_part_id.unwrap_or("scene");
 
     match &spec.kind {
-        RequirementKind::NoInterference { pairs } => json!({
-            "id": spec.id,
-            "part_id": effective_part_id,
-            "scope": scope_label,
-            "type": "no_interference",
-            "status": RequirementStatus::NotAvailable.as_str(),
-            "measured": Value::Null,
-            "target": {
-                "interfering_pairs": 0,
-                "pairs": pairs,
-            },
-            "margin": Value::Null,
-            "hint": "Static multi-body interference analysis ('check_interference') is not yet available (scheduled for P3-T10).",
-        }),
+        RequirementKind::NoInterference { pairs } => {
+            // Check whether all explicitly referenced parts exist and have non-empty meshes
+            if let Some(pair_list) = pairs {
+                let mut missing_or_empty = Vec::new();
+                for [pa, pb] in pair_list {
+                    for pid in [pa, pb] {
+                        match state.parts.get(pid) {
+                            None => missing_or_empty.push(pid.clone()),
+                            Some(p) if p.mesh().vertices.is_empty() => {
+                                missing_or_empty.push(format!("{pid} (empty mesh)"));
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                }
+                if !missing_or_empty.is_empty() {
+                    return json!({
+                        "id": spec.id,
+                        "part_id": effective_part_id,
+                        "scope": scope_label,
+                        "type": "no_interference",
+                        "status": RequirementStatus::NotAvailable.as_str(),
+                        "measured": Value::Null,
+                        "target": {
+                            "interfering_pairs": 0,
+                            "pairs": pairs,
+                        },
+                        "margin": Value::Null,
+                        "hint": format!(
+                            "Cannot evaluate 'no_interference' yet: part(s) [{}] do not exist or have empty geometry.",
+                            missing_or_empty.join(", ")
+                        ),
+                    });
+                }
+            } else {
+                let non_empty_count = state
+                    .parts
+                    .values()
+                    .filter(|p| !p.mesh().vertices.is_empty())
+                    .count();
+                if non_empty_count < 2 {
+                    return json!({
+                        "id": spec.id,
+                        "part_id": effective_part_id,
+                        "scope": scope_label,
+                        "type": "no_interference",
+                        "status": RequirementStatus::NotAvailable.as_str(),
+                        "measured": Value::Null,
+                        "target": {
+                            "interfering_pairs": 0,
+                            "pairs": pairs,
+                        },
+                        "margin": Value::Null,
+                        "hint": "At least 2 parts with non-empty geometry are required to evaluate 'no_interference'.",
+                    });
+                }
+            }
 
-        RequirementKind::MechanismDof { expected } => json!({
-            "id": spec.id,
-            "part_id": effective_part_id,
-            "scope": scope_label,
-            "type": "mechanism_dof",
-            "status": RequirementStatus::NotAvailable.as_str(),
-            "measured": Value::Null,
-            "target": *expected,
-            "margin": Value::Null,
-            "hint": "Mechanism mobility / degrees-of-freedom analysis ('analyze_mechanism') is not yet available (scheduled for P3-T9).",
-        }),
+            let k_vol = k_from_m.powi(3);
+            let tuple_pairs: Option<Vec<(String, String)>> = pairs.as_ref().map(|list| {
+                list.iter()
+                    .map(|[a, b]| (a.clone(), b.clone()))
+                    .collect()
+            });
+            match state.physics_world.check_interference_with_parts(
+                None,
+                false,
+                tuple_pairs.as_deref(),
+                Some(&state.parts),
+            ) {
+                Ok(report) => {
+                    let passed = report.interfering_pairs_count == 0;
+                    let min_clr_u = report.min_clearance.map(|c| c * k_from_m);
+                    let max_pen_u = report.max_penetration_depth * k_from_m;
+                    let max_vol_u = report.max_intersection_volume * k_vol;
+                    let margin = if passed {
+                        min_clr_u.unwrap_or(0.0)
+                    } else {
+                        -max_pen_u
+                    };
+
+                    let interfering_details: Vec<Value> = report
+                        .pairs
+                        .iter()
+                        .filter(|p| p.intersects)
+                        .map(|p| {
+                            json!({
+                                "a": p.a,
+                                "b": p.b,
+                                "penetration_depth": p.penetration_depth.map(|d| d * k_from_m),
+                                "intersection_volume": p.intersection_volume.map(|v| v * k_vol),
+                            })
+                        })
+                        .collect();
+
+                    let hint = if passed {
+                        None
+                    } else {
+                        let summary_str: Vec<String> = report
+                            .pairs
+                            .iter()
+                            .filter(|p| p.intersects)
+                            .map(|p| {
+                                format!(
+                                    "({} <-> {}: depth {:.3} {u_str}, vol {:.3} {u_str}^3)",
+                                    p.a,
+                                    p.b,
+                                    p.penetration_depth.unwrap_or(0.0) * k_from_m,
+                                    p.intersection_volume.unwrap_or(0.0) * k_vol
+                                )
+                            })
+                            .collect();
+                        Some(format!(
+                            "Detected {} interfering part pair(s): [{}]. Use 'check_interference', 'transform_part', or 'modify_feature' to resolve collisions.",
+                            report.interfering_pairs_count,
+                            summary_str.join(", ")
+                        ))
+                    };
+
+                    json!({
+                        "id": spec.id,
+                        "part_id": effective_part_id,
+                        "scope": scope_label,
+                        "type": "no_interference",
+                        "status": if passed { RequirementStatus::Pass.as_str() } else { RequirementStatus::Fail.as_str() },
+                        "measured": report.interfering_pairs_count,
+                        "target": 0,
+                        "margin": margin,
+                        "interfering_pairs_count": report.interfering_pairs_count,
+                        "interfering_pairs": interfering_details,
+                        "min_clearance": min_clr_u,
+                        "max_penetration_depth": max_pen_u,
+                        "max_intersection_volume": max_vol_u,
+                        "hint": hint,
+                    })
+                }
+                Err(err) => json!({
+                    "id": spec.id,
+                    "part_id": effective_part_id,
+                    "scope": scope_label,
+                    "type": "no_interference",
+                    "status": RequirementStatus::Fail.as_str(),
+                    "measured": Value::Null,
+                    "target": 0,
+                    "margin": Value::Null,
+                    "hint": format!("Failed to evaluate interference: {err}"),
+                }),
+            }
+        }
+
+        RequirementKind::MechanismDof { expected } => {
+            let scene_parts: Vec<(String, bool)> = state
+                .parts
+                .iter()
+                .map(|(id, part)| (id.clone(), part.is_fixed))
+                .collect();
+
+            match state.physics_world.analyze_mechanism_with_scene_parts(
+                None,
+                None,
+                Some(&scene_parts),
+            ) {
+                Ok(report) => {
+                    let measured_dof = report.dof_numeric;
+                    let passed = measured_dof == *expected;
+                    let margin = if passed {
+                        0.0
+                    } else {
+                        -((measured_dof - *expected).abs() as f64)
+                    };
+                    let hint = if passed {
+                        None
+                    } else {
+                        let mut msg = format!(
+                            "Mechanism numerical DOF is {measured_dof} (Grübler M={}, redundant_constraints={}), expected {expected}.",
+                            report.dof_grubler, report.redundant_constraints
+                        );
+                        if !report.floating_parts.is_empty() {
+                            msg.push_str(&format!(
+                                " Floating parts not grounded: [{}].",
+                                report.floating_parts.join(", ")
+                            ));
+                        }
+                        if !report.warnings.is_empty() {
+                            msg.push_str(&format!(" Warnings: [{}].", report.warnings.join("; ")));
+                        }
+                        msg.push_str(" Call 'analyze_mechanism' and adjust joints via 'create_joint'.");
+                        Some(msg)
+                    };
+
+                    json!({
+                        "id": spec.id,
+                        "part_id": effective_part_id,
+                        "scope": scope_label,
+                        "type": "mechanism_dof",
+                        "status": if passed { RequirementStatus::Pass.as_str() } else { RequirementStatus::Fail.as_str() },
+                        "measured": measured_dof,
+                        "target": *expected,
+                        "margin": margin,
+                        "dof_grubler": report.dof_grubler,
+                        "redundant_constraints": report.redundant_constraints,
+                        "floating_parts": report.floating_parts,
+                        "unconnected_parts": report.unconnected_parts,
+                        "warnings": report.warnings,
+                        "hint": hint,
+                    })
+                }
+                Err(err) => json!({
+                    "id": spec.id,
+                    "part_id": effective_part_id,
+                    "scope": scope_label,
+                    "type": "mechanism_dof",
+                    "status": RequirementStatus::Fail.as_str(),
+                    "measured": Value::Null,
+                    "target": *expected,
+                    "margin": Value::Null,
+                    "hint": format!("Failed to evaluate mechanism DOF: {err}"),
+                }),
+            }
+        }
 
         RequirementKind::BboxMax { dims_m } => {
             let target_u = [
@@ -406,11 +600,12 @@ fn evaluate_single_requirement(
                 dims_m[2] * k_from_m,
             ];
 
+            // Scene-level bbox_max if no single part is specified
+            if effective_part_id.is_none() && !state.parts.is_empty() {
+                return evaluate_scene_bbox_requirement(spec, *dims_m, true, state, unit);
+            }
+
             let Some(part) = resolve_target_part(effective_part_id, state) else {
-                // Scene-level bbox_max if no single part is specified
-                if effective_part_id.is_none() && !state.parts.is_empty() {
-                    return evaluate_scene_bbox_requirement(spec, *dims_m, true, state, unit);
-                }
                 let missing = effective_part_id.unwrap_or("scene");
                 return json!({
                     "id": spec.id,
@@ -499,10 +694,12 @@ fn evaluate_single_requirement(
                 dims_m[2] * k_from_m,
             ];
 
+            // Scene-level bbox_min if no single part is specified
+            if effective_part_id.is_none() && !state.parts.is_empty() {
+                return evaluate_scene_bbox_requirement(spec, *dims_m, false, state, unit);
+            }
+
             let Some(part) = resolve_target_part(effective_part_id, state) else {
-                if effective_part_id.is_none() && !state.parts.is_empty() {
-                    return evaluate_scene_bbox_requirement(spec, *dims_m, false, state, unit);
-                }
                 let missing = effective_part_id.unwrap_or("scene");
                 return json!({
                     "id": spec.id,
@@ -585,7 +782,7 @@ fn evaluate_single_requirement(
         }
 
         RequirementKind::MassMax { kg: max_kg } => {
-            if effective_part_id.is_none() && state.parts.len() > 1 {
+            if effective_part_id.is_none() && !state.parts.is_empty() {
                 let total_mass_kg: f64 = state.parts.values().map(|p| p.mass()).sum();
                 let any_non_empty = state.parts.values().any(|p| !p.mesh().vertices.is_empty());
                 let margin = max_kg - total_mass_kg;
@@ -669,7 +866,7 @@ fn evaluate_single_requirement(
         }
 
         RequirementKind::MeshValid { expected_genus } => {
-            if effective_part_id.is_none() && state.parts.len() > 1 {
+            if effective_part_id.is_none() && !state.parts.is_empty() {
                 let mut all_pass = !state.parts.is_empty();
                 let mut failed_parts = Vec::new();
                 for p in state.parts.values() {
@@ -1020,9 +1217,8 @@ pub fn evaluate_requirements_report(
             }
         }
         // Also include any scene-level requirements that explicitly target this part_id
-        // or apply globally when auto-checking a mutated part
         for spec in &state.requirements.scene_requirements {
-            if spec.part_id.is_none() || spec.part_id.as_deref() == Some(pid) {
+            if spec.part_id.as_deref() == Some(pid) {
                 evaluated.push(evaluate_single_requirement(spec, spec.part_id.as_deref(), state, unit));
             }
         }
@@ -1108,10 +1304,15 @@ pub fn attach_auto_check_if_enabled(
         return;
     }
 
-    // Determine whether we have requirements for `part_id_opt`; if none are registered on that specific
-    // part but requirements exist elsewhere in the scene, evaluate all scene/part requirements.
+    // Determine whether we have requirements solely for `part_id_opt`; if scene-level requirements
+    // are also active (or no requirements exist on `part_id_opt`), evaluate the full scene + part report.
     let filter = match part_id_opt {
-        Some(pid) if state.requirements.part_requirements.contains_key(pid) => Some(pid),
+        Some(pid)
+            if state.requirements.part_requirements.contains_key(pid)
+                && state.requirements.scene_requirements.is_empty() =>
+        {
+            Some(pid)
+        }
         _ => None,
     };
 

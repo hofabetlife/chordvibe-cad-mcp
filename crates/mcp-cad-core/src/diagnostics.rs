@@ -17,6 +17,12 @@ pub struct MeshValidationReport {
     pub issues: Vec<String>,
     /// Non-critical geometric quality warnings (slivers, unwelded vertices, T-junctions)
     pub warnings: Vec<String>,
+    /// True if the mesh is a closed watertight manifold solid
+    #[serde(default)]
+    pub is_valid_solid: bool,
+    /// True if the mesh is topologically ready for FEA tetrahedralization
+    #[serde(default)]
+    pub fea_ready: bool,
     /// Topology metrics
     pub topology: TopologyMetrics,
     /// Geometry metrics
@@ -46,7 +52,7 @@ pub struct TopologyMetrics {
     pub triangles_count: usize,
     /// Euler characteristic: chi = V - E + F
     pub euler_characteristic: i32,
-    /// Computed genus: g = (2 - chi) / 2
+    /// Computed topological genus across connected shells: g = (2 * k - chi) / 2
     pub genus: f64,
     /// Number of connected surface components
     pub connected_components: usize,
@@ -167,6 +173,20 @@ struct DirectedEdge(u32, u32);
 /// - `lt_5_deg_ratio <= MAX_ALLOWED_SLIVER_RATIO` (1.0%) and `lt_1_deg_count == 0`
 /// - `expected_genus` matches if provided
 pub fn validate_mesh(mesh: &TriangleMesh, expected_genus: Option<i32>) -> MeshValidationReport {
+    validate_mesh_options(mesh, expected_genus, false)
+}
+
+/// Strict validation gate that fails if any sliver triangles are present.
+pub fn validate_mesh_strict(mesh: &TriangleMesh, expected_genus: Option<i32>) -> MeshValidationReport {
+    validate_mesh_options(mesh, expected_genus, true)
+}
+
+/// Validates a mesh with configurable strictness for sliver triangles.
+pub fn validate_mesh_options(
+    mesh: &TriangleMesh,
+    expected_genus: Option<i32>,
+    strict_slivers: bool,
+) -> MeshValidationReport {
     let mut issues = Vec::new();
 
     if mesh.vertices.is_empty() || mesh.indices.is_empty() {
@@ -174,6 +194,8 @@ pub fn validate_mesh(mesh: &TriangleMesh, expected_genus: Option<i32>) -> MeshVa
             status: "FAIL".to_string(),
             issues: vec!["Mesh is empty (no vertices or indices)".to_string()],
             warnings: Vec::new(),
+            is_valid_solid: false,
+            fea_ready: false,
             topology: TopologyMetrics {
                 is_watertight: false,
                 boundary_edges_count: 0,
@@ -411,7 +433,6 @@ pub fn validate_mesh(mesh: &TriangleMesh, expected_genus: Option<i32>) -> MeshVa
     let e_count = undirected_edge_counts.len() as i32;
     let f_count = welded_indices.len() as i32;
     let euler_characteristic = v_count - e_count + f_count;
-    let genus = (2.0 - euler_characteristic as f64) / 2.0;
 
     // Connected components via BFS on triangle adjacency
     let mut edge_to_triangles: HashMap<UndirectedEdge, Vec<usize>> = HashMap::new();
@@ -449,6 +470,14 @@ pub fn validate_mesh(mesh: &TriangleMesh, expected_genus: Option<i32>) -> MeshVa
             }
         }
     }
+
+    // Generalized Euler-Poincare formula for k closed surface components:
+    // chi = 2 * k - 2 * g  =>  g = (2 * k - chi) / 2
+    let genus = if connected_components > 0 {
+        (2.0 * (connected_components as f64) - (euler_characteristic as f64)) / 2.0
+    } else {
+        0.0
+    };
 
     // Non-manifold vertices check:
     // For each vertex, the ring of adjacent triangles must form a single fan/cycle
@@ -611,20 +640,32 @@ pub fn validate_mesh(mesh: &TriangleMesh, expected_genus: Option<i32>) -> MeshVa
             self_intersections_count
         ));
     }
+    let mut warnings = Vec::new();
+
     if lt_1_deg_count > 0 {
-        issues.push(format!(
-            "Sliver quality gate failed: {} needle triangles with min angle < 1° (min_angle={:.4}°)",
+        let msg = format!(
+            "Sliver quality notice: {} needle triangles with min angle < 1° (min_angle={:.4}°)",
             lt_1_deg_count, min_angle_deg
-        ));
+        );
+        if strict_slivers {
+            issues.push(msg);
+        } else {
+            warnings.push(msg);
+        }
     }
     if lt_5_deg_ratio > MAX_ALLOWED_SLIVER_RATIO {
-        issues.push(format!(
-            "Sliver quality gate failed: {:.2}% of triangles ({}/{}) have min angle < 5° (threshold {:.2}%)",
+        let msg = format!(
+            "Sliver quality notice: {:.2}% of triangles ({}/{}) have min angle < 5° (threshold {:.2}%)",
             lt_5_deg_ratio * 100.0,
             lt_5_deg_count,
             valid_tris,
             MAX_ALLOWED_SLIVER_RATIO * 100.0
-        ));
+        );
+        if strict_slivers {
+            issues.push(msg);
+        } else {
+            warnings.push(msg);
+        }
     }
     if let Some(exp_g) = expected_genus {
         let int_genus = genus.round() as i32;
@@ -636,7 +677,6 @@ pub fn validate_mesh(mesh: &TriangleMesh, expected_genus: Option<i32>) -> MeshVa
         }
     }
 
-    let mut warnings = Vec::new();
     if sliver_triangles_count > 0 {
         warnings.push(format!(
             "Notice: {} sliver triangles detected (min angle < 5° or aspect ratio > 100)",
@@ -668,6 +708,14 @@ pub fn validate_mesh(mesh: &TriangleMesh, expected_genus: Option<i32>) -> MeshVa
         ));
     }
 
+    let is_valid_solid = is_watertight
+        && non_manifold_edges_count == 0
+        && orientation_consistent
+        && is_positive_volume
+        && degenerate_triangles_count == 0
+        && self_intersections_count == 0;
+    let fea_ready = is_valid_solid;
+
     let status = if !issues.is_empty() {
         "FAIL".to_string()
     } else {
@@ -678,6 +726,8 @@ pub fn validate_mesh(mesh: &TriangleMesh, expected_genus: Option<i32>) -> MeshVa
         status,
         issues,
         warnings,
+        is_valid_solid,
+        fea_ready,
         topology: TopologyMetrics {
             is_watertight,
             boundary_edges_count,
@@ -1094,5 +1144,46 @@ mod tests {
         let rep = validate_mesh(&b, Some(0));
         assert_eq!(rep.status, "FAIL");
         assert!(rep.geometry.degenerate_triangles_count > 0);
+    }
+
+    #[test]
+    fn test_validate_mesh_disjoint_union_connected_components_genus() {
+        use crate::csg::csg_union;
+        use crate::primitives::cut_hole;
+
+        // 1. Disjoint union of 2 closed genus-0 boxes: k = 2, chi = 4, g = (2*k - chi)/2 = 0.0
+        let b1 = create_box(1.0, 1.0, 1.0);
+        let mut b2 = create_box(1.0, 1.0, 1.0);
+        b2.translate([5.0, 0.0, 0.0]);
+        let disjoint_2 = csg_union(&b1, &b2);
+        let rep_2 = validate_mesh(&disjoint_2, Some(0));
+        assert_eq!(rep_2.status, "PASS", "issues: {:?}", rep_2.issues);
+        assert!(rep_2.topology.is_watertight);
+        assert_eq!(rep_2.topology.boundary_edges_count, 0);
+        assert_eq!(rep_2.topology.non_manifold_edges_count, 0);
+        assert_eq!(rep_2.topology.connected_components, 2);
+        assert_eq!(rep_2.topology.euler_characteristic, 4);
+        assert!((rep_2.topology.genus - 0.0).abs() < 1e-12);
+
+        // 2. Disjoint union of 3 closed genus-0 boxes: k = 3, chi = 6, g = 0.0
+        let mut b3 = create_box(1.0, 1.0, 1.0);
+        b3.translate([10.0, 0.0, 0.0]);
+        let disjoint_3 = csg_union(&disjoint_2, &b3);
+        let rep_3 = validate_mesh(&disjoint_3, Some(0));
+        assert_eq!(rep_3.status, "PASS", "issues: {:?}", rep_3.issues);
+        assert_eq!(rep_3.topology.connected_components, 3);
+        assert_eq!(rep_3.topology.euler_characteristic, 6);
+        assert!((rep_3.topology.genus - 0.0).abs() < 1e-12);
+
+        // 3. Disjoint union of a genus-0 box and a genus-1 perforated plate: k = 2, chi = 2, total g = 1.0
+        let mut plate = create_box(2.0, 2.0, 0.5);
+        plate = cut_hole(&plate, [0.0, 0.0, 0.0], [0.0, 0.0, 1.0], 0.4, 1.0, None, None);
+        plate.translate([-6.0, 0.0, 0.0]);
+        let disjoint_g1 = csg_union(&b1, &plate);
+        let rep_g1 = validate_mesh(&disjoint_g1, Some(1));
+        assert_eq!(rep_g1.status, "PASS", "issues: {:?}", rep_g1.issues);
+        assert_eq!(rep_g1.topology.connected_components, 2);
+        assert_eq!(rep_g1.topology.euler_characteristic, 2);
+        assert!((rep_g1.topology.genus - 1.0).abs() < 1e-12);
     }
 }

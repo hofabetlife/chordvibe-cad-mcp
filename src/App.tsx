@@ -80,6 +80,12 @@ const NATIVE_STL_PRESET_MAP: Record<
   string,
   { url: string; title: string; materialId: string; density: number }
 > = {
+  raw_stl_v8_piston: {
+    url: '/output/v8_racing_piston.stl',
+    title: 'v8_racing_piston.stl (62 676 Δ)',
+    materialId: 'alu_6061',
+    density: 2700,
+  },
   raw_stl_spur_gear: {
     url: '/output/spur_gear.stl',
     title: 'spur_gear.stl (23 172 Δ)',
@@ -1772,7 +1778,7 @@ export function App() {
         {/* Native-Style Minimalist Windows Preview Header */}
         <header className="h-10 bg-[#181c24] border-b border-[#29303d] px-3 flex items-center justify-between gap-2 shrink-0 z-20 whitespace-nowrap">
           {/* Left: Window Title, Unified Bridge Status & Model Selector */}
-          <div className="flex items-center gap-2 min-w-0 overflow-hidden">
+          <div className="flex items-center gap-2 min-w-0">
             <div className="flex items-center gap-1.5 text-xs font-semibold tracking-tight text-[#e2e8f0] shrink-0">
               <Box className="w-4 h-4 text-[#38bdf8]" />
               <span>MCP-CAD 3D Preview (WGPU)</span>
@@ -1799,13 +1805,13 @@ export function App() {
 
             <div className="h-4 w-[1px] bg-[#29303d] shrink-0" />
 
-            <label className="flex items-center gap-1.5 text-[11px] text-[#94a3b8] min-w-0">
-              <span className="hidden xl:inline shrink-0">Модель:</span>
+            <label className="flex items-center gap-1.5 text-[11px] text-[#94a3b8] shrink-0">
+              <span className="hidden 2xl:inline shrink-0">Модель:</span>
               <select
                 aria-label="Выбор 3D модели предпросмотра"
                 value={activePreset}
                 onChange={(e) => loadScenePreset(e.target.value, quality)}
-                className="w-36 xl:w-44 shrink bg-[#222730] hover:bg-[#282e3a] text-[#f1f5f9] text-xs font-mono px-2 py-1 rounded border border-[#333b4a] focus:outline-none focus:border-[#38bdf8] cursor-pointer truncate"
+                className="w-40 2xl:w-48 bg-[#222730] hover:bg-[#282e3a] text-[#f1f5f9] text-xs font-mono px-2 py-1 rounded border border-[#333b4a] focus:outline-none focus:border-[#38bdf8] cursor-pointer truncate"
               >
                 <optgroup label="Параметрические модели (WGPU Golden)">
                                     <option value="v8_piston">
@@ -1828,6 +1834,9 @@ export function App() {
                   </option>
                 </optgroup>
                 <optgroup label="Файлы сборки Windows (/output/*.stl)">
+                  <option value="raw_stl_v8_piston">
+                    /output/v8_racing_piston.stl (62 676 Δ)
+                  </option>
                   <option value="raw_stl_spur_gear">
                     /output/spur_gear.stl (23 172 Δ)
                   </option>

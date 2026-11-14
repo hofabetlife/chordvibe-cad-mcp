@@ -169,15 +169,28 @@ impl ToolCallResult {
 }
 
 /// Concise agent operating instructions returned in the MCP `initialize` response (`instructions` field).
-/// Summarizes the full guide in `docs/AGENT_GUIDE.md` (~1480 characters).
+/// Summarizes the full guide in `docs/AGENT_GUIDE.md` (~1580 characters).
 pub const AGENT_INSTRUCTIONS: &str = "\
-MCP-CAD Agent Guide (full text: docs/AGENT_GUIDE.md, docs/MCP_API_REFERENCE.md, docs/UNITS.md):
-1. SCENE SUMMARY: Call 'get_scene_summary' first in a new context to inspect active units, parts (id, bbox, volume, mass, mesh validity, FEA FoS/verdict/stale), joints, and requirements.
-2. UNITS: Default length_unit is 'mm' (switch to 'm' via 'set_units' or per-call 'length_unit'). Force: N, moment: N*m, stress/pressure: MPa, Young's modulus: GPa, displacement: mm, mass: kg, density: kg/m^3, angles: deg, angular velocity: rad/s, time: s (step_size_ms: ms). STL files on disk use meters (m).
-3. REQUIREMENTS: Declare constraints ('bbox_max', 'bbox_min', 'mass_max', 'mesh_valid', 'min_safety_factor') via 'set_requirements' with 'auto_check': true so mutating tools append 'requirements_status' and 'failed_requirements'.
-4. TRANSACTIONS & VALIDATION: Use 'batch_cad_operations' for atomic multi-step edits (rolls back on error). Always call 'validate_mesh' after 'boolean_*', 'cut_hole', or 'cut_helical_groove' to confirm status=='PASS' before FEA.
-5. FEA & NAMED FACES: Run 'run_fea_analysis' only after 'validate_mesh' PASS. Reference named faces from 'query_part_geometry' ('cap_bottom', 'cap_top', 'left', 'right', 'hole_wall:*') in 'fixed' and 'loads'. Edits bump part.revision and mark FEA 'STALE'.
-6. ERRORS & LOOP: When isError=true, parse JSON {'error':{'code','param','hint','details'}} and follow 'hint'. Workflow: Build -> Validate ('validate_mesh') -> Analyze ('run_fea_analysis') -> Iterate ('modify_feature' + 'check_requirements') -> 'save_project'.";
+MCP-CAD Agent Guide (docs/AGENT_GUIDE.md, SKILL.md, docs/MCP_API_REFERENCE.md):
+DO NOT read Rust source files in crates/ — all coordinates and contracts are specified here.
+1. PRIMITIVES (Z-up, origin [0,0,0], centered in [-height/2, +height/2]):
+- box: X[-width/2,+width/2], Y[-height/2,+height/2], Z[-depth/2,+depth/2]
+- cylinder: x^2+y^2<=radius^2, Z[-height/2,+height/2] (cap_bottom/cap_top)
+- cone: radius_bottom at Z=-height/2, radius_top at Z=+height/2
+- sphere: radius at [0,0,0]; revolve: 2D [r,z] around Z
+- polygon_prism: N-gon, Z[-height/2,+height/2], optional chamfer_radius
+- spur_gear: DIN 867, Z[-face_width/2,+face_width/2], bore/hub/keyway
+- wheel_rim: Z[-rim_width/2,+rim_width/2], PCD bolts, hub bore
+2. DAG & SPECIAL TOOLS:
+- 1st add_feature_primitive creates base; subsequent calls on same part_id auto-apply csg_union (never overwrite).
+- cut_hole (through:true, keyway_width/depth) & cut_helical_groove (profile_type: circular|metric_60; start_z auto-aligns to bounding_box.min[2]) auto-apply csg_difference.
+3. GUI VS HEADLESS:
+- capture_viewport: offscreen Base64 PNG for AI (works headless).
+- open_preview_window: WGPU 3D window for user (auto-spawns --stl in stdio mode).
+4. UNITS, WORKFLOW & ERRORS:
+- Default length_unit='mm' (N, N*m, MPa, GPa, kg, deg; STL on disk=m).
+- Cycle: get_scene_summary -> set_requirements(auto_check:true) -> batch_cad_operations -> validate_mesh -> query_part_geometry(faces) -> run_fea_analysis (rerun if STALE) -> save_project.
+- Tool failures return result.isError=true with JSON {code,param,hint,details}.";
 
 /// Dispatches an MCP request and returns the optional JSON-RPC response.
 pub async fn handle_request(req: JsonRpcRequest, state: &SharedState) -> Option<JsonRpcResponse> {

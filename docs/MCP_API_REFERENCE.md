@@ -51,6 +51,10 @@
    - [32. `set_requirements`](#32-set_requirements)
    - [33. `check_requirements`](#33-check_requirements)
    - [34. `get_scene_summary`](#34-get_scene_summary)
+   - [35. `get_part_load_cases`](#35-get_part_load_cases)
+   - [36. `run_fea_from_simulation`](#36-run_fea_from_simulation)
+   - [37. `check_gear_strength`](#37-check_gear_strength)
+   - [38. `analyze_mechanism`](#38-analyze_mechanism)
 
 ---
 
@@ -378,7 +382,7 @@
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"status\": \"deleted\"\n}"
+        "text": "{\n  \"status\": \"deleted\",\n  \"part_id\": \"part-a1b2c3d4e5f64789\",\n  \"deleted_part_id\": \"part-a1b2c3d4e5f64789\"\n}"
       }
     ]
   }
@@ -857,7 +861,7 @@
 
 ### 14. `run_fea_analysis`
 
-Выполняет автоматическую тетраэдризацию детали (TET4), решает 3D уравнения линейной упругости ($K \cdot u = F$), вычисляет эквивалентные напряжения по Мизесу и запас прочности. Поддерживает задание граничных условий закрепления и нагрузок по именам граней / селекторам (`fixed`, `loads`), а также по осевым граням AABB и координатам (`fixed_faces`, `fixed_plane`, `applied_forces`).
+Выполняет автоматическую тетраэдризацию детали (`TET4` при `element_order = 1` или квадратичные 10-узловые тетраэдры `TET10` при `element_order = 2`), решает 3D уравнения линейной упругости ($K \cdot u = F$), вычисляет эквивалентные напряжения по Мизесу и запас прочности. Поддерживает задание граничных условий закрепления и нагрузок по именам граней / селекторам (`fixed`, `loads`), а также по осевым граням AABB и координатам (`fixed_faces`, `fixed_plane`, `applied_forces`).
 
 #### Входные параметры
 | Параметр | Тип | Обязательный | Описание |
@@ -865,14 +869,33 @@
 | `part_id` | `string` | Да | Идентификатор анализируемой детали |
 | `length_unit` | `string` | Нет | Переопределение единиц длины на вызов (`"mm"` или `"m"`) |
 | `mesh_density` | `string` | Нет | Плотность сетки: `"coarse"` (по умолчанию), `"medium"`, `"fine"` |
+| `element_order` | `integer` | Нет | Порядок конечных элементов: `1` (линейные 4-узловые тетраэдры `TET4`, по умолчанию) или `2` (квадратичные 10-узловые изопараметрические тетраэдры `TET10` с 4-точечной квадратурой Гаусса, устраняющие эффект сдвигового запирания `shear locking` при изгибе) |
 | `fixed` | `object[]` | Нет | Закрепления Дирихле по именованным граням или селекторам: `[{"face": "cap_bottom", "components"?: "all"\|"x"\|"y"\|"z", "tolerance"?: number}, {"where": {...}}]` |
 | `fixed_faces` | `string[]` | Нет | Грани AABB (`"min_x"`, `"max_x"`, `"min_y"`, `"max_y"`, `"min_z"`, `"max_z"`) или имена граней детали (`"cap_bottom"`, `"left"`) для жесткого закрепления |
 | `fixed_plane` | `object` | Нет | Опорная плоскость: `{"origin": [x,y,z], "normal": [nx,ny,nz], "tolerance"?: number}` (в активных `length_unit`) |
 | `loads` | `object[]` | Нет | Нагрузки по именованным граням или селекторам: суммарная сила `{"face": "cap_top", "force": [Fx, Fy, Fz]}` (в `N`, распределяется пропорционально грузовым площадям узлов $\sum \mathbf{f}_i = \mathbf{F}$), нормальное давление `{"face": "hole_wall", "pressure": p_mpa}` (в `MPa`) или момент `{"face": "cap_top", "moment": [Mx, My, Mz]}` (в `N·m`) |
 | `applied_force` | `object` | Нет | Одиночная нагрузка: `{"position"?: [x,y,z], "face"?: string, "force_vector": [Fx,Fy,Fz]}` |
 | `applied_forces` | `object[]` | Нет | Массив распределенных или точечных нагрузок |
+| `convergence_study` | `boolean` | Нет | Если `true`, выполняет прогон расчёта на последовательности сеток и добавляет блок оценки сходимости `accuracy` (и полную сводку `convergence_study`). Если вердикт сходимости `NOT_CONVERGED`, поле `confidence` автоматически понижается до `"low"` |
+| `levels` | `string[]` | Нет | Список плотностей сетки для исследования сходимости (минимум 2 уровня из `"coarse"`, `"medium"`, `"fine"`). По умолчанию `["coarse", "medium", "fine"]` |
+| `max_seconds` | `number` | Нет | Бюджет времени на исследование сходимости в секундах (`>= 0`). При превышении лимита после завершения очередного уровня возвращается частичный результат с явным маркером `accuracy.partial_result: true` и `verdict: "NOT_CONVERGED"` |
 
-#### Пример запроса (по именованным граням)
+#### Оценка сходимости (`accuracy`) и экстраполяция Ричардсона (`P3-T3`)
+При `convergence_study: true` в ответ добавляется объект `accuracy`:
+- `levels`: массив пройденных уровней сетки (`density`, `target_element_size_m`, `node_count`, `element_count`, `max_displacement_m`, `max_displacement_mm`, `max_von_mises_pa`, `max_von_mises_mpa`, `computation_time_ms`).
+- `displacement_change_pct` / `stress_change_pct`: относительное изменение (в `%`) пикового перемещения и напряжения Мизеса между двумя последними уровнями сетки.
+- `effective_refinement_ratio`: фактический кубический корень отношения числа тетраэдров $r_{\text{eff}} = (N_{\text{last}} / N_{\text{prev}})^{1/3}$.
+- `converged` / `verdict` (`"CONVERGED"` | `"NOT_CONVERGED"`): вердикт `CONVERGED` выставляется только при одновременном выполнении условий:
+  1. Исследование завершено полностью (`partial_result == false`, минимум 2 уровня);
+  2. $|\Delta u| < 5.0\%$ (`CONVERGENCE_DISP_TOLERANCE_PCT`) и $|\Delta \sigma| < 10.0\%$ (`CONVERGENCE_STRESS_TOLERANCE_PCT`);
+  3. Сетка реально измельчалась между двумя последними уровнями ($r_{\text{eff}} \ge 1.25$, `grid_clamped_detected == false` — защита от ложной сходимости при упоре воксельной сетки в лимит `60` ячеек по оси);
+  4. Отсутствует сингулярность напряжения на закреплении (`singularity_detected == false`) и ступенчатый воксельный концентратор напряжений на криволинейной границе/отверстии (`voxel_staircase_detected == false`).
+- **Условия применимости экстраполяции Ричардсона** (`richardson_applicable == true`):
+  - Выполнено не менее 3 уровней сетки со строго возрастающим числом элементов ($r_{21} > 1.05$, $r_{32} > 1.05$);
+  - Отсутствует сингулярность в точке измерения (`!singularity_detected`) и ступенчатое искажение криволинейного концентратора (`!voxel_staircase_detected`);
+  - Наблюдается монотонная сходимость ($(\phi_2 - \phi_1)\cdot(\phi_3 - \phi_2) > 0$) с уменьшающимся приращением в асимптотической области (наблюдаемый порядок сходимости $p_{\text{obs}} \in [0.25, 4.0]$). При выполнении этих условий вычисляются `richardson_displacement_mm`, `richardson_stress_mpa` и `observed_order_p`.
+
+#### Пример запроса (по именованным граням со сходимостью)
 ```json
 {
   "jsonrpc": "2.0",
@@ -882,7 +905,9 @@
     "name": "run_fea_analysis",
     "arguments": {
       "part_id": "part-a1b2c3d4e5f64789",
-      "mesh_density": "medium",
+      "convergence_study": true,
+      "levels": ["coarse", "medium", "fine"],
+      "max_seconds": 30.0,
       "fixed": [
         { "face": "cap_bottom" }
       ],
@@ -906,7 +931,7 @@
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"computation_time_ms\": 245,\n  \"element_count\": 864,\n  \"max_displacement_mm\": 0.184,\n  \"max_von_mises_mpa\": 98.42,\n  \"node_count\": 275,\n  \"safety_factor\": 2.54,\n  \"status\": \"PASS\",\n  \"yield_strength_mpa\": 250.0\n}"
+        "text": "{\n  \"computation_time_ms\": 245,\n  \"confidence\": \"low\",\n  \"element_count\": 10290,\n  \"max_displacement_mm\": 0.7284,\n  \"max_stress_excluding_constraint_zone_mpa\": 82.97,\n  \"max_von_mises_mpa\": 112.97,\n  \"node_count\": 2528,\n  \"safety_factor\": 2.21,\n  \"status\": \"PASS\",\n  \"verdict\": \"PASS\",\n  \"yield_strength_mpa\": 250.0,\n  \"accuracy\": {\n    \"converged\": false,\n    \"verdict\": \"NOT_CONVERGED\",\n    \"partial_result\": false,\n    \"displacement_change_pct\": 12.40,\n    \"stress_change_pct\": 13.17,\n    \"effective_refinement_ratio\": 1.498,\n    \"richardson_applicable\": true,\n    \"richardson_displacement_mm\": 0.9032,\n    \"richardson_stress_mpa\": 144.89,\n    \"observed_order_p\": 1.0,\n    \"recommendation\": \"NOT_CONVERGED: Mesh change between last two levels (disp +12.40%, stress +13.17%) exceeds tolerances (5.0% disp / 10.0% stress). Confidence is low.\"\n  }\n}"
       }
     ]
   }
@@ -1826,5 +1851,343 @@
 }
 ```
 
+---
 
+### 35. `get_part_load_cases`
+
+Извлекает расчётный случай нагружения (`PartLoadCase`) для заданной детали `part_id` из последней выполненной динамической симуляции (`run_physics_simulation`) в **локальной системе координат этой детали** (напрямую готовый для передачи в `run_fea_analysis`).
+
+Возвращает:
+- **Реакции в шарнирах (`joints`)**: для каждого шарнира, соединённого с `part_id` (`part_a == part_id` или `part_b == part_id`), возвращает `joint_id`, `joint_type`, `connected_part_id`, `role` (`"part_a"` или `"part_b"`), локальные координаты точки крепления `anchor_local: [x, y, z]` (в активном `length_unit`: `mm` или `m`), вектор силы реакции `force: [Fx, Fy, Fz]` (`N`) и вектор момента реакции `torque: [Tx, Ty, Tz]` (`N·m`), действующие **НА эту деталь** в её локальной СК (с соблюдением 3-го закона Ньютона).
+- **Инерционные нагрузки (`inertia`)**: массу `mass` (`kg`), локальный центр масс `center_of_mass_local` (в `length_unit`), линейное ускорение ЦМ `linear_acceleration` (`m/s²`), угловое ускорение `angular_acceleration` (`rad/s²`) и вектор гравитации `gravity_local` (`m/s²`) в локальной СК детали.
+- **Невязки динамического равновесия (`equilibrium_residual`)**: вектор и норму невязки баланса сил $\sum \mathbf{F}_{\text{joints}} + m \mathbf{g} - m \mathbf{a}_{\text{COM}}$ (`N`) и баланса моментов относительно ЦМ (`N·m`).
+
+#### Входные параметры
+| Параметр | Тип | Обязательный | Описание |
+|---|---|:---:|---|
+| `part_id` | `string` | **Да** | Идентификатор целевой детали (или `"ground"`) |
+| `select` | `"peak_force" \| "peak_torque" \| number` | Нет | Режим выбора шага времени: `"peak_force"` (по умолчанию — момент максимальной суммарной силы реакции в `N`), `"peak_torque"` (момент максимального реактивного момента в `N·m`) или неотрицательное число `time_s` в секундах (`s`) |
+| `length_unit` | `"mm" \| "m"` | Нет | Опциональное переопределение единицы длины (`"mm"` или `"m"`) для `anchor_local`, `center_of_mass_local` и `position_world` |
+
+#### Пример запроса
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 35,
+  "method": "tools/call",
+  "params": {
+    "name": "get_part_load_cases",
+    "arguments": {
+      "part_id": "beam_1",
+      "select": "peak_force"
+    }
+  }
+}
+```
+
+---
+
+### 36. `run_fea_from_simulation`
+
+Выполняет квазистатический 3D расчёт прочности (МКЭ) детали `part_id` непосредственно по нагрузкам, извлечённым из последней динамической симуляции (`run_physics_simulation`).
+
+Алгоритм (`P3-T7`):
+1. **Распределение реакций шарниров ($\mathbf{F}_j, \boldsymbol{\tau}_j$)**: для каждого шарнира, соединённого с деталью, точка крепления `anchor_local` автоматически сопоставляется с ближайшей именованной топологической гранью (`FaceInfo` из `P2-T8`), либо выбираются узлы тетраэдральной сетки в сфере радиуса `load_radius`. Вектор реакции $\mathbf{F}_j$ (`N`) и реактивный момент $\boldsymbol{\tau}_j$ (`N·m`, раскладываемый в пару распределённых сил по согласованным моментам функций формы первого порядка) прикладываются к узлам зоны крепления с точным сохранением главного вектора и главного момента.
+2. **Объёмные силы инерции Даламбера и минимальная опора `3-2-1`**: по объёму детали прикладываются объёмные силы тяжести и инерции Даламбера $m(\mathbf{g}_{\text{local}} - \mathbf{a}(\mathbf{x})) = m(\mathbf{g}_{\text{local}} - \mathbf{a}_{\text{COM}} - \boldsymbol{\alpha}\times\mathbf{r}_n - \boldsymbol{\omega}\times(\boldsymbol{\omega}\times\mathbf{r}_n))$, уравновешивающие динамическую нагрузку ($\sum \mathbf{f}_n = \mathbf{0}$, $\sum \mathbf{r}_n \times \mathbf{f}_n = \mathbf{0}$), а для устранения 6 степеней свободы жёсткого тела без искажения поля напряжений фиксируются ровно **6 DOF** на 3 неколлинеарных узлах вне зоны нагружения (**схема 3-2-1**: `3 + 2 + 1`).
+3. **Трассировка и проверка равновесия**: возвращает стандартный отчёт МКЭ (`max_von_mises_mpa`, `safety_factor`, `max_displacement_mm`, `verdict`, `confidence`, `diagnostics.equilibrium_error_pct`) с дополнительным блоком `source: { simulation_time_s, select, step_index, inertial_relief_applied, body_force_total_n, support_mode, support_nodes_321, joints: [...] }`.
+
+#### Входные параметры
+| Параметр | Тип | Обязательный | Описание |
+|---|---|:---:|---|
+| `part_id` | `string` | **Да** | Идентификатор рассчитываемой детали |
+| `select` | `"peak_force" \| "peak_torque" \| number` | Нет | Режим выбора шага времени из симуляции: `"peak_force"` (по умолчанию), `"peak_torque"` или время `time_s` в секундах (`s`) |
+| `load_radius` | `number` | Нет | Радиус сферической зоны распределения нагрузки вокруг якоря шарнира в активном `length_unit` (`mm` или `m`, `> 0`) |
+| `mesh_density` | `"coarse" \| "medium" \| "fine"` | Нет | Плотность тетраэдральной сетки (по умолчанию `"coarse"`) |
+| `element_order` | `1 \| 2` | Нет | Порядок элементов: `1` (`TET4`) или `2` (`TET10`, по умолчанию `2` для высокой точности изгиба) |
+| `fea_case` | `string` | Нет | Имя расчётного случая для связки с требованием `min_safety_factor` в `check_requirements` |
+| `convergence_study` | `boolean` | Нет | Если `true`, выполняет исследование сеточной сходимости и добавляет блок `accuracy` |
+| `levels` | `string[]` | Нет | Уровни сетки для исследования сходимости (по умолчанию `["coarse", "medium", "fine"]`) |
+| `max_seconds` | `number` | Нет | Лимит времени на исследование сходимости в секундах (`s`) |
+| `length_unit` | `"mm" \| "m"` | Нет | Опциональное переопределение единицы длины (`"mm"` или `"m"`) |
+
+#### Пример запроса
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 36,
+  "method": "tools/call",
+  "params": {
+    "name": "run_fea_from_simulation",
+    "arguments": {
+      "part_id": "beam_1",
+      "select": "peak_force",
+      "mesh_density": "coarse",
+      "element_order": 2
+    }
+  }
+}
+```
+
+---
+
+### 37. `check_gear_strength`
+
+Выполняет быструю аналитическую проверку изгибной прочности зубьев прямозубых шестерён по уравнению Льюиса (с учётом динамического коэффициента скорости по Барту $K_v$) и контактной прочности / сопротивления питтингу по теории Герца / AGMA / ISO 6336.
+
+Позволяет агенту мгновенно валидировать зубчатые передачи без необходимости запуска дорогостоящего МКЭ-анализа (который на воксельной сетке сглаживает эвольвентный профиль зуба).
+
+Математический аппарат (`P3-T8`):
+1. **Геометрия зацепления**:
+   - Делительный диаметр: $d = m \cdot z$ (`m` или `mm`)
+   - Передаваемая окружная сила: $W_t = \frac{2 T}{d}$ (`N`)
+   - Окружная скорость на делительной окружности: $V = \frac{\pi \cdot d \cdot n}{60}$ (`m/s`), где $n$ — частота вращения в об/мин (`speed_rpm`)
+2. **Динамический коэффициент скорости по Барту ($K_v$)**:
+   - Фрезерованные/строганные зубья стандартного качества (`manufacturing_method = "commercial_cut"`): $K_v = \frac{6.1 + V}{6.1}$
+   - Шлифованные/прецизионно зубофрезерованные зубья (`manufacturing_method = "precision_ground"`): $K_v = \frac{15.2 + V}{15.2}$
+   - Статическая нагрузка или $V=0$: $K_v = 1.0$
+3. **Изгибные напряжения у корня зуба (Уравнение Льюиса)**:
+   $$\sigma_b = \frac{K_v \cdot W_t}{b \cdot m \cdot Y} \quad (\text{Па})$$
+   где $Y$ — коэффициент формы зуба Льюиса (Shigley Table 14-2 для угла зацепления $\alpha = 20^\circ$ полной высоты; кусочно-линейная интерполяция по $z$, $z=17 \to 0.303$, $z=20 \to 0.322$, $z=400 \to 0.480$, рейка $\to 0.485$).  
+   Коэффициент запаса по изгибу: $\text{FoS}_b = \frac{S_y}{\sigma_b}$ (или $\frac{\sigma_{\text{allow,b}}}{\sigma_b}$).
+4. **Контактные напряжения сжатия в полюсе зацепления (Питтинг Герца / AGMA)**:
+   - Радиусы кривизны эвольвенты: $r_1 = \frac{d_1 \sin\alpha}{2}$, $r_2 = \frac{d_2 \sin\alpha}{2}$
+   - Коэффициент упругости материалов пары $C_p$:
+     $$C_p = \sqrt{\frac{1}{\pi \left(\frac{1 - \nu_1^2}{E_1} + \frac{1 - \nu_2^2}{E_2}\right)}} \quad (\text{Па}^{0.5})$$
+     (для сталь-по-стали $C_p \approx 188.74\text{ МПа}^{0.5}$)
+   - Контактное напряжение:
+     $$\sigma_H = C_p \sqrt{\frac{K_v \cdot W_t}{b \cos\alpha} \left(\frac{1}{r_1} + \frac{1}{r_2}\right)} \quad (\text{Па})$$
+   - Коэффициент запаса по контактной прочности: $\text{FoS}_H = \frac{\sigma_{\text{allow,H}}}{\sigma_H}$.
+5. **Предупреждения области применимости**:
+   - `UNDERCUT_SEVERE`: $z < 12$ — опасный подрез ножки зуба без высотной коррекции;
+   - `UNDERCUT_RISK`: $z < 17$ — теоретический риск подреза для некорригированного 20° зацепления;
+   - `FACE_WIDTH_TOO_NARROW`: $b/m < 6.0$ — узкий венец, чувствителен к перекосам валов;
+   - `FACE_WIDTH_TOO_WIDE`: $b/m > 16.0$ — чрезмерно широкий венец, концентрация нагрузки на краях зубьев.
+
+#### Входные параметры
+| Параметр | Тип | Обязательный | Описание |
+|---|---|:---:|---|
+| `part_id` | `string` | Нет | Идентификатор существующей детали-шестерни в сцене (автоматически подтягивает `module`, `teeth`, `face_width`, `pressure_angle_deg` и материал) |
+| `module` | `number` | **Да\*** | Модуль зацепления $m$ в активном `length_unit` (`mm` или `m`) |
+| `teeth` | `integer` | **Да\*** | Число зубьев $z$ ($\ge 3$) |
+| `face_width` | `number` | **Да\*** | Ширина зубчатого венца $b$ в активном `length_unit` (`mm` или `m`) |
+| `torque` | `number` | **Да\*\*** | Передаваемый крутящий момент $T$ в Н·м |
+| `power_watts` / `power_kw` | `number` | **Да\*\*** | Передаваемая мощность в Вт или кВт (альтернатива `torque` при указанном `speed_rpm`) |
+| `speed_rpm` | `number` | Нет | Частота вращения в об/мин (для расчёта скорости $V$ и коэффициента Барта $K_v$) |
+| `pressure_angle_deg` | `number` | Нет | Угол зацепления в градусах (по умолчанию `20.0`) |
+| `material` | `string` | Нет | Идентификатор или алиас материала шестерни (по умолчанию `"steel_structural_aisi1020"`) |
+| `allowable_bending_stress_mpa` | `number` | Нет | Допускаемое напряжение изгиба в МПа (переопределяет предел текучести) |
+| `yield_strength_mpa` | `number` | Нет | Предел текучести материала в МПа |
+| `manufacturing_method` | `"commercial_cut" \| "precision_ground" \| "static"` | Нет | Метод обработки для коэффициента Барта (по умолчанию `"commercial_cut"` при вращении) |
+| `mating_teeth` | `integer` | Нет | Число зубьев парного колеса $z_2$ (по умолчанию равно $z$) |
+| `mating_material` | `string` | Нет | Материал парного колеса (по умолчанию совпадает с ведущей шестерней) |
+| `allowable_contact_stress_mpa` | `number` | Нет | Допускаемое контактное напряжение в МПа |
+| `length_unit` | `"mm" \| "m"` | Нет | Опциональное локальное переопределение единиц длины |
+
+*\* Если передан `part_id` детали с операцией `spur_gear`, геометрические параметры берутся из DAG по умолчанию.*  
+*\*\* Требуется передать либо `torque`, либо пару (`power_watts` / `power_kw`, `speed_rpm`).*
+
+#### Пример запроса
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 37,
+  "method": "tools/call",
+  "params": {
+    "name": "check_gear_strength",
+    "arguments": {
+      "module": 3.0,
+      "teeth": 20,
+      "face_width": 30.0,
+      "torque": 100.0,
+      "material": "steel_structural_aisi1020",
+      "manufacturing_method": "static"
+    }
+  }
+}
+```
+
+#### Пример ответа
+```json
+{
+  "pitch_diameter": 60.0,
+  "pitch_diameter_mm": 60.0,
+  "tangential_force_n": 3333.333,
+  "pitch_line_velocity_m_s": 0.0,
+  "dynamic_factor_kv": 1.0,
+  "lewis_form_factor_y": 0.322,
+  "bending_stress_mpa": 115.02,
+  "bending_safety_factor": 2.173,
+  "mating_pitch_diameter": 60.0,
+  "mating_pitch_diameter_mm": 60.0,
+  "curvature_radius_pinion": 10.261,
+  "curvature_radius_gear": 10.261,
+  "elastic_coefficient_cp_mpa_half": 188.74,
+  "contact_stress_mpa": 906.1,
+  "contact_safety_factor": null,
+  "warnings": [],
+  "assumptions": [
+    "Lewis bending formulation assumes full transmitted tangential load Wt is applied at the tip of a single tooth without load sharing.",
+    "Barth dynamic velocity factor Kv assumes commercially cut/milled spur gears in SI units: Kv = (6.1 + V) / 6.1.",
+    "Hertz contact stress assumes external spur gears in pitch point contact with cylindrical profile curvature r_i = 0.5 * d_i * sin(alpha).",
+    "ISO/AGMA nominal factors are assumed (rim thickness KB = 1.0, load distribution Km = 1.0, stress concentration Kf = 1.0)."
+  ],
+  "references": [
+    "Lewis, W. (1892). 'Investigation of the Strength of Gear Teeth'. Proceedings of the Engineers' Club of Philadelphia.",
+    "Budynas, R. G., & Nisbett, J. K. (2014). Shigley's Mechanical Engineering Design (10th ed.), Chapter 14: Gears - Mechanical Aspects, Table 14-2 (Lewis Form Factor Y).",
+    "Barth Velocity Factor: AGMA 2001-D04 / Shigley Eq. (14-8) in SI units.",
+    "ISO 6336-1:2006 / DIN 3990: Calculation of load capacity of spur and helical gears."
+  ],
+  "length_unit": "mm",
+  "units": {
+    "length": "mm",
+    "force": "N",
+    "torque": "N·m",
+    "stress": "MPa"
+  }
+}
+```
+
+---
+
+### 38. `analyze_mechanism`
+
+Выполняет мгновенный кинематический анализ подвижности механизма (степеней свободы, **DOF**), избыточных связей (заклинивания) и несвязанных («висящих») деталей в текущей конфигурации сцены (`P3-T9`).
+
+Математический аппарат:
+1. **Формула Чебышёва–Грюблера–Кутцбаха** (пространственная):
+   $$M = 6(N - 1) - \sum c_i = 6 N_{\text{moving}} - \sum c_i$$
+   где $N$ — число звеньев включая «землю» (`ground` / `world` / детали с `is_fixed: true`), а число связей шарниров $c_i$: `Fixed` = `6`, `Revolute` = `5`, `Prismatic` = `5`, `Spherical` = `3`, `Gear` = `1` (высшая кинематическая пара).
+   > **Важно**: на плоских и симметричных механизмах (плоский четырёхзвенник, кривошипно-ползунный механизм) пространственная формула Грюблера даёт отрицательное значение (`-2`) из-за 3 пассивных (избыточных) внеплоскостных связей, хотя реальная подвижность равна `1`.
+2. **Численная подвижность по SVD матрицы Якоби связей (`nalgebra`)**:
+   - Для каждого шарнира в текущей мировой позе строятся линейные уравнения связей $J \, \delta q = 0$ относительно 6-вектора приращений поз подвижных тел ($\delta \mathbf{p}_k, \delta \boldsymbol{\theta}_k$):
+     - `Fixed` (6): совпадение точек якорей (3) + блокировка относительного поворота (3);
+     - `Revolute` (5): совпадение точек якорей (3) + блокировка вращений по двум осям $\perp \mathbf{u}$ (2);
+     - `Prismatic` (5): блокировка относительного поворота (3) + запрет смещения $\perp \mathbf{u}$ (2);
+     - `Spherical` (3): совпадение точек якорей (3);
+     - `Gear` (1): кинематическая связь угловых скоростей `ratio * (theta_a . z_a) + (theta_b . z_b) = 0`.
+   - Вычисляется сингулярное разложение $J = U \Sigma V^T$:
+     $$\text{DOF}_{\text{numeric}} = 6 N_{\text{moving}} - \text{rank}(J), \qquad \text{redundant\_constraints} = \max(0, \text{DOF}_{\text{numeric}} - \text{DOF}_{\text{grubler}})$$
+   - Порог ранга `rank_tolerance` по умолчанию: $\max(\text{rows}, \text{cols}) \cdot \max(\sigma_{\max}, 1.0) \cdot 10^{-7}$ (не ниже $10^{-9}$).
+3. **Проверка графа связности и предупреждения (`warnings`)**:
+   - Строится обход BFS от множества неподвижных тел (`grounded_parts`); выявляются `floating_parts` (нет пути к земле) и `unconnected_parts` (нет ни одного шарнира).
+   - Формируются предупреждения:
+     - `"DOF=0 при заявленном механизме"` — если присутствуют шарниры, но $\text{DOF}_{\text{numeric}} = 0$ (механизм жёстко заклинен);
+     - `"DOF>1 без двигателей"` — если $\text{DOF}_{\text{numeric}} > 1$ и не назначено ни одного привода через `set_joint_motor`;
+     - `"есть свободные детали"` — если `unconnected_parts` или `floating_parts` не пусты.
+
+Также активирует проверку требования `{"type": "mechanism_dof", "expected": <int>}` в `set_requirements` / `check_requirements`.
+
+#### Входные параметры
+| Параметр | Тип | Обязательный | Описание |
+|---|---|:---:|---|
+| `part_ids` | `string[]` | Нет | Подмножество идентификаторов деталей (включая неявную землю `'ground'`/`'world'`) для анализа подмеханизма; по умолчанию анализируются все детали сцены |
+| `rank_tolerance` | `number` | Нет | Пользовательский положительный безразмерный порог отсечения сингулярных чисел $\sigma_i > \text{tol}$ для определения `rank(J)` |
+
+#### Пример запроса (плоский четырёхзвенник)
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 38,
+  "method": "tools/call",
+  "params": {
+    "name": "analyze_mechanism",
+    "arguments": {}
+  }
+}
+```
+
+#### Пример ответа
+```json
+{
+  "status": "PASS",
+  "dof_numeric": 1,
+  "dof_grubler": -2,
+  "redundant_constraints": 3,
+  "grounded_parts": ["ground"],
+  "moving_parts": ["coupler", "crank", "rocker"],
+  "floating_parts": [],
+  "unconnected_parts": [],
+  "joint_constraints_count": 20,
+  "jacobian_rows": 20,
+  "jacobian_cols": 18,
+  "jacobian_rank": 17,
+  "singular_values": [2.236, 2.0, "..."],
+  "rank_tolerance": 4.47e-6,
+  "warnings": [],
+  "notes": [
+    "Chebychev-Grübler-Kutzbach spatial mobility formula: M = 6(N - 1) - sum(c_i), where N includes ground and c_i are joint constraint counts.",
+    "Numerical mobility: DOF = 6 * N_moving (18) - rank(J) (17) = 1."
+  ],
+  "joints_count": 4
+}
+```
+
+---
+
+### 39. `check_interference`
+
+Проверяет попарную геометрическую интерференцию (пересечение объёмов) и минимальные зазоры между деталями сборки в их текущих мировых положениях (`P3-T10`).
+- **Broad-phase**: быстрая проверка пересечения мировых `AABB`.
+- **Narrow-phase**: при пересечении `AABB` вычисляется точное булево пересечение `csg_intersection(&mesh_a, &mesh_b)` с расчётом объёма пересечения `intersection_volume` (в `mm³` или `m³`) и глубины проникновения `penetration_depth` (в `mm` или `m`).
+- **Зазор (`clearance`)**: для непересекающихся пар (`intersects == false`) вычисляется точное минимальное евклидово расстояние между треугольниками сеток в 3D.
+- Активирует проверку инженерного требования `{"type": "no_interference", "pairs": [...]}` в `set_requirements` / `check_requirements`.
+
+#### Входные параметры
+| Параметр | Тип | Обязательный | Описание |
+|---|---|:---:|---|
+| `part_ids` | `string[]` | Нет | Опциональное подмножество ID деталей для попарной проверки (по умолчанию проверяются все детали сцены) |
+| `ignore_adjacent` | `boolean` | Нет | Игнорировать пары деталей, непосредственно соединённые шарниром в `physics_world` (по умолчанию `false`) |
+| `length_unit` | `"mm" \| "m"` | Нет | Переопределение единицы длины для этого вызова |
+
+#### Пример запроса
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 39,
+  "method": "tools/call",
+  "params": {
+    "name": "check_interference",
+    "arguments": {
+      "ignore_adjacent": true
+    }
+  }
+}
+```
+
+---
+
+### 40. `sweep_joint`
+
+Выполняет дискретное сканирование хода вращательного (`Revolute`) или поступательного (`Prismatic`) шарнира в диапазоне `[from, to]` за `steps` равных шагов (`0..=steps`), проверяя интерференцию и зазоры на каждом шаге и определяя безопасный диапазон свободного хода без мутации сцены (`P3-T10`).
+
+#### Входные параметры
+| Параметр | Тип | Обязательный | Описание |
+|---|---|:---:|---|
+| `joint_id` | `string` | **Да** | Идентификатор шарнира (`Revolute` или `Prismatic`) |
+| `from` | `number` | **Да** | Начальное значение координаты шарнира (`deg`/`rad` для `Revolute`, `mm`/`m` для `Prismatic`) |
+| `to` | `number` | **Да** | Конечное значение координаты шарнира (`deg`/`rad` для `Revolute`, `mm`/`m` для `Prismatic`) |
+| `steps` | `integer` | **Да** | Число шагов разбиения интервала `[from, to]` (`>= 1`, оценивается `steps + 1` положений) |
+| `part_ids` | `string[]` | Нет | Опциональное подмножество деталей для проверки коллизий |
+| `ignore_adjacent` | `boolean` | Нет | Игнорировать пары, непосредственно соединённые шарниром (по умолчанию `true`) |
+| `angle_unit` | `"deg" \| "rad"` | Нет | Единица измерения углов для `Revolute` шарнира (по умолчанию `"deg"`) |
+| `length_unit` | `"mm" \| "m"` | Нет | Переопределение единицы длины |
+
+#### Пример запроса
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 40,
+  "method": "tools/call",
+  "params": {
+    "name": "sweep_joint",
+    "arguments": {
+      "joint_id": "hinge_arm",
+      "from": 0.0,
+      "to": 90.0,
+      "steps": 18,
+      "ignore_adjacent": true
+    }
+  }
+}
+```
 

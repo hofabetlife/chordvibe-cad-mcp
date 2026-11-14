@@ -35,6 +35,7 @@ interface CadTitleBarProps {
 }
 
 const PRESET_SCENES = [
+  { id: 'v8_piston', label: '0. Поршень ДВС V8 (Камера сгорания, 3 кольца)' },
   { id: 'spur_gear', label: '1. Шестерня Z=20, m=2.0 (Шпонка DIN 6885)' },
   { id: 'hex_nut_m10', label: '2. Гайка М10 (DIN 934 / Резьба ISO 68-1)' },
   { id: 'twist_drill', label: '3. Спиральное сверло Ø10мм (2 канавки)' },

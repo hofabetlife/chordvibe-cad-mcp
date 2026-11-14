@@ -9,10 +9,55 @@
       "query_after_fail": true,
       "rejected_negative_box": true,
       "subsequent_op_response": {
-        "feature_id": "03a8a644-2ebc-40b8-b812-6226fe84cec8"
+        "bounding_box": {
+          "dimensions": [
+            100.0,
+            100.0,
+            100.0
+          ],
+          "max": [
+            50.0,
+            50.0,
+            50.0
+          ],
+          "min": [
+            -50.0,
+            -50.0,
+            -50.0
+          ]
+        },
+        "depth": 200.0,
+        "depth_m": 0.2,
+        "feature_id": "3448d3a2-2901-4487-9cb4-9d2f2b9f5b63",
+        "length_unit": "mm",
+        "part_id": "part-84a441ef14ee4fb9a852e641380ae2b3",
+        "revision": 2,
+        "through": false,
+        "units": {
+          "angle": "deg",
+          "angular_velocity": "rad/s",
+          "area": "mm²",
+          "density": "kg/m³",
+          "displacement": "mm",
+          "displacement_output": "mm",
+          "force": "N",
+          "length": "mm",
+          "linear_velocity": "m/s",
+          "mass": "kg",
+          "stress": "MPa",
+          "stress_output": "MPa",
+          "time": "s",
+          "torque": "N·m",
+          "volume": "mm³",
+          "volume_si": "m³",
+          "young_modulus": "GPa"
+        },
+        "volume": 875142.193909669,
+        "volume_m3": 0.0008751421939096689,
+        "warnings": []
       },
       "subsequent_valid_op_succeeded": true,
-      "volume_preserved": 0.0010000000000000005
+      "volume_preserved": 1000000.0000000003
     },
     {
       "batch_failed_as_expected": true,

@@ -590,6 +590,28 @@ fn map_fea_error(full_message: String, err: &mcp_cad_fea::FeaError) -> ErrorBody
             ErrorBody::new("FEA_NODE_OUT_OF_BOUNDS", full_message)
                 .with_details(json!({ "node_id": node_id, "total_nodes": total_nodes }))
         }
+        mcp_cad_fea::FeaError::InvalidSurfaceMesh {
+            message,
+            boundary_edges_count,
+            non_manifold_edges_count,
+            non_manifold_vertices_count,
+            inconsistent_edges_count,
+            is_watertight,
+        } => {
+            ErrorBody::new("MESH_INVALID", full_message)
+                .with_param("part_id")
+                .with_hint(format!(
+                    "Surface mesh is not a closed watertight 2-manifold (boundary_edges: {boundary_edges_count}, non_manifold_edges: {non_manifold_edges_count}, non_manifold_vertices: {non_manifold_vertices_count}). Run 'validate_mesh' to inspect topological defects and repair the CAD features before running FEA."
+                ))
+                .with_details(json!({
+                    "is_watertight": is_watertight,
+                    "boundary_edges_count": boundary_edges_count,
+                    "non_manifold_edges_count": non_manifold_edges_count,
+                    "non_manifold_vertices_count": non_manifold_vertices_count,
+                    "inconsistent_edges_count": inconsistent_edges_count,
+                    "reason": message,
+                }))
+        }
         mcp_cad_fea::FeaError::MeshGenerationFailed(msg) => {
             ErrorBody::new("FEA_MESH_GENERATION_FAILED", full_message)
                 .with_hint("Voxel tetrahedral meshing failed. Inspect the part geometry with 'validate_mesh' to ensure a watertight 2-manifold surface.")

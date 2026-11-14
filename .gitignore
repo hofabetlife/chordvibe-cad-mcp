@@ -7,9 +7,3 @@ coverage/
 *.log
 .env*
 !.env.example
-.aistudio/
-.vite/
-.playwright-cli/
-bun.lock
-public/assets/
-

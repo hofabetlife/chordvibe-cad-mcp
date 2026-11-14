@@ -7,7 +7,6 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 mcp-cad-core = { path = "../mcp-cad-core" }
-mcp-cad-fea = { path = "../mcp-cad-fea" }
 wgpu = "22.0"
 winit = "0.30"
 bytemuck = { version = "1.16", features = ["derive"] }

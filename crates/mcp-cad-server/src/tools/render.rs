@@ -133,9 +133,91 @@ pub fn open_preview_window(args: &Value, state: &EngineState) -> Result<Value, S
             }))
         }
     } else {
-        Ok(json!({
-            "status": "headless",
-            "message": "Server is running in headless mode without --gui. Interactive window not available, use capture_viewport instead."
-        }))
+        let part_id_opt = args.get("part_id").and_then(|v| v.as_str());
+        let target_mesh = if let Some(part_id) = part_id_opt {
+            let part = state
+                .parts
+                .get(part_id)
+                .ok_or_else(|| ServerError::PartNotFound(part_id.to_string()))?;
+            part.mesh.clone()
+        } else {
+            let mut combined_verts = Vec::new();
+            let mut combined_indices = Vec::new();
+            for part in state.parts.values() {
+                if !part.mesh.vertices.is_empty() {
+                    let offset = combined_verts.len() as u32;
+                    combined_verts.extend_from_slice(&part.mesh.vertices);
+                    for tri in &part.mesh.indices {
+                        combined_indices.push([tri[0] + offset, tri[1] + offset, tri[2] + offset]);
+                    }
+                }
+            }
+            TriangleMesh::new(combined_verts, combined_indices)
+        };
+
+        if target_mesh.vertices.is_empty() {
+            return Ok(json!({
+                "status": "empty",
+                "message": "No geometry in scene to preview. Create parts or add features first."
+            }));
+        }
+
+        // Export target mesh to temporary binary STL
+        let out_dir = std::path::Path::new("./output");
+        let preview_stl_path = if out_dir.exists() || std::fs::create_dir_all(out_dir).is_ok() {
+            out_dir.join("_mcp_preview_live.stl")
+        } else {
+            std::env::temp_dir().join("mcp_cad_preview_live.stl")
+        };
+
+        if let Ok(mut f) = std::fs::File::create(&preview_stl_path) {
+            let _ = mcp_cad_core::export_stl::export_stl_binary(&target_mesh, &mut f);
+        }
+
+        let disable_spawn = std::env::var("MCP_CAD_DISABLE_GUI_SPAWN")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        if disable_spawn {
+            return Ok(json!({
+                "status": "headless",
+                "stl_path": preview_stl_path.to_string_lossy(),
+                "message": "Server is in headless mode (MCP_CAD_DISABLE_GUI_SPAWN=1). Preview STL exported; use capture_viewport for headless perception."
+            }));
+        }
+
+        let exe_path = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(json!({
+                    "status": "headless",
+                    "stl_path": preview_stl_path.to_string_lossy(),
+                    "message": format!("Could not resolve current executable ({e}). Preview STL exported.")
+                }));
+            }
+        };
+
+        match std::process::Command::new(exe_path)
+            .arg("--stl")
+            .arg(&preview_stl_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => Ok(json!({
+                "status": "opened",
+                "mode": "spawned_gui_process",
+                "pid": child.id(),
+                "stl_path": preview_stl_path.to_string_lossy(),
+                "part_id": part_id_opt,
+                "message": "Interactive 3D preview window spawned in background"
+            })),
+            Err(err) => Ok(json!({
+                "status": "headless",
+                "stl_path": preview_stl_path.to_string_lossy(),
+                "message": format!("Server failed to spawn GUI process: {err}. Preview STL exported.")
+            })),
+        }
     }
 }

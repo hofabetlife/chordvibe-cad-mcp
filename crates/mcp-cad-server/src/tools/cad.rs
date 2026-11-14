@@ -412,9 +412,13 @@ pub fn delete_part(args: &Value, state: &mut EngineState) -> Result<Value, Serve
     state.requirements.part_requirements.remove(part_id);
     state.requirements.part_auto_check.remove(part_id);
 
-    Ok(json!({
-        "status": "deleted"
-    }))
+    let mut resp = json!({
+        "status": "deleted",
+        "part_id": part_id,
+        "deleted_part_id": part_id
+    });
+    super::requirements::attach_auto_check_if_enabled(state, None, &mut resp);
+    Ok(resp)
 }
 
 /// 4. `add_feature_primitive`: Adds a 3D solid primitive to a part's DAG.
@@ -2868,10 +2872,15 @@ pub fn validate_mesh_tool(args: &Value, state: &mut EngineState) -> Result<Value
         .and_then(|v| v.as_i64())
         .map(|v| v as i32);
 
+    let strict_slivers = args
+        .get("strict_slivers")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     let unit = state.resolve_length_unit(args)?;
     let k_from_m = unit.from_meters_factor();
 
-    let report = mcp_cad_core::validate_mesh(&part.mesh, expected_genus);
+    let report = mcp_cad_core::diagnostics::validate_mesh_options(&part.mesh, expected_genus, strict_slivers);
     let vol_m3 = report.geometry.signed_volume;
     let area_m2 = part.surface_area();
     let mut val = serde_json::to_value(&report).map_err(ServerError::Json)?;
@@ -3498,7 +3507,7 @@ pub fn optimize_feature_tree(args: &Value, state: &mut EngineState) -> Result<Va
     let k_from_m = unit.from_meters_factor();
     let k_vol = k_from_m.powi(3);
 
-    let (report, mesh_opt, part_rev, vol_m3) = {
+    let (mut report, mesh_opt, part_rev, vol_m3) = {
         let part = state
             .parts
             .get_mut(part_id)
@@ -3521,6 +3530,18 @@ pub fn optimize_feature_tree(args: &Value, state: &mut EngineState) -> Result<Va
             if !part.mesh().vertices.is_empty() {
                 let _ = state.physics_world.update_part_collider(part);
             }
+        }
+    }
+
+    for node in &mut report.logical_plan.dag {
+        node.op = scale_feature_op_from_meters(&node.op, k_from_m);
+    }
+    for node in &mut report.physical_plan.dag {
+        node.op = scale_feature_op_from_meters(&node.op, k_from_m);
+    }
+    for plan in &mut report.candidate_plans {
+        for node in &mut plan.dag {
+            node.op = scale_feature_op_from_meters(&node.op, k_from_m);
         }
     }
 
@@ -3549,6 +3570,281 @@ pub fn optimize_feature_tree(args: &Value, state: &mut EngineState) -> Result<Va
         super::requirements::attach_auto_check_if_enabled(state, Some(part_id), &mut val);
     }
     Ok(val)
+}
+
+/// 37. `check_gear_strength`: Rapid analytical evaluation of spur gear tooth bending (Lewis / Barth) and pitting (Hertz / AGMA).
+pub fn check_gear_strength(args: &Value, state: &mut EngineState) -> Result<Value, ServerError> {
+    let unit = state.resolve_length_unit(args)?;
+    let k_to_m = unit.to_meters_factor();
+    let k_from_m = unit.from_meters_factor();
+
+    // 1. Inspect optional part_id for default gear parameters from DAG and material
+    let part_id = args.get("part_id").and_then(|v| v.as_str());
+    let mut part_module_m = None;
+    let mut part_teeth = None;
+    let mut part_face_width_m = None;
+    let mut part_pa_deg = None;
+    let mut part_mat_name = None;
+
+    if let Some(pid) = part_id {
+        let part = state
+            .parts
+            .get(pid)
+            .ok_or_else(|| ServerError::PartNotFound(pid.to_string()))?;
+        part_mat_name = Some(part.material.name.clone());
+
+        for node in &part.dag.nodes {
+            if let mcp_cad_core::dag::FeatureOp::AddSpurGear {
+                module,
+                teeth,
+                pressure_angle_deg,
+                face_width,
+                ..
+            } = node.op
+            {
+                part_module_m = Some(module);
+                part_teeth = Some(teeth);
+                part_face_width_m = Some(face_width);
+                part_pa_deg = Some(pressure_angle_deg);
+                break;
+            }
+        }
+    }
+
+    // 2. Resolve gear geometric parameters (explicit arguments override part defaults)
+    let module_m = args
+        .get("module")
+        .or_else(|| args.get("m"))
+        .and_then(|v| v.as_f64())
+        .map(|m| m * k_to_m)
+        .or(part_module_m)
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'module' (or 'm')".to_string()))?;
+
+    if module_m <= 1e-9 {
+        return Err(ServerError::InvalidArgument(
+            "Module 'module' must be positive and non-zero".to_string(),
+        ));
+    }
+
+    let teeth = args
+        .get("teeth")
+        .or_else(|| args.get("z"))
+        .or_else(|| args.get("tooth_count"))
+        .and_then(|v| v.as_u64())
+        .map(|z| z as usize)
+        .or(part_teeth)
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'teeth' (or 'z')".to_string()))?;
+
+    if teeth < 3 {
+        return Err(ServerError::InvalidArgument(
+            "Teeth count 'teeth' must be at least 3".to_string(),
+        ));
+    }
+
+    let face_width_m = args
+        .get("face_width")
+        .or_else(|| args.get("b"))
+        .or_else(|| args.get("width"))
+        .and_then(|v| v.as_f64())
+        .map(|b| b * k_to_m)
+        .or(part_face_width_m)
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'face_width' (or 'b')".to_string()))?;
+
+    if face_width_m <= 1e-9 {
+        return Err(ServerError::InvalidArgument(
+            "Face width 'face_width' must be positive and non-zero".to_string(),
+        ));
+    }
+
+    let pressure_angle_deg = args
+        .get("pressure_angle_deg")
+        .or_else(|| args.get("pressure_angle"))
+        .or_else(|| args.get("alpha"))
+        .and_then(|v| v.as_f64())
+        .or(part_pa_deg)
+        .unwrap_or(20.0);
+
+    // 3. Resolve torque T (N*m) or power & rotational speed
+    let speed_rpm = args
+        .get("speed_rpm")
+        .or_else(|| args.get("rotational_speed_rpm"))
+        .or_else(|| args.get("rpm"))
+        .or_else(|| args.get("n"))
+        .and_then(|v| v.as_f64());
+
+    let torque_nm = if let Some(t) = args
+        .get("torque")
+        .or_else(|| args.get("torque_nm"))
+        .or_else(|| args.get("t"))
+        .and_then(|v| v.as_f64())
+    {
+        t
+    } else {
+        let power_w = args
+            .get("power_watts")
+            .or_else(|| args.get("power_w"))
+            .or_else(|| args.get("power"))
+            .and_then(|v| v.as_f64())
+            .or_else(|| {
+                args.get("power_kw")
+                    .and_then(|v| v.as_f64())
+                    .map(|kw| kw * 1000.0)
+            });
+
+        match (power_w, speed_rpm) {
+            (Some(p), Some(rpm)) => {
+                if rpm.abs() <= 1e-9 {
+                    return Err(ServerError::InvalidArgument(
+                        "Cannot compute torque from power when speed_rpm is zero".to_string(),
+                    ));
+                }
+                let omega = 2.0 * std::f64::consts::PI * (rpm.abs() / 60.0);
+                p / omega
+            }
+            _ => {
+                return Err(ServerError::InvalidArgument(
+                    "Missing required torque input: provide 'torque' (in N*m) or both 'power_watts'/'power_kw' and 'speed_rpm'".to_string(),
+                ));
+            }
+        }
+    };
+
+    if torque_nm.abs() <= 1e-12 {
+        return Err(ServerError::InvalidArgument(
+            "Torque 'torque' must be non-zero".to_string(),
+        ));
+    }
+
+    // 4. Resolve manufacturing method
+    let manufacturing_method = if let Some(m_str) = args
+        .get("manufacturing_method")
+        .or_else(|| args.get("manufacturing_process"))
+        .or_else(|| args.get("quality"))
+        .or_else(|| args.get("finish"))
+        .and_then(|v| v.as_str())
+    {
+        mcp_cad_core::gear_strength::GearManufacturingMethod::parse(m_str)
+    } else if speed_rpm.is_some() {
+        mcp_cad_core::gear_strength::GearManufacturingMethod::CommercialCut
+    } else {
+        mcp_cad_core::gear_strength::GearManufacturingMethod::Static
+    };
+
+    // 5. Resolve material properties
+    let mat_id = args
+        .get("material")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or(part_mat_name)
+        .unwrap_or_else(|| "steel_structural_aisi1020".to_string());
+
+    let canonical_mat = mcp_cad_core::material::MaterialRegistry::resolve_alias(&mat_id);
+    let resolved_mat = state.materials.get(canonical_mat).cloned();
+
+    let default_sy_mpa = resolved_mat.as_ref().map(|m| m.yield_strength_mpa).unwrap_or(250.0);
+    let default_e_pa = resolved_mat.as_ref().map(|m| m.youngs_modulus_pa()).unwrap_or(205.0e9);
+    let default_nu = resolved_mat.as_ref().map(|m| m.poissons_ratio).unwrap_or(0.29);
+
+    let allowable_bending_mpa = args
+        .get("allowable_bending_stress_mpa")
+        .or_else(|| args.get("allowable_bending_mpa"))
+        .and_then(|v| v.as_f64());
+
+    let yield_strength_mpa = args
+        .get("yield_strength_mpa")
+        .and_then(|v| v.as_f64())
+        .or(Some(default_sy_mpa));
+
+    let youngs_modulus_pa = args
+        .get("youngs_modulus_gpa")
+        .or_else(|| args.get("young_modulus_gpa"))
+        .and_then(|v| v.as_f64())
+        .map(|g| g * 1.0e9)
+        .unwrap_or(default_e_pa);
+
+    let poissons_ratio = args
+        .get("poissons_ratio")
+        .or_else(|| args.get("poisson_ratio"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(default_nu);
+
+    // 6. Mating gear parameters for Hertz contact stress
+    let mating_teeth = args
+        .get("mating_teeth")
+        .or_else(|| args.get("mating_z"))
+        .or_else(|| args.get("pinion_teeth"))
+        .or_else(|| args.get("gear_teeth"))
+        .and_then(|v| v.as_u64())
+        .map(|z| z as usize);
+
+    let (mating_e_pa, mating_nu) = if let Some(m_mat_id) = args.get("mating_material").and_then(|v| v.as_str()) {
+        let m_can = mcp_cad_core::material::MaterialRegistry::resolve_alias(m_mat_id);
+        if let Some(m_mat) = state.materials.get(m_can) {
+            (Some(m_mat.youngs_modulus_pa()), Some(m_mat.poissons_ratio))
+        } else {
+            (Some(youngs_modulus_pa), Some(poissons_ratio))
+        }
+    } else {
+        (Some(youngs_modulus_pa), Some(poissons_ratio))
+    };
+
+    let allowable_contact_mpa = args
+        .get("allowable_contact_stress_mpa")
+        .or_else(|| args.get("allowable_contact_mpa"))
+        .and_then(|v| v.as_f64());
+
+    // 7. Perform calculation
+    let calc_params = mcp_cad_core::gear_strength::GearStrengthCalculationParams {
+        module_m,
+        teeth,
+        face_width_m,
+        pressure_angle_deg,
+        torque_nm,
+        speed_rpm,
+        manufacturing_method,
+        allowable_bending_stress_mpa: allowable_bending_mpa,
+        yield_strength_mpa,
+        youngs_modulus_pa,
+        poissons_ratio,
+        mating_teeth,
+        mating_youngs_modulus_pa: mating_e_pa,
+        mating_poissons_ratio: mating_nu,
+        allowable_contact_stress_mpa: allowable_contact_mpa,
+    };
+
+    let report = mcp_cad_core::gear_strength::evaluate_gear_strength(&calc_params);
+
+    // 8. Build JSON response honoring active length_unit
+    let mut resp = serde_json::to_value(&report).map_err(ServerError::Json)?;
+    if let Some(obj) = resp.as_object_mut() {
+        if let Some(pid) = part_id {
+            obj.insert("part_id".to_string(), json!(pid));
+        }
+        obj.insert("module".to_string(), json!(module_m * k_from_m));
+        obj.insert("teeth".to_string(), json!(teeth));
+        obj.insert("face_width".to_string(), json!(face_width_m * k_from_m));
+        obj.insert("pressure_angle_deg".to_string(), json!(pressure_angle_deg));
+        obj.insert("torque_nm".to_string(), json!(torque_nm));
+        obj.insert("material".to_string(), json!(canonical_mat));
+        obj.insert("pitch_diameter".to_string(), json!(report.pitch_diameter_mm * 1e-3 * k_from_m));
+        if let Some(d2_mm) = report.mating_pitch_diameter_mm {
+            obj.insert("mating_pitch_diameter".to_string(), json!(d2_mm * 1e-3 * k_from_m));
+        }
+        if let Some(r1_mm) = report.curvature_radius_1_mm {
+            obj.insert("curvature_radius_pinion".to_string(), json!(r1_mm * 1e-3 * k_from_m));
+        }
+        if let Some(r2_mm) = report.curvature_radius_2_mm {
+            obj.insert("curvature_radius_gear".to_string(), json!(r2_mm * 1e-3 * k_from_m));
+        }
+        obj.insert("length_unit".to_string(), json!(unit.as_str()));
+        obj.insert("units".to_string(), unit.units_metadata());
+    }
+
+    if let Some(pid) = part_id {
+        super::requirements::attach_auto_check_if_enabled(state, Some(pid), &mut resp);
+    }
+
+    Ok(resp)
 }
 
 #[cfg(test)]
@@ -3612,9 +3908,8 @@ mod tests {
         )
         .unwrap();
         assert!(state.physics_world.has_part("fixed_base"));
-        assert_eq!(
-            state.physics_world.is_part_dynamic("fixed_base").unwrap(),
-            false,
+        assert!(
+            !state.physics_world.is_part_dynamic("fixed_base").unwrap(),
             "boolean_difference must register fixed part as non-dynamic (!part.is_fixed)"
         );
 
@@ -3626,9 +3921,8 @@ mod tests {
             &mut state,
         )
         .unwrap();
-        assert_eq!(
-            state.physics_world.is_part_dynamic("fixed_base").unwrap(),
-            false,
+        assert!(
+            !state.physics_world.is_part_dynamic("fixed_base").unwrap(),
             "boolean_union must preserve !part.is_fixed"
         );
 
@@ -3640,9 +3934,8 @@ mod tests {
             &mut state,
         )
         .unwrap();
-        assert_eq!(
-            state.physics_world.is_part_dynamic("fixed_base").unwrap(),
-            false,
+        assert!(
+            !state.physics_world.is_part_dynamic("fixed_base").unwrap(),
             "boolean_intersection must preserve !part.is_fixed"
         );
 
@@ -3654,9 +3947,8 @@ mod tests {
             &mut state,
         )
         .unwrap();
-        assert_eq!(
-            state.physics_world.is_part_dynamic("fixed_base").unwrap(),
-            false,
+        assert!(
+            !state.physics_world.is_part_dynamic("fixed_base").unwrap(),
             "transform_part must preserve !part.is_fixed"
         );
 
@@ -3668,9 +3960,8 @@ mod tests {
             &mut state,
         )
         .unwrap();
-        assert_eq!(
-            state.physics_world.is_part_dynamic("fixed_base").unwrap(),
-            false,
+        assert!(
+            !state.physics_world.is_part_dynamic("fixed_base").unwrap(),
             "optimize_feature_tree must preserve !part.is_fixed"
         );
 
@@ -3683,9 +3974,8 @@ mod tests {
             &mut state,
         )
         .unwrap();
-        assert_eq!(
+        assert!(
             state.physics_world.is_part_dynamic("tool_block").unwrap(),
-            true,
             "transform_part must register dynamic part with is_dynamic == true"
         );
 
@@ -4906,10 +5196,7 @@ mod tests {
 
         // 3. Verify registration in state.physics_world as fixed body
         assert!(state.physics_world.has_part("imported_fixed_box"));
-        assert_eq!(
-            state.physics_world.is_part_dynamic("imported_fixed_box").unwrap(),
-            false
-        );
+        assert!(!state.physics_world.is_part_dynamic("imported_fixed_box").unwrap());
 
         // 4. Import another part with `is_fixed: false` (dynamic)
         let dynamic_res = import_stl(
@@ -4923,10 +5210,7 @@ mod tests {
         .unwrap();
         assert_eq!(dynamic_res["is_fixed"], false);
         assert!(state.physics_world.has_part("imported_dyn_box"));
-        assert_eq!(
-            state.physics_world.is_part_dynamic("imported_dyn_box").unwrap(),
-            true
-        );
+        assert!(state.physics_world.is_part_dynamic("imported_dyn_box").unwrap());
 
         // 5. Duplicate part_id must fail with PART_ALREADY_EXISTS
         let dup_err = import_stl(
@@ -5537,5 +5821,250 @@ mod tests {
         assert!(groove_resp["bounding_box"]["dimensions"].is_array());
         assert!(groove_resp["volume"].as_f64().unwrap() > 0.0);
         assert!(groove_resp["volume_m3"].as_f64().unwrap() > 0.0);
+    }
+
+    #[test]
+    fn test_p2_t36_optimize_feature_tree_dag_scaling_and_delete_part_id() {
+        let mut state = EngineState::new().unwrap();
+        create_part(
+            &json!({
+                "part_id": "bushing_p2t36",
+                "name": "Bushing P2-T36",
+                "material": "steel_structural_aisi1020"
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        add_feature_primitive(
+            &json!({
+                "part_id": "bushing_p2t36",
+                "primitive_type": "cylinder",
+                "params": { "radius": 28.0, "height": 60.0 }
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        cut_hole(
+            &json!({
+                "part_id": "bushing_p2t36",
+                "position": [0.0, 0.0, 30.0],
+                "normal": [0.0, 0.0, -1.0],
+                "radius": 14.0,
+                "depth": 60.0
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        // 1. Explain-only in default "mm": verify logical_plan.dag, physical_plan.dag, and candidate_plans[i].dag are scaled in mm
+        let opt_mm = optimize_feature_tree(
+            &json!({
+                "part_id": "bushing_p2t36",
+                "apply": false
+            }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(opt_mm["length_unit"], "mm");
+
+        // logical_plan.dag[0] is AddCylinder with radius=28.0 mm, height=60.0 mm
+        let log_cyl = &opt_mm["logical_plan"]["dag"][0]["op"]["AddCylinder"];
+        assert!((log_cyl["radius"].as_f64().unwrap() - 28.0).abs() < 1e-6);
+        assert!((log_cyl["height"].as_f64().unwrap() - 60.0).abs() < 1e-6);
+
+        // logical_plan.dag[1] is CutHole with radius=14.0 mm, depth=60.0 mm, center[2]=30.0 mm
+        let log_hole = &opt_mm["logical_plan"]["dag"][1]["op"]["CutHole"];
+        assert!((log_hole["radius"].as_f64().unwrap() - 14.0).abs() < 1e-6);
+        assert!((log_hole["depth"].as_f64().unwrap() - 60.0).abs() < 1e-6);
+        assert!((log_hole["center"][2].as_f64().unwrap() - 30.0).abs() < 1e-6);
+
+        // physical_plan.dag[0] is AddRevolve (R4 Coaxial Revolve Reduction) with profile points in mm (14.0..28.0, -30.0..30.0)
+        let phys_rev = &opt_mm["physical_plan"]["dag"][0]["op"]["AddRevolve"];
+        let prof_pt0 = &phys_rev["profile"][0];
+        assert!((prof_pt0[0].as_f64().unwrap() - 14.0).abs() < 1e-6);
+        assert!((prof_pt0[1].as_f64().unwrap() - (-30.0)).abs() < 1e-6);
+
+        // candidate_plans[0].dag[0] (naive plan) and candidate_plans[last].dag[0] (CBO plan) must also be scaled in mm
+        let cand0_cyl = &opt_mm["candidate_plans"][0]["dag"][0]["op"]["AddCylinder"];
+        assert!((cand0_cyl["radius"].as_f64().unwrap() - 28.0).abs() < 1e-6);
+        let cands = opt_mm["candidate_plans"].as_array().unwrap();
+        let cand_last_rev = &cands.last().unwrap()["dag"][0]["op"]["AddRevolve"];
+        assert!((cand_last_rev["profile"][1][0].as_f64().unwrap() - 28.0).abs() < 1e-6);
+
+        // 2. Call optimize_feature_tree with length_unit: "m" and apply: true -> verify SI meters in all plan DAGs
+        let opt_m = optimize_feature_tree(
+            &json!({
+                "part_id": "bushing_p2t36",
+                "apply": true,
+                "length_unit": "m"
+            }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(opt_m["length_unit"], "m");
+        let log_cyl_m = &opt_m["logical_plan"]["dag"][0]["op"]["AddCylinder"];
+        assert!((log_cyl_m["radius"].as_f64().unwrap() - 0.028).abs() < 1e-9);
+        assert!((log_cyl_m["height"].as_f64().unwrap() - 0.06).abs() < 1e-9);
+        let phys_rev_m = &opt_m["physical_plan"]["dag"][0]["op"]["AddRevolve"];
+        assert!((phys_rev_m["profile"][0][0].as_f64().unwrap() - 0.014).abs() < 1e-9);
+        assert!((phys_rev_m["profile"][1][0].as_f64().unwrap() - 0.028).abs() < 1e-9);
+
+        // Verify internal part DAG was preserved in meters and get_feature_tree in "mm" scales it back to 14.0 / 28.0 mm
+        let tree_mm = get_feature_tree(
+            &json!({
+                "part_id": "bushing_p2t36",
+                "length_unit": "mm"
+            }),
+            &state,
+        )
+        .unwrap();
+        let tree_rev = &tree_mm["dag"][0]["op"]["AddRevolve"];
+        assert!((tree_rev["profile"][0][0].as_f64().unwrap() - 14.0).abs() < 1e-6);
+        assert!((tree_rev["profile"][1][0].as_f64().unwrap() - 28.0).abs() < 1e-6);
+
+        // 3. Verify delete_part returns status, part_id, and deleted_part_id
+        let del_resp = delete_part(
+            &json!({
+                "part_id": "bushing_p2t36"
+            }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(del_resp["status"], "deleted");
+        assert_eq!(del_resp["part_id"], "bushing_p2t36");
+        assert_eq!(del_resp["deleted_part_id"], "bushing_p2t36");
+    }
+
+    #[test]
+    fn test_check_gear_strength_manual_criteria() {
+        let mut state = EngineState::new().unwrap();
+
+        // Acceptance criteria: m=3mm, z=20, b=30mm, T=100 N*m, Kv=1:
+        // d=60mm, Wt=3333.3 N, at Y=0.322 sigma_b ≈ 115.0 MPa, sigma_H ≈ 906.1 MPa.
+        let resp = check_gear_strength(
+            &json!({
+                "module": 3.0,
+                "teeth": 20,
+                "face_width": 30.0,
+                "torque": 100.0,
+                "material": "steel_structural_aisi1020",
+                "pressure_angle_deg": 20.0,
+                "manufacturing_method": "static"
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        assert!((resp["pitch_diameter"].as_f64().unwrap() - 60.0).abs() < 1e-3);
+        assert!((resp["tangential_force_n"].as_f64().unwrap() - 3333.333).abs() < 1e-2);
+        assert!((resp["lewis_form_factor_y"].as_f64().unwrap() - 0.322).abs() < 1e-4);
+        assert_eq!(resp["dynamic_factor_kv"].as_f64().unwrap(), 1.0);
+        assert!((resp["bending_stress_mpa"].as_f64().unwrap() - 115.02).abs() < 0.1);
+
+        let bending_sf = resp["bending_safety_factor"].as_f64().unwrap();
+        assert!((bending_sf - 2.173).abs() < 0.02);
+
+        let contact_stress = resp["contact_stress_mpa"].as_f64().unwrap();
+        assert!((contact_stress - 906.1).abs() < 1.0);
+
+        assert_eq!(resp["length_unit"].as_str().unwrap(), "mm");
+        assert!(resp["warnings"].as_array().unwrap().is_empty());
+        assert!(!resp["assumptions"].as_array().unwrap().is_empty());
+        assert!(!resp["references"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_check_gear_strength_with_part_in_scene_and_power_input() {
+        let mut state = EngineState::new().unwrap();
+
+        // 1. Create part in scene with spur_gear primitive
+        create_part(
+            &json!({
+                "name": "HighStrengthPinion",
+                "part_id": "pinion_test",
+                "material": "steel_high_strength_4140"
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        add_feature_primitive(
+            &json!({
+                "part_id": "pinion_test",
+                "primitive_type": "spur_gear",
+                "params": {
+                    "module": 2.5,
+                    "teeth": 24,
+                    "face_width": 25.0,
+                    "pressure_angle_deg": 20.0
+                }
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        // 2. Check gear strength using part_id and power_kw + speed_rpm
+        // P = 10 kW, n = 1500 RPM => omega = 2*pi*1500/60 = 157.0796 rad/s => T = 10000 / 157.0796 = 63.662 N*m
+        let resp = check_gear_strength(
+            &json!({
+                "part_id": "pinion_test",
+                "power_kw": 10.0,
+                "speed_rpm": 1500.0,
+                "manufacturing_method": "precision_ground",
+                "mating_teeth": 48
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        assert_eq!(resp["part_id"].as_str().unwrap(), "pinion_test");
+        assert!((resp["module"].as_f64().unwrap() - 2.5).abs() < 1e-4);
+        assert_eq!(resp["teeth"].as_u64().unwrap(), 24);
+        assert!((resp["face_width"].as_f64().unwrap() - 25.0).abs() < 1e-4);
+        assert!((resp["pitch_diameter"].as_f64().unwrap() - 60.0).abs() < 1e-4);
+        assert!((resp["mating_pitch_diameter"].as_f64().unwrap() - 120.0).abs() < 1e-4);
+
+        // Torque ≈ 63.66 N*m
+        let torque = resp["torque_nm"].as_f64().unwrap();
+        assert!((torque - 63.662).abs() < 0.1);
+
+        // V = pi * 0.06 * 1500 / 60 = 4.712 m/s
+        let v = resp["pitch_line_velocity_m_s"].as_f64().unwrap();
+        assert!((v - 4.712).abs() < 0.01);
+
+        // Kv for precision ground: (15.2 + 4.712) / 15.2 ≈ 1.310
+        let kv = resp["dynamic_factor_kv"].as_f64().unwrap();
+        assert!((kv - 1.310).abs() < 0.02);
+
+        // Material is 4140, yield strength 655 MPa
+        let bending_sf = resp["bending_safety_factor"].as_f64().unwrap();
+        assert!(bending_sf > 4.0);
+    }
+
+    #[test]
+    fn test_check_gear_strength_units_m() {
+        let mut state = EngineState::new().unwrap();
+
+        // Test in SI meters override
+        let resp = check_gear_strength(
+            &json!({
+                "length_unit": "m",
+                "module": 0.003,
+                "teeth": 20,
+                "face_width": 0.030,
+                "torque": 100.0,
+                "material": "steel_structural_aisi1020"
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        assert_eq!(resp["length_unit"].as_str().unwrap(), "m");
+        assert!((resp["pitch_diameter"].as_f64().unwrap() - 0.060).abs() < 1e-6);
+        assert!((resp["module"].as_f64().unwrap() - 0.003).abs() < 1e-6);
+        assert!((resp["face_width"].as_f64().unwrap() - 0.030).abs() < 1e-6);
+        assert!((resp["bending_stress_mpa"].as_f64().unwrap() - 115.02).abs() < 0.1);
     }
 }

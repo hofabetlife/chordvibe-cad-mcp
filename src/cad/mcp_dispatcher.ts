@@ -10,7 +10,12 @@ import {
   RenderMode,
 } from '../types/cad';
 import { runLinearFeaSolver } from './fea_solver';
-import { runPhysicsSimulationTrajectory } from './kinematics';
+import {
+  analyzeMechanism,
+  checkInterference,
+  runPhysicsSimulationTrajectory,
+  sweepJoint,
+} from './kinematics';
 import {
   applyTransformToMesh,
   createBoxMesh,
@@ -276,6 +281,36 @@ export const MCP_TOOLS_CATALOG: McpToolDefinition[] = [
       gravity: [0, -9.81, 0],
     },
   },
+  {
+    name: 'analyze_mechanism',
+    category: 'Physics & Kinematics',
+    description:
+      'Analyze mechanism degrees of freedom (DOF), mobility (Chebychev-Grübler-Kutzbach & Jacobian SVD), redundant constraints, and floating parts',
+    defaultParams: {},
+  },
+  {
+    name: 'check_interference',
+    category: 'Physics & Kinematics',
+    description:
+      'Check pairwise geometric interference and minimum clearance between parts (broad-phase AABB + narrow-phase CSG intersection & exact mesh clearance)',
+    defaultParams: {
+      ignore_adjacent: false,
+      length_unit: 'mm',
+    },
+  },
+  {
+    name: 'sweep_joint',
+    category: 'Physics & Kinematics',
+    description:
+      'Sweep a revolute or prismatic joint across [from, to] in steps increments, checking interference at every step to find the range of free motion',
+    defaultParams: {
+      joint_id: 'joint_drive',
+      from: 0,
+      to: 90,
+      steps: 18,
+      ignore_adjacent: true,
+    },
+  },
 
   // 21-22: FEA Structural
   {
@@ -379,14 +414,14 @@ function cloneEngineState(state: EngineStateSnapshot): EngineStateSnapshot {
       scale: [...p.scale] as [number, number, number],
     })),
     selectedPartId: state.selectedPartId,
-    joints: state.joints.map((j) => ({
+    joints: (state.joints || []).map((j) => ({
       ...j,
       anchor: [...j.anchor] as [number, number, number],
       axis: [...j.axis] as [number, number, number],
     })),
-    materials: state.materials.map((m) => ({ ...m })),
+    materials: (state.materials || []).map((m) => ({ ...m })),
     feaResult: state.feaResult ? { ...state.feaResult } : null,
-    physicsFrames: [...state.physicsFrames],
+    physicsFrames: state.physicsFrames ? [...state.physicsFrames] : [],
     quality: state.quality,
     renderMode: state.renderMode,
   };
@@ -542,7 +577,7 @@ export function executeMcpToolOnEngineState(
       if (state.selectedPartId === target.id && state.parts.length > 0) {
         state.selectedPartId = state.parts[0].id;
       }
-      response = { status: 'deleted', deleted_part_id: target.id };
+      response = { status: 'deleted', part_id: target.id, deleted_part_id: target.id };
       break;
     }
 
@@ -1153,11 +1188,14 @@ export function executeMcpToolOnEngineState(
       const part = resolveTargetPart(state, params.part_id);
       const expectedGenus =
         params.expected_genus !== undefined ? Number(params.expected_genus) : undefined;
-      const report = validatePartMesh(part.id, part.mesh, expectedGenus);
+      const strictSlivers = Boolean(params.strict_slivers);
+      const report = validatePartMesh(part.id, part.mesh, expectedGenus, strictSlivers);
       response = {
         status: report.status,
-        issues: report.warnings.filter((w) => !w.toLowerCase().includes('warning')),
+        issues: report.issues ?? report.warnings.filter((w) => !w.toLowerCase().includes('notice') && !w.toLowerCase().includes('warning')),
         warnings: report.warnings,
+        is_valid_solid: report.isValidSolid ?? (report.isWatertight && report.isManifold && report.isOutwardOriented),
+        fea_ready: report.feaReady ?? (report.isWatertight && report.isManifold && report.isOutwardOriented),
         part_id: report.partId,
         revision: part.dag.length,
         raw_vertices_count: report.rawVerticesCount,
@@ -1491,6 +1529,196 @@ export function executeMcpToolOnEngineState(
       break;
     }
 
+    case 'analyze_mechanism': {
+      const partIds = Array.isArray(params.part_ids)
+        ? params.part_ids.map(String)
+        : undefined;
+      const rankTolerance =
+        params.rank_tolerance !== undefined && params.rank_tolerance !== null
+          ? Number(params.rank_tolerance)
+          : undefined;
+      const report = analyzeMechanism(state.parts, state.joints, {
+        partIds,
+        rankTolerance,
+      });
+      response = {
+        ...report,
+        length_unit: 'mm',
+        units: {
+          length: 'mm',
+          area: 'mm^2',
+          volume: 'mm^3',
+          mass: 'kg',
+          force: 'N',
+          stress: 'MPa',
+          angle: 'deg',
+        },
+      };
+      break;
+    }
+
+    case 'check_interference': {
+      const rawUnit = String(params.length_unit ?? 'mm').toLowerCase();
+      if (rawUnit !== 'mm' && rawUnit !== 'm') {
+        throw new Error(`Unsupported length_unit '${rawUnit}'. Supported: mm, m`);
+      }
+      const kLen = rawUnit === 'mm' ? 1000.0 : 1.0;
+      const kVol = Math.pow(kLen, 3);
+      const partIds = Array.isArray(params.part_ids)
+        ? params.part_ids.map(String)
+        : undefined;
+      const ignoreAdjacent = Boolean(params.ignore_adjacent ?? false);
+      const report = checkInterference(state.parts, state.joints, {
+        partIds,
+        ignoreAdjacent,
+      });
+      response = {
+        status: report.status,
+        interfering_pairs_count: report.interfering_pairs_count,
+        checked_pairs_count: report.checked_pairs_count,
+        ignore_adjacent: ignoreAdjacent,
+        total_intersection_volume: report.total_intersection_volume * kVol,
+        total_intersection_volume_m3: report.total_intersection_volume,
+        max_penetration_depth: report.max_penetration_depth * kLen,
+        max_penetration_depth_m: report.max_penetration_depth,
+        min_clearance:
+          report.min_clearance !== undefined ? report.min_clearance * kLen : null,
+        min_clearance_m: report.min_clearance ?? null,
+        pairs: report.pairs.map((p) => ({
+          a: p.a,
+          b: p.b,
+          intersects: p.intersects,
+          adjacent_by_joint: p.adjacent_by_joint,
+          intersection_volume:
+            p.intersection_volume !== undefined ? p.intersection_volume * kVol : null,
+          intersection_volume_m3: p.intersection_volume ?? null,
+          penetration_depth:
+            p.penetration_depth !== undefined ? p.penetration_depth * kLen : null,
+          penetration_depth_m: p.penetration_depth ?? null,
+          clearance: p.clearance !== undefined ? p.clearance * kLen : null,
+          clearance_m: p.clearance ?? null,
+        })),
+        length_unit: rawUnit,
+        units: {
+          length: rawUnit,
+          area: `${rawUnit}^2`,
+          volume: `${rawUnit}^3`,
+          mass: 'kg',
+          force: 'N',
+          stress: 'MPa',
+          angle: 'deg',
+        },
+      };
+      break;
+    }
+
+    case 'sweep_joint': {
+      const rawLenUnit = String(params.length_unit ?? 'mm').toLowerCase();
+      if (rawLenUnit !== 'mm' && rawLenUnit !== 'm') {
+        throw new Error(`Unsupported length_unit '${rawLenUnit}'. Supported: mm, m`);
+      }
+      const rawAngUnit = String(params.angle_unit ?? 'deg').toLowerCase();
+      if (rawAngUnit !== 'deg' && rawAngUnit !== 'rad') {
+        throw new Error(`Unsupported angle_unit '${rawAngUnit}'. Supported: deg, rad`);
+      }
+      const kLenFromM = rawLenUnit === 'mm' ? 1000.0 : 1.0;
+      const kLenToM = rawLenUnit === 'mm' ? 0.001 : 1.0;
+      const kVolFromM3 = Math.pow(kLenFromM, 3);
+      const kAngFromRad = rawAngUnit === 'deg' ? 180 / Math.PI : 1.0;
+      const kAngToRad = rawAngUnit === 'deg' ? Math.PI / 180 : 1.0;
+
+      const jointId = String(params.joint_id || '');
+      const fromCaller = Number(params.from);
+      const toCaller = Number(params.to);
+      const steps = Number(params.steps);
+      const ignoreAdjacent =
+        params.ignore_adjacent !== undefined ? Boolean(params.ignore_adjacent) : true;
+      const partIds = Array.isArray(params.part_ids)
+        ? params.part_ids.map(String)
+        : undefined;
+
+      const joint = state.joints.find((j) => j.id === jointId);
+      if (!joint) {
+        throw new Error(`Joint not found: ${jointId}`);
+      }
+      const isRevolute = joint.type === 'revolute';
+      const toInternal = isRevolute ? kAngToRad : kLenToM;
+      const fromInternal = isRevolute ? kAngFromRad : kLenFromM;
+      const jointCoordinateUnit = isRevolute ? rawAngUnit : rawLenUnit;
+
+      const report = sweepJoint(state.parts, state.joints, {
+        jointId,
+        from: fromCaller * toInternal,
+        to: toCaller * toInternal,
+        steps,
+        partIds,
+        ignoreAdjacent,
+      });
+
+      response = {
+        status: report.status,
+        joint_id: report.joint_id,
+        joint_type: report.joint_type,
+        joint_coordinate_unit: jointCoordinateUnit,
+        from: fromCaller,
+        to: toCaller,
+        steps: report.steps,
+        ignore_adjacent: ignoreAdjacent,
+        first_collision_step: report.first_collision_step ?? null,
+        first_collision_value:
+          report.first_collision_value !== undefined
+            ? report.first_collision_value * fromInternal
+            : null,
+        first_collision_angle_deg: report.first_collision_angle_deg ?? null,
+        first_collision_angle_rad: report.first_collision_angle_rad ?? null,
+        first_collision_pairs: report.first_collision_pairs,
+        min_clearance:
+          report.min_clearance !== undefined ? report.min_clearance * kLenFromM : null,
+        min_clearance_m: report.min_clearance ?? null,
+        min_clearance_step: report.min_clearance_step ?? null,
+        min_clearance_value:
+          report.min_clearance_value !== undefined
+            ? report.min_clearance_value * fromInternal
+            : null,
+        safe_travel_range: report.safe_travel_range
+          ? [
+              report.safe_travel_range[0] * fromInternal,
+              report.safe_travel_range[1] * fromInternal,
+            ]
+          : null,
+        margin_to_collision:
+          report.margin_to_collision !== undefined
+            ? report.margin_to_collision * fromInternal
+            : null,
+        samples: report.samples.map((s) => ({
+          step: s.step,
+          value: s.value * fromInternal,
+          angle_deg: s.angle_deg ?? null,
+          angle_rad: s.angle_rad ?? null,
+          interfering_pairs: s.interfering_pairs,
+          min_clearance:
+            s.min_clearance !== undefined ? s.min_clearance * kLenFromM : null,
+          min_clearance_m: s.min_clearance ?? null,
+          max_penetration_depth: s.max_penetration_depth * kLenFromM,
+          max_penetration_depth_m: s.max_penetration_depth,
+          total_intersection_volume: s.total_intersection_volume * kVolFromM3,
+          total_intersection_volume_m3: s.total_intersection_volume,
+        })),
+        length_unit: rawLenUnit,
+        angle_unit: rawAngUnit,
+        units: {
+          length: rawLenUnit,
+          area: `${rawLenUnit}^2`,
+          volume: `${rawLenUnit}^3`,
+          mass: 'kg',
+          force: 'N',
+          stress: 'MPa',
+          angle: rawAngUnit,
+        },
+      };
+      break;
+    }
+
     case 'run_fea_analysis': {
       const part = resolveTargetPart(state, params.part_id);
       const mat =
@@ -1682,8 +1910,10 @@ export function executeMcpToolOnEngineState(
       const part = resolveTargetPart(state, params.part_id);
       state.selectedPartId = part.id;
       response = {
-        status: 'preview_window_active',
+        status: 'opened',
+        mode: 'spawned_gui_process',
         part_id: part.id,
+        stl_path: `./output/${part.id}.stl`,
         title: String(params.title || `MCP-CAD 3D Viewer — ${part.name}`),
         hotkeys: ['P (Play/Pause Physics)', 'O (Ortho/Persp)', 'F (Fit View)', '1-6 (Debug Shaders)'],
       };
@@ -1892,6 +2122,74 @@ export function executeMcpToolOnEngineState(
         nextRev = prevRev + 1;
         (part as any).revision = nextRev;
       }
+      const scaleDagNodeFromMeters = (node: any) => {
+        if (Math.abs(kFromM - 1.0) <= 1e-12) return node;
+        const nextParams: Record<string, any> = { ...(node.params || {}) };
+        const linearScalarKeys = [
+          'width',
+          'height',
+          'depth',
+          'radius',
+          'diameter',
+          'outer_radius',
+          'inner_radius',
+          'radius_bottom',
+          'radius_top',
+          'width_across_flats',
+          'chamfer',
+          'chamfer_radius',
+          'module',
+          'face_width',
+          'bore_radius',
+          'keyway_width',
+          'keyway_depth',
+          'hub_diameter',
+          'hub_length',
+          'rim_diameter',
+          'rim_width',
+          'flange_diameter',
+          'hub_bore_diameter',
+          'pcd_diameter',
+          'bolt_hole_diameter',
+          'spoke_width',
+          'spoke_thickness',
+          'offset_et',
+          'helix_radius',
+          'groove_radius',
+          'pitch',
+          'start_z',
+          'thread_pitch',
+          'thread_depth',
+        ];
+        for (const key of linearScalarKeys) {
+          if (typeof nextParams[key] === 'number') {
+            nextParams[key] = Number((nextParams[key] * kFromM).toFixed(6));
+          }
+        }
+        const vec3Keys = ['position', 'center', 'translation'];
+        for (const key of vec3Keys) {
+          if (Array.isArray(nextParams[key]) && nextParams[key].length === 3) {
+            nextParams[key] = nextParams[key].map((v: number) =>
+              Number((Number(v) * kFromM).toFixed(6))
+            );
+          }
+        }
+        if (Array.isArray(nextParams.profile)) {
+          nextParams.profile = nextParams.profile.map((pt: any) =>
+            Array.isArray(pt) && pt.length >= 2
+              ? [Number((Number(pt[0]) * kFromM).toFixed(6)), Number((Number(pt[1]) * kFromM).toFixed(6))]
+              : pt
+          );
+        }
+        return { ...node, params: nextParams };
+      };
+      const scalePlanFromMeters = (plan: any) => ({
+        ...plan,
+        dag: Array.isArray(plan.dag) ? plan.dag.map(scaleDagNodeFromMeters) : [],
+      });
+      const logicalPlan = scalePlanFromMeters(report.candidatePlans[0] ?? report.bestPlan);
+      const physicalPlan = scalePlanFromMeters(report.bestPlan);
+      const candidatePlans = report.candidatePlans.map(scalePlanFromMeters);
       response = {
         status: shouldApply ? 'optimized_and_applied' : 'explained_only',
         part_id: part.id,
@@ -1918,6 +2216,9 @@ export function executeMcpToolOnEngineState(
         applied_rules: appliedRules,
         invariants: report.invariantCheck,
         explain_tree: report.bestPlan.explainTree,
+        logical_plan: logicalPlan,
+        physical_plan: physicalPlan,
+        candidate_plans: candidatePlans,
       };
       break;
     }

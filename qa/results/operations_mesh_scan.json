@@ -9,7 +9,7 @@
       "operation": "cut_hole_through_box",
       "orientation_consistent": true,
       "self_intersections": 0,
-      "signed_volume": 0.0003719069936296798,
+      "signed_volume": 0.00037190699362967976,
       "status": "PASS",
       "t_junctions": 0,
       "watertight": true
@@ -22,7 +22,7 @@
       "operation": "cut_hole_blind_box",
       "orientation_consistent": true,
       "self_intersections": 0,
-      "signed_volume": 0.00037893024522226137,
+      "signed_volume": 0.00037893024522225996,
       "status": "PASS",
       "t_junctions": 0,
       "watertight": true
@@ -52,37 +52,26 @@
       "watertight": true
     },
     {
-      "boundary_edges": 961,
-      "genus": 167.5,
-      "issues": [
-        "Mesh is not watertight: 961 boundary edges (holes), 0 non-manifold edges",
-        "Found 24 self-intersecting non-adjacent triangle pairs",
-        "Sliver quality gate failed: 1900 needle triangles with min angle < 1° (min_angle=0.0004°)",
-        "Sliver quality gate failed: 33.49% of triangles (4034/12045) have min angle < 5° (threshold 1.00%)",
-        "Euler genus mismatch: computed 167.5 (round 168), expected 0"
-      ],
+      "boundary_edges": 0,
+      "genus": 0.0,
+      "issues": [],
       "operation": "cut_helical_groove_circular",
       "orientation_consistent": true,
-      "self_intersections": 24,
-      "status": "FAIL",
+      "self_intersections": 0,
+      "status": "PASS",
       "t_junctions": 0,
-      "watertight": false
+      "watertight": true
     },
     {
-      "boundary_edges": 413,
-      "genus": 67.0,
-      "issues": [
-        "Mesh is not watertight: 413 boundary edges (holes), 0 non-manifold edges",
-        "Sliver quality gate failed: 1382 needle triangles with min angle < 1° (min_angle=0.0510°)",
-        "Sliver quality gate failed: 35.09% of triangles (3641/10375) have min angle < 5° (threshold 1.00%)",
-        "Euler genus mismatch: computed 67.0 (round 67), expected 0"
-      ],
+      "boundary_edges": 0,
+      "genus": 0.0,
+      "issues": [],
       "operation": "cut_helical_groove_metric_60",
       "orientation_consistent": true,
       "self_intersections": 0,
-      "status": "FAIL",
+      "status": "PASS",
       "t_junctions": 0,
-      "watertight": false
+      "watertight": true
     },
     {
       "boundary_edges": 0,
@@ -136,38 +125,45 @@
       "validation": {
         "angle_stats": {
           "histogram": {
-            "deg_15_to_30": 50,
-            "deg_1_to_5": 7,
-            "deg_30_to_45": 4506,
-            "deg_45_to_60": 11,
-            "deg_5_to_15": 148,
+            "deg_15_to_30": 45,
+            "deg_1_to_5": 28,
+            "deg_30_to_45": 4499,
+            "deg_45_to_60": 8,
+            "deg_5_to_15": 120,
             "lt_1_deg": 0
           },
           "median_angle_deg": 38.79025157977224,
-          "min_angle_deg": 3.135922499852452,
-          "p5_angle_deg": 35.971138355831975
+          "min_angle_deg": 1.612796147206471,
+          "p5_angle_deg": 35.971138355832025
         },
+        "fea_ready": true,
         "geometry": {
           "coplanar_overlaps_count": 0,
           "degenerate_triangles_count": 0,
-          "duplicate_vertices_count": 11807,
+          "duplicate_vertices_count": 11752,
           "is_positive_volume": true,
           "lt_1_deg_count": 0,
           "lt_1_deg_ratio": 0.0,
-          "lt_5_deg_count": 7,
-          "lt_5_deg_ratio": 0.0014824227022448115,
-          "max_aspect_ratio": 43.01644989515312,
+          "lt_5_deg_count": 28,
+          "lt_5_deg_ratio": 0.005957446808510639,
+          "max_aspect_ratio": 39.53289958074962,
           "median_aspect_ratio": 1.231782644662398,
-          "min_aspect_ratio": 1.0087223669170218,
+          "min_aspect_ratio": 1.0011648380090568,
           "normals_vs_winding_mismatches": 0,
           "p5_aspect_ratio": 1.2317826446623967,
           "self_intersections_count": 0,
-          "signed_volume": 0.0009101025788472524,
-          "sliver_triangles_count": 7,
+          "signed_volume": 0.000910102578847253,
+          "sliver_triangles_count": 28,
           "t_junctions_count": 0
         },
+        "is_valid_solid": true,
         "issues": [],
+        "length_unit": "mm",
+        "part_id": "part-19d8498dc81e4039b4bd966e1c0a77dd",
+        "revision": 3,
         "status": "PASS",
+        "surface_area": 73257.55830270567,
+        "surface_area_m2": 0.07325755830270567,
         "topology": {
           "boundary_edges_count": 0,
           "connected_components": 1,
@@ -178,13 +174,34 @@
           "non_manifold_edges_count": 0,
           "non_manifold_vertices_count": 0,
           "orientation_consistent": true,
-          "triangles_count": 4722,
-          "unique_edges_count": 7083,
-          "welded_vertices_count": 2359
+          "triangles_count": 4700,
+          "unique_edges_count": 7050,
+          "welded_vertices_count": 2348
         },
+        "units": {
+          "angle": "deg",
+          "angular_velocity": "rad/s",
+          "area": "mm²",
+          "density": "kg/m³",
+          "displacement": "mm",
+          "displacement_output": "mm",
+          "force": "N",
+          "length": "mm",
+          "linear_velocity": "m/s",
+          "mass": "kg",
+          "stress": "MPa",
+          "stress_output": "MPa",
+          "time": "s",
+          "torque": "N·m",
+          "volume": "mm³",
+          "volume_si": "m³",
+          "young_modulus": "GPa"
+        },
+        "volume": 910102.578847253,
+        "volume_m3": 0.000910102578847253,
         "warnings": [
-          "Notice: 7 sliver triangles detected (min angle < 5° or aspect ratio > 100)",
-          "Notice: 11807 un-welded duplicate vertices found (CAD split normals)"
+          "Notice: 28 sliver triangles detected (min angle < 5° or aspect ratio > 100)",
+          "Notice: 11752 un-welded duplicate vertices found (CAD split normals)"
         ]
       }
     }

@@ -546,6 +546,14 @@ fn test_dag_helical_groove_drill_bit_model() {
         vol_drill
     );
     assert!(drill_mesh.triangle_count() > 0);
+    let rep_drill = mcp_cad_core::diagnostics::validate_mesh(&drill_mesh, Some(0));
+    assert_eq!(rep_drill.status, "PASS", "Drill bit failed validate_mesh: {:?}", rep_drill.issues);
+    assert!(rep_drill.topology.is_watertight);
+    assert_eq!(rep_drill.topology.boundary_edges_count, 0);
+    assert_eq!(rep_drill.topology.non_manifold_edges_count, 0);
+    assert_eq!(rep_drill.geometry.self_intersections_count, 0);
+    assert_eq!(rep_drill.geometry.lt_1_deg_count, 0);
+    assert!(rep_drill.geometry.lt_5_deg_ratio <= 0.01);
 
     // 3. Test BooleanDifferenceMesh with custom cutting tool
     let mut diff_tree = FeatureTree::new();
@@ -607,6 +615,8 @@ fn test_dag_polygon_prism_hex_nut_model() {
         },
         Some("Tap Hole".to_string()),
     );
+    let drilled_nut_mesh = tree.evaluate().expect("Drilled hex nut evaluation failed");
+    let vol_drilled = drilled_nut_mesh.volume();
 
     // 3. Cut internal metric 60-degree thread: M10x1.5 pitch, height 8.0, ISO 68-1
     tree.add_feature(
@@ -624,9 +634,29 @@ fn test_dag_polygon_prism_hex_nut_model() {
     );
 
     let nut_mesh = tree.evaluate().expect("Hex nut evaluation failed");
+    let rep_nut = mcp_cad_core::diagnostics::validate_mesh(&nut_mesh, Some(1));
+    assert_eq!(
+        rep_nut.status, "PASS",
+        "Hex nut (mm) failed validate_mesh: {:?}",
+        rep_nut.issues
+    );
+    assert!(rep_nut.topology.is_watertight);
+    assert_eq!(rep_nut.topology.boundary_edges_count, 0);
+    assert_eq!(rep_nut.topology.non_manifold_edges_count, 0);
+    assert_eq!(rep_nut.geometry.self_intersections_count, 0);
+    assert_eq!(rep_nut.geometry.lt_1_deg_count, 0);
+    assert!(rep_nut.geometry.lt_5_deg_ratio <= 0.01);
+    assert!((rep_nut.topology.genus - 1.0).abs() < 1e-6);
+
     assert!(nut_mesh.triangle_count() > 0);
     let vol_nut = nut_mesh.volume();
     assert!(vol_nut > 0.0, "Hex nut volume must be positive: got {}", vol_nut);
+    assert!(
+        vol_nut < vol_drilled,
+        "Threaded nut volume ({}) must be strictly less than drilled nut volume ({})",
+        vol_nut,
+        vol_drilled
+    );
 
     // Verify AABB dimensions roughly match S (16.0) and height (8.0)
     let aabb = nut_mesh.bounding_box();
@@ -634,6 +664,160 @@ fn test_dag_polygon_prism_hex_nut_model() {
     assert!((dims[2] - height).abs() < 0.1, "Nut height must be ~8.0, got {}", dims[2]);
     assert!(dims[0] > waf * 0.95 && dims[0] < waf * 1.25);
     assert!(dims[1] > waf * 0.95 && dims[1] < waf * 1.25);
+
+    // 4. Verify T08_hex_nut_m10 exact SI benchmark parameters (outer_radius = 0.0098, helix_radius = 0.005)
+    let mut t08 = FeatureTree::new();
+    t08.add_feature(
+        FeatureOp::AddPolygonPrism {
+            sides: 6,
+            height: 0.008,
+            width_across_flats: None,
+            radius: Some(0.0098),
+            chamfer: Some(0.0008),
+            position: None,
+            rotation_deg: None,
+        },
+        None,
+    );
+    t08.add_feature(
+        FeatureOp::CutHole {
+            center: [0.0, 0.0, 0.0],
+            normal: [0.0, 0.0, -1.0],
+            radius: 0.00425,
+            depth: 0.010,
+            keyway_width: None,
+            keyway_depth: None,
+        },
+        None,
+    );
+    t08.add_feature(
+        FeatureOp::CutHelicalGroove {
+            helix_radius: 0.005,
+            groove_radius: 0.0008,
+            pitch: 0.0015,
+            height: 0.008,
+            start_z: -0.004,
+            starts: 1,
+            is_right_hand: true,
+            profile_type: "metric_60".to_string(),
+        },
+        None,
+    );
+    let t08_mesh = t08.evaluate().expect("T08 hex nut evaluation failed");
+    let rep_t08 = mcp_cad_core::diagnostics::validate_mesh(&t08_mesh, Some(1));
+    assert_eq!(
+        rep_t08.status, "PASS",
+        "T08_hex_nut_m10 failed validate_mesh: {:?}",
+        rep_t08.issues
+    );
+    assert!(rep_t08.topology.is_watertight);
+    assert_eq!(rep_t08.topology.boundary_edges_count, 0);
+    assert_eq!(rep_t08.topology.non_manifold_edges_count, 0);
+    assert_eq!(rep_t08.geometry.self_intersections_count, 0);
+    assert_eq!(rep_t08.geometry.lt_1_deg_count, 0);
+    assert!(rep_t08.geometry.lt_5_deg_ratio <= 0.01);
+    assert!((rep_t08.topology.genus - 1.0).abs() < 1e-6);
+
+    // 5. Verify Twist Drill with conical tip in both feature orders:
+    // Order A: Cylinder -> Cone -> CutHelicalGroove
+    let mut drill_cone_a = FeatureTree::new();
+    drill_cone_a.add_feature(
+        FeatureOp::AddCylinder {
+            radius: 10.0,
+            height: 100.0,
+            segments: 32,
+            position: Some([0.0, 0.0, 50.0]),
+            rotation_deg: None,
+        },
+        None,
+    );
+    drill_cone_a.add_feature(
+        FeatureOp::AddCone {
+            radius_bottom: 10.0,
+            radius_top: 0.0,
+            height: 20.0,
+            segments: 32,
+            position: Some([0.0, 0.0, 110.0]),
+            rotation_deg: None,
+        },
+        None,
+    );
+    drill_cone_a.add_feature(
+        FeatureOp::CutHelicalGroove {
+            helix_radius: 10.0,
+            groove_radius: 4.0,
+            pitch: 40.0,
+            height: 80.0,
+            start_z: 20.0,
+            starts: 2,
+            is_right_hand: true,
+            profile_type: "circular".to_string(),
+        },
+        None,
+    );
+    let dc_mesh_a = drill_cone_a.evaluate().unwrap();
+    let rep_dc_a = mcp_cad_core::diagnostics::validate_mesh(&dc_mesh_a, Some(0));
+    assert_eq!(
+        rep_dc_a.status, "PASS",
+        "Drill with cone (Order A) failed validate_mesh: {:?}",
+        rep_dc_a.issues
+    );
+    assert!(rep_dc_a.topology.is_watertight);
+    assert_eq!(rep_dc_a.topology.boundary_edges_count, 0);
+    assert_eq!(rep_dc_a.topology.non_manifold_edges_count, 0);
+    assert_eq!(rep_dc_a.geometry.self_intersections_count, 0);
+    assert_eq!(rep_dc_a.geometry.lt_1_deg_count, 0);
+    assert!(rep_dc_a.geometry.lt_5_deg_ratio <= 0.01);
+
+    // Order B: Cylinder -> CutHelicalGroove -> Cone
+    let mut drill_cone_b = FeatureTree::new();
+    drill_cone_b.add_feature(
+        FeatureOp::AddCylinder {
+            radius: 10.0,
+            height: 100.0,
+            segments: 32,
+            position: Some([0.0, 0.0, 50.0]),
+            rotation_deg: None,
+        },
+        None,
+    );
+    drill_cone_b.add_feature(
+        FeatureOp::CutHelicalGroove {
+            helix_radius: 10.0,
+            groove_radius: 4.0,
+            pitch: 40.0,
+            height: 80.0,
+            start_z: 20.0,
+            starts: 2,
+            is_right_hand: true,
+            profile_type: "circular".to_string(),
+        },
+        None,
+    );
+    drill_cone_b.add_feature(
+        FeatureOp::AddCone {
+            radius_bottom: 10.0,
+            radius_top: 0.0,
+            height: 20.0,
+            segments: 32,
+            position: Some([0.0, 0.0, 110.0]),
+            rotation_deg: None,
+        },
+        None,
+    );
+    let dc_mesh_b = drill_cone_b.evaluate().unwrap();
+    let rep_dc_b = mcp_cad_core::diagnostics::validate_mesh(&dc_mesh_b, Some(0));
+    assert_eq!(
+        rep_dc_b.status, "PASS",
+        "Drill with cone (Order B) failed validate_mesh: {:?}",
+        rep_dc_b.issues
+    );
+    assert!(rep_dc_b.topology.is_watertight);
+    assert_eq!(rep_dc_b.topology.boundary_edges_count, 0);
+    assert_eq!(rep_dc_b.topology.non_manifold_edges_count, 0);
+    assert_eq!(rep_dc_b.geometry.self_intersections_count, 0);
+    assert_eq!(rep_dc_b.geometry.lt_1_deg_count, 0);
+    assert!(rep_dc_b.geometry.lt_5_deg_ratio <= 0.01);
 }
 
 #[test]

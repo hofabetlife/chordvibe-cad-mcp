@@ -58,6 +58,25 @@ pub enum FeaError {
         tolerance: f64,
     },
 
+    /// Raised when the input CAD surface mesh is not a closed watertight 2-manifold (`MESH_INVALID`).
+    #[error(
+        "Invalid CAD surface mesh for FEA (MESH_INVALID): {message} (boundary_edges: {boundary_edges_count}, non_manifold_edges: {non_manifold_edges_count}, non_manifold_vertices: {non_manifold_vertices_count})"
+    )]
+    InvalidSurfaceMesh {
+        /// Human-readable summary of topological/geometric defects
+        message: String,
+        /// Number of open boundary edges (holes)
+        boundary_edges_count: usize,
+        /// Number of non-manifold edges (>= 3 incident triangles)
+        non_manifold_edges_count: usize,
+        /// Number of non-manifold vertices
+        non_manifold_vertices_count: usize,
+        /// Number of inconsistent/inverted directed edges
+        inconsistent_edges_count: usize,
+        /// Whether the mesh is watertight
+        is_watertight: bool,
+    },
+
     /// Raised when mesh generation fails.
     #[error("Mesh generation failed: {0}")]
     MeshGenerationFailed(String),

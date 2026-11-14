@@ -7,7 +7,7 @@ use uuid::Uuid;
 use mcp_cad_core::part::Part;
 use mcp_cad_core::topology::{TriangleMesh, Vertex};
 use mcp_cad_physics::joint::{CadJointType, MotorConfig};
-use mcp_cad_physics::telemetry::BodyTelemetry;
+use mcp_cad_physics::telemetry::{BodyTelemetry, LoadCaseSelector};
 use mcp_cad_physics::PhysicsError;
 
 use crate::error::ServerError;
@@ -376,11 +376,14 @@ pub fn create_joint(args: &Value, state: &mut EngineState) -> Result<Value, Serv
         .physics_world
         .add_joint(joint_id.clone(), &part_a, &part_b, cad_joint, None)?;
 
-    Ok(json!({
+    let mut resp = json!({
         "joint_id": joint_id,
         "length_unit": unit.as_str(),
         "units": unit.units_metadata(),
-    }))
+    });
+    super::requirements::attach_auto_check_if_enabled(state, None, &mut resp);
+
+    Ok(resp)
 }
 
 /// 9. `set_joint_motor`: Configures and activates a velocity motor on a joint.
@@ -440,11 +443,14 @@ pub fn set_joint_motor(args: &Value, state: &mut EngineState) -> Result<Value, S
 
     let unit = state.length_unit;
 
-    Ok(json!({
+    let mut resp = json!({
         "status": "motor_active",
         "length_unit": unit.as_str(),
         "units": unit.units_metadata(),
-    }))
+    });
+    super::requirements::attach_auto_check_if_enabled(state, None, &mut resp);
+
+    Ok(resp)
 }
 
 /// Converts a `BodyTelemetry` map's sample positions from internal SI meters to `k_from_m`.
@@ -529,6 +535,691 @@ pub fn run_physics_simulation(args: &Value, state: &mut EngineState) -> Result<V
         "length_unit": unit.as_str(),
         "units": unit.units_metadata(),
     }))
+}
+
+/// 11. `get_part_load_cases`: Extracts dynamic/quasi-static joint reaction forces, torques,
+///     and inertial accelerations acting ON a part in its local coordinate system (`P3-T6`).
+pub fn get_part_load_cases(args: &Value, state: &mut EngineState) -> Result<Value, ServerError> {
+    let raw_part_id = args
+        .get("part_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ServerError::InvalidArgument("Missing required argument 'part_id'".to_string()))?;
+    let part_id = raw_part_id.trim();
+    if part_id.is_empty() {
+        return Err(ServerError::InvalidArgument(
+            "Argument 'part_id' must be a non-empty string".to_string(),
+        ));
+    }
+
+    let is_ground = part_id.eq_ignore_ascii_case("ground") || part_id.eq_ignore_ascii_case("world");
+    if !is_ground && !state.parts.contains_key(part_id) {
+        return Err(ServerError::PartNotFound(part_id.to_string()));
+    }
+
+    let selector = match args.get("select") {
+        None | Some(Value::Null) => LoadCaseSelector::PeakForce,
+        Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "peak_force" => LoadCaseSelector::PeakForce,
+            "peak_torque" => LoadCaseSelector::PeakTorque,
+            other => {
+                if let Some(rest) = other.strip_prefix("time_s:") {
+                    let t = rest.trim().parse::<f64>().map_err(|_| {
+                        ServerError::InvalidArgument(format!(
+                            "Argument 'select' has invalid timestamp '{s}'. Supported: 'peak_force', 'peak_torque', or a non-negative finite number (seconds)"
+                        ))
+                    })?;
+                    if !t.is_finite() || t < 0.0 {
+                        return Err(ServerError::InvalidArgument(format!(
+                            "Argument 'select' timestamp must be a finite non-negative number (>= 0.0), got {t}"
+                        )));
+                    }
+                    LoadCaseSelector::AtTime(t)
+                } else if let Ok(t) = other.parse::<f64>() {
+                    if !t.is_finite() || t < 0.0 {
+                        return Err(ServerError::InvalidArgument(format!(
+                            "Argument 'select' timestamp must be a finite non-negative number (>= 0.0), got {t}"
+                        )));
+                    }
+                    LoadCaseSelector::AtTime(t)
+                } else {
+                    return Err(ServerError::InvalidArgument(format!(
+                        "Argument 'select' has unknown mode '{s}'. Supported: 'peak_force', 'peak_torque', or a non-negative finite number (seconds)"
+                    )));
+                }
+            }
+        },
+        Some(Value::Number(n)) => {
+            let t = n.as_f64().ok_or_else(|| {
+                ServerError::InvalidArgument(
+                    "Argument 'select' timestamp must be a finite non-negative number (>= 0.0)"
+                        .to_string(),
+                )
+            })?;
+            if !t.is_finite() || t < 0.0 {
+                return Err(ServerError::InvalidArgument(format!(
+                    "Argument 'select' timestamp must be a finite non-negative number (>= 0.0), got {t}"
+                )));
+            }
+            LoadCaseSelector::AtTime(t)
+        }
+        Some(Value::Object(map)) => {
+            let t = map
+                .get("time_s")
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| {
+                    ServerError::InvalidArgument(
+                        "Argument 'select' object must contain a finite non-negative 'time_s' number"
+                            .to_string(),
+                    )
+                })?;
+            if !t.is_finite() || t < 0.0 {
+                return Err(ServerError::InvalidArgument(format!(
+                    "Argument 'select' timestamp must be a finite non-negative number (>= 0.0), got {t}"
+                )));
+            }
+            LoadCaseSelector::AtTime(t)
+        }
+        Some(_) => {
+            return Err(ServerError::InvalidArgument(
+                "Argument 'select' must be 'peak_force', 'peak_torque', or a finite non-negative number (seconds)"
+                    .to_string(),
+            ));
+        }
+    };
+
+    let unit = state.resolve_length_unit(args)?;
+    let k_from_m = unit.from_meters_factor();
+
+    let summary = state.last_simulation.as_ref().ok_or_else(|| {
+        ServerError::InvalidArgument(
+            "No physics simulation has been run yet; execute run_physics_simulation before calling get_part_load_cases"
+                .to_string(),
+        )
+    })?;
+
+    let load_case = state
+        .physics_world
+        .extract_part_load_case(summary, part_id, selector)?;
+
+    let scale_vec3 = |v: [f64; 3]| -> [f64; 3] { [v[0] * k_from_m, v[1] * k_from_m, v[2] * k_from_m] };
+
+    let joints_json: Vec<Value> = load_case
+        .joints
+        .iter()
+        .map(|j| {
+            json!({
+                "joint_id": j.joint_id,
+                "joint_type": j.joint_type,
+                "connected_part_id": j.connected_part_id,
+                "role": j.role,
+                "anchor_local": scale_vec3(j.anchor_local),
+                "force": j.force,
+                "torque": j.torque,
+                "force_world": j.force_world,
+                "torque_world": j.torque_world,
+                "force_magnitude": j.force_magnitude,
+                "torque_magnitude": j.torque_magnitude,
+            })
+        })
+        .collect();
+
+    let com_scaled = scale_vec3(load_case.inertia.center_of_mass_local);
+    let pos_scaled = scale_vec3(load_case.position_world);
+
+    Ok(json!({
+        "part_id": load_case.part_id,
+        "select": load_case.select,
+        "time_s": load_case.time_s,
+        "step_index": load_case.step_index,
+        "position_world": pos_scaled,
+        "orientation_quat": load_case.orientation_quat,
+        "joints": joints_json,
+        "net_joint_force": load_case.net_joint_force,
+        "net_joint_torque_about_com": load_case.net_joint_torque_about_com,
+        "net_joint_couple": load_case.net_joint_couple,
+        "net_joint_force_magnitude": load_case.net_joint_force_magnitude,
+        "net_joint_torque_about_com_magnitude": load_case.net_joint_torque_about_com_magnitude,
+        "mass": load_case.inertia.mass_kg,
+        "linear_acceleration": load_case.inertia.linear_acceleration,
+        "angular_acceleration": load_case.inertia.angular_acceleration,
+        "inertia": {
+            "mass": load_case.inertia.mass_kg,
+            "mass_kg": load_case.inertia.mass_kg,
+            "is_fixed": load_case.inertia.is_fixed,
+            "center_of_mass_local": com_scaled,
+            "linear_acceleration": load_case.inertia.linear_acceleration,
+            "angular_acceleration": load_case.inertia.angular_acceleration,
+            "linear_acceleration_world": load_case.inertia.linear_acceleration_world,
+            "angular_acceleration_world": load_case.inertia.angular_acceleration_world,
+            "linear_velocity": load_case.inertia.linear_velocity,
+            "angular_velocity": load_case.inertia.angular_velocity,
+            "gravity_local": load_case.inertia.gravity_local,
+        },
+        "equilibrium_residual": {
+            "force": load_case.equilibrium_residual_force,
+            "force_norm": load_case.equilibrium_residual_force_norm,
+            "torque": load_case.equilibrium_residual_torque,
+            "torque_norm": load_case.equilibrium_residual_torque_norm,
+        },
+        "equilibrium_residual_force": load_case.equilibrium_residual_force,
+        "equilibrium_residual_force_norm": load_case.equilibrium_residual_force_norm,
+        "equilibrium_residual_torque": load_case.equilibrium_residual_torque,
+        "equilibrium_residual_torque_norm": load_case.equilibrium_residual_torque_norm,
+        "length_unit": unit.as_str(),
+        "units": unit.units_metadata(),
+    }))
+}
+
+/// Tool 12 (`analyze_mechanism`): Analyzes mechanism degrees of freedom, mobility, redundant constraints,
+/// and floating/unconnected parts using both Chebychev-Grübler-Kutzbach and SVD rank of the
+/// constraint Jacobian (`P3-T9`).
+pub fn analyze_mechanism(args: &Value, state: &mut EngineState) -> Result<Value, ServerError> {
+    let unit = state.resolve_length_unit(args)?;
+
+    let part_ids: Option<Vec<String>> = match args.get("part_ids") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(arr)) => {
+            let mut ids = Vec::with_capacity(arr.len());
+            for (idx, item) in arr.iter().enumerate() {
+                let s = item.as_str().ok_or_else(|| {
+                    ServerError::InvalidArgument(format!(
+                        "Argument 'part_ids[{idx}]' must be a non-empty string"
+                    ))
+                })?;
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    return Err(ServerError::InvalidArgument(format!(
+                        "Argument 'part_ids[{idx}]' must not be empty"
+                    )));
+                }
+                ids.push(trimmed.to_string());
+            }
+            Some(ids)
+        }
+        Some(_) => {
+            return Err(ServerError::InvalidArgument(
+                "Argument 'part_ids' must be an array of part ID strings".to_string(),
+            ));
+        }
+    };
+
+    let rank_tolerance: Option<f64> = match args.get("rank_tolerance") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let tol = v.as_f64().ok_or_else(|| {
+                ServerError::InvalidArgument(
+                    "Argument 'rank_tolerance' must be a positive number".to_string(),
+                )
+            })?;
+            if !tol.is_finite() || tol <= 0.0 {
+                return Err(ServerError::InvalidArgument(format!(
+                    "Argument 'rank_tolerance' must be finite and > 0.0, got {tol}"
+                )));
+            }
+            Some(tol)
+        }
+    };
+
+    // Synchronize any parts with valid mesh not yet in physics world
+    for part in state.parts.values() {
+        if !part.mesh.vertices.is_empty() {
+            let _ = state.physics_world.add_part(part, !part.is_fixed);
+        }
+    }
+
+    let scene_parts: Vec<(String, bool)> = state
+        .parts
+        .iter()
+        .map(|(id, part)| (id.clone(), part.is_fixed))
+        .collect();
+
+    let report = state.physics_world.analyze_mechanism_with_scene_parts(
+        part_ids.as_deref(),
+        rank_tolerance,
+        Some(&scene_parts),
+    )?;
+
+    let status = if report.warnings.is_empty() {
+        "PASS"
+    } else {
+        "WARN"
+    };
+
+    Ok(json!({
+        "status": status,
+        "dof_numeric": report.dof_numeric,
+        "dof_grubler": report.dof_grubler,
+        "redundant_constraints": report.redundant_constraints,
+        "grounded_parts": report.grounded_parts,
+        "moving_parts": report.moving_parts,
+        "floating_parts": report.floating_parts,
+        "unconnected_parts": report.unconnected_parts,
+        "joint_constraints_count": report.joint_constraints_count,
+        "jacobian_rows": report.jacobian_rows,
+        "jacobian_cols": report.jacobian_cols,
+        "jacobian_rank": report.jacobian_rank,
+        "singular_values": report.singular_values,
+        "rank_tolerance": report.rank_tolerance,
+        "warnings": report.warnings,
+        "notes": report.notes,
+        "joints_count": state.physics_world.joints().len(),
+        "length_unit": unit.as_str(),
+        "units": unit.units_metadata(),
+    }))
+}
+
+/// Tool 13 (`check_interference`): Performs static multi-body interference and clearance analysis
+/// across all or selected part pairs using broad-phase AABB filtering and narrow-phase CSG Boolean
+/// intersection (`P3-T10`).
+pub fn check_interference(args: &Value, state: &mut EngineState) -> Result<Value, ServerError> {
+    let unit = state.resolve_length_unit(args)?;
+    let k_from_m = unit.from_meters_factor();
+    let k_vol = k_from_m.powi(3);
+
+    let ignore_adjacent = match args.get("ignore_adjacent") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => {
+            return Err(ServerError::InvalidArgument(
+                "Argument 'ignore_adjacent' must be a boolean".to_string(),
+            ));
+        }
+    };
+
+    let part_ids: Option<Vec<String>> = match args.get("part_ids") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(arr)) => {
+            let mut ids = Vec::with_capacity(arr.len());
+            for (idx, item) in arr.iter().enumerate() {
+                let s = item.as_str().ok_or_else(|| {
+                    ServerError::InvalidArgument(format!(
+                        "Argument 'part_ids[{idx}]' must be a non-empty string"
+                    ))
+                })?;
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    return Err(ServerError::InvalidArgument(format!(
+                        "Argument 'part_ids[{idx}]' must not be empty"
+                    )));
+                }
+                if !trimmed.eq_ignore_ascii_case("ground")
+                    && !trimmed.eq_ignore_ascii_case("world")
+                    && !state.parts.contains_key(trimmed)
+                {
+                    return Err(ServerError::PartNotFound(trimmed.to_string()));
+                }
+                ids.push(trimmed.to_string());
+            }
+            Some(ids)
+        }
+        Some(_) => {
+            return Err(ServerError::InvalidArgument(
+                "Argument 'part_ids' must be an array of part ID strings".to_string(),
+            ));
+        }
+    };
+
+    let explicit_pairs: Option<Vec<(String, String)>> = match args.get("pairs") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(arr)) => {
+            let mut list = Vec::with_capacity(arr.len());
+            for (idx, pair_val) in arr.iter().enumerate() {
+                let pair_arr = pair_val.as_array().ok_or_else(|| {
+                    ServerError::InvalidArgument(format!(
+                        "Argument 'pairs[{idx}]' must be a 2-element array [part_a, part_b]"
+                    ))
+                })?;
+                if pair_arr.len() != 2 {
+                    return Err(ServerError::InvalidArgument(format!(
+                        "Argument 'pairs[{idx}]' must contain exactly 2 part IDs"
+                    )));
+                }
+                let a = pair_arr[0]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        ServerError::InvalidArgument(format!(
+                            "Argument 'pairs[{idx}][0]' must be a non-empty string"
+                        ))
+                    })?;
+                let b = pair_arr[1]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        ServerError::InvalidArgument(format!(
+                            "Argument 'pairs[{idx}][1]' must be a non-empty string"
+                        ))
+                    })?;
+                if a == b {
+                    return Err(ServerError::InvalidArgument(format!(
+                        "Argument 'pairs[{idx}]' cannot pair part '{a}' with itself"
+                    )));
+                }
+                if !state.parts.contains_key(a) {
+                    return Err(ServerError::PartNotFound(a.to_string()));
+                }
+                if !state.parts.contains_key(b) {
+                    return Err(ServerError::PartNotFound(b.to_string()));
+                }
+                list.push((a.to_string(), b.to_string()));
+            }
+            Some(list)
+        }
+        Some(_) => {
+            return Err(ServerError::InvalidArgument(
+                "Argument 'pairs' must be an array of [part_a, part_b] pairs".to_string(),
+            ));
+        }
+    };
+
+    // Synchronize any parts with valid mesh into the physics world
+    for part in state.parts.values() {
+        if !part.mesh.vertices.is_empty() {
+            let _ = state.physics_world.add_part(part, !part.is_fixed);
+        }
+    }
+
+    let report = state.physics_world.check_interference_with_parts(
+        part_ids.as_deref(),
+        ignore_adjacent,
+        explicit_pairs.as_deref(),
+        Some(&state.parts),
+    )?;
+
+    let mut pairs_json = Vec::with_capacity(report.pairs.len());
+    let mut interfering_pairs_json = Vec::new();
+
+    for p in &report.pairs {
+        let pen_u = p.penetration_depth.map(|d| d * k_from_m);
+        let vol_u = p.intersection_volume.map(|v| v * k_vol);
+        let clr_u = p.clearance.map(|c| c * k_from_m);
+        let item = json!({
+            "a": p.a,
+            "b": p.b,
+            "intersects": p.intersects,
+            "adjacent_by_joint": p.adjacent_by_joint,
+            "aabb_overlap": p.aabb_overlap,
+            "penetration_depth": pen_u,
+            "penetration_depth_m": p.penetration_depth,
+            "intersection_volume": vol_u,
+            "intersection_volume_m3": p.intersection_volume,
+            "clearance": clr_u,
+            "clearance_m": p.clearance,
+        });
+        if p.intersects {
+            interfering_pairs_json.push(item.clone());
+        }
+        pairs_json.push(item);
+    }
+
+    Ok(json!({
+        "status": report.status,
+        "intersects": report.interfering_pairs_count > 0,
+        "candidate_pairs_count": report.candidate_pairs_count,
+        "skipped_adjacent_pairs_count": report.skipped_adjacent_pairs_count,
+        "broadphase_overlap_pairs_count": report.broadphase_overlap_pairs_count,
+        "evaluated_pairs_count": report.evaluated_pairs_count,
+        "interfering_pairs_count": report.interfering_pairs_count,
+        "min_clearance": report.min_clearance.map(|c| c * k_from_m),
+        "min_clearance_m": report.min_clearance,
+        "max_intersection_volume": report.max_intersection_volume * k_vol,
+        "max_intersection_volume_m3": report.max_intersection_volume,
+        "max_penetration_depth": report.max_penetration_depth * k_from_m,
+        "max_penetration_depth_m": report.max_penetration_depth,
+        "ignore_adjacent": report.ignore_adjacent,
+        "pairs": pairs_json,
+        "interfering_pairs": interfering_pairs_json,
+        "elapsed_ms": report.elapsed_ms,
+        "length_unit": unit.as_str(),
+        "units": unit.units_metadata(),
+    }))
+}
+
+/// Tool 14 (`sweep_joint`): Sweeps a revolute or prismatic joint across `[from, to]` in `steps`
+/// discrete intervals, evaluating interference and minimum clearance along the trajectory (`P3-T10`).
+pub fn sweep_joint(args: &Value, state: &mut EngineState) -> Result<Value, ServerError> {
+    let unit = state.resolve_length_unit(args)?;
+    let k_to_m = unit.to_meters_factor();
+    let k_from_m = unit.from_meters_factor();
+    let k_vol = k_from_m.powi(3);
+
+    let raw_joint_id = args
+        .get("joint_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            ServerError::InvalidArgument("Missing required argument 'joint_id'".to_string())
+        })?;
+    let joint_id = raw_joint_id.trim();
+    if joint_id.is_empty() {
+        return Err(ServerError::InvalidArgument(
+            "Argument 'joint_id' must be a non-empty string".to_string(),
+        ));
+    }
+
+    let from_raw = match args.get("from") {
+        None | Some(Value::Null) => {
+            return Err(ServerError::InvalidArgument(
+                "Missing required argument 'from'".to_string(),
+            ));
+        }
+        Some(v) => v.as_f64().ok_or_else(|| {
+            ServerError::InvalidArgument("Argument 'from' must be a finite number".to_string())
+        })?,
+    };
+    if !from_raw.is_finite() {
+        return Err(ServerError::InvalidArgument(format!(
+            "Argument 'from' must be a finite number, got {from_raw}"
+        )));
+    }
+
+    let to_raw = match args.get("to") {
+        None | Some(Value::Null) => {
+            return Err(ServerError::InvalidArgument(
+                "Missing required argument 'to'".to_string(),
+            ));
+        }
+        Some(v) => v.as_f64().ok_or_else(|| {
+            ServerError::InvalidArgument("Argument 'to' must be a finite number".to_string())
+        })?,
+    };
+    if !to_raw.is_finite() {
+        return Err(ServerError::InvalidArgument(format!(
+            "Argument 'to' must be a finite number, got {to_raw}"
+        )));
+    }
+
+    let steps: usize = match args.get("steps") {
+        None | Some(Value::Null) => {
+            return Err(ServerError::InvalidArgument(
+                "Missing required argument 'steps'".to_string(),
+            ));
+        }
+        Some(v) => {
+            let n = v.as_i64().ok_or_else(|| {
+                ServerError::InvalidArgument(
+                    "Argument 'steps' must be a positive integer (>= 1)".to_string(),
+                )
+            })?;
+            if !(1..=10_000).contains(&n) {
+                return Err(ServerError::InvalidArgument(format!(
+                    "Argument 'steps' must be between 1 and 10000, got {n}"
+                )));
+            }
+            n as usize
+        }
+    };
+
+    let ignore_adjacent = match args.get("ignore_adjacent") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => {
+            return Err(ServerError::InvalidArgument(
+                "Argument 'ignore_adjacent' must be a boolean".to_string(),
+            ));
+        }
+    };
+
+    let angle_unit = match args.get("angle_unit") {
+        None | Some(Value::Null) => "deg",
+        Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "deg" | "degree" | "degrees" => "deg",
+            "rad" | "radian" | "radians" => "rad",
+            other => {
+                return Err(ServerError::InvalidArgument(format!(
+                    "Argument 'angle_unit' must be 'deg' or 'rad', got '{other}'"
+                )));
+            }
+        },
+        Some(_) => {
+            return Err(ServerError::InvalidArgument(
+                "Argument 'angle_unit' must be 'deg' or 'rad'".to_string(),
+            ));
+        }
+    };
+
+    // Synchronize any parts with valid mesh into the physics world
+    for part in state.parts.values() {
+        if !part.mesh.vertices.is_empty() {
+            let _ = state.physics_world.add_part(part, !part.is_fixed);
+        }
+    }
+
+    let joint_rec = state
+        .physics_world
+        .joints()
+        .get(joint_id)
+        .ok_or_else(|| ServerError::Physics(PhysicsError::JointNotFound(joint_id.to_string())))?;
+
+    let (is_revolute, k_coord_to_si, k_coord_from_si, sweep_unit) = match &joint_rec.joint_type {
+        CadJointType::Revolute { .. } => {
+            if angle_unit == "rad" {
+                (true, 1.0, 1.0, "rad".to_string())
+            } else {
+                (
+                    true,
+                    std::f64::consts::PI / 180.0,
+                    180.0 / std::f64::consts::PI,
+                    "deg".to_string(),
+                )
+            }
+        }
+        CadJointType::Prismatic { .. } => (false, k_to_m, k_from_m, unit.as_str().to_string()),
+        other => {
+            return Err(ServerError::Physics(
+                PhysicsError::InvalidJointConfiguration(format!(
+                    "sweep_joint is only supported on 'revolute' and 'prismatic' joints, but joint '{joint_id}' has type '{}'",
+                    other.type_name()
+                )),
+            ));
+        }
+    };
+
+    let from_si = from_raw * k_coord_to_si;
+    let to_si = to_raw * k_coord_to_si;
+
+    let report = state.physics_world.sweep_joint_with_parts(
+        joint_id,
+        from_si,
+        to_si,
+        steps,
+        ignore_adjacent,
+        Some(&state.parts),
+    )?;
+
+    let format_pair = |p: &mcp_cad_physics::telemetry::PairInterferenceResult| -> Value {
+        json!({
+            "a": p.a,
+            "b": p.b,
+            "intersects": p.intersects,
+            "adjacent_by_joint": p.adjacent_by_joint,
+            "aabb_overlap": p.aabb_overlap,
+            "penetration_depth": p.penetration_depth.map(|d| d * k_from_m),
+            "penetration_depth_m": p.penetration_depth,
+            "intersection_volume": p.intersection_volume.map(|v| v * k_vol),
+            "intersection_volume_m3": p.intersection_volume,
+            "clearance": p.clearance.map(|c| c * k_from_m),
+            "clearance_m": p.clearance,
+        })
+    };
+
+    let first_collision_pairs_json: Vec<Value> = report
+        .first_collision_pairs
+        .iter()
+        .map(format_pair)
+        .collect();
+
+    let samples_json: Vec<Value> = report
+        .samples
+        .iter()
+        .map(|s| {
+            let pairs_s: Vec<Value> = s.interfering_pairs.iter().map(format_pair).collect();
+            json!({
+                "step_index": s.step_index,
+                "value": s.value * k_coord_from_si,
+                "intersects": s.intersects,
+                "interfering_pairs_count": s.interfering_pairs_count,
+                "min_clearance": s.min_clearance.map(|c| c * k_from_m),
+                "min_clearance_m": s.min_clearance,
+                "max_penetration_depth": s.max_penetration_depth * k_from_m,
+                "max_intersection_volume": s.max_intersection_volume * k_vol,
+                "interfering_pairs": pairs_s,
+            })
+        })
+        .collect();
+
+    let first_col_val_u = report.first_collision_value.map(|v| v * k_coord_from_si);
+    let min_clr_u = report.min_clearance.map(|c| c * k_from_m);
+    let min_clr_val_u = report.min_clearance_value.map(|v| v * k_coord_from_si);
+    let safe_range_u = report.safe_travel_range * k_coord_from_si;
+    let margin_u = if report.collision_detected {
+        Some(safe_range_u)
+    } else {
+        min_clr_u
+    };
+
+    let mut resp = json!({
+        "status": report.status,
+        "joint_id": report.joint_id,
+        "joint_type": report.joint_type,
+        "driven_part_id": report.driven_part_id,
+        "reference_part_id": report.reference_part_id,
+        "from": from_raw,
+        "to": to_raw,
+        "steps": report.steps,
+        "sweep_unit": sweep_unit,
+        "collision_detected": report.collision_detected,
+        "first_collision_step": report.first_collision_step,
+        "first_collision_value": first_col_val_u,
+        "first_collision_pairs": first_collision_pairs_json,
+        "min_clearance": min_clr_u,
+        "min_clearance_m": report.min_clearance,
+        "min_clearance_step": report.min_clearance_step,
+        "min_clearance_value": min_clr_val_u,
+        "safe_travel_range": safe_range_u,
+        "margin_to_collision": margin_u,
+        "ignore_adjacent": report.ignore_adjacent,
+        "samples": samples_json,
+        "elapsed_ms": report.elapsed_ms,
+        "length_unit": unit.as_str(),
+        "units": unit.units_metadata(),
+    });
+
+    if is_revolute {
+        if let Some(obj) = resp.as_object_mut() {
+            obj.insert(
+                "first_collision_angle_deg".to_string(),
+                json!(report.first_collision_value.map(|v| v.to_degrees())),
+            );
+            obj.insert(
+                "first_collision_angle_rad".to_string(),
+                json!(report.first_collision_value),
+            );
+        }
+    }
+
+    Ok(resp)
 }
 
 #[cfg(test)]
@@ -673,7 +1364,7 @@ mod tests {
         let m_res = set_joint_motor(
             &json!({
                 "joint_id": "j_driver_custom",
-                "target_velocity": 6.28,
+                "target_velocity": std::f64::consts::TAU,
                 "max_force": 100.0
             }),
             &mut state,
@@ -1002,6 +1693,146 @@ mod tests {
         )
         .expect("valid simulation should succeed");
         assert!(sim_res["steps_simulated"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn test_p3_t6_get_part_load_cases_unit() {
+        let mut state = EngineState::new().expect("EngineState initialization failed");
+        cad::create_part(
+            &json!({ "name": "Wall", "part_id": "wall_u", "material": "steel_1045", "is_fixed": true }),
+            &mut state,
+        )
+        .unwrap();
+        cad::add_feature_primitive(
+            &json!({
+                "part_id": "wall_u",
+                "primitive_type": "box",
+                "params": { "width": 20.0, "height": 60.0, "depth": 60.0 },
+                "position": [-20.0, 0.0, 0.0]
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        cad::create_part(
+            &json!({ "name": "Beam", "part_id": "beam_u", "material": "steel_1045" }),
+            &mut state,
+        )
+        .unwrap();
+        cad::add_feature_primitive(
+            &json!({
+                "part_id": "beam_u",
+                "primitive_type": "box",
+                "params": { "width": 200.0, "height": 20.0, "depth": 20.0 },
+                "position": [100.0, 0.0, 0.0]
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        // Before simulation -> INVALID_ARGUMENT
+        let pre_err = get_part_load_cases(&json!({ "part_id": "beam_u" }), &mut state).unwrap_err();
+        assert_eq!(pre_err.to_error_body().code, "INVALID_ARGUMENT");
+
+        create_joint(
+            &json!({
+                "joint_id": "j_fixed_u",
+                "joint_type": "fixed",
+                "part_a": "wall_u",
+                "part_b": "beam_u",
+                "anchor_a": [0.0, 0.0, 0.0],
+                "anchor_b": [0.0, 0.0, 0.0]
+            }),
+            &mut state,
+        )
+        .expect("create fixed joint should succeed");
+
+        run_physics_simulation(
+            &json!({
+                "duration_seconds": 0.2,
+                "step_size_ms": 5.0
+            }),
+            &mut state,
+        )
+        .expect("simulation should succeed");
+
+        let lc = get_part_load_cases(
+            &json!({
+                "part_id": "beam_u",
+                "select": "peak_force"
+            }),
+            &mut state,
+        )
+        .expect("get_part_load_cases should succeed");
+        assert_eq!(lc["part_id"], "beam_u");
+        assert_eq!(lc["joints"][0]["joint_id"], "j_fixed_u");
+        assert!(lc["joints"][0]["force_magnitude"].as_f64().unwrap() > 0.0);
+        assert!(lc["joints"][0]["torque_magnitude"].as_f64().unwrap() > 0.0);
+    }
+
+    #[test]
+    fn test_p3_t9_analyze_mechanism_unit() {
+        let mut state = EngineState::new().expect("EngineState init");
+
+        // 1. Create a fixed base and a free moving arm (no joints yet)
+        cad::create_part(
+            &json!({ "name": "Base", "part_id": "base_u", "material": "steel_structural_aisi1020", "is_fixed": true }),
+            &mut state,
+        )
+        .unwrap();
+        cad::add_feature_primitive(
+            &json!({ "part_id": "base_u", "primitive_type": "box", "params": { "width": 100.0, "height": 20.0, "depth": 20.0 } }),
+            &mut state,
+        )
+        .unwrap();
+
+        cad::create_part(
+            &json!({ "name": "Arm", "part_id": "arm_u", "material": "aluminum_6061_t6", "is_fixed": false }),
+            &mut state,
+        )
+        .unwrap();
+        cad::add_feature_primitive(
+            &json!({ "part_id": "arm_u", "primitive_type": "box", "params": { "width": 20.0, "height": 100.0, "depth": 20.0 } }),
+            &mut state,
+        )
+        .unwrap();
+
+        let free_rep = analyze_mechanism(&json!({}), &mut state).expect("analyze free");
+        assert_eq!(free_rep["dof_numeric"], 6);
+        assert_eq!(free_rep["dof_grubler"], 6);
+        assert_eq!(free_rep["unconnected_parts"], json!(["arm_u"]));
+        assert_eq!(free_rep["floating_parts"], json!(["arm_u"]));
+        assert_eq!(free_rep["status"], "WARN");
+
+        // 2. Connect with a Revolute joint -> DOF = 1
+        create_joint(
+            &json!({
+                "joint_id": "j_rev_u",
+                "joint_type": "revolute",
+                "part_a": "base_u",
+                "part_b": "arm_u",
+                "anchor_a": [0.0, 0.0, 0.0],
+                "anchor_b": [0.0, -50.0, 0.0],
+                "axis": [0.0, 0.0, 1.0]
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        let rev_rep = analyze_mechanism(&json!({}), &mut state).expect("analyze revolute");
+        assert_eq!(rev_rep["dof_numeric"], 1);
+        assert_eq!(rev_rep["dof_grubler"], 1);
+        assert_eq!(rev_rep["redundant_constraints"], 0);
+        assert_eq!(rev_rep["floating_parts"], json!([]));
+        assert_eq!(rev_rep["unconnected_parts"], json!([]));
+        assert_eq!(rev_rep["status"], "PASS");
+
+        // 3. Invalid inputs: unknown part_id and non-positive rank_tolerance
+        let err_part = analyze_mechanism(&json!({ "part_ids": ["missing_part"] }), &mut state).unwrap_err();
+        assert_eq!(err_part.to_error_body().code, "PART_NOT_FOUND");
+
+        let err_tol = analyze_mechanism(&json!({ "rank_tolerance": 0.0 }), &mut state).unwrap_err();
+        assert_eq!(err_tol.to_error_body().code, "INVALID_ARGUMENT");
     }
 }
 

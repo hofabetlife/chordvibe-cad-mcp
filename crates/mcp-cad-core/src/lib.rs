@@ -13,6 +13,7 @@ pub mod export_stl;
 pub mod import_stl;
 pub mod diagnostics;
 pub mod query_optimizer;
+pub mod gear_strength;
 
 pub use error::CadError;
 pub use material::{Material, MaterialRegistry};
@@ -39,3 +40,9 @@ pub use export_stl::{
     write_part_stl_with_quality, write_stl_ascii_file, write_stl_binary_file,
 };
 pub use import_stl::{import_stl, import_stl_ascii, import_stl_binary, import_stl_file, weld_vertices};
+pub use gear_strength::{
+    barth_dynamic_factor_si, evaluate_gear_strength, hertz_contact_stress_pa,
+    hertz_elastic_coefficient_pa, lewis_bending_stress_pa, lewis_form_factor,
+    transmitted_tangential_force, GearManufacturingMethod, GearStrengthCalculationParams,
+    GearStrengthReport, LEWIS_Y_RACK_20_DEG, LEWIS_Y_TABLE_20_DEG,
+};

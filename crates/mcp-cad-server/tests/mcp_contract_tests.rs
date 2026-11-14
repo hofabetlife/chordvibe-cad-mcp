@@ -141,8 +141,8 @@ async fn test_mcp_tools_list() {
         .as_array()
         .expect("tools must be an array");
 
-    // Must declare exactly 34 tools
-    assert_eq!(tools.len(), 34, "Server must expose exactly 34 MCP tools");
+    // Must declare all 40 tools
+    assert_eq!(tools.len(), 40, "Server must expose exactly 40 MCP tools");
 
     let expected_tools = [
         "create_part",
@@ -179,6 +179,12 @@ async fn test_mcp_tools_list() {
         "set_requirements",
         "check_requirements",
         "get_scene_summary",
+        "get_part_load_cases",
+        "run_fea_from_simulation",
+        "check_gear_strength",
+        "analyze_mechanism",
+        "check_interference",
+        "sweep_joint",
     ];
 
     let mut found_names = HashSet::new();
@@ -2421,7 +2427,7 @@ async fn test_bug015_create_joint_and_create_part_schema_contract() {
     })).await;
 
     let tools = list_resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 34, "tools/list must expose all 34 MCP tools");
+    assert_eq!(tools.len(), 40, "tools/list must expose all 40 MCP tools");
 
     let create_part_tool = tools.iter().find(|t| t["name"] == "create_part").unwrap();
     assert!(
@@ -4106,7 +4112,8 @@ async fn test_mcp_p2_t9_requirements_and_auto_check() {
     assert_eq!(set_req_json["auto_check"], true);
     assert_eq!(set_req_json["requirements_count"], 5);
 
-    // Also set scene-level requirements (no_interference, mechanism_dof) -> NOT_AVAILABLE
+    // Also set scene-level requirements: no_interference (NOT_AVAILABLE until P3-T10)
+    // and mechanism_dof (active since P3-T9 -> evaluates free body DOF=6 != expected=1 -> FAIL)
     let set_scene_resp = rpc_call(
         &state,
         json!({
@@ -4136,7 +4143,7 @@ async fn test_mcp_p2_t9_requirements_and_auto_check() {
     .await;
     assert_eq!(parse_content(&set_scene_resp)["status"], "requirements_set");
 
-    // 4. Check all requirements (before FEA is run -> min_safety_factor is STALE)
+    // 4. Check all requirements (before FEA is run -> min_safety_factor is STALE, req_dof is FAIL for free body 6 != 1)
     let check_1_resp = rpc_call(
         &state,
         json!({
@@ -4152,10 +4159,10 @@ async fn test_mcp_p2_t9_requirements_and_auto_check() {
     .await;
     let check_1 = parse_content(&check_1_resp);
     assert_eq!(check_1["summary"]["passed"], 4);
-    assert_eq!(check_1["summary"]["failed"], 0);
+    assert_eq!(check_1["summary"]["failed"], 1);
     assert_eq!(check_1["summary"]["stale"], 1);
-    assert_eq!(check_1["summary"]["not_available"], 2);
-    assert_eq!(check_1["status"], "STALE");
+    assert_eq!(check_1["summary"]["not_available"], 1);
+    assert_eq!(check_1["status"], "FAIL");
 
     let reqs_1 = check_1["requirements"].as_array().unwrap();
     let fos_1 = reqs_1.iter().find(|r| r["id"] == "req_fos").unwrap();
@@ -4165,7 +4172,8 @@ async fn test_mcp_p2_t9_requirements_and_auto_check() {
     let interf_1 = reqs_1.iter().find(|r| r["id"] == "req_interf").unwrap();
     assert_eq!(interf_1["status"], "NOT_AVAILABLE");
     let dof_1 = reqs_1.iter().find(|r| r["id"] == "req_dof").unwrap();
-    assert_eq!(dof_1["status"], "NOT_AVAILABLE");
+    assert_eq!(dof_1["status"], "FAIL");
+    assert_eq!(dof_1["measured"], 6);
 
     // 5. Run FEA analysis with fea_case = "cantilever_tip"
     let fea_resp = rpc_call(
@@ -4272,14 +4280,15 @@ async fn test_mcp_p2_t9_requirements_and_auto_check() {
         "modify_feature must include requirements_status when auto_check=true"
     );
     assert_eq!(mod_json["requirements_status"]["passed"], 2); // bbox_min, mesh_valid
-    assert_eq!(mod_json["requirements_status"]["failed"], 2); // bbox_max, mass_max
+    assert_eq!(mod_json["requirements_status"]["failed"], 3); // bbox_max, mass_max, mechanism_dof
     assert_eq!(mod_json["requirements_status"]["stale"], 1);  // min_safety_factor (part revision 2 != fea revision 1)
     let failed_reqs = mod_json["failed_requirements"]
         .as_array()
         .expect("failed_requirements must be present");
-    assert_eq!(failed_reqs.len(), 2);
+    assert_eq!(failed_reqs.len(), 3);
     assert!(failed_reqs.iter().any(|r| r["id"] == "req_bbox_max" && r["status"] == "FAIL"));
     assert!(failed_reqs.iter().any(|r| r["id"] == "req_mass" && r["status"] == "FAIL"));
+    assert!(failed_reqs.iter().any(|r| r["id"] == "req_dof" && r["status"] == "FAIL"));
 
     // 8. Cut a through-hole -> genus becomes 1, so mesh_valid {expected_genus: 0} also FAILS!
     let hole_resp = rpc_call(
@@ -4303,7 +4312,7 @@ async fn test_mcp_p2_t9_requirements_and_auto_check() {
     .await;
     let hole_json = parse_content(&hole_resp);
     assert_eq!(hole_json["revision"], 3);
-    assert_eq!(hole_json["requirements_status"]["failed"], 3); // bbox_max, mass_max, mesh_valid (genus=1 != 0)
+    assert_eq!(hole_json["requirements_status"]["failed"], 4); // bbox_max, mass_max, mesh_valid (genus=1 != 0), mechanism_dof
     let hole_failed = hole_json["failed_requirements"].as_array().unwrap();
     assert!(hole_failed.iter().any(|r| r["id"] == "req_mesh" && r["status"] == "FAIL"));
 
@@ -4363,9 +4372,9 @@ async fn test_mcp_p2_t9_requirements_and_auto_check() {
     let check_loaded = parse_content(&check_loaded_resp);
     assert_eq!(check_loaded["auto_check"], true);
     assert_eq!(check_loaded["summary"]["total"], 7);
-    assert_eq!(check_loaded["summary"]["failed"], 3);
+    assert_eq!(check_loaded["summary"]["failed"], 4);
     assert_eq!(check_loaded["summary"]["stale"], 1);
-    assert_eq!(check_loaded["summary"]["not_available"], 2);
+    assert_eq!(check_loaded["summary"]["not_available"], 1);
 
     // 10. Negative test: invalid requirement type returns structured INVALID_ARGUMENT
     let bad_req_resp = rpc_call(
@@ -4417,6 +4426,9 @@ fn assert_numeric_schema_fields_have_units(tool_name: &str, path: &str, schema: 
         "(s)",
         "(ms)",
         "millisecond",
+        "watt",
+        "kw",
+        "rpm",
         "dimensionless",
     ];
 
@@ -4521,6 +4533,17 @@ async fn test_mcp_p2_t10_initialize_instructions_and_tool_descriptions_contract(
         "query_part_geometry",
         "STALE",
         "isError",
+        // P2-T39 geometric & workflow invariants
+        "SKILL.md",
+        "crates/",
+        "[-height/2, +height/2]",
+        "csg_union",
+        "csg_difference",
+        "radius_bottom",
+        "radius_top",
+        "cut_helical_groove",
+        "capture_viewport",
+        "open_preview_window",
     ] {
         assert!(
             instructions.contains(required_topic),
@@ -4562,7 +4585,7 @@ async fn test_mcp_p2_t10_initialize_instructions_and_tool_descriptions_contract(
     let tools = list_resp["result"]["tools"]
         .as_array()
         .expect("tools must be an array");
-    assert_eq!(tools.len(), 34);
+    assert_eq!(tools.len(), 40);
 
     for tool in tools {
         let name = tool["name"].as_str().unwrap();
@@ -4586,6 +4609,26 @@ async fn test_mcp_p2_t10_initialize_instructions_and_tool_descriptions_contract(
         );
 
         assert_numeric_schema_fields_have_units(name, "", &tool["inputSchema"]);
+
+        // P2-T39 tool description invariants
+        if name == "add_feature_primitive" {
+            for kw in ["[-height/2, +height/2]", "csg_union", "radius_bottom"] {
+                assert!(
+                    desc.contains(kw),
+                    "Tool '{name}' description must mention '{kw}'"
+                );
+            }
+        } else if name == "open_preview_window" {
+            assert!(
+                desc.contains("--stl"),
+                "Tool '{name}' description must mention '--stl'"
+            );
+        } else if name == "validate_mesh" {
+            assert!(
+                desc.contains("strict_slivers"),
+                "Tool '{name}' description must mention 'strict_slivers'"
+            );
+        }
     }
 }
 
@@ -5246,9 +5289,8 @@ async fn test_mcp_p2_t12_batch_physics_rollback_and_fixed_part_preservation() {
             guard.physics_world.has_part("fixed_anchor"),
             "{tool_name} must register 'fixed_anchor' in physics_world"
         );
-        assert_eq!(
-            guard.physics_world.is_part_dynamic("fixed_anchor").unwrap(),
-            false,
+        assert!(
+            !guard.physics_world.is_part_dynamic("fixed_anchor").unwrap(),
             "{tool_name} must preserve !part.is_fixed (is_dynamic == false) for fixed_anchor"
         );
     }
@@ -5575,7 +5617,7 @@ async fn test_mcp_p2_t13_custom_joint_id_through_hole_and_aliases() {
                 "name": "set_joint_motor",
                 "arguments": {
                     "joint_id": "j_bushing_drive",
-                    "target_velocity": 6.283185,
+                    "target_velocity": std::f64::consts::TAU,
                     "max_force": 200.0
                 }
             }
@@ -9284,3 +9326,1255 @@ async fn test_mcp_p2_t35_feature_mutation_tools_part_id_depth_and_feature_id() {
     assert!(groove_data["bounding_box"]["dimensions"].is_array());
     assert!(groove_data["volume"].as_f64().unwrap() > 0.0);
 }
+
+#[tokio::test]
+async fn test_mcp_p2_t36_optimize_feature_tree_dag_scaling_delete_part_id_and_gravity_f64() {
+    let state = EngineState::new()
+        .expect("EngineState initialization failed")
+        .into_shared();
+
+    // 1. Create a part and add coaxial cylinder + hole features in default "mm"
+    let _ = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3601,
+            "method": "tools/call",
+            "params": {
+                "name": "create_part",
+                "arguments": {
+                    "part_id": "sleeve_p2t36",
+                    "name": "Sleeve P2-T36",
+                    "material": "steel_structural_aisi1020"
+                }
+            }
+        }),
+    )
+    .await;
+
+    let _ = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3602,
+            "method": "tools/call",
+            "params": {
+                "name": "add_feature_primitive",
+                "arguments": {
+                    "part_id": "sleeve_p2t36",
+                    "primitive_type": "cylinder",
+                    "params": {
+                        "radius": 28.0,
+                        "height": 60.0
+                    }
+                }
+            }
+        }),
+    )
+    .await;
+
+    let _ = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3603,
+            "method": "tools/call",
+            "params": {
+                "name": "cut_hole",
+                "arguments": {
+                    "part_id": "sleeve_p2t36",
+                    "position": [0.0, 0.0, 30.0],
+                    "normal": [0.0, 0.0, -1.0],
+                    "radius": 14.0,
+                    "depth": 60.0
+                }
+            }
+        }),
+    )
+    .await;
+
+    // 2. Call optimize_feature_tree with apply: false (default length_unit: "mm")
+    let opt_mm_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3604,
+            "method": "tools/call",
+            "params": {
+                "name": "optimize_feature_tree",
+                "arguments": {
+                    "part_id": "sleeve_p2t36",
+                    "apply": false
+                }
+            }
+        }),
+    )
+    .await;
+    assert_ne!(opt_mm_resp["result"]["isError"], json!(true));
+    let opt_mm = parse_content(&opt_mm_resp);
+    assert_eq!(opt_mm["length_unit"], "mm");
+    assert!((opt_mm["logical_plan"]["dag"][0]["op"]["AddCylinder"]["radius"].as_f64().unwrap() - 28.0).abs() < 1e-6);
+    assert!((opt_mm["logical_plan"]["dag"][0]["op"]["AddCylinder"]["height"].as_f64().unwrap() - 60.0).abs() < 1e-6);
+    assert!((opt_mm["logical_plan"]["dag"][1]["op"]["CutHole"]["radius"].as_f64().unwrap() - 14.0).abs() < 1e-6);
+    assert!((opt_mm["logical_plan"]["dag"][1]["op"]["CutHole"]["depth"].as_f64().unwrap() - 60.0).abs() < 1e-6);
+    assert!((opt_mm["physical_plan"]["dag"][0]["op"]["AddRevolve"]["profile"][0][0].as_f64().unwrap() - 14.0).abs() < 1e-6);
+    assert!((opt_mm["candidate_plans"][0]["dag"][0]["op"]["AddCylinder"]["radius"].as_f64().unwrap() - 28.0).abs() < 1e-6);
+
+    // 3. Call optimize_feature_tree with length_unit: "m" and apply: true
+    let opt_m_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3605,
+            "method": "tools/call",
+            "params": {
+                "name": "optimize_feature_tree",
+                "arguments": {
+                    "part_id": "sleeve_p2t36",
+                    "apply": true,
+                    "length_unit": "m"
+                }
+            }
+        }),
+    )
+    .await;
+    assert_ne!(opt_m_resp["result"]["isError"], json!(true));
+    let opt_m = parse_content(&opt_m_resp);
+    assert_eq!(opt_m["length_unit"], "m");
+    assert!((opt_m["logical_plan"]["dag"][0]["op"]["AddCylinder"]["radius"].as_f64().unwrap() - 0.028).abs() < 1e-9);
+    assert!((opt_m["physical_plan"]["dag"][0]["op"]["AddRevolve"]["profile"][0][0].as_f64().unwrap() - 0.014).abs() < 1e-9);
+
+    // 4. Verify get_simulation_metrics_json returns exact f64 gravity (-9810.0 in mm/s^2, -9.81 in m/s^2)
+    let sim_mm_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3606,
+            "method": "tools/call",
+            "params": {
+                "name": "get_simulation_metrics_json",
+                "arguments": {
+                    "length_unit": "mm"
+                }
+            }
+        }),
+    )
+    .await;
+    assert_ne!(sim_mm_resp["result"]["isError"], json!(true));
+    let sim_mm = parse_content(&sim_mm_resp);
+    assert_eq!(sim_mm["current_metrics"]["physics"]["gravity"][1].as_f64().unwrap(), -9810.0);
+    assert_eq!(sim_mm["current_metrics"]["physics"]["gravity_m_s2"][1].as_f64().unwrap(), -9.81);
+
+    // 5. Verify delete_part returns status, part_id, and deleted_part_id
+    let del_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3607,
+            "method": "tools/call",
+            "params": {
+                "name": "delete_part",
+                "arguments": {
+                    "part_id": "sleeve_p2t36"
+                }
+            }
+        }),
+    )
+    .await;
+    assert_ne!(del_resp["result"]["isError"], json!(true));
+    let del_data = parse_content(&del_resp);
+    assert_eq!(del_data["status"], "deleted");
+    assert_eq!(del_data["part_id"], "sleeve_p2t36");
+    assert_eq!(del_data["deleted_part_id"], "sleeve_p2t36");
+}
+
+#[tokio::test]
+async fn test_mcp_p3_t6_get_part_load_cases_contract() {
+    let state = EngineState::new()
+        .expect("EngineState initialization failed")
+        .into_shared();
+
+    // 1. Create a fixed wall (`is_fixed: true`) and a horizontal cantilever beam (`L = 200 mm` along +X)
+    let _ = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3701,
+            "method": "tools/call",
+            "params": {
+                "name": "batch_cad_operations",
+                "arguments": {
+                    "operations": [
+                        {
+                            "tool": "create_part",
+                            "params": {
+                                "part_id": "wall_p3t6",
+                                "name": "Fixed Wall",
+                                "material": "steel_structural_aisi1020",
+                                "is_fixed": true
+                            }
+                        },
+                        {
+                            "tool": "add_feature_primitive",
+                            "params": {
+                                "part_id": "wall_p3t6",
+                                "primitive_type": "box",
+                                "params": { "width": 20.0, "depth": 60.0, "height": 60.0 },
+                                "position": [-20.0, 0.0, 0.0]
+                            }
+                        },
+                        {
+                            "tool": "create_part",
+                            "params": {
+                                "part_id": "beam_p3t6",
+                                "name": "Cantilever Beam",
+                                "material": "steel_structural_aisi1020"
+                            }
+                        },
+                        {
+                            "tool": "add_feature_primitive",
+                            "params": {
+                                "part_id": "beam_p3t6",
+                                "primitive_type": "box",
+                                "params": { "width": 200.0, "depth": 20.0, "height": 20.0 },
+                                "position": [100.0, 0.0, 0.0]
+                            }
+                        }
+                    ]
+                }
+            }
+        }),
+    )
+    .await;
+
+    // 2. Calling get_part_load_cases BEFORE run_physics_simulation must return INVALID_ARGUMENT
+    let pre_sim_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3702,
+            "method": "tools/call",
+            "params": {
+                "name": "get_part_load_cases",
+                "arguments": { "part_id": "beam_p3t6" }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(pre_sim_resp["result"]["isError"], json!(true));
+    let pre_sim_err = parse_error_envelope(&pre_sim_resp);
+    assert_eq!(pre_sim_err.error.code, "INVALID_ARGUMENT");
+
+    // 3. Connect wall_p3t6 and beam_p3t6 with a Fixed joint at [0, 0, 0] mm and run simulation
+    let j_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3703,
+            "method": "tools/call",
+            "params": {
+                "name": "create_joint",
+                "arguments": {
+                    "joint_id": "weld_root",
+                    "joint_type": "fixed",
+                    "part_a": "wall_p3t6",
+                    "part_b": "beam_p3t6",
+                    "anchor_a": [0.0, 0.0, 0.0],
+                    "anchor_b": [0.0, 0.0, 0.0]
+                }
+            }
+        }),
+    )
+    .await;
+    assert_ne!(j_resp["result"]["isError"], json!(true));
+
+    let sim_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3704,
+            "method": "tools/call",
+            "params": {
+                "name": "run_physics_simulation",
+                "arguments": {
+                    "duration_seconds": 0.4,
+                    "step_size_ms": 5.0
+                }
+            }
+        }),
+    )
+    .await;
+    assert_ne!(sim_resp["result"]["isError"], json!(true));
+
+    // 4. Query load cases with select="peak_force" (default mm), select="peak_torque", and select=0.25 (m override)
+    let lc_force_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3705,
+            "method": "tools/call",
+            "params": {
+                "name": "get_part_load_cases",
+                "arguments": {
+                    "part_id": "beam_p3t6",
+                    "select": "peak_force"
+                }
+            }
+        }),
+    )
+    .await;
+    assert_ne!(lc_force_resp["result"]["isError"], json!(true));
+    let lc_force = parse_content(&lc_force_resp);
+    assert_eq!(lc_force["part_id"], "beam_p3t6");
+    assert_eq!(lc_force["select"], "peak_force");
+    assert_eq!(lc_force["length_unit"], "mm");
+
+    let mass_kg = lc_force["mass"].as_f64().unwrap();
+    let expected_fy = mass_kg * 9.81;
+    let expected_tz = mass_kg * 9.81 * 0.10; // L/2 = 0.10 m
+
+    let j0 = &lc_force["joints"][0];
+    assert_eq!(j0["joint_id"], "weld_root");
+    assert_eq!(j0["anchor_local"], json!([0.0, 0.0, 0.0]));
+    let fy = j0["force"][1].as_f64().unwrap();
+    let tz = j0["torque"][2].as_f64().unwrap();
+    assert!(
+        ((fy - expected_fy).abs() / expected_fy) < 0.01,
+        "Expected Fy ≈ {expected_fy} N, got {fy} N"
+    );
+    assert!(
+        ((tz - expected_tz).abs() / expected_tz) < 0.01,
+        "Expected Tz ≈ {expected_tz} N*m, got {tz} N*m"
+    );
+    assert!(
+        (lc_force["inertia"]["center_of_mass_local"][0].as_f64().unwrap() - 100.0).abs() < 1e-3,
+        "Expected center_of_mass_local.x ≈ 100 mm in 'mm' mode, got {:?}",
+        lc_force["inertia"]["center_of_mass_local"]
+    );
+    assert!(lc_force["equilibrium_residual_force_norm"].as_f64().unwrap() < 0.02 * expected_fy);
+
+    // 5. Query at specific timestamp select=0.25 with length_unit="m" and verify Newton's 3rd law with wall_p3t6
+    let lc_time_m_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3706,
+            "method": "tools/call",
+            "params": {
+                "name": "get_part_load_cases",
+                "arguments": {
+                    "part_id": "beam_p3t6",
+                    "select": 0.25,
+                    "length_unit": "m"
+                }
+            }
+        }),
+    )
+    .await;
+    assert_ne!(lc_time_m_resp["result"]["isError"], json!(true));
+    let lc_time_m = parse_content(&lc_time_m_resp);
+    assert_eq!(lc_time_m["length_unit"], "m");
+    assert!(
+        (lc_time_m["inertia"]["center_of_mass_local"][0].as_f64().unwrap() - 0.10).abs() < 1e-5,
+        "Expected center_of_mass_local.x ≈ 0.10 m in 'm' mode"
+    );
+
+    let lc_wall_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3707,
+            "method": "tools/call",
+            "params": {
+                "name": "get_part_load_cases",
+                "arguments": {
+                    "part_id": "wall_p3t6",
+                    "select": 0.25,
+                    "length_unit": "m"
+                }
+            }
+        }),
+    )
+    .await;
+    assert_ne!(lc_wall_resp["result"]["isError"], json!(true));
+    let lc_wall = parse_content(&lc_wall_resp);
+    let fy_beam = lc_time_m["joints"][0]["force"][1].as_f64().unwrap();
+    let fy_wall = lc_wall["joints"][0]["force"][1].as_f64().unwrap();
+    let tz_beam = lc_time_m["joints"][0]["torque"][2].as_f64().unwrap();
+    let tz_wall = lc_wall["joints"][0]["torque"][2].as_f64().unwrap();
+    assert!((fy_beam + fy_wall).abs() < 1e-6, "Newton 3rd law force: {fy_beam} vs {fy_wall}");
+    assert!((tz_beam + tz_wall).abs() < 1e-6, "Newton 3rd law torque: {tz_beam} vs {tz_wall}");
+
+    // 6. Error checks: unknown part -> PART_NOT_FOUND; invalid select -> INVALID_ARGUMENT with param="select"
+    let nf_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3708,
+            "method": "tools/call",
+            "params": {
+                "name": "get_part_load_cases",
+                "arguments": { "part_id": "missing_part" }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(nf_resp["result"]["isError"], json!(true));
+    assert_eq!(parse_error_envelope(&nf_resp).error.code, "PART_NOT_FOUND");
+
+    let bad_sel_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3709,
+            "method": "tools/call",
+            "params": {
+                "name": "get_part_load_cases",
+                "arguments": {
+                    "part_id": "beam_p3t6",
+                    "select": "invalid_selector"
+                }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(bad_sel_resp["result"]["isError"], json!(true));
+    let bad_sel_err = parse_error_envelope(&bad_sel_resp);
+    assert_eq!(bad_sel_err.error.code, "INVALID_ARGUMENT");
+    assert_eq!(bad_sel_err.error.param.as_deref(), Some("select"));
+}
+
+#[tokio::test]
+async fn test_mcp_p3_t7_run_fea_from_simulation_contract() {
+    let state = EngineState::new()
+        .expect("EngineState initialization failed")
+        .into_shared();
+
+    // 1. Calling run_fea_from_simulation before run_physics_simulation must return INVALID_ARGUMENT
+    let no_sim_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3801,
+            "method": "tools/call",
+            "params": {
+                "name": "run_fea_from_simulation",
+                "arguments": { "part_id": "beam_p3t7" }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(no_sim_resp["result"]["isError"], json!(true));
+    assert_eq!(parse_error_envelope(&no_sim_resp).error.code, "INVALID_ARGUMENT");
+
+    // 2. Build P3-T6(a) cantilever beam scene:
+    //    L = 200 mm (0.20 m), b = h = 20 mm (0.02 m), steel_structural_aisi1020
+    //    (rho = 7850 kg/m^3, E = 205 GPa, nu = 0.30, yield = 350 MPa),
+    //    fixed joint 'weld_root' at x = 0 mm to fixed support wall.
+    let batch_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3802,
+            "method": "tools/call",
+            "params": {
+                "name": "batch_cad_operations",
+                "arguments": {
+                    "operations": [
+                        {
+                            "tool": "create_part",
+                            "params": {
+                                "part_id": "wall_p3t7",
+                                "name": "Support Wall",
+                                "material": "steel_structural_aisi1020",
+                                "is_fixed": true
+                            }
+                        },
+                        {
+                            "tool": "add_feature_primitive",
+                            "params": {
+                                "part_id": "wall_p3t7",
+                                "primitive_type": "box",
+                                "params": {
+                                    "width": 20.0,
+                                    "depth": 40.0,
+                                    "height": 40.0,
+                                    "position": [-30.0, 0.0, 0.0]
+                                }
+                            }
+                        },
+                        {
+                            "tool": "create_part",
+                            "params": {
+                                "part_id": "beam_p3t7",
+                                "name": "Cantilever Beam P3T7",
+                                "material": "steel_structural_aisi1020"
+                            }
+                        },
+                        {
+                            "tool": "add_feature_primitive",
+                            "params": {
+                                "part_id": "beam_p3t7",
+                                "primitive_type": "box",
+                                "params": {
+                                    "width": 200.0,
+                                    "depth": 20.0,
+                                    "height": 20.0,
+                                    "position": [100.0, 0.0, 0.0]
+                                }
+                            }
+                        },
+                        {
+                            "tool": "create_joint",
+                            "params": {
+                                "joint_id": "weld_root",
+                                "joint_type": "fixed",
+                                "part_a": "wall_p3t7",
+                                "part_b": "beam_p3t7",
+                                "anchor_a": [0.0, 0.0, 0.0],
+                                "anchor_b": [0.0, 0.0, 0.0]
+                            }
+                        }
+                    ]
+                }
+            }
+        }),
+    )
+    .await;
+    assert_ne!(batch_resp["result"]["isError"], json!(true));
+
+    // Set requirement linked to run_fea_from_simulation case
+    let req_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3803,
+            "method": "tools/call",
+            "params": {
+                "name": "set_requirements",
+                "arguments": {
+                    "part_id": "beam_p3t7",
+                    "auto_check": true,
+                    "requirements": [
+                        {
+                            "id": "req_sim_fos",
+                            "type": "min_safety_factor",
+                            "value": 100.0,
+                            "fea_case": "sim_gravity_root"
+                        }
+                    ]
+                }
+            }
+        }),
+    )
+    .await;
+    assert_ne!(req_resp["result"]["isError"], json!(true));
+
+    // 3. Run physics simulation (0.4 s, dt = 2 ms)
+    let sim_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3804,
+            "method": "tools/call",
+            "params": {
+                "name": "run_physics_simulation",
+                "arguments": {
+                    "duration_seconds": 0.4,
+                    "step_size_ms": 2.0
+                }
+            }
+        }),
+    )
+    .await;
+    assert_ne!(sim_resp["result"]["isError"], json!(true));
+
+    // 4. Call run_fea_from_simulation on beam_p3t7
+    let fea_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3805,
+            "method": "tools/call",
+            "params": {
+                "name": "run_fea_from_simulation",
+                "arguments": {
+                    "part_id": "beam_p3t7",
+                    "select": 0.35,
+                    "fea_case": "sim_gravity_root",
+                    "mesh_density": "coarse",
+                    "element_order": 2
+                }
+            }
+        }),
+    )
+    .await;
+    assert_ne!(fea_resp["result"]["isError"], json!(true));
+    let fea = parse_content(&fea_resp);
+
+    assert_eq!(fea["part_id"], "beam_p3t7");
+    assert_eq!(fea["fea_case"], "sim_gravity_root");
+    assert_eq!(fea["verdict"], "PASS");
+    assert_eq!(fea["length_unit"], "mm");
+
+    // Analytical root bending stress: sigma = 3 * rho * g * L^2 / h = 0.462051 MPa
+    let sigma_analytical_mpa = (3.0 * 7850.0 * 9.81 * 0.20 * 0.20 / 0.02) / 1.0e6;
+    let vm_mpa = fea["max_von_mises_mpa"].as_f64().unwrap();
+    let rel_err_pct = ((vm_mpa - sigma_analytical_mpa).abs() / sigma_analytical_mpa) * 100.0;
+    assert!(
+        rel_err_pct < 15.0,
+        "Cantilever root max_von_mises_mpa ({vm_mpa:.5} MPa) must match analytical ({sigma_analytical_mpa:.5} MPa) within 15%, got {rel_err_pct:.2}%"
+    );
+
+    // Peak stress must be near the root x = 0 mm
+    let peak_x_mm = fea["peak_stress_location"][0].as_f64().unwrap();
+    assert!(
+        peak_x_mm < 50.0,
+        "Expected peak stress near root x = 0 mm, got x = {peak_x_mm:.2} mm"
+    );
+
+    // Equilibrium error < 1% and 3-2-1 minimal kinematic support
+    let eq_err_pct = fea["diagnostics"]["equilibrium_error_pct"].as_f64().unwrap();
+    assert!(
+        eq_err_pct < 1.0,
+        "Expected equilibrium_error_pct < 1%, got {eq_err_pct:.6}%"
+    );
+    assert_eq!(fea["diagnostics"]["constrained_rigid_body_modes_ok"], true);
+
+    // Verify source block
+    let source = &fea["source"];
+    assert!((source["simulation_time_s"].as_f64().unwrap() - 0.35).abs() < 0.01);
+    assert_eq!(source["inertial_relief_applied"], true);
+    assert_eq!(source["support_mode"], "3-2-1_inertial_relief");
+    assert_eq!(source["support_nodes_321"].as_array().unwrap().len(), 3);
+    let joints = source["joints"].as_array().unwrap();
+    assert_eq!(joints.len(), 1);
+    assert_eq!(joints[0]["joint_id"], "weld_root");
+    assert_eq!(joints[0]["matched_face"], "left");
+    assert!(joints[0]["matched_node_count"].as_u64().unwrap() >= 3);
+
+    // Verify auto-checked requirement passed
+    assert_eq!(fea["requirements_status"]["status"], "PASS");
+
+    // 5. Error checks: unknown part -> PART_NOT_FOUND, invalid select -> INVALID_ARGUMENT, non-positive load_radius -> INVALID_ARGUMENT
+    let nf_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3806,
+            "method": "tools/call",
+            "params": {
+                "name": "run_fea_from_simulation",
+                "arguments": { "part_id": "missing_part" }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(nf_resp["result"]["isError"], json!(true));
+    assert_eq!(parse_error_envelope(&nf_resp).error.code, "PART_NOT_FOUND");
+
+    let bad_rad_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3807,
+            "method": "tools/call",
+            "params": {
+                "name": "run_fea_from_simulation",
+                "arguments": {
+                    "part_id": "beam_p3t7",
+                    "load_radius": -5.0
+                }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(bad_rad_resp["result"]["isError"], json!(true));
+    let bad_rad_err = parse_error_envelope(&bad_rad_resp);
+    assert_eq!(bad_rad_err.error.code, "INVALID_ARGUMENT");
+    assert_eq!(bad_rad_err.error.param.as_deref(), Some("load_radius"));
+}
+
+#[tokio::test]
+async fn test_mcp_p3_t8_check_gear_strength_contract() {
+    let state = EngineState::new()
+        .expect("EngineState initialization failed")
+        .into_shared();
+
+    // 1. Verify tools/list schema for `check_gear_strength`
+    let list_tools_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3901,
+            "method": "tools/list",
+            "params": {}
+        }),
+    )
+    .await;
+    let tools = list_tools_resp["result"]["tools"].as_array().unwrap();
+    let gear_tool = tools
+        .iter()
+        .find(|t| t["name"] == "check_gear_strength")
+        .expect("check_gear_strength tool must exist in tools/list");
+    let props = &gear_tool["inputSchema"]["properties"];
+    assert!(props.get("module").is_some());
+    assert!(props.get("teeth").is_some());
+    assert!(props.get("face_width").is_some());
+    assert!(props.get("torque").is_some());
+    assert!(props.get("power_watts").is_some());
+    assert!(props.get("speed_rpm").is_some());
+    assert!(props.get("material").is_some());
+    assert!(props.get("mating_teeth").is_some());
+
+    // 2. Acceptance criteria manual calculation:
+    // m = 3 mm, z = 20, b = 30 mm, T = 100 N*m, Kv = 1:
+    // d = 60 mm, Wt = 3333.3 N, at Y = 0.322 sigma_b ≈ 115.0 MPa, sigma_H ≈ 906.1 MPa.
+    let call_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3902,
+            "method": "tools/call",
+            "params": {
+                "name": "check_gear_strength",
+                "arguments": {
+                    "module": 3.0,
+                    "teeth": 20,
+                    "face_width": 30.0,
+                    "torque": 100.0,
+                    "material": "steel_structural_aisi1020",
+                    "manufacturing_method": "static"
+                }
+            }
+        }),
+    )
+    .await;
+    assert_ne!(call_resp["result"]["isError"], json!(true));
+    let text = call_resp["result"]["content"][0]["text"].as_str().unwrap();
+    let result: Value = serde_json::from_str(text).unwrap();
+
+    assert!((result["pitch_diameter"].as_f64().unwrap() - 60.0).abs() < 1e-3);
+    assert!((result["tangential_force_n"].as_f64().unwrap() - 3333.333).abs() < 1e-2);
+    assert!((result["lewis_form_factor_y"].as_f64().unwrap() - 0.322).abs() < 1e-4);
+    assert_eq!(result["dynamic_factor_kv"].as_f64().unwrap(), 1.0);
+    assert!((result["bending_stress_mpa"].as_f64().unwrap() - 115.02).abs() < 0.1);
+    assert!((result["bending_safety_factor"].as_f64().unwrap() - 2.173).abs() < 0.02);
+    assert!((result["contact_stress_mpa"].as_f64().unwrap() - 906.1).abs() < 1.0);
+    assert_eq!(result["length_unit"].as_str().unwrap(), "mm");
+
+    // 3. Test dynamic verification with power and rotational speed and mating gear:
+    let dyn_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3903,
+            "method": "tools/call",
+            "params": {
+                "name": "check_gear_strength",
+                "arguments": {
+                    "module": 2.0,
+                    "teeth": 25,
+                    "face_width": 20.0,
+                    "power_kw": 5.0,
+                    "speed_rpm": 1200.0,
+                    "mating_teeth": 50,
+                    "material": "steel_high_strength_4140"
+                }
+            }
+        }),
+    )
+    .await;
+    assert_ne!(dyn_resp["result"]["isError"], json!(true));
+    let dyn_result: Value = serde_json::from_str(dyn_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!((dyn_result["pitch_diameter"].as_f64().unwrap() - 50.0).abs() < 1e-3);
+    assert!((dyn_result["mating_pitch_diameter"].as_f64().unwrap() - 100.0).abs() < 1e-3);
+    assert!(dyn_result["dynamic_factor_kv"].as_f64().unwrap() > 1.0);
+    assert!(dyn_result["bending_safety_factor"].as_f64().unwrap() > 1.0);
+
+    // 4. Test error handling for missing torque/power and missing module
+    let err_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3904,
+            "method": "tools/call",
+            "params": {
+                "name": "check_gear_strength",
+                "arguments": {
+                    "module": 3.0,
+                    "teeth": 20,
+                    "face_width": 30.0
+                }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(err_resp["result"]["isError"], json!(true));
+    assert_eq!(parse_error_envelope(&err_resp).error.code, "INVALID_ARGUMENT");
+}
+
+#[tokio::test]
+async fn test_mcp_p3_t9_analyze_mechanism_and_requirement_contract() {
+    let state = EngineState::new()
+        .expect("EngineState initialization failed")
+        .into_shared();
+
+    // 1. Verify tools/list schema for `analyze_mechanism`
+    let list_tools_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4001,
+            "method": "tools/list",
+            "params": {}
+        }),
+    )
+    .await;
+    let tools = list_tools_resp["result"]["tools"].as_array().unwrap();
+    let mech_tool = tools
+        .iter()
+        .find(|t| t["name"] == "analyze_mechanism")
+        .expect("analyze_mechanism tool must exist in tools/list");
+    let props = &mech_tool["inputSchema"]["properties"];
+    assert!(props.get("part_ids").is_some());
+    assert!(props.get("rank_tolerance").is_some());
+
+    // 2. Build a planar four-bar linkage (ground + 3 moving links, 4 revolute joints along Z)
+    for (id, name, w, h, pos) in [
+        ("crank", "Crank", 10.0, 50.0, [0.0, 25.0, 0.0]),
+        ("coupler", "Coupler", 200.0, 10.0, [100.0, 50.0, 0.0]),
+        ("rocker", "Rocker", 10.0, 50.0, [200.0, 25.0, 0.0]),
+    ] {
+        rpc_call(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4002,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_part",
+                    "arguments": {
+                        "part_id": id,
+                        "name": name,
+                        "material": "steel_structural_aisi1020",
+                        "is_fixed": false
+                    }
+                }
+            }),
+        )
+        .await;
+
+        rpc_call(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4003,
+                "method": "tools/call",
+                "params": {
+                    "name": "add_feature_primitive",
+                    "arguments": {
+                        "part_id": id,
+                        "primitive_type": "box",
+                        "params": {
+                            "width": w,
+                            "height": h,
+                            "depth": 10.0,
+                            "position": pos
+                        }
+                    }
+                }
+            }),
+        )
+        .await;
+    }
+
+    // Before adding joints: 3 free bodies -> DOF = 18, floating_parts = 3, warnings present
+    let free_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4004,
+            "method": "tools/call",
+            "params": {
+                "name": "analyze_mechanism",
+                "arguments": {}
+            }
+        }),
+    )
+    .await;
+    let free_res = parse_content(&free_resp);
+    assert_eq!(free_res["dof_numeric"], 18);
+    assert_eq!(free_res["dof_grubler"], 18);
+    assert_eq!(free_res["unconnected_parts"].as_array().unwrap().len(), 3);
+    assert_eq!(free_res["floating_parts"].as_array().unwrap().len(), 3);
+    assert!(free_res["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|w| w.as_str().unwrap().contains("свободные детали")));
+
+    // Connect 4 revolute joints (coordinates in active mm units)
+    for (jid, pa, pb, aa, ab) in [
+        ("j1", "ground", "crank", [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]),
+        ("j2", "crank", "coupler", [0.0, 50.0, 0.0], [0.0, 50.0, 0.0]),
+        ("j3", "coupler", "rocker", [200.0, 50.0, 0.0], [200.0, 50.0, 0.0]),
+        ("j4", "rocker", "ground", [200.0, 0.0, 0.0], [200.0, 0.0, 0.0]),
+    ] {
+        let jr = rpc_call(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4005,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_joint",
+                    "arguments": {
+                        "joint_id": jid,
+                        "joint_type": "revolute",
+                        "part_a": pa,
+                        "part_b": pb,
+                        "anchor_a": aa,
+                        "anchor_b": ab,
+                        "axis": [0.0, 0.0, 1.0]
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_ne!(jr["result"]["isError"], json!(true));
+    }
+
+    let fourbar_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4006,
+            "method": "tools/call",
+            "params": {
+                "name": "analyze_mechanism",
+                "arguments": {}
+            }
+        }),
+    )
+    .await;
+    let fourbar_res = parse_content(&fourbar_resp);
+    assert_eq!(fourbar_res["dof_numeric"], 1);
+    assert_eq!(fourbar_res["dof_grubler"], -2);
+    assert_eq!(fourbar_res["redundant_constraints"], 3);
+    assert_eq!(fourbar_res["jacobian_rank"], 17);
+    assert_eq!(fourbar_res["floating_parts"], json!([]));
+    assert_eq!(fourbar_res["unconnected_parts"], json!([]));
+    assert_eq!(fourbar_res["status"], "PASS");
+
+    // 3. Verify mechanism_dof requirement integration in set_requirements + check_requirements
+    let set_req_pass = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4007,
+            "method": "tools/call",
+            "params": {
+                "name": "set_requirements",
+                "arguments": {
+                    "scope": "scene",
+                    "requirements": [
+                        { "id": "req_mech_1", "type": "mechanism_dof", "expected": 1 }
+                    ]
+                }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(parse_content(&set_req_pass)["status"], "requirements_set");
+
+    let check_pass = parse_content(
+        &rpc_call(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4008,
+                "method": "tools/call",
+                "params": { "name": "check_requirements", "arguments": {} }
+            }),
+        )
+        .await,
+    );
+    assert_eq!(check_pass["status"], "PASS");
+    assert_eq!(check_pass["requirements"][0]["type"], "mechanism_dof");
+    assert_eq!(check_pass["requirements"][0]["status"], "PASS");
+    assert_eq!(check_pass["requirements"][0]["measured"], 1);
+    assert_eq!(check_pass["requirements"][0]["dof_grubler"], -2);
+    assert_eq!(check_pass["requirements"][0]["redundant_constraints"], 3);
+
+    // Mismatch expected DOF -> FAIL with hint
+    rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4009,
+            "method": "tools/call",
+            "params": {
+                "name": "set_requirements",
+                "arguments": {
+                    "scope": "scene",
+                    "requirements": [
+                        { "id": "req_mech_2", "type": "mechanism_dof", "expected": 2 }
+                    ]
+                }
+            }
+        }),
+    )
+    .await;
+    let check_fail = parse_content(
+        &rpc_call(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4010,
+                "method": "tools/call",
+                "params": { "name": "check_requirements", "arguments": {} }
+            }),
+        )
+        .await,
+    );
+    assert_eq!(check_fail["status"], "FAIL");
+    assert_eq!(check_fail["requirements"][0]["status"], "FAIL");
+    assert_eq!(check_fail["requirements"][0]["measured"], 1);
+    assert!(check_fail["requirements"][0]["hint"]
+        .as_str()
+        .unwrap()
+        .contains("analyze_mechanism"));
+}
+
+#[tokio::test]
+async fn test_mcp_p3_t10_check_interference_sweep_joint_and_no_interference_requirement() {
+    let state = EngineState::new()
+        .expect("EngineState initialization failed")
+        .into_shared();
+
+    // 1. Two boxes with known overlap in mm:
+    //    box_1: 100 x 100 x 100 mm at [0, 0, 0] -> x in [-50, 50]
+    //    box_2: 100 x 100 x 100 mm at [60, 0, 0] -> x in [10, 110]
+    //    Overlap: 40 x 100 x 100 mm = 400,000 mm^3, penetration_depth = 40 mm
+    //    wall_fixed: 100 x 20 x 40 mm at [70, 60, 0] -> y in [50, 70]
+    for (pid, w, h, d, pos, fixed) in [
+        ("box_1", 100.0, 100.0, 100.0, [0.0, 0.0, 0.0], false),
+        ("box_2", 100.0, 100.0, 100.0, [60.0, 0.0, 0.0], false),
+        ("box_3", 100.0, 100.0, 100.0, [250.0, 0.0, 0.0], true),
+    ] {
+        rpc_call(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4100,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_part",
+                    "arguments": {
+                        "part_id": pid,
+                        "name": pid,
+                        "material": "aluminum_6061_t6",
+                        "is_fixed": fixed
+                    }
+                }
+            }),
+        )
+        .await;
+        rpc_call(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4101,
+                "method": "tools/call",
+                "params": {
+                    "name": "add_feature_primitive",
+                    "arguments": {
+                        "part_id": pid,
+                        "primitive_type": "box",
+                        "params": {
+                            "width": w,
+                            "height": h,
+                            "depth": d,
+                            "position": pos
+                        }
+                    }
+                }
+            }),
+        )
+        .await;
+    }
+
+    let interf_resp = parse_content(
+        &rpc_call(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4102,
+                "method": "tools/call",
+                "params": {
+                    "name": "check_interference",
+                    "arguments": {}
+                }
+            }),
+        )
+        .await,
+    );
+    assert_eq!(interf_resp["status"], "FAIL");
+    assert_eq!(interf_resp["intersects"], true);
+    assert_eq!(interf_resp["interfering_pairs_count"], 1);
+    let vol_mm3 = interf_resp["interfering_pairs"][0]["intersection_volume"]
+        .as_f64()
+        .unwrap();
+    let expected_vol_mm3 = 400_000.0;
+    assert!(
+        (vol_mm3 - expected_vol_mm3).abs() / expected_vol_mm3 <= 0.01,
+        "Expected intersection_volume ~ 400000 mm^3 within 1%, got {vol_mm3}"
+    );
+    let depth_mm = interf_resp["interfering_pairs"][0]["penetration_depth"]
+        .as_f64()
+        .unwrap();
+    assert!((depth_mm - 40.0).abs() <= 0.1);
+    assert!((interf_resp["min_clearance"].as_f64().unwrap() - 90.0).abs() <= 0.1);
+
+    // 2. Verify no_interference requirement in set_requirements / check_requirements
+    rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4103,
+            "method": "tools/call",
+            "params": {
+                "name": "set_requirements",
+                "arguments": {
+                    "scope": "scene",
+                    "requirements": [
+                        { "id": "req_no_int_fail", "type": "no_interference", "pairs": [["box_1", "box_2"]] },
+                        { "id": "req_no_int_pass", "type": "no_interference", "pairs": [["box_2", "box_3"]] }
+                    ]
+                }
+            }
+        }),
+    )
+    .await;
+
+    let req_check = parse_content(
+        &rpc_call(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4104,
+                "method": "tools/call",
+                "params": { "name": "check_requirements", "arguments": {} }
+            }),
+        )
+        .await,
+    );
+    assert_eq!(req_check["status"], "FAIL");
+    assert_eq!(req_check["requirements"][0]["id"], "req_no_int_fail");
+    assert_eq!(req_check["requirements"][0]["status"], "FAIL");
+    assert_eq!(req_check["requirements"][0]["measured"], 1);
+    assert_eq!(req_check["requirements"][1]["id"], "req_no_int_pass");
+    assert_eq!(req_check["requirements"][1]["status"], "PASS");
+    assert_eq!(req_check["requirements"][1]["measured"], 0);
+
+    // 3. Test sweep_joint on hinged arm hitting a wall
+    let state_sweep = EngineState::new()
+        .expect("EngineState init")
+        .into_shared();
+    for (pid, w, h, d, pos, fixed) in [
+        ("arm", 100.0, 10.0, 10.0, [50.0, 0.0, 0.0], false),
+        ("wall", 100.0, 20.0, 40.0, [70.0, 60.0, 0.0], true),
+    ] {
+        rpc_call(
+            &state_sweep,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4110,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_part",
+                    "arguments": {
+                        "part_id": pid,
+                        "name": pid,
+                        "material": "steel_1045",
+                        "is_fixed": fixed
+                    }
+                }
+            }),
+        )
+        .await;
+        rpc_call(
+            &state_sweep,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4111,
+                "method": "tools/call",
+                "params": {
+                    "name": "add_feature_primitive",
+                    "arguments": {
+                        "part_id": pid,
+                        "primitive_type": "box",
+                        "params": { "width": w, "height": h, "depth": d, "position": pos }
+                    }
+                }
+            }),
+        )
+        .await;
+    }
+
+    rpc_call(
+        &state_sweep,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4112,
+            "method": "tools/call",
+            "params": {
+                "name": "create_joint",
+                "arguments": {
+                    "joint_id": "j_arm_hinge",
+                    "joint_type": "revolute",
+                    "part_a": "ground",
+                    "part_b": "arm",
+                    "anchor_a": [0.0, 0.0, 0.0],
+                    "anchor_b": [0.0, 0.0, 0.0],
+                    "axis": [0.0, 0.0, 1.0]
+                }
+            }
+        }),
+    )
+    .await;
+
+    let sweep_res = parse_content(
+        &rpc_call(
+            &state_sweep,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4113,
+                "method": "tools/call",
+                "params": {
+                    "name": "sweep_joint",
+                    "arguments": {
+                        "joint_id": "j_arm_hinge",
+                        "from": 0.0,
+                        "to": 90.0,
+                        "steps": 90
+                    }
+                }
+            }),
+        )
+        .await,
+    );
+    assert_eq!(sweep_res["status"], "FAIL");
+    assert_eq!(sweep_res["collision_detected"], true);
+    let col_deg = sweep_res["first_collision_value"].as_f64().unwrap();
+    assert!(
+        (col_deg - 27.492).abs() <= 1.0,
+        "Expected collision angle within 1 deg step of 27.49 deg, got {col_deg}"
+    );
+    assert!(sweep_res["min_clearance"].as_f64().unwrap() > 0.0);
+}
+
+
+
+

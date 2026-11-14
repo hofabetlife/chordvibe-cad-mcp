@@ -443,16 +443,15 @@
     {
       "euler_chi": 0,
       "genus": 1.0,
-      "issues": [
-        "Sliver quality gate failed: 2 needle triangles with min angle < 1° (min_angle=0.6600°)"
-      ],
+      "issues": [],
       "orientation_consistent": true,
       "signed_volume": 0.0001705396415471469,
-      "status": "FAIL",
+      "status": "PASS",
       "target": "spur_gear_teeth_60_with_hub_bore_keyway",
       "teeth": 60,
       "triangles": 33172,
       "warnings": [
+        "Sliver quality notice: 2 needle triangles with min angle < 1° (min_angle=0.6600°)",
         "Notice: 294 sliver triangles detected (min angle < 5° or aspect ratio > 100)",
         "Notice: 48914 un-welded duplicate vertices found (CAD split normals)"
       ],
@@ -535,7 +534,7 @@
       "genus": 11.0,
       "issues": [],
       "orientation_consistent": true,
-      "signed_volume": 0.003818809138645353,
+      "signed_volume": 0.003820103021850618,
       "spokes": 5,
       "status": "PASS",
       "target": "wheel_rim_5spoke",
@@ -550,7 +549,7 @@
       "genus": 12.0,
       "issues": [],
       "orientation_consistent": true,
-      "signed_volume": 0.003851659058962761,
+      "signed_volume": 0.003852952942168026,
       "spokes": 6,
       "status": "PASS",
       "target": "wheel_rim_6spoke",
@@ -565,7 +564,7 @@
       "genus": 16.0,
       "issues": [],
       "orientation_consistent": true,
-      "signed_volume": 0.004061663630599059,
+      "signed_volume": 0.0040629575138043245,
       "spokes": 10,
       "status": "PASS",
       "target": "wheel_rim_10spoke",

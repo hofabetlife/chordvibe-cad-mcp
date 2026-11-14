@@ -14,7 +14,7 @@ use crate::error::ServerError;
 use crate::protocol::{ToolCallResult, ToolDefinition};
 use crate::state::EngineState;
 
-/// Returns the complete registry of all 34 MCP engineering tools with strict input schemas,
+/// Returns the complete registry of all 40 MCP engineering tools with strict input schemas,
 /// explicit unit contracts, usage examples, common errors, and recommended next steps.
 pub fn list_tools() -> Vec<ToolDefinition> {
     vec![
@@ -78,7 +78,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         // 4. add_feature_primitive
         ToolDefinition {
             name: "add_feature_primitive".to_string(),
-            description: "Appends a 3D solid primitive (box, cylinder, sphere, cone, polygon_prism, spur_gear, revolve, or wheel_rim) into the parametric history DAG of a part. Units: all linear dimensions, radii, module, and positions [x, y, z] are in active length_unit ('mm' by default, or 'm'); angles (pressure_angle_deg, angle_deg, rotation_deg) are in degrees (deg); output volume in mm^3/m^3 and mass in kg. Example: {\"part_id\": \"bracket_1\", \"primitive_type\": \"box\", \"params\": {\"width\": 100.0, \"height\": 20.0, \"depth\": 20.0, \"position\": [0.0, 0.0, 0.0]}}. Common errors: PART_NOT_FOUND, INVALID_PRIMITIVE_TYPE, INVALID_ARGUMENT (non-positive dimensions, self-intersecting revolve profile, or r < 0). Next step: call 'cut_hole' / 'boolean_*' to refine geometry, or 'validate_mesh' and 'query_part_geometry' to inspect named faces.".to_string(),
+            description: "Appends a 3D solid primitive (box, cylinder, sphere, cone, polygon_prism, spur_gear, revolve, or wheel_rim) into the parametric history DAG of a part. Coordinate conventions: all primitives are centered along Z in [-height/2, +height/2] with origin [0,0,0] (box: X in [-width/2, +width/2], Y in [-height/2, +height/2], Z in [-depth/2, +depth/2]; cone: base radius_bottom at Z=-height/2, apex radius_top at Z=+height/2). FeatureTree DAG semantics: subsequent add_feature_primitive calls on the same part_id AUTOMATICALLY perform csg_union with the existing solid body (they do not overwrite the part). Units: all linear dimensions, radii, module, and positions [x, y, z] are in active length_unit ('mm' by default, or 'm'); angles are in degrees (deg). Example: {\"part_id\": \"bracket_1\", \"primitive_type\": \"box\", \"params\": {\"width\": 100.0, \"height\": 20.0, \"depth\": 20.0, \"position\": [0.0, 0.0, 0.0]}}. Common errors: PART_NOT_FOUND, INVALID_ARGUMENT (non-positive dimensions or invalid primitive_type), CAD_EVALUATION_ERROR. Next step: call 'cut_hole' to add bores, 'validate_mesh' to verify topology, or 'query_part_geometry' to inspect named faces.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -508,7 +508,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         // 13. run_fea_analysis
         ToolDefinition {
             name: "run_fea_analysis".to_string(),
-            description: "Generates a 3D tetrahedral mesh (TET4), solves linear elasticity (K*u = F), and computes von Mises stresses, displacements, and Factor of Safety (FoS). Units: boundary plane/load coordinates and tolerances use active length_unit ('mm' by default, or 'm'); forces use Newtons (N), pressures use Megapascals (MPa), moments use Newton-meters (N*m); output max_von_mises_mpa and yield_strength_mpa in MPa, max_displacement_mm in mm, safety_factor dimensionless. Example: {\"part_id\": \"bracket_1\", \"fea_case\": \"tip_load\", \"mesh_density\": \"coarse\", \"fixed\": [{\"face\": \"left\"}], \"loads\": [{\"face\": \"right\", \"force\": [0.0, -500.0, 0.0]}]}. Common errors: PART_NOT_FOUND, EMPTY_GEOMETRY, FACE_NOT_FOUND, AMBIGUOUS_FACE_SELECTOR, FEA_UNCONSTRAINED, FEA_NO_LOADS, FEA_NO_BOUNDARY_NODES. Next step: call 'check_requirements' to verify min_safety_factor or 'get_fea_heatmap_image' to visualize stress distribution.".to_string(),
+            description: "Generates a 3D tetrahedral mesh (TET4), solves linear elasticity (K*u = F), and computes von Mises stresses, displacements, support reaction equilibrium, and Factor of Safety (FoS). Supports optional multi-level mesh convergence study ('convergence_study': true across Coarse->Medium->Fine with Richardson extrapolation and 'accuracy' report). Units: boundary plane/load coordinates and tolerances use active length_unit ('mm' by default, or 'm'); forces use Newtons (N), pressures use Megapascals (MPa), moments use Newton-meters (N*m); output max_von_mises_mpa and yield_strength_mpa in MPa, max_displacement_mm in mm, safety_factor dimensionless, max_seconds in seconds (s). Example: {\"part_id\": \"bracket_1\", \"fea_case\": \"tip_load\", \"mesh_density\": \"coarse\", \"convergence_study\": true, \"fixed\": [{\"face\": \"left\"}], \"loads\": [{\"face\": \"right\", \"force\": [0.0, -500.0, 0.0]}]}. Common errors: PART_NOT_FOUND, EMPTY_GEOMETRY, MESH_INVALID, FACE_NOT_FOUND, AMBIGUOUS_FACE_SELECTOR, FEA_UNCONSTRAINED, FEA_NO_LOADS, FEA_NO_BOUNDARY_NODES. Next step: call 'check_requirements' to verify min_safety_factor or 'get_fea_heatmap_image' to visualize stress distribution.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -524,7 +524,30 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     "mesh_density": {
                         "type": "string",
                         "enum": ["coarse", "medium", "fine"],
-                        "description": "Tetrahedral mesh resolution (default: coarse)"
+                        "description": "Tetrahedral mesh resolution when convergence_study is false (default: coarse)"
+                    },
+                    "element_order": {
+                        "type": "integer",
+                        "enum": [1, 2],
+                        "description": "Finite element polynomial order (dimensionless integer): 1 for linear 4-node tetrahedra (TET4, default) or 2 for quadratic 10-node tetrahedra (TET10, eliminates shear locking in bending)"
+                    },
+                    "convergence_study": {
+                        "type": "boolean",
+                        "description": "When true, runs a multi-level mesh convergence study (default levels: ['coarse', 'medium', 'fine']), computes relative stress/displacement changes and Richardson extrapolation (where applicable), and populates the 'accuracy' block with verdict 'CONVERGED' or 'NOT_CONVERGED'"
+                    },
+                    "levels": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["coarse", "medium", "fine"]
+                        },
+                        "minItems": 2,
+                        "description": "Optional ordered list of mesh density levels for convergence_study (default: ['coarse', 'medium', 'fine'])"
+                    },
+                    "max_seconds": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "description": "Optional wall-clock time budget in seconds for convergence_study; if exceeded, stops remaining levels and returns a partial result with accuracy.partial_result = true"
                     },
                     "fea_case": {
                         "type": "string",
@@ -716,7 +739,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         // 18. open_preview_window
         ToolDefinition {
             name: "open_preview_window".to_string(),
-            description: "Opens or focuses the interactive native 3D CAD preview window, optionally displaying a specified part. Units: none (identifies optional part by string ID). Example: {\"part_id\": \"bracket_1\"}. Common errors: PART_NOT_FOUND, VIEWER_EMPTY_MESH. Next step: call 'capture_viewport' for headless PNG snapshots.".to_string(),
+            description: "Opens or focuses the interactive native 3D CAD preview window, optionally displaying a specified part. When running in a standard headless stdio session (without --gui), automatically exports a live binary STL file and spawns a background interactive 3D window (mcp-cad-server --stl <path>). Units: none (identifies optional part by string ID). Example: {\"part_id\": \"bracket_1\"}. Common errors: PART_NOT_FOUND, VIEWER_EMPTY_MESH (scene has no non-empty geometry), IO_ERROR. Next step: use 'capture_viewport' to inspect an offscreen Base64 PNG render directly in headless environments.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1011,7 +1034,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         // 27. validate_mesh
         ToolDefinition {
             name: "validate_mesh".to_string(),
-            description: "Performs a 12-point topological and geometric diagnostic on a part's mesh (watertightness, manifoldness, outward winding, Euler characteristic, genus, sliver triangles < 1 deg / < 5 deg, T-junctions, and 3D self-intersections). Units: expected_genus is a dimensionless integer; reported min/max triangle angles are in degrees (deg). Example: {\"part_id\": \"bracket_1\", \"expected_genus\": 1}. Common errors: PART_NOT_FOUND. Next step: if status=='PASS', proceed to 'run_fea_analysis' or 'export_stl'; if status=='FAIL', inspect 'errors' and adjust features via 'modify_feature'.".to_string(),
+            description: "Performs topological and geometric diagnostics on a part's mesh (watertightness, manifoldness, outward winding, Euler characteristic, genus, sliver triangles, T-junctions, and 3D self-intersections). In default mode (strict_slivers: false), micro-slivers on complex flutes/threads report as non-fatal warnings while solid status remains PASS (is_valid_solid: true, fea_ready: true). Set strict_slivers: true for strict primitive verification. Units: expected_genus is a dimensionless integer. Example: {\"part_id\": \"bracket_1\", \"expected_genus\": 1}. Common errors: PART_NOT_FOUND, EMPTY_GEOMETRY, MESH_INVALID. Next step: if status is PASS (fea_ready: true), call 'query_part_geometry' and 'run_fea_analysis'.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1027,6 +1050,10 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     "expected_genus": {
                         "type": "integer",
                         "description": "Optional expected topological genus g = (2 - chi) / 2 (dimensionless integer, e.g. 0 for sphere/box, 1 for torus/through-hole)"
+                    },
+                    "strict_slivers": {
+                        "type": "boolean",
+                        "description": "Optional strict sliver quality gate enforcement (default: false). When false, sliver micro-triangles report as warnings with status 'PASS'. When true, slivers cause status 'FAIL'."
                     }
                 },
                 "required": ["part_id"]
@@ -1233,6 +1260,287 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 }
             }),
         },
+        // 35. get_part_load_cases (P3-T6)
+        ToolDefinition {
+            name: "get_part_load_cases".to_string(),
+            description: "Extracts dynamic or quasi-static load cases acting ON a part from the most recent physics simulation, expressed in the part's local coordinate system (ready for FEA boundary conditions). Units: anchor_local and center_of_mass_local in active length_unit ('mm' by default, or 'm'); reaction force in Newtons (N); reaction torque in Newton-meters (N*m); mass in kilograms (kg); linear_acceleration in m/s^2; angular_acceleration in rad/s^2; timestamps in seconds (s). Example: {\"part_id\": \"beam_1\", \"select\": \"peak_force\"}. Common errors: PART_NOT_FOUND, INVALID_ARGUMENT (run_physics_simulation has not been executed yet, or invalid select value). Next step: pass the extracted reaction forces and fixed joint anchors to 'run_fea_analysis'.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "part_id": {
+                        "type": "string",
+                        "description": "Target part ID (or 'ground') for which to extract connected joint reaction forces and inertial loads"
+                    },
+                    "select": {
+                        "description": "Timestep selection mode: 'peak_force' (default, instant of maximum joint reaction force in N), 'peak_torque' (instant of maximum joint reaction torque in N*m), or a non-negative timestamp in seconds (s, e.g. 0.5)",
+                        "oneOf": [
+                            {
+                                "type": "string",
+                                "enum": ["peak_force", "peak_torque"],
+                                "description": "Peak selection mode ('peak_force' in N or 'peak_torque' in N*m)"
+                            },
+                            {
+                                "type": "number",
+                                "description": "Specific simulation timestamp in seconds (s, >= 0)"
+                            }
+                        ]
+                    },
+                    "length_unit": {
+                        "type": "string",
+                        "enum": ["mm", "m"],
+                        "description": "Optional per-call length unit override ('mm' or 'm') for anchor_local and center_of_mass_local"
+                    }
+                },
+                "required": ["part_id"]
+            }),
+        },
+        // 36. run_fea_from_simulation (P3-T7)
+        ToolDefinition {
+            name: "run_fea_from_simulation".to_string(),
+            description: "Runs 3D Finite Element Analysis (FEA) on a part using joint reaction forces, torques, and D'Alembert inertial accelerations (-m*a) extracted from the most recent physics simulation, automatically applying a 6-DOF 3-2-1 minimal kinematic support (inertial relief) and distributing joint forces and torque couples over matched named CAD faces or within load_radius of each joint anchor. Units: load_radius in active length_unit ('mm' by default, or 'm'); select timestamp in seconds (s); returned stresses in MPa; displacements in mm; reaction forces in N; torques in N*m; element_order is dimensionless (1 or 2). Example: {\"part_id\": \"beam_1\", \"select\": \"peak_force\", \"mesh_density\": \"medium\"}. Common errors: PART_NOT_FOUND, MESH_INVALID, INVALID_ARGUMENT (run_physics_simulation has not been executed yet, invalid select, or non-positive load_radius). Next step: inspect 'safety_factor', 'diagnostics.equilibrium_error_pct', and 'source', or call 'get_fea_heatmap_image'.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "part_id": {
+                        "type": "string",
+                        "description": "Target deformable CAD part ID to analyze under simulation loads"
+                    },
+                    "select": {
+                        "description": "Timestep selection mode: 'peak_force' (default, instant of maximum joint reaction force in N), 'peak_torque' (instant of maximum joint reaction torque in N*m), or a non-negative timestamp in seconds (s, e.g. 0.5)",
+                        "oneOf": [
+                            {
+                                "type": "string",
+                                "enum": ["peak_force", "peak_torque"],
+                                "description": "Peak selection mode ('peak_force' in N or 'peak_torque' in N*m)"
+                            },
+                            {
+                                "type": "number",
+                                "description": "Specific simulation timestamp in seconds (s, >= 0)"
+                            }
+                        ]
+                    },
+                    "load_radius": {
+                        "type": "number",
+                        "description": "Optional radius around each joint's anchor_local in active length_unit ('mm' by default, or 'm', > 0) for distributing joint forces and torque couples when not bound to a named CAD face"
+                    },
+                    "mesh_density": {
+                        "type": "string",
+                        "enum": ["coarse", "medium", "fine"],
+                        "description": "Tetrahedral mesh density preset ('coarse', 'medium', 'fine', default: 'medium')"
+                    },
+                    "element_order": {
+                        "type": "integer",
+                        "enum": [1, 2],
+                        "description": "Finite element polynomial order (dimensionless integer): 1 for linear 4-node tetrahedra (TET4) or 2 for quadratic 10-node tetrahedra (TET10, default: 2)"
+                    },
+                    "convergence_study": {
+                        "type": "boolean",
+                        "description": "If true, automatically runs a multi-level mesh convergence study (default: false)"
+                    },
+                    "levels": {
+                        "type": "array",
+                        "description": "Optional mesh density sequence for convergence_study (e.g. ['coarse', 'medium', 'fine'])",
+                        "items": {
+                            "type": "string"
+                        }
+                    },
+                    "max_seconds": {
+                        "type": "number",
+                        "description": "Optional wall-clock timeout in seconds (s, >= 0) for convergence_study"
+                    },
+                    "fea_case": {
+                        "type": "string",
+                        "description": "Optional load-case identifier (e.g. 'sim_peak') to store results for check_requirements"
+                    },
+                    "joint_faces": {
+                        "type": "object",
+                        "description": "Optional map of joint_id -> face_selector to explicitly bind specific joints to named CAD faces"
+                    },
+                    "length_unit": {
+                        "type": "string",
+                        "enum": ["mm", "m"],
+                        "description": "Optional per-call length unit override ('mm' or 'm'; defaults to session length_unit)"
+                    }
+                },
+                "required": ["part_id"]
+            }),
+        },
+        // 37. check_gear_strength
+        ToolDefinition {
+            name: "check_gear_strength".to_string(),
+            description: "Performs rapid analytical verification of spur gear tooth bending strength (Lewis equation with Barth dynamic velocity factor Kv) and surface contact durability / pitting resistance (Hertzian contact theory / AGMA / ISO 6336). Units: module and face width in active length_unit ('mm' by default, or 'm'), torque in N*m, speed in RPM, power in W or kW, stresses and material strengths in MPa, Young's modulus in GPa. Can evaluate an existing spur gear in the scene via 'part_id' or standalone parametric inputs ('module', 'teeth', 'face_width', 'torque'). Returns tooth bending stress, bending safety factor, contact stress, contact safety factor, pitch diameters, pitch line velocity, and engineering warnings (undercutting z < 17, narrow or excessive face width ratio b/m). Example: {\"module\": 3.0, \"teeth\": 20, \"face_width\": 30.0, \"torque\": 100.0, \"material\": \"steel_structural_aisi1020\"}. Common errors: PART_NOT_FOUND, UNKNOWN_MATERIAL, INVALID_ARGUMENT (missing required gear parameters, non-positive module/face_width/torque, or teeth < 3). Next step: adjust module, face_width, or material if safety factor < 1.5, or run 'analyze_mechanism' and 'run_physics_simulation' on the gear assembly.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "part_id": {
+                        "type": "string",
+                        "description": "Optional ID of an existing gear part in the scene to extract default module, teeth, face width, and material from"
+                    },
+                    "module": {
+                        "type": "number",
+                        "description": "Gear module m in active length_unit ('mm' by default, or 'm')"
+                    },
+                    "teeth": {
+                        "type": "integer",
+                        "description": "Number of gear teeth z (dimensionless integer >= 3)"
+                    },
+                    "face_width": {
+                        "type": "number",
+                        "description": "Gear face width b along Z in active length_unit ('mm' by default, or 'm')"
+                    },
+                    "pressure_angle_deg": {
+                        "type": "number",
+                        "description": "Tooth pressure angle in degrees (default: 20.0)"
+                    },
+                    "torque": {
+                        "type": "number",
+                        "description": "Transmitted mechanical torque in Newton-meters (N*m)"
+                    },
+                    "power_watts": {
+                        "type": "number",
+                        "description": "Transmitted power in Watts (W, equivalent to N*m/s; used with speed_rpm to calculate torque if torque is omitted)"
+                    },
+                    "power_kw": {
+                        "type": "number",
+                        "description": "Transmitted power in Kilowatts (kW, 1000 W; alternative to power_watts)"
+                    },
+                    "speed_rpm": {
+                        "type": "number",
+                        "description": "Rotational speed in RPM (revolutions per minute, rad/s * 30/pi; used for pitch line velocity and Barth dynamic factor Kv)"
+                    },
+                    "material": {
+                        "type": "string",
+                        "description": "Gear material identifier from registry or alias (e.g. 'steel_structural_aisi1020', 'steel_high_strength_4140', 'brass_c360')"
+                    },
+                    "allowable_bending_stress_mpa": {
+                        "type": "number",
+                        "description": "Allowable tooth bending stress in MPa (overrides material yield strength for safety factor)"
+                    },
+                    "yield_strength_mpa": {
+                        "type": "number",
+                        "description": "Material yield strength in MPa override"
+                    },
+                    "manufacturing_method": {
+                        "type": "string",
+                        "enum": ["commercial_cut", "precision_ground", "static"],
+                        "description": "Manufacturing process for Barth dynamic velocity factor Kv: 'commercial_cut' (milled/cut, default), 'precision_ground' (hobbed/ground), or 'static'"
+                    },
+                    "mating_teeth": {
+                        "type": "integer",
+                        "description": "Number of teeth z2 of the mating gear (dimensionless integer; defaults to evaluated gear teeth if omitted)"
+                    },
+                    "mating_material": {
+                        "type": "string",
+                        "description": "Material identifier for the mating gear (defaults to primary gear material if omitted)"
+                    },
+                    "allowable_contact_stress_mpa": {
+                        "type": "number",
+                        "description": "Allowable surface contact / pitting endurance stress in MPa"
+                    },
+                    "length_unit": {
+                        "type": "string",
+                        "enum": ["mm", "m"],
+                        "description": "Optional per-call length unit override ('mm' or 'm'; defaults to session length_unit)"
+                    }
+                }
+            }),
+        },
+        // 38. analyze_mechanism
+        ToolDefinition {
+            name: "analyze_mechanism".to_string(),
+            description: "Analyzes mechanism mobility, degrees of freedom (DOF), redundant/overconstrained constraints, and floating/unconnected parts using both the Chebychev-Grübler-Kutzbach formula and SVD rank decomposition of the linearized constraint Jacobian. Units: DOF counts, constraint counts, Jacobian dimensions/rank, singular values, and rank_tolerance are dimensionless (internal geometry uses SI meters and radians). Example: {\"part_ids\": [\"crank\", \"coupler\", \"rocker\"]}. Common errors: PART_NOT_FOUND (unknown part_id in part_ids), INVALID_ARGUMENT (non-positive rank_tolerance or invalid part_ids array). Next step: review warnings (e.g. DOF=0 locking, DOF>1 without motors, or floating/unconnected parts), add missing joints via 'create_joint', or evaluate 'mechanism_dof' requirements via 'check_requirements'.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "part_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional subset of part IDs (plus implicit 'ground'/'world') to include in the mechanism analysis; defaults to all parts in the scene"
+                    },
+                    "rank_tolerance": {
+                        "type": "number",
+                        "description": "Optional dimensionless SVD singular-value cutoff threshold (> 0) for numerical Jacobian rank determination; defaults to max(rows, cols) * max(s_max, 1.0) * 1e-7"
+                    }
+                }
+            }),
+        },
+        // 39. check_interference
+        ToolDefinition {
+            name: "check_interference".to_string(),
+            description: "Performs static multi-body geometric interference and clearance analysis across all or selected part pairs using broad-phase AABB overlap filtering and narrow-phase CSG Boolean intersection ('csg_intersection') plus exact Euclidean mesh distance queries. Units: clearance and penetration_depth are reported in active length_unit ('mm' by default, or 'm'; plus _m in meters); intersection_volume is reported in active length_unit^3 (mm^3 or m^3; plus intersection_volume_m3 in m^3). Example: {\"part_ids\": [\"arm\", \"housing\"], \"ignore_adjacent\": true}. Common errors: PART_NOT_FOUND (unknown part_id in part_ids or pairs), INVALID_ARGUMENT (pairing a part with itself or invalid argument types). Next step: if intersects is true, adjust part positions with 'transform_part' or dimensions with 'modify_feature', or run 'sweep_joint' to inspect interference along a joint trajectory.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "part_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional subset of part IDs to check for pairwise interference; defaults to all parts in the scene"
+                    },
+                    "ignore_adjacent": {
+                        "type": "boolean",
+                        "description": "If true, skips part pairs that are directly connected by a registered kinematic joint (default: false)"
+                    },
+                    "pairs": {
+                        "type": "array",
+                        "items": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "minItems": 2,
+                            "maxItems": 2
+                        },
+                        "description": "Optional explicit list of part pairs [[part_a, part_b], ...] to evaluate instead of all combinations"
+                    },
+                    "length_unit": {
+                        "type": "string",
+                        "enum": ["mm", "m"],
+                        "description": "Optional per-call length unit override ('mm' or 'm'; defaults to session length_unit)"
+                    }
+                }
+            }),
+        },
+        // 40. sweep_joint
+        ToolDefinition {
+            name: "sweep_joint".to_string(),
+            description: "Sweeps a 'revolute' or 'prismatic' joint across the range [from, to] in 'steps' discrete intervals (0..=steps), evaluating multi-body interference and minimum clearance at each configuration without mutating the scene state. Units: for 'revolute' joints, 'from', 'to', 'first_collision_value', and 'safe_travel_range' are in degrees ('deg' by default, or 'rad' when angle_unit='rad'); for 'prismatic' joints, they are in active length_unit ('mm' by default, or 'm'). Clearances and penetration depths are reported in active length_unit ('mm' or 'm'). Example: {\"joint_id\": \"j_hinge\", \"from\": 0.0, \"to\": 90.0, \"steps\": 90}. Common errors: JOINT_NOT_FOUND, INVALID_JOINT_CONFIGURATION (joint is fixed, spherical, or gear), INVALID_ARGUMENT (steps < 1 or non-finite range). Next step: inspect 'first_collision_value', 'min_clearance', and 'margin_to_collision', then update joint limits or part geometry.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "joint_id": {
+                        "type": "string",
+                        "description": "Identifier of the revolute or prismatic joint to sweep"
+                    },
+                    "from": {
+                        "type": "number",
+                        "description": "Starting joint coordinate (angle in deg/rad for revolute joints; displacement in active length_unit mm/m for prismatic joints)"
+                    },
+                    "to": {
+                        "type": "number",
+                        "description": "Ending joint coordinate (angle in deg/rad for revolute joints; displacement in active length_unit mm/m for prismatic joints)"
+                    },
+                    "steps": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 10000,
+                        "description": "Number of discrete sweep intervals between 'from' and 'to' (dimensionless integer, evaluates steps + 1 configurations)"
+                    },
+                    "ignore_adjacent": {
+                        "type": "boolean",
+                        "description": "If true, skips part pairs directly connected by a registered kinematic joint (default: false)"
+                    },
+                    "angle_unit": {
+                        "type": "string",
+                        "enum": ["deg", "rad"],
+                        "description": "Angular unit for 'from' and 'to' on revolute joints ('deg' by default, or 'rad')"
+                    },
+                    "length_unit": {
+                        "type": "string",
+                        "enum": ["mm", "m"],
+                        "description": "Optional per-call length unit override ('mm' or 'm'; defaults to session length_unit)"
+                    }
+                },
+                "required": ["joint_id", "from", "to", "steps"]
+            }),
+        },
     ]
 }
 
@@ -1295,8 +1603,16 @@ pub fn dispatch_tool(
             let res = physics::run_physics_simulation(args, state)?;
             ToolCallResult::json(&res).map_err(ServerError::Json)
         }
+        "get_part_load_cases" => {
+            let res = physics::get_part_load_cases(args, state)?;
+            ToolCallResult::json(&res).map_err(ServerError::Json)
+        }
         "run_fea_analysis" => {
             let res = fea::run_fea_analysis(args, state)?;
+            ToolCallResult::json(&res).map_err(ServerError::Json)
+        }
+        "run_fea_from_simulation" => {
+            let res = fea::run_fea_from_simulation(args, state)?;
             ToolCallResult::json(&res).map_err(ServerError::Json)
         }
         "get_fea_heatmap_image" => {
@@ -1379,6 +1695,22 @@ pub fn dispatch_tool(
         }
         "get_scene_summary" => {
             let res = metrics::get_scene_summary(args, state)?;
+            ToolCallResult::json(&res).map_err(ServerError::Json)
+        }
+        "check_gear_strength" => {
+            let res = cad::check_gear_strength(args, state)?;
+            ToolCallResult::json(&res).map_err(ServerError::Json)
+        }
+        "analyze_mechanism" => {
+            let res = physics::analyze_mechanism(args, state)?;
+            ToolCallResult::json(&res).map_err(ServerError::Json)
+        }
+        "check_interference" => {
+            let res = physics::check_interference(args, state)?;
+            ToolCallResult::json(&res).map_err(ServerError::Json)
+        }
+        "sweep_joint" => {
+            let res = physics::sweep_joint(args, state)?;
             ToolCallResult::json(&res).map_err(ServerError::Json)
         }
         other => Err(ServerError::ToolNotFound(other.to_string())),

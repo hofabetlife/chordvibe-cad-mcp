@@ -1181,9 +1181,9 @@ impl TriangleMesh {
 
             let mut components: std::collections::HashMap<usize, Vec<&TriInfo>> =
                 std::collections::HashMap::new();
-            for i in 0..n_tris {
+            for (i, tri) in group.tris.iter().enumerate() {
                 let root = uf_find(&mut parent, i);
-                components.entry(root).or_default().push(&group.tris[i]);
+                components.entry(root).or_default().push(tri);
             }
 
             for comp_tris in components.into_values() {

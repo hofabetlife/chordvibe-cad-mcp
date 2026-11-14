@@ -1,18 +1,22 @@
 //! Physics simulation world managing Rapier3D pipelines, bodies, colliders, and joints.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
+use mcp_cad_core::csg::csg_intersection;
+use mcp_cad_core::topology::{BoundingBox, TriangleMesh, Vertex};
 use mcp_cad_core::Part;
-use nalgebra::Vector3;
+use nalgebra::{DMatrix, Matrix3, Quaternion, UnitQuaternion, Vector3};
 use rapier3d::crossbeam::channel::{Receiver, Sender};
 use rapier3d::prelude::*;
 
 use crate::error::PhysicsError;
-use crate::joint::{CadJointType, MotorConfig};
+use crate::joint::{CadJointType, MechanismAnalysisReport, MotorConfig, quat_to_matrix};
 use crate::rigid_body::{ColliderType, create_collider_builder, create_rigid_body_builder};
 use crate::telemetry::{
-    BodyState, BodyTelemetry, CollisionEventType, CollisionRecord, JointReactionForce,
-    SimulationSummary,
+    BodyState, BodyTelemetry, CollisionEventType, CollisionRecord, InterferenceReport,
+    JointLoadCase, JointReactionForce, JointSweepReport, LoadCaseSelector, PairInterferenceResult,
+    PartInertialLoad, PartLoadCase, SimulationSummary, SweepStepResult,
 };
 
 /// Internal record of a kinematic joint registered in the physics world.
@@ -47,6 +51,7 @@ pub struct GearConstraintRecord {
 pub struct PhysicsWorld {
     pipeline: PhysicsPipeline,
     gravity: Vector<Real>,
+    gravity_f64: [f64; 3],
     integration_parameters: IntegrationParameters,
     island_manager: IslandManager,
     broad_phase: DefaultBroadPhase,
@@ -68,6 +73,7 @@ pub struct PhysicsWorld {
     body_to_part: HashMap<RigidBodyHandle, String>,
     collider_to_part: HashMap<ColliderHandle, String>,
     part_to_colliders: HashMap<String, Vec<ColliderHandle>>,
+    part_meshes: HashMap<String, TriangleMesh>,
     joints: HashMap<String, CadJointRecord>,
     gear_constraints: HashMap<String, GearConstraintRecord>,
 
@@ -84,6 +90,7 @@ impl Clone for PhysicsWorld {
         Self {
             pipeline: PhysicsPipeline::new(),
             gravity: self.gravity,
+            gravity_f64: self.gravity_f64,
             integration_parameters: self.integration_parameters,
             island_manager: self.island_manager.clone(),
             broad_phase: self.broad_phase.clone(),
@@ -103,6 +110,7 @@ impl Clone for PhysicsWorld {
             body_to_part: self.body_to_part.clone(),
             collider_to_part: self.collider_to_part.clone(),
             part_to_colliders: self.part_to_colliders.clone(),
+            part_meshes: self.part_meshes.clone(),
             joints: self.joints.clone(),
             gear_constraints: self.gear_constraints.clone(),
 
@@ -146,6 +154,7 @@ impl PhysicsWorld {
         Self {
             pipeline: PhysicsPipeline::new(),
             gravity: vector![gravity[0] as Real, gravity[1] as Real, gravity[2] as Real],
+            gravity_f64: gravity,
             integration_parameters,
             island_manager: IslandManager::new(),
             broad_phase: DefaultBroadPhase::new(),
@@ -165,6 +174,7 @@ impl PhysicsWorld {
             body_to_part,
             collider_to_part: HashMap::new(),
             part_to_colliders: HashMap::new(),
+            part_meshes: HashMap::new(),
             joints: HashMap::new(),
             gear_constraints: HashMap::new(),
 
@@ -175,15 +185,12 @@ impl PhysicsWorld {
     /// Sets the gravity acceleration vector [gx, gy, gz].
     pub fn set_gravity(&mut self, gravity: [f64; 3]) {
         self.gravity = vector![gravity[0] as Real, gravity[1] as Real, gravity[2] as Real];
+        self.gravity_f64 = gravity;
     }
 
     /// Gets the current gravity acceleration vector [gx, gy, gz].
     pub fn gravity(&self) -> [f64; 3] {
-        [
-            self.gravity.x as f64,
-            self.gravity.y as f64,
-            self.gravity.z as f64,
-        ]
+        self.gravity_f64
     }
 
     /// Current accumulated simulation time in seconds.
@@ -242,6 +249,7 @@ impl PhysicsWorld {
             .entry(part.id.clone())
             .or_default()
             .push(collider_handle);
+        self.part_meshes.insert(part.id.clone(), part.mesh.clone());
 
         Ok(rb_handle)
     }
@@ -304,6 +312,7 @@ impl PhysicsWorld {
             .entry(part.id.clone())
             .or_default()
             .push(collider_handle);
+        self.part_meshes.insert(part.id.clone(), part.mesh.clone());
 
         if let Some(rb) = self.bodies.get_mut(rb_handle) {
             rb.recompute_mass_properties_from_colliders(&self.colliders);
@@ -346,6 +355,7 @@ impl PhysicsWorld {
             .ok_or_else(|| PhysicsError::PartNotFound(part_id.to_string()))?;
 
         self.body_to_part.remove(&rb_handle);
+        self.part_meshes.remove(part_id);
 
         if let Some(col_handles) = self.part_to_colliders.remove(part_id) {
             for col_h in col_handles {
@@ -719,17 +729,7 @@ impl PhysicsWorld {
         let safe_dt = if dt > 0.0 { dt } else { 1.0 / 60.0 };
         for (joint_id, joint_rec) in &self.joints {
             if let Some(joint) = self.impulse_joints.get(joint_rec.handle) {
-                let imp = joint.impulses;
-                let force = [
-                    imp[0] as f64 / safe_dt,
-                    imp[1] as f64 / safe_dt,
-                    imp[2] as f64 / safe_dt,
-                ];
-                let torque = [
-                    imp[3] as f64 / safe_dt,
-                    imp[4] as f64 / safe_dt,
-                    imp[5] as f64 / safe_dt,
-                ];
+                let (force, torque) = self.compute_joint_world_wrench_on_part_a(joint, safe_dt);
                 let force_mag = (force[0].powi(2) + force[1].powi(2) + force[2].powi(2)).sqrt();
                 let torque_mag =
                     (torque[0].powi(2) + torque[1].powi(2) + torque[2].powi(2)).sqrt();
@@ -956,6 +956,51 @@ impl PhysicsWorld {
         Ok(())
     }
 
+    /// Sets the world-space position `[x, y, z]` (m) and orientation quaternion `[qx, qy, qz, qw]`
+    /// of a registered part and immediately synchronizes its attached colliders.
+    pub fn set_part_pose(
+        &mut self,
+        part_id: &str,
+        position: [f64; 3],
+        orientation_quat: [f64; 4],
+    ) -> Result<(), PhysicsError> {
+        let quat = Quaternion::new(
+            orientation_quat[3] as Real,
+            orientation_quat[0] as Real,
+            orientation_quat[1] as Real,
+            orientation_quat[2] as Real,
+        );
+        let unit_quat = if quat.norm() > 1e-12 {
+            UnitQuaternion::from_quaternion(quat)
+        } else {
+            UnitQuaternion::identity()
+        };
+        let iso = Isometry::from_parts(
+            Translation::new(
+                position[0] as Real,
+                position[1] as Real,
+                position[2] as Real,
+            ),
+            unit_quat,
+        );
+
+        let rb = self.get_body_mut(part_id)?;
+        rb.set_position(iso, true);
+
+        if let Some(col_handles) = self.part_to_colliders.get(part_id).cloned() {
+            for col_h in col_handles {
+                if let Some(col) = self.colliders.get_mut(col_h) {
+                    let local_pos = col
+                        .position_wrt_parent()
+                        .copied()
+                        .unwrap_or_else(Isometry::identity);
+                    col.set_position(iso * local_pos);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Applies a continuous external force vector [fx, fy, fz] in Newtons to a part.
     pub fn apply_force(&mut self, part_id: &str, force: [f64; 3]) -> Result<(), PhysicsError> {
         let rb = self.get_body_mut(part_id)?;
@@ -993,17 +1038,7 @@ impl PhysicsWorld {
             .ok_or_else(|| PhysicsError::JointNotFound(joint_id.to_string()))?;
 
         let safe_dt = if dt > 0.0 { dt } else { 1.0 / 60.0 };
-        let imp = joint.impulses;
-        let force = [
-            imp[0] as f64 / safe_dt,
-            imp[1] as f64 / safe_dt,
-            imp[2] as f64 / safe_dt,
-        ];
-        let torque = [
-            imp[3] as f64 / safe_dt,
-            imp[4] as f64 / safe_dt,
-            imp[5] as f64 / safe_dt,
-        ];
+        let (force, torque) = self.compute_joint_world_wrench_on_part_a(joint, safe_dt);
         let force_magnitude = (force[0].powi(2) + force[1].powi(2) + force[2].powi(2)).sqrt();
         let torque_magnitude = (torque[0].powi(2) + torque[1].powi(2) + torque[2].powi(2)).sqrt();
 
@@ -1016,4 +1051,2041 @@ impl PhysicsWorld {
             torque_magnitude,
         })
     }
+
+    /// Reconstructs the physical reaction wrench `(force_world, torque_anchor_world)` acting ON
+    /// `part_a` (`joint.body1`) at its joint anchor from Rapier3D 0.22's solved joint impulses.
+    ///
+    /// ### Rapier3D 0.22 Impulse Representation (`P3-T6`)
+    /// 1. **TGS-Soft Substepping**: `IslandSolver::init_and_solve` divides `dt` into
+    ///    `num_substeps = num_solver_iterations + additional_solver_iterations` substeps of
+    ///    duration `substep_dt = dt / num_substeps`. Each substep resets `constraint.impulse = 0`
+    ///    during `joint_constraints.update(...)`, solves for that substep's impulse, and at the
+    ///    end of the step writes the final substep's impulse into `joint.impulses[0..6]`,
+    ///    `joint.data.motors[0..6].impulse`, and `joint.data.limits[0..6].impulse`.
+    ///    Therefore, physical forces and torques equal `impulse / substep_dt`.
+    /// 2. **One-Body vs Two-Body Flipping**: When `joint.body2` (`part_b`) is fixed and
+    ///    `joint.body1` (`part_a`) is dynamic, `JointOneBodyConstraintBuilder::generate` swaps
+    ///    `body1 <-> body2` and calls `joint_data.flip()` so `body2` is always the dynamic body.
+    ///    In `solve_generic`, `+impulse * lin_jac` is applied to `body1` and `-impulse * lin_jac`
+    ///    is applied to `body2`.
+    /// 3. **Modified Gram-Schmidt Decoupling**: In `lock_axes`, locked angular rows (`i = 3..6`)
+    ///    are emitted before locked linear rows (`i = 0..3`), and `finalize_constraints` runs
+    ///    Modified Gram-Schmidt orthogonalization in inverse-inertia space. This subtracts the
+    ///    lever-arm moment `r x lin_jac` along locked angular axes from the linear constraint rows,
+    ///    shifting the effective line of action of `joint.impulses[0..3]` to the center of mass.
+    ///    Tracking the pure anchor couple `tau_anchor` alongside `(lin_jac, ang_jac1, ang_jac2)`
+    ///    through the exact same Gram-Schmidt orthogonalization recovers both the world force
+    ///    `F` and the physical reaction torque `T_anchor` at the joint anchor.
+    fn compute_joint_world_wrench_on_part_a(
+        &self,
+        joint: &ImpulseJoint,
+        dt: f64,
+    ) -> ([f64; 3], [f64; 3]) {
+        let (Some(rb1_orig), Some(rb2_orig)) =
+            (self.bodies.get(joint.body1), self.bodies.get(joint.body2))
+        else {
+            return ([0.0; 3], [0.0; 3]);
+        };
+
+        if !rb1_orig.is_dynamic() && !rb2_orig.is_dynamic() {
+            return ([0.0; 3], [0.0; 3]);
+        }
+
+        // Match JointOneBodyConstraintBuilder::generate flipping when body2 is not dynamic.
+        let flipped = !rb2_orig.is_dynamic();
+        let (rb1, rb2, joint_data) = if flipped {
+            let mut jd = joint.data;
+            jd.flip();
+            (rb2_orig, rb1_orig, jd)
+        } else {
+            (rb1_orig, rb2_orig, joint.data)
+        };
+
+        let safe_dt = if dt > 0.0 {
+            dt
+        } else {
+            self.integration_parameters.dt as f64
+        };
+        let num_substeps = (self.integration_parameters.num_solver_iterations.get()
+            + rb1.additional_solver_iterations()
+            + rb2.additional_solver_iterations())
+        .max(1) as f64;
+        let substep_dt = safe_dt / num_substeps;
+        if substep_dt <= 1e-15 {
+            return ([0.0; 3], [0.0; 3]);
+        }
+        let inv_substep_dt = 1.0 / substep_dt;
+
+        // Reconstruct pre-integration poses of rb1 and rb2 at the final substep where
+        // joint_constraints.update() assembled the constraint Jacobians.
+        let substep_dt_r = substep_dt as Real;
+        let pos1 = if rb1.is_dynamic() {
+            let v1 = RigidBodyVelocity {
+                linvel: *rb1.linvel(),
+                angvel: *rb1.angvel(),
+            };
+            v1.integrate(
+                -substep_dt_r,
+                rb1.position(),
+                &rb1.mass_properties().local_mprops.local_com,
+            )
+        } else {
+            *rb1.position()
+        };
+        let pos2 = if rb2.is_dynamic() {
+            let v2 = RigidBodyVelocity {
+                linvel: *rb2.linvel(),
+                angvel: *rb2.angvel(),
+            };
+            v2.integrate(
+                -substep_dt_r,
+                rb2.position(),
+                &rb2.mass_properties().local_mprops.local_com,
+            )
+        } else {
+            *rb2.position()
+        };
+        let world_com1 = pos1 * rb1.mass_properties().local_mprops.local_com;
+        let world_com2 = pos2 * rb2.mass_properties().local_mprops.local_com;
+
+        let mut frame1 = pos1 * joint_data.local_frame1;
+        let frame2 = pos2 * joint_data.local_frame2;
+        let basis = frame1.rotation.to_rotation_matrix().into_inner();
+        let lin_err = frame2.translation.vector - frame1.translation.vector;
+
+        let locked_axes = joint_data.locked_axes.bits();
+        let motor_axes = joint_data.motor_axes.bits() & !locked_axes;
+        let limit_axes = joint_data.limit_axes.bits() & !locked_axes;
+        let coupled_axes = joint_data.coupled_axes.bits();
+
+        // Snap free linear axes of frame1.translation to frame2.translation
+        let mut new_center1 = frame2.translation.vector;
+        for i in 0..3 {
+            if locked_axes & (1 << i) != 0 {
+                let axis = basis.column(i);
+                new_center1 -= axis * lin_err.dot(&axis);
+            }
+        }
+        frame1.translation.vector = new_center1;
+
+        let r1 = frame1.translation.vector - world_com1.coords;
+        let r2 = frame2.translation.vector - world_com2.coords;
+        let cmat1_basis = r1.cross_matrix() * basis;
+        let cmat2_basis = r2.cross_matrix() * basis;
+
+        // Compute ang_basis = diff_conj1_2(frame1.rotation, frame2.rotation).transpose() * sgn
+        let q1 = frame1.rotation;
+        let q2 = frame2.rotation;
+        let v1 = q1.imag();
+        let v2 = q2.imag();
+        let w1 = q1.w;
+        let w2 = q2.w;
+        let diff_conj = (v1 * v2.transpose()
+            + nalgebra::Matrix3::from_diagonal_element(w1 * w2)
+            - (v1 * w2 + v2 * w1).cross_matrix()
+            + v1.cross_matrix() * v2.cross_matrix())
+            * 0.5_f32;
+        let sgn = 1.0_f32.copysign(q1.coords.dot(&q2.coords));
+        let ang_basis = diff_conj.transpose() * sgn;
+
+        let (im1, sqrt_ii1) = if rb1.is_dynamic() {
+            (
+                rb1.mass_properties().effective_inv_mass,
+                rb1.mass_properties().effective_world_inv_inertia_sqrt,
+            )
+        } else {
+            (nalgebra::Vector3::zeros(), AngularInertia::zero())
+        };
+        let im2 = rb2.mass_properties().effective_inv_mass;
+        let sqrt_ii2 = rb2.mass_properties().effective_world_inv_inertia_sqrt;
+        let imsum = im1 + im2;
+
+        #[derive(Clone, Copy)]
+        struct ConstraintRow {
+            lin_jac: nalgebra::Vector3<Real>,
+            ang_jac1: nalgebra::Vector3<Real>,
+            ang_jac2: nalgebra::Vector3<Real>,
+            tau_anchor: nalgebra::Vector3<Real>,
+            is_unbounded: bool,
+            impulse: Real,
+        }
+
+        let finalize_rows = |rows: &mut [ConstraintRow]| {
+            let len = rows.len();
+            for j in 0..len {
+                let dot_jj = rows[j].lin_jac.dot(&imsum.component_mul(&rows[j].lin_jac))
+                    + rows[j].ang_jac1.dot(&rows[j].ang_jac1)
+                    + rows[j].ang_jac2.dot(&rows[j].ang_jac2);
+                if !rows[j].is_unbounded || dot_jj <= 0.0 {
+                    continue;
+                }
+                let inv_dot_jj = 1.0 / dot_jj;
+                let row_j = rows[j];
+                for row_i in rows.iter_mut().skip(j + 1) {
+                    let dot_ij = row_i.lin_jac.dot(&imsum.component_mul(&row_j.lin_jac))
+                        + row_i.ang_jac1.dot(&row_j.ang_jac1)
+                        + row_i.ang_jac2.dot(&row_j.ang_jac2);
+                    let coeff = dot_ij * inv_dot_jj;
+                    row_i.lin_jac -= row_j.lin_jac * coeff;
+                    row_i.ang_jac1 -= row_j.ang_jac1 * coeff;
+                    row_i.ang_jac2 -= row_j.ang_jac2 * coeff;
+                    row_i.tau_anchor -= row_j.tau_anchor * coeff;
+                }
+            }
+        };
+
+        let mut all_rows: Vec<ConstraintRow> = Vec::with_capacity(12);
+
+        // 1. Motor rows (angular then linear)
+        let mut motor_rows: Vec<ConstraintRow> = Vec::new();
+        for (i, motor) in joint.data.motors.iter().enumerate().skip(3) {
+            if (motor_axes & !coupled_axes) & (1 << i) != 0 {
+                let ang_jac = basis.column(i - 3).into_owned();
+                motor_rows.push(ConstraintRow {
+                    lin_jac: nalgebra::Vector3::zeros(),
+                    ang_jac1: sqrt_ii1 * ang_jac,
+                    ang_jac2: sqrt_ii2 * ang_jac,
+                    tau_anchor: ang_jac,
+                    is_unbounded: false,
+                    impulse: motor.impulse,
+                });
+            }
+        }
+        for (i, motor) in joint.data.motors.iter().enumerate().take(3) {
+            if (motor_axes & !coupled_axes) & (1 << i) != 0 {
+                let lin_jac = basis.column(i).into_owned();
+                let c1 = cmat1_basis.column(i).into_owned();
+                let c2 = cmat2_basis.column(i).into_owned();
+                motor_rows.push(ConstraintRow {
+                    lin_jac,
+                    ang_jac1: sqrt_ii1 * c1,
+                    ang_jac2: sqrt_ii2 * c2,
+                    tau_anchor: nalgebra::Vector3::zeros(),
+                    is_unbounded: false,
+                    impulse: motor.impulse,
+                });
+            }
+        }
+        finalize_rows(&mut motor_rows);
+        all_rows.extend(motor_rows);
+
+        // 2. Locked + Limit rows (locked angular, locked linear, limit angular, limit linear)
+        let mut constraint_rows: Vec<ConstraintRow> = Vec::new();
+        for i in 3..6 {
+            if locked_axes & (1 << i) != 0 {
+                let ang_jac = ang_basis.column(i - 3).into_owned();
+                constraint_rows.push(ConstraintRow {
+                    lin_jac: nalgebra::Vector3::zeros(),
+                    ang_jac1: sqrt_ii1 * ang_jac,
+                    ang_jac2: sqrt_ii2 * ang_jac,
+                    tau_anchor: ang_jac,
+                    is_unbounded: true,
+                    impulse: joint.impulses[i],
+                });
+            }
+        }
+        for i in 0..3 {
+            if locked_axes & (1 << i) != 0 {
+                let lin_jac = basis.column(i).into_owned();
+                let c1 = cmat1_basis.column(i).into_owned();
+                let c2 = cmat2_basis.column(i).into_owned();
+                constraint_rows.push(ConstraintRow {
+                    lin_jac,
+                    ang_jac1: sqrt_ii1 * c1,
+                    ang_jac2: sqrt_ii2 * c2,
+                    tau_anchor: nalgebra::Vector3::zeros(),
+                    is_unbounded: true,
+                    impulse: joint.impulses[i],
+                });
+            }
+        }
+        for (i, limit) in joint.data.limits.iter().enumerate().skip(3) {
+            if (limit_axes & !coupled_axes) & (1 << i) != 0 {
+                let ang_jac = ang_basis.column(i - 3).into_owned();
+                constraint_rows.push(ConstraintRow {
+                    lin_jac: nalgebra::Vector3::zeros(),
+                    ang_jac1: sqrt_ii1 * ang_jac,
+                    ang_jac2: sqrt_ii2 * ang_jac,
+                    tau_anchor: ang_jac,
+                    is_unbounded: false,
+                    impulse: limit.impulse,
+                });
+            }
+        }
+        for (i, limit) in joint.data.limits.iter().enumerate().take(3) {
+            if (limit_axes & !coupled_axes) & (1 << i) != 0 {
+                let lin_jac = basis.column(i).into_owned();
+                let c1 = cmat1_basis.column(i).into_owned();
+                let c2 = cmat2_basis.column(i).into_owned();
+                constraint_rows.push(ConstraintRow {
+                    lin_jac,
+                    ang_jac1: sqrt_ii1 * c1,
+                    ang_jac2: sqrt_ii2 * c2,
+                    tau_anchor: nalgebra::Vector3::zeros(),
+                    is_unbounded: false,
+                    impulse: limit.impulse,
+                });
+            }
+        }
+        finalize_rows(&mut constraint_rows);
+        all_rows.extend(constraint_rows);
+
+        // Sum linear impulse and anchor angular impulse on body1 (in the possibly-flipped order).
+        let mut lin_imp1 = nalgebra::Vector3::<f64>::zeros();
+        let mut ang_imp1 = nalgebra::Vector3::<f64>::zeros();
+        for row in &all_rows {
+            let imp = row.impulse as f64;
+            lin_imp1 += nalgebra::Vector3::new(
+                row.lin_jac.x as f64,
+                row.lin_jac.y as f64,
+                row.lin_jac.z as f64,
+            ) * imp;
+            ang_imp1 += nalgebra::Vector3::new(
+                row.tau_anchor.x as f64,
+                row.tau_anchor.y as f64,
+                row.tau_anchor.z as f64,
+            ) * imp;
+        }
+
+        // If `flipped` was true, `body1` in the solver was `part_b` and `body2` was `part_a`,
+        // so the impulse on `part_a` (`body2`) has the opposite sign (`-lin_imp1`, `-ang_imp1`).
+        let sign_on_part_a = if flipped { -1.0 } else { 1.0 };
+        let force_on_a = lin_imp1 * (sign_on_part_a * inv_substep_dt);
+        let torque_on_a = ang_imp1 * (sign_on_part_a * inv_substep_dt);
+
+        (
+            [force_on_a.x, force_on_a.y, force_on_a.z],
+            [torque_on_a.x, torque_on_a.y, torque_on_a.z],
+        )
+    }
+
+    /// Returns all joint records connected to `part_id` (`part_a == part_id` or `part_b == part_id`),
+    /// sorted deterministically by `joint.id`.
+    #[must_use]
+    pub fn joints_for_part(&self, part_id: &str) -> Vec<&CadJointRecord> {
+        let norm_id = if part_id.eq_ignore_ascii_case("ground") {
+            "ground"
+        } else if part_id.eq_ignore_ascii_case("world") {
+            "world"
+        } else {
+            part_id
+        };
+        let mut list: Vec<&CadJointRecord> = self
+            .joints
+            .values()
+            .filter(|j| j.part_a == norm_id || j.part_b == norm_id)
+            .collect();
+        list.sort_by(|a, b| a.id.cmp(&b.id));
+        list
+    }
+
+    /// Extracts the complete dynamic/quasi-static load case for `part_id` from a completed
+    /// [`SimulationSummary`] in the **local coordinate system of `part_id`** (`P3-T6`).
+    ///
+    /// - Collects all joints connected to `part_id` (`part_a` or `part_b`), applies the
+    ///   Newton's 3rd law sign convention so forces and torques represent loads acting **ON**
+    ///   `part_id`, and rotates them into `part_id`'s local frame at the selected instant.
+    /// - Computes `part_id`'s inertial state (mass, COM, linear & angular acceleration in
+    ///   local and world frames) using the co-rotating transport theorem
+    ///   `a_local = (v_local(t_k) - v_local(t_{k-1})) / dt + omega_local x v_local`.
+    /// - Evaluates the translational and rotational dynamic equilibrium residuals:
+    ///   `R_F = sum(F_joints) + m * g - m * a_com` and
+    ///   `R_T = sum(T_joint + (anchor - com) x F_joint) - (I * alpha + omega x (I * omega))`.
+    pub fn extract_part_load_case(
+        &self,
+        summary: &SimulationSummary,
+        part_id: &str,
+        selector: LoadCaseSelector,
+    ) -> Result<PartLoadCase, PhysicsError> {
+        if let LoadCaseSelector::AtTime(t) = selector {
+            if !t.is_finite() || t < 0.0 {
+                return Err(PhysicsError::SimulationError(format!(
+                    "Load case timestamp must be a finite non-negative number, got {t}"
+                )));
+            }
+        }
+
+        let rb = self.get_body(part_id)?;
+        let is_fixed = !rb.is_dynamic();
+        let mass_kg = if is_fixed { 0.0 } else { rb.mass() as f64 };
+        let com_local_pt = rb.mass_properties().local_mprops.local_com;
+        let center_of_mass_local = [
+            com_local_pt.x as f64,
+            com_local_pt.y as f64,
+            com_local_pt.z as f64,
+        ];
+        let com_local_vec = Vector3::new(
+            center_of_mass_local[0],
+            center_of_mass_local[1],
+            center_of_mass_local[2],
+        );
+
+        // Local inertia tensor I_local (3x3) in body local coordinates
+        let local_inertia_mat = if is_fixed {
+            nalgebra::Matrix3::<f64>::zeros()
+        } else {
+            let p_inertia = rb.mass_properties().local_mprops.principal_inertia();
+            let p_frame = rb
+                .mass_properties()
+                .local_mprops
+                .principal_inertia_local_frame
+                .to_rotation_matrix()
+                .into_inner();
+            let p_mat = nalgebra::Matrix3::from_diagonal(&nalgebra::Vector3::new(
+                p_inertia.x as f64,
+                p_inertia.y as f64,
+                p_inertia.z as f64,
+            ));
+            let r_f64 = nalgebra::Matrix3::new(
+                p_frame[(0, 0)] as f64,
+                p_frame[(0, 1)] as f64,
+                p_frame[(0, 2)] as f64,
+                p_frame[(1, 0)] as f64,
+                p_frame[(1, 1)] as f64,
+                p_frame[(1, 2)] as f64,
+                p_frame[(2, 0)] as f64,
+                p_frame[(2, 1)] as f64,
+                p_frame[(2, 2)] as f64,
+            );
+            r_f64 * p_mat * r_f64.transpose()
+        };
+
+        let connected_joints = self.joints_for_part(part_id);
+        let norm_part_id = if part_id.eq_ignore_ascii_case("ground") {
+            "ground"
+        } else if part_id.eq_ignore_ascii_case("world") {
+            "world"
+        } else {
+            part_id
+        };
+
+        // Determine sample timeline for this part (or synthesized fixed-ground samples)
+        let synthesized_samples: Vec<BodyState>;
+        let samples: &[BodyState] = if let Some(traj) = summary.trajectories.get(norm_part_id) {
+            if traj.samples.is_empty() {
+                return Err(PhysicsError::SimulationError(format!(
+                    "No simulation telemetry samples recorded for part '{part_id}'"
+                )));
+            }
+            &traj.samples
+        } else {
+            let n = summary
+                .joint_reactions
+                .values()
+                .map(Vec::len)
+                .max()
+                .unwrap_or(summary.step_count + 1)
+                .max(1);
+            let pos = self.part_position(part_id).unwrap_or([0.0; 3]);
+            let quat = self.part_orientation(part_id).unwrap_or([0.0, 0.0, 0.0, 1.0]);
+            synthesized_samples = (0..n)
+                .map(|i| BodyState {
+                    time_s: (i as f64) * summary.step_size_s,
+                    position: pos,
+                    orientation_quat: quat,
+                    linear_velocity: [0.0; 3],
+                    angular_velocity: [0.0; 3],
+                })
+                .collect();
+            &synthesized_samples
+        };
+
+        let num_samples = samples.len();
+        // Sample 0 is recorded prior to the first solver step; stepped samples start at 1 when available.
+        let start_idx = usize::from(num_samples > 1);
+
+        let quat_from_arr = |q: [f64; 4]| -> nalgebra::UnitQuaternion<f64> {
+            nalgebra::UnitQuaternion::new_normalize(nalgebra::Quaternion::new(
+                q[3], q[0], q[1], q[2],
+            ))
+        };
+
+        // Helper to compute total force & torque metrics on `part_id` at a given sample index
+        let score_at_step = |idx: usize| -> (f64, f64, f64, f64) {
+            let q_k = quat_from_arr(samples[idx].orientation_quat);
+            let rot_inv = q_k.inverse();
+            let mut sum_f_mag = 0.0_f64;
+            let mut sum_t_mag = 0.0_f64;
+            let mut net_f_local = Vector3::<f64>::zeros();
+            let mut net_t_com_local = Vector3::<f64>::zeros();
+
+            for jrec in &connected_joints {
+                if let Some(reactions) = summary.joint_reactions.get(&jrec.id) {
+                    if let Some(rf) = reactions.get(idx) {
+                        let (sign, anchor_arr) = if jrec.part_a == norm_part_id {
+                            (1.0_f64, jrec.joint_type.anchor_a())
+                        } else {
+                            (-1.0_f64, jrec.joint_type.anchor_b())
+                        };
+                        let fw = Vector3::new(
+                            sign * rf.force[0],
+                            sign * rf.force[1],
+                            sign * rf.force[2],
+                        );
+                        let tw = Vector3::new(
+                            sign * rf.torque[0],
+                            sign * rf.torque[1],
+                            sign * rf.torque[2],
+                        );
+                        let fl = rot_inv * fw;
+                        let tl = rot_inv * tw;
+                        let anchor_vec = Vector3::new(anchor_arr[0], anchor_arr[1], anchor_arr[2]);
+                        let lever = anchor_vec - com_local_vec;
+                        sum_f_mag += fl.norm();
+                        sum_t_mag += tl.norm();
+                        net_f_local += fl;
+                        net_t_com_local += tl + lever.cross(&fl);
+                    }
+                }
+            }
+            (
+                sum_f_mag,
+                net_f_local.norm(),
+                sum_t_mag,
+                net_t_com_local.norm(),
+            )
+        };
+
+        let selected_idx = match selector {
+            LoadCaseSelector::PeakForce => {
+                let mut best_idx = start_idx;
+                let mut best_score = (-1.0_f64, -1.0_f64);
+                for idx in start_idx..num_samples {
+                    let (sum_f, net_f, _, _) = score_at_step(idx);
+                    let score = (sum_f.max(net_f), net_f);
+                    if score.0 > best_score.0 + 1e-12
+                        || ((score.0 - best_score.0).abs() <= 1e-12 && score.1 > best_score.1 + 1e-12)
+                    {
+                        best_score = score;
+                        best_idx = idx;
+                    }
+                }
+                best_idx
+            }
+            LoadCaseSelector::PeakTorque => {
+                let mut best_idx = start_idx;
+                let mut best_score = (-1.0_f64, -1.0_f64);
+                for idx in start_idx..num_samples {
+                    let (_, _, sum_t, net_t_com) = score_at_step(idx);
+                    let primary = sum_t.max(net_t_com);
+                    let secondary = sum_t + net_t_com;
+                    if primary > best_score.0 + 1e-12
+                        || ((primary - best_score.0).abs() <= 1e-12
+                            && secondary > best_score.1 + 1e-12)
+                    {
+                        best_score = (primary, secondary);
+                        best_idx = idx;
+                    }
+                }
+                best_idx
+            }
+            LoadCaseSelector::AtTime(target_t) => {
+                let mut best_idx = start_idx;
+                let mut best_diff = f64::INFINITY;
+                for (idx, sample) in samples.iter().enumerate().take(num_samples).skip(start_idx) {
+                    let diff = (sample.time_s - target_t).abs();
+                    if diff < best_diff {
+                        best_diff = diff;
+                        best_idx = idx;
+                    }
+                }
+                best_idx
+            }
+        };
+
+        let state_k = &samples[selected_idx];
+        let q_k = quat_from_arr(state_k.orientation_quat);
+
+        // Because Rapier3D assembles & solves the final velocity substep BEFORE `integrate_positions`
+        // advances the body pose by `substep_dt = dt / num_substeps`, the orientation at the exact
+        // instant of the final substep constraint solve is `q_solve = exp(-0.5 * omega * substep_dt) * q_k`.
+        let num_substeps = (self.integration_parameters.num_solver_iterations.get()
+            + rb.additional_solver_iterations())
+        .max(1) as f64;
+        let substep_dt = summary.step_size_s.max(1e-9) / num_substeps;
+        let omega_k_world = Vector3::new(
+            state_k.angular_velocity[0],
+            state_k.angular_velocity[1],
+            state_k.angular_velocity[2],
+        );
+        let q_solve = if omega_k_world.norm() > 1e-12 {
+            let delta_rot = nalgebra::UnitQuaternion::from_scaled_axis(-omega_k_world * substep_dt);
+            delta_rot * q_k
+        } else {
+            q_k
+        };
+        let rot_world_to_local = q_solve.inverse();
+
+        let mut joint_cases: Vec<JointLoadCase> = Vec::with_capacity(connected_joints.len());
+        let mut net_force_local = Vector3::<f64>::zeros();
+        let mut net_couple_local = Vector3::<f64>::zeros();
+        let mut net_torque_com_local = Vector3::<f64>::zeros();
+
+        for jrec in &connected_joints {
+            let (sign, role, connected_part_id, anchor_local) = if jrec.part_a == norm_part_id {
+                (
+                    1.0_f64,
+                    "part_a".to_string(),
+                    jrec.part_b.clone(),
+                    jrec.joint_type.anchor_a(),
+                )
+            } else {
+                (
+                    -1.0_f64,
+                    "part_b".to_string(),
+                    jrec.part_a.clone(),
+                    jrec.joint_type.anchor_b(),
+                )
+            };
+
+            let (rf_force, rf_torque) = summary
+                .joint_reactions
+                .get(&jrec.id)
+                .and_then(|list| list.get(selected_idx))
+                .map_or(([0.0; 3], [0.0; 3]), |rf| (rf.force, rf.torque));
+
+            let force_world_vec = Vector3::new(
+                sign * rf_force[0],
+                sign * rf_force[1],
+                sign * rf_force[2],
+            );
+            let torque_world_vec = Vector3::new(
+                sign * rf_torque[0],
+                sign * rf_torque[1],
+                sign * rf_torque[2],
+            );
+
+            let force_local_vec = rot_world_to_local * force_world_vec;
+            let torque_local_vec = rot_world_to_local * torque_world_vec;
+            let force_mag = force_local_vec.norm();
+            let torque_mag = torque_local_vec.norm();
+
+            let anchor_vec = Vector3::new(anchor_local[0], anchor_local[1], anchor_local[2]);
+            let lever_from_com = anchor_vec - com_local_vec;
+
+            net_force_local += force_local_vec;
+            net_couple_local += torque_local_vec;
+            net_torque_com_local += torque_local_vec + lever_from_com.cross(&force_local_vec);
+
+            joint_cases.push(JointLoadCase {
+                joint_id: jrec.id.clone(),
+                joint_type: jrec.joint_type.type_name().to_string(),
+                connected_part_id,
+                role,
+                anchor_local,
+                force: [force_local_vec.x, force_local_vec.y, force_local_vec.z],
+                torque: [torque_local_vec.x, torque_local_vec.y, torque_local_vec.z],
+                force_world: [force_world_vec.x, force_world_vec.y, force_world_vec.z],
+                torque_world: [torque_world_vec.x, torque_world_vec.y, torque_world_vec.z],
+                force_magnitude: force_mag,
+                torque_magnitude: torque_mag,
+            });
+        }
+
+        // Compute linear and angular velocities and accelerations in the part's local frame
+        let v_k_world = Vector3::new(
+            state_k.linear_velocity[0],
+            state_k.linear_velocity[1],
+            state_k.linear_velocity[2],
+        );
+        let v_k_local = q_k.inverse() * v_k_world;
+        let omega_k_local = q_k.inverse() * omega_k_world;
+
+        let (a_com_local, alpha_local) = if is_fixed || num_samples <= 1 {
+            (Vector3::zeros(), Vector3::zeros())
+        } else {
+            let (prev_idx, curr_idx) = if selected_idx > 0 {
+                (selected_idx - 1, selected_idx)
+            } else {
+                (0, 1)
+            };
+            let s_prev = &samples[prev_idx];
+            let s_curr = &samples[curr_idx];
+            let dt_step = (s_curr.time_s - s_prev.time_s).max(1e-9);
+            let q_prev = quat_from_arr(s_prev.orientation_quat);
+            let q_curr = quat_from_arr(s_curr.orientation_quat);
+
+            let v_prev_local = q_prev.inverse()
+                * Vector3::new(
+                    s_prev.linear_velocity[0],
+                    s_prev.linear_velocity[1],
+                    s_prev.linear_velocity[2],
+                );
+            let v_curr_local = q_curr.inverse()
+                * Vector3::new(
+                    s_curr.linear_velocity[0],
+                    s_curr.linear_velocity[1],
+                    s_curr.linear_velocity[2],
+                );
+            let omega_prev_local = q_prev.inverse()
+                * Vector3::new(
+                    s_prev.angular_velocity[0],
+                    s_prev.angular_velocity[1],
+                    s_prev.angular_velocity[2],
+                );
+            let omega_curr_local = q_curr.inverse()
+                * Vector3::new(
+                    s_curr.angular_velocity[0],
+                    s_curr.angular_velocity[1],
+                    s_curr.angular_velocity[2],
+                );
+
+            // Co-rotating transport theorem: a_local = dv_local/dt + omega_local x v_local
+            let dv_local_dt = (v_curr_local - v_prev_local) / dt_step;
+            let a_local = dv_local_dt + omega_curr_local.cross(&v_curr_local);
+            let domega_local_dt = (omega_curr_local - omega_prev_local) / dt_step;
+            (a_local, domega_local_dt)
+        };
+
+        let a_com_world = q_solve * a_com_local;
+        let alpha_world = q_solve * alpha_local;
+
+        let gravity_world = Vector3::new(
+            self.gravity_f64[0],
+            self.gravity_f64[1],
+            self.gravity_f64[2],
+        );
+        let gravity_local = rot_world_to_local * gravity_world;
+
+        // Dynamic equilibrium residuals in the part's local frame (for dynamic bodies):
+        // Force equilibrium: sum(F_joints) + m * g - m * a_com = 0
+        // Moment equilibrium about COM: sum(T_joint + (anchor - com) x F_joint) - (I * alpha + omega x (I * omega)) = 0
+        let (res_force_vec, res_torque_vec) = if is_fixed {
+            (Vector3::zeros(), Vector3::zeros())
+        } else {
+            let rf = net_force_local + mass_kg * gravity_local - mass_kg * a_com_local;
+            let i_omega = local_inertia_mat * omega_k_local;
+            let euler_inertial_torque =
+                local_inertia_mat * alpha_local + omega_k_local.cross(&i_omega);
+            let rt = net_torque_com_local - euler_inertial_torque;
+            (rf, rt)
+        };
+
+        let res_force_norm = res_force_vec.norm();
+        let res_torque_norm = res_torque_vec.norm();
+
+        Ok(PartLoadCase {
+            part_id: part_id.to_string(),
+            select: selector.label(),
+            time_s: state_k.time_s,
+            step_index: selected_idx,
+            position_world: state_k.position,
+            orientation_quat: state_k.orientation_quat,
+            joints: joint_cases,
+            net_joint_force: [net_force_local.x, net_force_local.y, net_force_local.z],
+            net_joint_torque_about_com: [
+                net_torque_com_local.x,
+                net_torque_com_local.y,
+                net_torque_com_local.z,
+            ],
+            net_joint_couple: [net_couple_local.x, net_couple_local.y, net_couple_local.z],
+            net_joint_force_magnitude: net_force_local.norm(),
+            net_joint_torque_about_com_magnitude: net_torque_com_local.norm(),
+            inertia: PartInertialLoad {
+                mass_kg,
+                is_fixed,
+                center_of_mass_local,
+                linear_acceleration: [a_com_local.x, a_com_local.y, a_com_local.z],
+                angular_acceleration: [alpha_local.x, alpha_local.y, alpha_local.z],
+                linear_acceleration_world: [a_com_world.x, a_com_world.y, a_com_world.z],
+                angular_acceleration_world: [alpha_world.x, alpha_world.y, alpha_world.z],
+                linear_velocity: [v_k_local.x, v_k_local.y, v_k_local.z],
+                angular_velocity: [omega_k_local.x, omega_k_local.y, omega_k_local.z],
+                gravity_local: [gravity_local.x, gravity_local.y, gravity_local.z],
+            },
+            equilibrium_residual_force: [res_force_vec.x, res_force_vec.y, res_force_vec.z],
+            equilibrium_residual_force_norm: res_force_norm,
+            equilibrium_residual_torque: [res_torque_vec.x, res_torque_vec.y, res_torque_vec.z],
+            equilibrium_residual_torque_norm: res_torque_norm,
+        })
+    }
+
+    /// Retrieves world position and 3x3 rotation matrix for a body or ground anchor.
+    fn get_world_pose_vectors(&self, part_id: &str) -> (Vector3<f64>, Matrix3<f64>) {
+        if part_id.eq_ignore_ascii_case("ground") || part_id.eq_ignore_ascii_case("world") {
+            (Vector3::zeros(), Matrix3::identity())
+        } else if let Ok(rb) = self.get_body(part_id) {
+            let pos = rb.translation();
+            let q = rb.rotation().quaternion();
+            let pos_vec = Vector3::new(pos.x as f64, pos.y as f64, pos.z as f64);
+            let rot_mat = quat_to_matrix([
+                q.coords.x as f64,
+                q.coords.y as f64,
+                q.coords.z as f64,
+                q.coords.w as f64,
+            ]);
+            (pos_vec, rot_mat)
+        } else {
+            (Vector3::zeros(), Matrix3::identity())
+        }
+    }
+
+    /// Performs kinematic degrees-of-freedom, mobility, and overconstraint analysis (`P3-T9`).
+    ///
+    /// Computes:
+    /// 1. Spatial mobility using the Chebychev-Grübler-Kutzbach formula:
+    ///    $$M = 6(N - 1) - \sum c_i$$
+    /// 2. Numerical degrees of freedom via SVD rank decomposition of the linearized kinematic constraint Jacobian $J$:
+    ///    $$\text{DOF} = 6 N_{\text{moving}} - \text{rank}(J)$$
+    /// 3. Redundant constraints count: $\max(0, \text{DOF}_{\text{numeric}} - \text{DOF}_{\text{grubler}})$.
+    /// 4. Graph connectivity: identification of grounded, floating, and unconnected bodies.
+    pub fn analyze_mechanism(
+        &self,
+        part_ids: Option<&[String]>,
+        rank_tolerance: Option<f64>,
+    ) -> Result<MechanismAnalysisReport, PhysicsError> {
+        self.analyze_mechanism_with_scene_parts(part_ids, rank_tolerance, None)
+    }
+
+    /// Variant of [`Self::analyze_mechanism`] that also accounts for CAD scene parts
+    /// (`(part_id, is_fixed)`) not yet registered as Rapier bodies in `PhysicsWorld`.
+    pub fn analyze_mechanism_with_scene_parts(
+        &self,
+        part_ids: Option<&[String]>,
+        rank_tolerance: Option<f64>,
+        scene_parts: Option<&[(String, bool)]>,
+    ) -> Result<MechanismAnalysisReport, PhysicsError> {
+        if let Some(tol) = rank_tolerance {
+            if !tol.is_finite() || tol <= 0.0 {
+                return Err(PhysicsError::InvalidJointConfiguration(format!(
+                    "rank_tolerance must be a finite positive number (> 0), got {tol}"
+                )));
+            }
+        }
+
+        let norm_part = |id: &str| -> String {
+            if id.eq_ignore_ascii_case("ground") {
+                "ground".to_string()
+            } else if id.eq_ignore_ascii_case("world") {
+                "world".to_string()
+            } else {
+                id.to_string()
+            }
+        };
+
+        let target_part_set: Option<std::collections::HashSet<String>> = part_ids.map(|ids| {
+            ids.iter().map(|s| norm_part(s)).collect()
+        });
+
+        if let Some(ref set) = target_part_set {
+            for pid in set {
+                if pid == "ground" || pid == "world" {
+                    continue;
+                }
+                let in_world = self.part_to_body.contains_key(pid);
+                let in_scene = scene_parts
+                    .map(|sp| sp.iter().any(|(id, _)| norm_part(id) == *pid))
+                    .unwrap_or(false);
+                if !in_world && !in_scene {
+                    return Err(PhysicsError::PartNotFound(pid.clone()));
+                }
+            }
+        }
+
+        let mut grounded_set = std::collections::HashSet::new();
+        let mut moving_set = std::collections::HashSet::new();
+
+        grounded_set.insert("ground".to_string());
+        grounded_set.insert("world".to_string());
+
+        for (pid, &handle) in &self.part_to_body {
+            let norm_id = norm_part(pid);
+            if norm_id == "ground" || norm_id == "world" {
+                continue;
+            }
+            if let Some(ref set) = target_part_set {
+                if !set.contains(&norm_id) {
+                    continue;
+                }
+            }
+            if let Some(rb) = self.bodies.get(handle) {
+                if rb.is_dynamic() {
+                    moving_set.insert(norm_id);
+                } else {
+                    grounded_set.insert(norm_id);
+                }
+            }
+        }
+
+        if let Some(sp) = scene_parts {
+            for (pid, is_fixed) in sp {
+                let norm_id = norm_part(pid);
+                if norm_id == "ground" || norm_id == "world" {
+                    continue;
+                }
+                if let Some(ref set) = target_part_set {
+                    if !set.contains(&norm_id) {
+                        continue;
+                    }
+                }
+                if !moving_set.contains(&norm_id) && !grounded_set.contains(&norm_id) {
+                    if *is_fixed {
+                        grounded_set.insert(norm_id);
+                    } else {
+                        moving_set.insert(norm_id);
+                    }
+                }
+            }
+        }
+
+        let mut moving_parts: Vec<String> = moving_set.into_iter().collect();
+        moving_parts.sort();
+
+        let moving_index_map: HashMap<String, usize> = moving_parts
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), i))
+            .collect();
+
+        let mut active_joints = Vec::new();
+        for joint in self.joints.values() {
+            let na = norm_part(&joint.part_a);
+            let nb = norm_part(&joint.part_b);
+
+            if let Some(ref set) = target_part_set {
+                let a_ok = set.contains(&na) || na == "ground" || na == "world";
+                let b_ok = set.contains(&nb) || nb == "ground" || nb == "world";
+                if !a_ok || !b_ok {
+                    continue;
+                }
+            }
+            active_joints.push(joint);
+        }
+        active_joints.sort_by_key(|j| j.id.clone());
+
+        // Connectivity graph
+        let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+        for j in &active_joints {
+            let na = norm_part(&j.part_a);
+            let nb = norm_part(&j.part_b);
+            adj.entry(na.clone()).or_default().push(nb.clone());
+            adj.entry(nb).or_default().push(na);
+        }
+
+        let mut unconnected_parts = Vec::new();
+        for p in &moving_parts {
+            if !adj.contains_key(p) || adj[p].is_empty() {
+                unconnected_parts.push(p.clone());
+            }
+        }
+        unconnected_parts.sort();
+
+        let mut visited_from_ground = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        for g in &grounded_set {
+            visited_from_ground.insert(g.clone());
+            queue.push_back(g.clone());
+        }
+        while let Some(curr) = queue.pop_front() {
+            if let Some(neighbors) = adj.get(&curr) {
+                for n in neighbors {
+                    if visited_from_ground.insert(n.clone()) {
+                        queue.push_back(n.clone());
+                    }
+                }
+            }
+        }
+
+        let mut floating_parts = Vec::new();
+        for p in &moving_parts {
+            if !visited_from_ground.contains(p) {
+                floating_parts.push(p.clone());
+            }
+        }
+        floating_parts.sort();
+
+        let mut reported_grounded = Vec::new();
+        for g in &grounded_set {
+            if g == "ground" || g == "world" {
+                if active_joints.iter().any(|j| norm_part(&j.part_a) == *g || norm_part(&j.part_b) == *g) {
+                    reported_grounded.push(g.clone());
+                }
+            } else {
+                reported_grounded.push(g.clone());
+            }
+        }
+        reported_grounded.sort();
+        reported_grounded.dedup();
+
+        let mut contributing_joints = Vec::new();
+        for j in active_joints {
+            let na = norm_part(&j.part_a);
+            let nb = norm_part(&j.part_b);
+            let is_a_moving = moving_index_map.contains_key(&na);
+            let is_b_moving = moving_index_map.contains_key(&nb);
+            if is_a_moving || is_b_moving {
+                contributing_joints.push(j);
+            }
+        }
+
+        let total_constraint_rows: usize = contributing_joints
+            .iter()
+            .map(|j| j.joint_type.constraints_count())
+            .sum();
+        let num_moving = moving_parts.len();
+        let total_cols = 6 * num_moving;
+
+        let (jacobian_rank, singular_values, effective_tol) = if total_constraint_rows == 0 || total_cols == 0 {
+            (0, Vec::new(), rank_tolerance.unwrap_or(1e-6))
+        } else {
+            let mut j_mat = DMatrix::<f64>::zeros(total_constraint_rows, total_cols);
+            let mut current_row = 0;
+
+            for j in &contributing_joints {
+                let na = norm_part(&j.part_a);
+                let nb = norm_part(&j.part_b);
+                let col_a = moving_index_map.get(&na).copied();
+                let col_b = moving_index_map.get(&nb).copied();
+
+                let (pos_a, rot_a) = self.get_world_pose_vectors(&na);
+                let (pos_b, rot_b) = self.get_world_pose_vectors(&nb);
+
+                let rows_added = j.joint_type.fill_jacobian_rows(
+                    &mut j_mat,
+                    current_row,
+                    col_a,
+                    col_b,
+                    pos_a,
+                    rot_a,
+                    pos_b,
+                    rot_b,
+                );
+                current_row += rows_added;
+            }
+
+            let svd = j_mat.svd(false, false);
+            let s_max = svd.singular_values[0];
+            let tol = match rank_tolerance {
+                Some(t) => t,
+                None => ((total_constraint_rows.max(total_cols) as f64) * s_max.max(1.0) * 1e-7).max(1e-9),
+            };
+
+            let rank = svd.singular_values.iter().filter(|&&s| s > tol).count();
+            let s_vals: Vec<f64> = svd.singular_values.iter().copied().collect();
+            (rank, s_vals, tol)
+        };
+
+        let dof_numeric = (6 * num_moving as i32) - (jacobian_rank as i32);
+        let sum_constraints: i32 = contributing_joints
+            .iter()
+            .map(|j| j.joint_type.constraints_count() as i32)
+            .sum();
+        let dof_grubler = (6 * num_moving as i32) - sum_constraints;
+        let redundant_constraints = (dof_numeric - dof_grubler).max(0);
+
+        let mut warnings = Vec::new();
+        if !contributing_joints.is_empty() && dof_numeric == 0 {
+            warnings.push("DOF=0 при заявленном механизме".to_string());
+        }
+        let motors_count = contributing_joints.iter().filter(|j| j.motor.is_some()).count();
+        if dof_numeric > 1 && motors_count == 0 {
+            warnings.push("DOF>1 без двигателей".to_string());
+        }
+        if !unconnected_parts.is_empty() || !floating_parts.is_empty() {
+            warnings.push("есть свободные детали".to_string());
+        }
+
+        let mut notes = Vec::new();
+        notes.push("Chebychev-Grübler-Kutzbach spatial mobility formula: M = 6(N - 1) - sum(c_i), where N includes ground and c_i are joint constraint counts.".to_string());
+        notes.push(format!(
+            "Numerical mobility: DOF = 6 * N_moving ({}) - rank(J) ({}) = {}.",
+            6 * num_moving, jacobian_rank, dof_numeric
+        ));
+        notes.push(format!(
+            "Jacobian SVD rank tolerance: {:.2e} (maximum singular value: {:.4}).",
+            effective_tol,
+            singular_values.first().copied().unwrap_or(0.0)
+        ));
+        if redundant_constraints > 0 {
+            notes.push(format!(
+                "Detected {} redundant constraints (common in planar four-bar linkages, slider-cranks, and overconstrained parallel mechanisms).",
+                redundant_constraints
+            ));
+        }
+
+        Ok(MechanismAnalysisReport {
+            dof_numeric,
+            dof_grubler,
+            redundant_constraints,
+            grounded_parts: reported_grounded,
+            moving_parts,
+            floating_parts,
+            unconnected_parts,
+            joint_constraints_count: total_constraint_rows,
+            jacobian_rows: total_constraint_rows,
+            jacobian_cols: total_cols,
+            jacobian_rank,
+            singular_values,
+            rank_tolerance: effective_tol,
+            warnings,
+            notes,
+        })
+    }
+
+    /// Computes the world-space `TriangleMesh` for `part_id` by transforming its local mesh
+    /// by the rigid body's current world pose `(translation, rotation)`.
+    pub fn world_mesh_for_part(
+        &self,
+        part_id: &str,
+        scene_parts: Option<&HashMap<String, Part>>,
+    ) -> Result<TriangleMesh, PhysicsError> {
+        let base_mesh = scene_parts
+            .and_then(|sp| sp.get(part_id))
+            .map(|p| &p.mesh)
+            .or_else(|| self.part_meshes.get(part_id))
+            .ok_or_else(|| PhysicsError::PartNotFound(part_id.to_string()))?;
+
+        if base_mesh.vertices.is_empty() || base_mesh.indices.is_empty() {
+            return Err(PhysicsError::InvalidGeometry(
+                part_id.to_string(),
+                "Part mesh is empty (0 vertices or 0 triangles)".to_string(),
+            ));
+        }
+
+        let (pos, rot_mat) = self.get_world_pose_vectors(part_id);
+        Ok(transform_triangle_mesh(base_mesh, pos, rot_mat))
+    }
+
+    /// Checks static multi-body geometric interference and clearance across registered parts (`P3-T10`).
+    ///
+    /// Performs:
+    /// 1. Broad-phase world-space AABB overlap filtering across candidate part pairs.
+    /// 2. Narrow-phase exact Boolean intersection (`csg_intersection`) on overlapping AABB pairs
+    ///    to compute `intersection_volume` and `penetration_depth`.
+    /// 3. Exact minimum Euclidean distance (`clearance`) computation on non-intersecting pairs.
+    pub fn check_interference(
+        &self,
+        part_ids: Option<&[String]>,
+        ignore_adjacent: bool,
+        explicit_pairs: Option<&[(String, String)]>,
+    ) -> Result<InterferenceReport, PhysicsError> {
+        self.check_interference_with_parts(part_ids, ignore_adjacent, explicit_pairs, None)
+    }
+
+    /// Variant of [`Self::check_interference`] that also accepts a reference to the CAD scene's
+    /// `Part` map so parts not yet inserted into `PhysicsWorld` can be evaluated in place.
+    pub fn check_interference_with_parts(
+        &self,
+        part_ids: Option<&[String]>,
+        ignore_adjacent: bool,
+        explicit_pairs: Option<&[(String, String)]>,
+        scene_parts: Option<&HashMap<String, Part>>,
+    ) -> Result<InterferenceReport, PhysicsError> {
+        let start_time = Instant::now();
+
+        let norm_part = |id: &str| -> String {
+            if id.eq_ignore_ascii_case("ground") {
+                "ground".to_string()
+            } else if id.eq_ignore_ascii_case("world") {
+                "world".to_string()
+            } else {
+                id.to_string()
+            }
+        };
+
+        // Build adjacency set of part pairs directly connected by a joint
+        let mut adjacent_pairs: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        for joint in self.joints.values() {
+            let na = norm_part(&joint.part_a);
+            let nb = norm_part(&joint.part_b);
+            if na != "ground" && na != "world" && nb != "ground" && nb != "world" {
+                adjacent_pairs.insert((na.clone(), nb.clone()));
+                adjacent_pairs.insert((nb, na));
+            }
+        }
+
+        // Determine candidate pairs
+        let candidate_pairs: Vec<(String, String)> = if let Some(pairs) = explicit_pairs {
+            let mut list = Vec::with_capacity(pairs.len());
+            let mut seen = std::collections::HashSet::new();
+            for (pa, pb) in pairs {
+                let a = pa.trim().to_string();
+                let b = pb.trim().to_string();
+                if a.is_empty() || b.is_empty() {
+                    return Err(PhysicsError::InvalidJointConfiguration(
+                        "Interference pair part IDs must be non-empty strings".to_string(),
+                    ));
+                }
+                if a == b {
+                    return Err(PhysicsError::InvalidJointConfiguration(format!(
+                        "Cannot check interference of part '{a}' against itself"
+                    )));
+                }
+                let key = if a < b {
+                    (a.clone(), b.clone())
+                } else {
+                    (b.clone(), a.clone())
+                };
+                if seen.insert(key) {
+                    list.push((a, b));
+                }
+            }
+            list
+        } else {
+            let mut parts_list: Vec<String> = if let Some(ids) = part_ids {
+                let mut unique = Vec::with_capacity(ids.len());
+                let mut seen = std::collections::HashSet::new();
+                for raw in ids {
+                    let pid = raw.trim().to_string();
+                    if pid.is_empty()
+                        || pid.eq_ignore_ascii_case("ground")
+                        || pid.eq_ignore_ascii_case("world")
+                    {
+                        continue;
+                    }
+                    if seen.insert(pid.clone()) {
+                        unique.push(pid);
+                    }
+                }
+                unique
+            } else {
+                let mut all_ids = std::collections::HashSet::new();
+                for pid in self.part_meshes.keys() {
+                    if !pid.eq_ignore_ascii_case("ground") && !pid.eq_ignore_ascii_case("world") {
+                        all_ids.insert(pid.clone());
+                    }
+                }
+                if let Some(sp) = scene_parts {
+                    for (pid, part) in sp {
+                        if !part.mesh.vertices.is_empty() {
+                            all_ids.insert(pid.clone());
+                        }
+                    }
+                }
+                all_ids.into_iter().collect()
+            };
+            parts_list.sort();
+
+            let mut list = Vec::new();
+            for i in 0..parts_list.len() {
+                for j in (i + 1)..parts_list.len() {
+                    list.push((parts_list[i].clone(), parts_list[j].clone()));
+                }
+            }
+            list
+        };
+
+        // Precompute world-space meshes and AABBs for all referenced parts
+        let mut needed_parts = std::collections::HashSet::new();
+        for (a, b) in &candidate_pairs {
+            needed_parts.insert(a.clone());
+            needed_parts.insert(b.clone());
+        }
+
+        let mut world_meshes: HashMap<String, (TriangleMesh, BoundingBox)> =
+            HashMap::with_capacity(needed_parts.len());
+        for pid in needed_parts {
+            let mesh = self.world_mesh_for_part(&pid, scene_parts)?;
+            let aabb = mesh.bounding_box();
+            world_meshes.insert(pid, (mesh, aabb));
+        }
+
+        let candidate_pairs_count = candidate_pairs.len();
+        let mut skipped_adjacent_pairs_count = 0usize;
+        let mut broadphase_overlap_pairs_count = 0usize;
+        let mut interfering_pairs_count = 0usize;
+        let mut min_clearance: Option<f64> = None;
+        let mut max_intersection_volume = 0.0_f64;
+        let mut max_penetration_depth = 0.0_f64;
+        let mut results: Vec<PairInterferenceResult> = Vec::with_capacity(candidate_pairs_count);
+
+        let aabb_eps = 1e-9_f64;
+        let vol_eps = 1e-15_f64;
+
+        for (a, b) in candidate_pairs {
+            let adjacent_by_joint = adjacent_pairs.contains(&(a.clone(), b.clone()));
+            if ignore_adjacent && adjacent_by_joint {
+                skipped_adjacent_pairs_count += 1;
+                continue;
+            }
+
+            let (mesh_a, aabb_a) = &world_meshes[&a];
+            let (mesh_b, aabb_b) = &world_meshes[&b];
+
+            let aabb_overlap = aabb_a.min[0] <= aabb_b.max[0] + aabb_eps
+                && aabb_b.min[0] <= aabb_a.max[0] + aabb_eps
+                && aabb_a.min[1] <= aabb_b.max[1] + aabb_eps
+                && aabb_b.min[1] <= aabb_a.max[1] + aabb_eps
+                && aabb_a.min[2] <= aabb_b.max[2] + aabb_eps
+                && aabb_b.min[2] <= aabb_a.max[2] + aabb_eps;
+
+            if aabb_overlap {
+                broadphase_overlap_pairs_count += 1;
+                let inter_mesh = csg_intersection(mesh_a, mesh_b);
+                let vol = if inter_mesh.is_empty() {
+                    0.0
+                } else {
+                    inter_mesh.volume()
+                };
+
+                if vol > vol_eps {
+                    interfering_pairs_count += 1;
+                    let pen_depth =
+                        compute_penetration_depth_from_intersection(&inter_mesh, aabb_a, aabb_b);
+                    if vol > max_intersection_volume {
+                        max_intersection_volume = vol;
+                    }
+                    if pen_depth > max_penetration_depth {
+                        max_penetration_depth = pen_depth;
+                    }
+                    results.push(PairInterferenceResult {
+                        a,
+                        b,
+                        intersects: true,
+                        adjacent_by_joint,
+                        aabb_overlap: true,
+                        penetration_depth: Some(pen_depth),
+                        intersection_volume: Some(vol),
+                        clearance: None,
+                    });
+                    continue;
+                }
+            }
+
+            // Non-intersecting pair: compute minimum separation distance (clearance)
+            let clearance = compute_mesh_clearance(mesh_a, aabb_a, mesh_b, aabb_b);
+            min_clearance = Some(match min_clearance {
+                Some(prev) => prev.min(clearance),
+                None => clearance,
+            });
+            results.push(PairInterferenceResult {
+                a,
+                b,
+                intersects: false,
+                adjacent_by_joint,
+                aabb_overlap,
+                penetration_depth: None,
+                intersection_volume: None,
+                clearance: Some(clearance),
+            });
+        }
+
+        let elapsed_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+        let status = if interfering_pairs_count == 0 {
+            "PASS".to_string()
+        } else {
+            "FAIL".to_string()
+        };
+
+        Ok(InterferenceReport {
+            status,
+            candidate_pairs_count,
+            skipped_adjacent_pairs_count,
+            broadphase_overlap_pairs_count,
+            evaluated_pairs_count: results.len(),
+            interfering_pairs_count,
+            min_clearance,
+            max_intersection_volume,
+            max_penetration_depth,
+            ignore_adjacent,
+            pairs: results,
+            elapsed_ms,
+        })
+    }
+
+    /// Sweeps a `Revolute` or `Prismatic` joint across `[from, to]` in `steps` intervals (`0..=steps`),
+    /// evaluating multi-body interference and clearance at each discrete configuration (`P3-T10`).
+    ///
+    /// * For `CadJointType::Revolute`, `from` and `to` are angles in **radians**.
+    /// * For `CadJointType::Prismatic`, `from` and `to` are translations in **meters**.
+    /// * Does not mutate `self` (evaluates on a cloned world state).
+    pub fn sweep_joint(
+        &self,
+        joint_id: &str,
+        from: f64,
+        to: f64,
+        steps: usize,
+        ignore_adjacent: bool,
+    ) -> Result<JointSweepReport, PhysicsError> {
+        self.sweep_joint_with_parts(joint_id, from, to, steps, ignore_adjacent, None)
+    }
+
+    /// Variant of [`Self::sweep_joint`] that accepts a reference to the CAD scene's `Part` map.
+    pub fn sweep_joint_with_parts(
+        &self,
+        joint_id: &str,
+        from: f64,
+        to: f64,
+        steps: usize,
+        ignore_adjacent: bool,
+        scene_parts: Option<&HashMap<String, Part>>,
+    ) -> Result<JointSweepReport, PhysicsError> {
+        let start_time = Instant::now();
+
+        if !from.is_finite() || !to.is_finite() {
+            return Err(PhysicsError::InvalidJointConfiguration(format!(
+                "sweep_joint range [from, to] must be finite numbers, got [{from}, {to}]"
+            )));
+        }
+        if steps == 0 || steps > 10_000 {
+            return Err(PhysicsError::InvalidJointConfiguration(format!(
+                "sweep_joint 'steps' must be between 1 and 10000, got {steps}"
+            )));
+        }
+
+        let record = self
+            .joints
+            .get(joint_id)
+            .ok_or_else(|| PhysicsError::JointNotFound(joint_id.to_string()))?
+            .clone();
+
+        let (is_revolute, anchor_a, anchor_b, axis_raw) = match &record.joint_type {
+            CadJointType::Revolute {
+                anchor_a,
+                anchor_b,
+                axis,
+                ..
+            } => (true, *anchor_a, *anchor_b, *axis),
+            CadJointType::Prismatic {
+                anchor_a,
+                anchor_b,
+                axis,
+                ..
+            } => (false, *anchor_a, *anchor_b, *axis),
+            other => {
+                return Err(PhysicsError::InvalidJointConfiguration(format!(
+                    "sweep_joint is only supported on 'revolute' and 'prismatic' joints, but joint '{joint_id}' has type '{}'",
+                    other.type_name()
+                )));
+            }
+        };
+
+        let axis_vec = Vector3::new(axis_raw[0], axis_raw[1], axis_raw[2]);
+        if axis_vec.norm() < 1e-9 {
+            return Err(PhysicsError::InvalidJointConfiguration(format!(
+                "Joint '{joint_id}' has a degenerate zero axis"
+            )));
+        }
+
+        let mut sim_world = self.clone();
+        if let Some(sp) = scene_parts {
+            for part in sp.values() {
+                if !part.mesh.vertices.is_empty() && !sim_world.has_part(&part.id) {
+                    let _ = sim_world.add_part(part, !part.is_fixed);
+                }
+            }
+        }
+
+        let is_fixed_or_ground = |pid: &str, w: &PhysicsWorld| -> bool {
+            if pid.eq_ignore_ascii_case("ground") || pid.eq_ignore_ascii_case("world") {
+                true
+            } else if let Some(sp) = scene_parts {
+                if let Some(p) = sp.get(pid) {
+                    return p.is_fixed;
+                }
+                !w.is_part_dynamic(pid).unwrap_or(true)
+            } else {
+                !w.is_part_dynamic(pid).unwrap_or(true)
+            }
+        };
+
+        let a_fixed = is_fixed_or_ground(&record.part_a, &sim_world);
+        let b_fixed = is_fixed_or_ground(&record.part_b, &sim_world);
+
+        let (reference_part_id, driven_part_id, anchor_ref, anchor_driven) = if a_fixed && !b_fixed
+        {
+            (
+                record.part_a.clone(),
+                record.part_b.clone(),
+                Vector3::new(anchor_a[0], anchor_a[1], anchor_a[2]),
+                Vector3::new(anchor_b[0], anchor_b[1], anchor_b[2]),
+            )
+        } else if b_fixed && !a_fixed {
+            (
+                record.part_b.clone(),
+                record.part_a.clone(),
+                Vector3::new(anchor_b[0], anchor_b[1], anchor_b[2]),
+                Vector3::new(anchor_a[0], anchor_a[1], anchor_a[2]),
+            )
+        } else {
+            // Determine which side is closer to ground via BFS excluding this joint
+            let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+            for (jid, jrec) in &sim_world.joints {
+                if jid == joint_id {
+                    continue;
+                }
+                adj.entry(jrec.part_a.clone())
+                    .or_default()
+                    .push(jrec.part_b.clone());
+                adj.entry(jrec.part_b.clone())
+                    .or_default()
+                    .push(jrec.part_a.clone());
+            }
+
+            let bfs_reaches_ground = |start: &str| -> Option<usize> {
+                let mut visited = std::collections::HashSet::new();
+                let mut queue = std::collections::VecDeque::new();
+                visited.insert(start.to_string());
+                queue.push_back((start.to_string(), 0usize));
+                while let Some((curr, d)) = queue.pop_front() {
+                    if is_fixed_or_ground(&curr, &sim_world) {
+                        return Some(d);
+                    }
+                    if let Some(neighbors) = adj.get(&curr) {
+                        for n in neighbors {
+                            if visited.insert(n.clone()) {
+                                queue.push_back((n.clone(), d + 1));
+                            }
+                        }
+                    }
+                }
+                None
+            };
+
+            let da = bfs_reaches_ground(&record.part_a).unwrap_or(usize::MAX);
+            let db = bfs_reaches_ground(&record.part_b).unwrap_or(usize::MAX);
+            if da <= db {
+                (
+                    record.part_a.clone(),
+                    record.part_b.clone(),
+                    Vector3::new(anchor_a[0], anchor_a[1], anchor_a[2]),
+                    Vector3::new(anchor_b[0], anchor_b[1], anchor_b[2]),
+                )
+            } else {
+                (
+                    record.part_b.clone(),
+                    record.part_a.clone(),
+                    Vector3::new(anchor_b[0], anchor_b[1], anchor_b[2]),
+                    Vector3::new(anchor_a[0], anchor_a[1], anchor_a[2]),
+                )
+            }
+        };
+
+        // Collect downstream moving subtree attached to `driven_part_id` (without crossing `joint_id` or fixed bodies)
+        let mut downstream_parts: Vec<String> = Vec::new();
+        {
+            let mut visited = std::collections::HashSet::new();
+            let mut queue = std::collections::VecDeque::new();
+            visited.insert(reference_part_id.clone());
+            visited.insert(driven_part_id.clone());
+            queue.push_back(driven_part_id.clone());
+
+            while let Some(curr) = queue.pop_front() {
+                for (jid, jrec) in &sim_world.joints {
+                    if jid == joint_id {
+                        continue;
+                    }
+                    let next_opt = if jrec.part_a == curr {
+                        Some(&jrec.part_b)
+                    } else if jrec.part_b == curr {
+                        Some(&jrec.part_a)
+                    } else {
+                        None
+                    };
+                    if let Some(next_id) = next_opt {
+                        if !is_fixed_or_ground(next_id, &sim_world)
+                            && visited.insert(next_id.clone())
+                        {
+                            downstream_parts.push(next_id.clone());
+                            queue.push_back(next_id.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        let (pos_ref_0, rot_ref_0) = sim_world.get_world_pose_vectors(&reference_part_id);
+        let (pos_drv_0, rot_drv_0) = sim_world.get_world_pose_vectors(&driven_part_id);
+        let rot_drv_0_inv = rot_drv_0.transpose();
+
+        let mut downstream_initial_poses: Vec<(String, Vector3<f64>, Matrix3<f64>)> =
+            Vec::with_capacity(downstream_parts.len());
+        for d_id in &downstream_parts {
+            let (p0, r0) = sim_world.get_world_pose_vectors(d_id);
+            downstream_initial_poses.push((d_id.clone(), p0, r0));
+        }
+
+        let pivot_world = pos_ref_0 + rot_ref_0 * anchor_ref;
+        let world_axis_unnorm = rot_ref_0 * axis_vec;
+        let world_axis = nalgebra::Unit::new_normalize(world_axis_unnorm);
+
+        let mat_to_quat_arr = |m: &Matrix3<f64>| -> [f64; 4] {
+            let rot3 = nalgebra::Rotation3::from_matrix_unchecked(*m);
+            let uq = nalgebra::UnitQuaternion::from_rotation_matrix(&rot3);
+            let q = uq.quaternion();
+            [q.coords.x, q.coords.y, q.coords.z, q.coords.w]
+        };
+
+        let mut samples = Vec::with_capacity(steps + 1);
+        let mut first_collision_step: Option<usize> = None;
+        let mut first_collision_value: Option<f64> = None;
+        let mut first_collision_pairs: Vec<PairInterferenceResult> = Vec::new();
+        let mut min_clearance: Option<f64> = None;
+        let mut min_clearance_step: Option<usize> = None;
+        let mut min_clearance_value: Option<f64> = None;
+
+        for step_idx in 0..=steps {
+            let alpha = (step_idx as f64) / (steps as f64);
+            let q_val = from + alpha * (to - from);
+
+            let (rot_drv_k, pos_drv_k) = if is_revolute {
+                let delta_rot =
+                    nalgebra::Rotation3::from_axis_angle(&world_axis, q_val).into_inner();
+                let rk = delta_rot * rot_drv_0;
+                let pk = pivot_world - rk * anchor_driven;
+                (rk, pk)
+            } else {
+                let rk = rot_drv_0;
+                let pk =
+                    pivot_world - rk * anchor_driven + world_axis.into_inner() * q_val;
+                (rk, pk)
+            };
+
+            let quat_drv_k = mat_to_quat_arr(&rot_drv_k);
+            let _ = sim_world.set_part_pose(
+                &driven_part_id,
+                [pos_drv_k.x, pos_drv_k.y, pos_drv_k.z],
+                quat_drv_k,
+            );
+
+            // Update any downstream parts rigidly relative to driven_part_id
+            let rel_rot = rot_drv_k * rot_drv_0_inv;
+            for (d_id, p0, r0) in &downstream_initial_poses {
+                let rk = rel_rot * r0;
+                let pk = pos_drv_k + rel_rot * (p0 - pos_drv_0);
+                let qk = mat_to_quat_arr(&rk);
+                let _ = sim_world.set_part_pose(d_id, [pk.x, pk.y, pk.z], qk);
+            }
+
+            let step_report = sim_world.check_interference_with_parts(
+                None,
+                ignore_adjacent,
+                None,
+                scene_parts,
+            )?;
+
+            let step_interfering: Vec<PairInterferenceResult> = step_report
+                .pairs
+                .iter()
+                .filter(|p| p.intersects)
+                .cloned()
+                .collect();
+            let intersects = !step_interfering.is_empty();
+
+            if intersects && first_collision_step.is_none() {
+                first_collision_step = Some(step_idx);
+                first_collision_value = Some(q_val);
+                first_collision_pairs = step_interfering.clone();
+            }
+
+            if !intersects {
+                if let Some(clr) = step_report.min_clearance {
+                    let is_smaller = match min_clearance {
+                        None => true,
+                        Some(prev) => clr < prev,
+                    };
+                    if is_smaller {
+                        min_clearance = Some(clr);
+                        min_clearance_step = Some(step_idx);
+                        min_clearance_value = Some(q_val);
+                    }
+                }
+            }
+
+            samples.push(SweepStepResult {
+                step_index: step_idx,
+                value: q_val,
+                intersects,
+                interfering_pairs_count: step_interfering.len(),
+                min_clearance: if intersects {
+                    Some(0.0)
+                } else {
+                    step_report.min_clearance
+                },
+                max_penetration_depth: step_report.max_penetration_depth,
+                max_intersection_volume: step_report.max_intersection_volume,
+                interfering_pairs: step_interfering,
+            });
+        }
+
+        let collision_detected = first_collision_step.is_some();
+        let safe_travel_range = match first_collision_value {
+            Some(v_col) => (v_col - from).abs(),
+            None => (to - from).abs(),
+        };
+        let margin_to_collision = if collision_detected {
+            Some(safe_travel_range)
+        } else {
+            min_clearance
+        };
+
+        let elapsed_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+        let status = if collision_detected {
+            "FAIL".to_string()
+        } else {
+            "PASS".to_string()
+        };
+
+        Ok(JointSweepReport {
+            status,
+            joint_id: joint_id.to_string(),
+            joint_type: record.joint_type.type_name().to_string(),
+            driven_part_id,
+            reference_part_id,
+            from,
+            to,
+            steps,
+            collision_detected,
+            first_collision_step,
+            first_collision_value,
+            first_collision_pairs,
+            min_clearance,
+            min_clearance_step,
+            min_clearance_value,
+            safe_travel_range,
+            margin_to_collision,
+            ignore_adjacent,
+            samples,
+            elapsed_ms,
+        })
+    }
 }
+
+/// Transforms a `TriangleMesh` by a 3D translation vector and 3x3 rotation matrix.
+fn transform_triangle_mesh(
+    mesh: &TriangleMesh,
+    translation: Vector3<f64>,
+    rotation: Matrix3<f64>,
+) -> TriangleMesh {
+    let is_identity_pos = translation.norm_squared() < 1e-24;
+    let is_identity_rot = (rotation - Matrix3::identity()).norm_squared() < 1e-24;
+    if is_identity_pos && is_identity_rot {
+        return mesh.clone();
+    }
+
+    let vertices: Vec<Vertex> = mesh
+        .vertices
+        .iter()
+        .map(|v| {
+            let p = Vector3::new(v.position[0], v.position[1], v.position[2]);
+            let n = Vector3::new(v.normal[0], v.normal[1], v.normal[2]);
+            let tp = rotation * p + translation;
+            let tn = rotation * n;
+            Vertex::new([tp.x, tp.y, tp.z], [tn.x, tn.y, tn.z])
+        })
+        .collect();
+
+    TriangleMesh {
+        vertices,
+        indices: mesh.indices.clone(),
+        face_ids: mesh.face_ids.clone(),
+        faces: mesh.faces.clone(),
+    }
+}
+
+/// Computes the minimum translational penetration depth from an intersection solid `inter_mesh`.
+fn compute_penetration_depth_from_intersection(
+    inter_mesh: &TriangleMesh,
+    aabb_a: &BoundingBox,
+    aabb_b: &BoundingBox,
+) -> f64 {
+    if inter_mesh.vertices.is_empty() {
+        return 0.0;
+    }
+
+    let mut dirs: Vec<Vector3<f64>> = vec![
+        Vector3::new(1.0, 0.0, 0.0),
+        Vector3::new(0.0, 1.0, 0.0),
+        Vector3::new(0.0, 0.0, 1.0),
+    ];
+
+    let ca = aabb_a.center();
+    let cb = aabb_b.center();
+    let center_diff = Vector3::new(cb[0] - ca[0], cb[1] - ca[1], cb[2] - ca[2]);
+    if center_diff.norm() > 1e-9 {
+        dirs.push(center_diff.normalize());
+    }
+
+    // Collect up to 48 distinct face normals from the intersection mesh
+    for tri in &inter_mesh.indices {
+        if dirs.len() >= 52 {
+            break;
+        }
+        let v0 = inter_mesh.vertices[tri[0] as usize].position;
+        let v1 = inter_mesh.vertices[tri[1] as usize].position;
+        let v2 = inter_mesh.vertices[tri[2] as usize].position;
+        let e1 = Vector3::new(v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]);
+        let e2 = Vector3::new(v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]);
+        let n = e1.cross(&e2);
+        let norm = n.norm();
+        if norm > 1e-12 {
+            let unit_n = n / norm;
+            let already_present = dirs.iter().any(|d| d.dot(&unit_n).abs() > 0.999);
+            if !already_present {
+                dirs.push(unit_n);
+            }
+        }
+    }
+
+    let mut min_span = f64::INFINITY;
+    for d in &dirs {
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for v in &inter_mesh.vertices {
+            let proj = d.x * v.position[0] + d.y * v.position[1] + d.z * v.position[2];
+            if proj < lo {
+                lo = proj;
+            }
+            if proj > hi {
+                hi = proj;
+            }
+        }
+        let span = (hi - lo).max(0.0);
+        if span > 1e-12 && span < min_span {
+            min_span = span;
+        }
+    }
+
+    if min_span.is_finite() {
+        min_span
+    } else {
+        let dims = inter_mesh.bounding_box().dimensions();
+        dims[0].min(dims[1]).min(dims[2]).max(0.0)
+    }
+}
+
+/// Minimum squared Euclidean distance between two axis-aligned bounding boxes.
+fn aabb_min_dist_sq(a: &BoundingBox, b: &BoundingBox) -> f64 {
+    let mut dist_sq = 0.0_f64;
+    for i in 0..3 {
+        if a.max[i] < b.min[i] {
+            let d = b.min[i] - a.max[i];
+            dist_sq += d * d;
+        } else if b.max[i] < a.min[i] {
+            let d = a.min[i] - b.max[i];
+            dist_sq += d * d;
+        }
+    }
+    dist_sq
+}
+
+/// Computes the exact minimum Euclidean distance (clearance) between two non-intersecting triangle meshes.
+fn compute_mesh_clearance(
+    mesh_a: &TriangleMesh,
+    aabb_a: &BoundingBox,
+    mesh_b: &TriangleMesh,
+    aabb_b: &BoundingBox,
+) -> f64 {
+    if mesh_a.indices.is_empty() || mesh_b.indices.is_empty() {
+        return aabb_min_dist_sq(aabb_a, aabb_b).sqrt();
+    }
+
+    // Precompute per-triangle vertices and AABBs for mesh A and mesh B
+    struct TriData {
+        p0: Vector3<f64>,
+        p1: Vector3<f64>,
+        p2: Vector3<f64>,
+        aabb: BoundingBox,
+    }
+
+    let build_tris = |mesh: &TriangleMesh| -> Vec<TriData> {
+        mesh.indices
+            .iter()
+            .map(|tri| {
+                let v0 = mesh.vertices[tri[0] as usize].position;
+                let v1 = mesh.vertices[tri[1] as usize].position;
+                let v2 = mesh.vertices[tri[2] as usize].position;
+                let min = [
+                    v0[0].min(v1[0]).min(v2[0]),
+                    v0[1].min(v1[1]).min(v2[1]),
+                    v0[2].min(v1[2]).min(v2[2]),
+                ];
+                let max = [
+                    v0[0].max(v1[0]).max(v2[0]),
+                    v0[1].max(v1[1]).max(v2[1]),
+                    v0[2].max(v1[2]).max(v2[2]),
+                ];
+                TriData {
+                    p0: Vector3::new(v0[0], v0[1], v0[2]),
+                    p1: Vector3::new(v1[0], v1[1], v1[2]),
+                    p2: Vector3::new(v2[0], v2[1], v2[2]),
+                    aabb: BoundingBox::new(min, max),
+                }
+            })
+            .collect()
+    };
+
+    let mut tris_a = build_tris(mesh_a);
+    let tris_b = build_tris(mesh_b);
+
+    // Sort triangles of A by their AABB distance to B's overall AABB so we find a tight upper bound immediately
+    tris_a.sort_by(|ta, tb| {
+        let da = aabb_min_dist_sq(&ta.aabb, aabb_b);
+        let db = aabb_min_dist_sq(&tb.aabb, aabb_b);
+        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let global_lower_bound_sq = aabb_min_dist_sq(aabb_a, aabb_b);
+    let mut best_dist_sq = f64::INFINITY;
+
+    for ta in &tris_a {
+        let lower_a = aabb_min_dist_sq(&ta.aabb, aabb_b);
+        if lower_a >= best_dist_sq {
+            // Because tris_a is sorted by lower_a, no subsequent triangle in A can improve best_dist_sq
+            break;
+        }
+        for tb in &tris_b {
+            if aabb_min_dist_sq(&ta.aabb, &tb.aabb) >= best_dist_sq {
+                continue;
+            }
+            let d_sq = tri_tri_dist_sq(ta.p0, ta.p1, ta.p2, tb.p0, tb.p1, tb.p2);
+            if d_sq < best_dist_sq {
+                best_dist_sq = d_sq;
+                if best_dist_sq <= global_lower_bound_sq + 1e-24 {
+                    return best_dist_sq.max(0.0).sqrt();
+                }
+            }
+        }
+    }
+
+    best_dist_sq.max(0.0).sqrt()
+}
+
+/// Squared Euclidean distance between two 3D triangles `(a0, a1, a2)` and `(b0, b1, b2)`.
+fn tri_tri_dist_sq(
+    a0: Vector3<f64>,
+    a1: Vector3<f64>,
+    a2: Vector3<f64>,
+    b0: Vector3<f64>,
+    b1: Vector3<f64>,
+    b2: Vector3<f64>,
+) -> f64 {
+    let mut best = point_triangle_dist_sq(a0, b0, b1, b2)
+        .min(point_triangle_dist_sq(a1, b0, b1, b2))
+        .min(point_triangle_dist_sq(a2, b0, b1, b2))
+        .min(point_triangle_dist_sq(b0, a0, a1, a2))
+        .min(point_triangle_dist_sq(b1, a0, a1, a2))
+        .min(point_triangle_dist_sq(b2, a0, a1, a2));
+
+    let edges_a = [(a0, a1), (a1, a2), (a2, a0)];
+    let edges_b = [(b0, b1), (b1, b2), (b2, b0)];
+    for &(pa, qa) in &edges_a {
+        for &(pb, qb) in &edges_b {
+            let d = segment_segment_dist_sq(pa, qa, pb, qb);
+            if d < best {
+                best = d;
+            }
+        }
+    }
+    best
+}
+
+/// Squared Euclidean distance from point `p` to 3D triangle `(a, b, c)` (Ericson §5.1.5).
+fn point_triangle_dist_sq(
+    p: Vector3<f64>,
+    a: Vector3<f64>,
+    b: Vector3<f64>,
+    c: Vector3<f64>,
+) -> f64 {
+    let ab = b - a;
+    let ac = c - a;
+    let ap = p - a;
+    let d1 = ab.dot(&ap);
+    let d2 = ac.dot(&ap);
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return ap.norm_squared();
+    }
+
+    let bp = p - b;
+    let d3 = ab.dot(&bp);
+    let d4 = ac.dot(&bp);
+    if d3 >= 0.0 && d4 <= d3 {
+        return bp.norm_squared();
+    }
+
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        let denom = d1 - d3;
+        let v = if denom.abs() > 1e-30 { d1 / denom } else { 0.0 };
+        let closest = a + v * ab;
+        return (p - closest).norm_squared();
+    }
+
+    let cp = p - c;
+    let d5 = ab.dot(&cp);
+    let d6 = ac.dot(&cp);
+    if d6 >= 0.0 && d5 <= d6 {
+        return cp.norm_squared();
+    }
+
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        let denom = d2 - d6;
+        let w = if denom.abs() > 1e-30 { d2 / denom } else { 0.0 };
+        let closest = a + w * ac;
+        return (p - closest).norm_squared();
+    }
+
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        let bc = c - b;
+        let denom = (d4 - d3) + (d5 - d6);
+        let w = if denom.abs() > 1e-30 {
+            (d4 - d3) / denom
+        } else {
+            0.0
+        };
+        let closest = b + w * bc;
+        return (p - closest).norm_squared();
+    }
+
+    let denom = va + vb + vc;
+    if denom.abs() <= 1e-30 {
+        return ap.norm_squared();
+    }
+    let inv_denom = 1.0 / denom;
+    let v = vb * inv_denom;
+    let w = vc * inv_denom;
+    let closest = a + ab * v + ac * w;
+    (p - closest).norm_squared()
+}
+
+/// Squared Euclidean distance between two 3D line segments `[p1, q1]` and `[p2, q2]` (Ericson §5.1.9).
+fn segment_segment_dist_sq(
+    p1: Vector3<f64>,
+    q1: Vector3<f64>,
+    p2: Vector3<f64>,
+    q2: Vector3<f64>,
+) -> f64 {
+    let d1 = q1 - p1;
+    let d2 = q2 - p2;
+    let r = p1 - p2;
+    let a = d1.dot(&d1);
+    let e = d2.dot(&d2);
+    let f = d2.dot(&r);
+    let eps = 1e-18;
+
+    let (s, t) = if a <= eps && e <= eps {
+        (0.0, 0.0)
+    } else if a <= eps {
+        (0.0, (f / e).clamp(0.0, 1.0))
+    } else {
+        let c = d1.dot(&r);
+        if e <= eps {
+            ((-c / a).clamp(0.0, 1.0), 0.0)
+        } else {
+            let b = d1.dot(&d2);
+            let denom = a * e - b * b;
+            let mut s = if denom.abs() > eps {
+                ((b * f - c * e) / denom).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let mut t = (b * s + f) / e;
+            if t < 0.0 {
+                t = 0.0;
+                s = (-c / a).clamp(0.0, 1.0);
+            } else if t > 1.0 {
+                t = 1.0;
+                s = ((b - c) / a).clamp(0.0, 1.0);
+            }
+            (s, t)
+        }
+    };
+
+    let c1 = p1 + d1 * s;
+    let c2 = p2 + d2 * t;
+    (c1 - c2).norm_squared()
+}
+
