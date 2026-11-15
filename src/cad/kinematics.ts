@@ -1634,7 +1634,7 @@ export function sweepJoint(
         safeEnd = val;
       }
 
-      if (rep.min_clearance !== undefined) {
+      if (rep.min_clearance !== undefined && interferingPairs.length === 0) {
         if (minClearance === undefined || rep.min_clearance < minClearance) {
           minClearance = rep.min_clearance;
           minClearanceStep = stepIdx;

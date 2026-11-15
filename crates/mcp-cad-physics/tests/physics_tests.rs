@@ -1631,8 +1631,31 @@ fn test_p3_t10_sweep_joint_hinged_arm_hitting_fixed_wall() {
     );
     assert_eq!(sweep.first_collision_step, Some(28));
     assert!(!sweep.first_collision_pairs.is_empty());
-    assert!(sweep.min_clearance.expect("min_clearance") > 0.0);
-    assert_eq!(sweep.min_clearance_step, Some(27));
+    // `min_clearance` / `min_clearance_step` track the global minimum across all non-colliding steps:
+    // - At step 27 (27 deg, pre-collision approach), upper tip (0.10, 0.005) has y = 0.049854 m -> clearance ~0.146 mm to y=0.05.
+    // - Steps 28..=77 intersect the finite wall (x in [0.02, 0.12], y in [0.05, 0.07]).
+    // - At step 78 (78 deg, exiting past the wall corner (0.02, 0.07)), trailing edge y_loc = -0.005 m
+    //   passes at y_loc(0.02, 0.07) = -0.02*sin(78°) + 0.07*cos(78°) ≈ -0.005009 m -> clearance ~0.009 mm < 0.146 mm.
+    let pre_collision_clr = sweep.samples[27]
+        .min_clearance
+        .expect("step 27 must be clear");
+    assert!(pre_collision_clr > 1e-4 && pre_collision_clr < 2e-4);
+    let min_clr = sweep.min_clearance.expect("min_clearance");
+    assert!(min_clr > 0.0 && min_clr < pre_collision_clr);
+    assert_eq!(sweep.min_clearance_step, Some(78));
+    assert!((sweep.safe_travel_range - 28.0_f64.to_radians()).abs() < 1e-9);
+
+    // When the sweep stops while still inside the obstacle (e.g. [0, 60 deg], 1 deg/step),
+    // the only clear steps are 0..=27 and `min_clearance_step` is the step right before collision (27).
+    let sweep_before_exit = world
+        .sweep_joint("j_hinge", 0.0, 60.0_f64.to_radians(), 60, false)
+        .expect("sweep_joint [0, 60 deg]");
+    assert_eq!(sweep_before_exit.first_collision_step, Some(28));
+    assert_eq!(sweep_before_exit.min_clearance_step, Some(27));
+    assert!(
+        (sweep_before_exit.min_clearance.expect("min_clearance [0,60]") - pre_collision_clr).abs()
+            < 1e-9
+    );
 }
 
 #[test]

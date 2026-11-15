@@ -52,7 +52,7 @@ mcp-cad/
 │   ├── BENCH_BASELINE_RUST.md    # Базовая линия 15 задач бенчмарка против нативного Rust-сервера
 │   ├── adr/0001-geometry-kernel.md # ADR выбора геометрического ядра (manifold-rust + monstertruck)
 │   ├── adr/0002-fe-mesher.md        # ADR выбора генератора сетки МКЭ (fe_snap + TET10, P3-T5)
-│   └── agent_tasks/              # Детальные отчёты о выполнении задач P0-T1..T12, P1-T1..T4, P2-T1..T40, P3-T1..T18
+│   └── agent_tasks/              # Детальные отчёты о выполнении задач P0-T1..T12, P1-T1..T4, P2-T1..T40, P3-T1..T19
 ├── spikes/
 │   ├── manifold_rust/            # Прототип ядра manifold-rust v0.19.2 (Pure Rust CSG + face_id)
 │   ├── monstertruck_brep/        # Прототип B-Rep ядра monstertruck v0.4.1 (fillet + ISO 10303-21 STEP)
@@ -296,20 +296,21 @@ graph TD
    - Любая ошибка параметров возвращается как `Result<T, CadError / ServerError>` и преобразуется в структурированный JSON `ErrorEnvelope`.
 2. **Чистота потока `stdout` в режиме `stdio`**:
    - В режиме `--mode stdio` поток `stdout` используется **исключительно** для сообщений JSON-RPC 2.0. Любой вывод логов (`tracing`, `eprintln!`) направляется строго в `std::io::stderr`.
-3. **Статус автоматического тестирования (`spikes/manifold_rust` и `clippy` workspace актуализированы в `P3-T18` от 15.11.2026; `mcp-cad-core`, `--lib` и `qa_wide_scan` в `mcp-cad-server` — `P3-T17` от 15.11.2026; `mcp-cad-physics`, `mcp_contract_tests`, TS-суит — `P3-T16` от 15.11.2026; `bench_suite`/`gear_kinematic_test` — `P3-T14`; `mcp-cad-fea`/`viewer` — аудит `P3-T13`)**:
-   - **Проверено в `P3-T18` после финальной правки `spikes/manifold_rust/src/main.rs`**:
-     - `spikes/manifold_rust`: `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (`0 passed; 0 failed`), `cargo run` — все **PASS** (`exit 0`);
+3. **Статус автоматического тестирования (`mcp-cad-physics`, `mcp-cad-server --lib`, TS-суит и `clippy` workspace актуализированы в `P3-T19` от 15.11.2026; `spikes/manifold_rust` — `P3-T18`; `mcp-cad-core` и `qa_wide_scan` — `P3-T17`; `mcp_contract_tests` — `P3-T16`; `bench_suite`/`gear_kinematic_test` — `P3-T14`; `mcp-cad-fea`/`viewer` — аудит `P3-T13`)**:
+   - **Проверено в `P3-T19` после финальной правки `physics_tests.rs`, `src/cad/kinematics.ts` и `src/cad/__tests__/analyze_mechanism.test.ts`**:
+     - `mcp-cad-physics`: **23/23 PASS** (`tests/physics_tests.rs`: `23 passed; 0 failed`, включая `test_p3_t10_sweep_joint_hinged_arm_hitting_fixed_wall`);
+     - `mcp-cad-server --lib`: **61/61 PASS** (при `MCP_CAD_DISABLE_GUI_SPAWN=1 -- --test-threads=1`);
+     - **TypeScript Suite (`npx tsx --test src/cad/__tests__/analyze_mechanism.test.ts`) — 15/15 PASS**, `tsc --noEmit` — 0 ошибок (`src/cad/cad_engine.test.ts` отсутствует — см. `P3-T22`);
      - **Линтер Rust (`cargo clippy --workspace --all-targets -- -D warnings`) — 0 ошибок, 0 предупреждений** (`exit 0`).
-   - **Проверено в `P3-T17` после финальной правки ядра/сервера**:
+   - **Проверено ранее в `P3-T18` после финальной правки `spikes/manifold_rust/src/main.rs`**:
+     - `spikes/manifold_rust`: `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (`0 passed; 0 failed`), `cargo run` — все **PASS** (`exit 0`).
+   - **Проверено ранее в `P3-T17` после финальной правки ядра/сервера**:
      - `mcp-cad-core`: **131 тест** (`74` `--lib` + `10` `csg_invariants` + `16` `dag_tests`, включая 2 новых теста `P3-T17` + `25` `primitive_invariants` + `6` `tessellation_tests`) — **131 PASS**;
-     - `mcp-cad-server`: `--lib` **61/61 PASS** (при `MCP_CAD_DISABLE_GUI_SPAWN=1 -- --test-threads=1`, включая `test_p3_t17_transform_part_then_cut_helical_groove_nut_and_drill`) и `qa_wide_scan` **13/13 PASS** (`MCP_CAD_DISABLE_GUI_SPAWN=1 -- --test-threads=1`);
-     - **Линтер Rust (`cargo clippy --workspace --all-targets -- -D warnings`) — 0 ошибок, 0 предупреждений** (`exit 0`).
-   - **Прочие таргеты/крейты (не перезапускались в `P3-T17`, данные предыдущих прогонов)**:
+     - `mcp-cad-server`: `qa_wide_scan` **13/13 PASS** (`MCP_CAD_DISABLE_GUI_SPAWN=1 -- --test-threads=1`).
+   - **Прочие таргеты/крейты (не перезапускались в `P3-T17`–`P3-T19`, данные предыдущих прогонов)**:
      - `mcp-cad-server`: `mcp_contract_tests` — `58/59` (`P3-T16`, единственное падение `test_mcp_open_preview_window` — см. `P3-T20`); `bench_suite` + `gear_kinematic_test` — `2/2` (`P3-T14`);
      - `mcp-cad-fea`: **21/21 PASS** (`P3-T13`);
-     - `mcp-cad-physics`: **22/23 PASS** (`P3-T16`, единственное падение — `P3-T19`);
-     - `mcp-cad-viewer`: **10/10 PASS** (`P3-T13`);
-     - **TypeScript Suite (`npx tsx --test src/cad/__tests__/analyze_mechanism.test.ts`) — 15/15 PASS**, `tsc --noEmit` — 0 ошибок (`P3-T16`; `src/cad/cad_engine.test.ts` отсутствует — см. `P3-T22`).
+     - `mcp-cad-viewer`: **10/10 PASS** (`P3-T13`).
 
 ---
 

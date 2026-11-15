@@ -299,6 +299,9 @@ describe('P3-T10: check_interference & sweep_joint', () => {
       `Expected collision around 35..45 deg within 5 deg step size, got ${firstDeg} deg`
     );
     assert.deepEqual(sweep.first_collision_pairs, [['arm', 'wall']]);
+    assert.ok(sweep.min_clearance !== undefined && sweep.min_clearance > 0);
+    assert.notEqual(sweep.min_clearance_step, undefined);
+    assert.equal(sweep.samples[sweep.min_clearance_step!].interfering_pairs.length, 0);
   });
 
   it('4. Benchmark check_interference on 10 parts (45 pairs)', () => {
