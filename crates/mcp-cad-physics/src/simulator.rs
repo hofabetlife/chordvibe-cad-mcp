@@ -11,7 +11,10 @@ use rapier3d::crossbeam::channel::{Receiver, Sender};
 use rapier3d::prelude::*;
 
 use crate::error::PhysicsError;
-use crate::joint::{CadJointType, MechanismAnalysisReport, MotorConfig, quat_to_matrix};
+use crate::joint::{
+    CadJointType, JointLimitStatus, MechanismAnalysisReport, MotorConfig, is_zero_range_limits,
+    quat_to_matrix,
+};
 use crate::rigid_body::{ColliderType, create_collider_builder, create_rigid_body_builder};
 use crate::telemetry::{
     BodyState, BodyTelemetry, CollisionEventType, CollisionRecord, InterferenceReport,
@@ -2020,58 +2023,88 @@ impl PhysicsWorld {
 
         let total_constraint_rows: usize = contributing_joints
             .iter()
-            .map(|j| j.joint_type.constraints_count())
+            .map(|j| j.joint_type.effective_constraints_count())
             .sum();
         let num_moving = moving_parts.len();
         let total_cols = 6 * num_moving;
 
-        let (jacobian_rank, singular_values, effective_tol) = if total_constraint_rows == 0 || total_cols == 0 {
-            (0, Vec::new(), rank_tolerance.unwrap_or(1e-6))
-        } else {
-            let mut j_mat = DMatrix::<f64>::zeros(total_constraint_rows, total_cols);
-            let mut current_row = 0;
+        let mut joints_at_limits = Vec::new();
+        let mut limit_warnings = Vec::new();
+        let mut joint_row_spans: Vec<(&CadJointRecord, usize, usize)> =
+            Vec::with_capacity(contributing_joints.len());
 
-            for j in &contributing_joints {
-                let na = norm_part(&j.part_a);
-                let nb = norm_part(&j.part_b);
-                let col_a = moving_index_map.get(&na).copied();
-                let col_b = moving_index_map.get(&nb).copied();
+        let (j_mat_opt, jacobian_rank, singular_values, effective_tol) =
+            if total_constraint_rows == 0 || total_cols == 0 {
+                for j in &contributing_joints {
+                    let na = norm_part(&j.part_a);
+                    let nb = norm_part(&j.part_b);
+                    let (pos_a, rot_a) = self.get_world_pose_vectors(&na);
+                    let (pos_b, rot_b) = self.get_world_pose_vectors(&nb);
+                    if let Some((status, warn)) =
+                        evaluate_joint_limit_status(j, pos_a, rot_a, pos_b, rot_b)
+                    {
+                        joints_at_limits.push(status);
+                        limit_warnings.push(warn);
+                    }
+                }
+                (None, 0, Vec::new(), rank_tolerance.unwrap_or(1e-6))
+            } else {
+                let mut j_mat = DMatrix::<f64>::zeros(total_constraint_rows, total_cols);
+                let mut current_row = 0;
 
-                let (pos_a, rot_a) = self.get_world_pose_vectors(&na);
-                let (pos_b, rot_b) = self.get_world_pose_vectors(&nb);
+                for j in &contributing_joints {
+                    let na = norm_part(&j.part_a);
+                    let nb = norm_part(&j.part_b);
+                    let col_a = moving_index_map.get(&na).copied();
+                    let col_b = moving_index_map.get(&nb).copied();
 
-                let rows_added = j.joint_type.fill_jacobian_rows(
-                    &mut j_mat,
-                    current_row,
-                    col_a,
-                    col_b,
-                    pos_a,
-                    rot_a,
-                    pos_b,
-                    rot_b,
-                );
-                current_row += rows_added;
-            }
+                    let (pos_a, rot_a) = self.get_world_pose_vectors(&na);
+                    let (pos_b, rot_b) = self.get_world_pose_vectors(&nb);
 
-            let svd = j_mat.svd(false, false);
-            let s_max = svd.singular_values[0];
-            let tol = match rank_tolerance {
-                Some(t) => t,
-                None => ((total_constraint_rows.max(total_cols) as f64) * s_max.max(1.0) * 1e-7).max(1e-9),
+                    if let Some((status, warn)) =
+                        evaluate_joint_limit_status(j, pos_a, rot_a, pos_b, rot_b)
+                    {
+                        joints_at_limits.push(status);
+                        limit_warnings.push(warn);
+                    }
+
+                    let rows_added = j.joint_type.fill_jacobian_rows(
+                        &mut j_mat,
+                        current_row,
+                        col_a,
+                        col_b,
+                        pos_a,
+                        rot_a,
+                        pos_b,
+                        rot_b,
+                    );
+                    joint_row_spans.push((j, current_row, rows_added));
+                    current_row += rows_added;
+                }
+
+                let svd = j_mat.clone().svd(false, false);
+                let s_max = svd.singular_values[0];
+                let tol = match rank_tolerance {
+                    Some(t) => t,
+                    None => ((total_constraint_rows.max(total_cols) as f64) * s_max.max(1.0) * 1e-7)
+                        .max(1e-9),
+                };
+
+                let rank = svd.singular_values.iter().filter(|&&s| s > tol).count();
+                let s_vals: Vec<f64> = svd.singular_values.iter().copied().collect();
+                (Some(j_mat), rank, s_vals, tol)
             };
 
-            let rank = svd.singular_values.iter().filter(|&&s| s > tol).count();
-            let s_vals: Vec<f64> = svd.singular_values.iter().copied().collect();
-            (rank, s_vals, tol)
-        };
-
         let dof_numeric = (6 * num_moving as i32) - (jacobian_rank as i32);
-        let sum_constraints: i32 = contributing_joints
-            .iter()
-            .map(|j| j.joint_type.constraints_count() as i32)
-            .sum();
+        let sum_constraints: i32 = total_constraint_rows as i32;
         let dof_grubler = (6 * num_moving as i32) - sum_constraints;
         let redundant_constraints = (dof_numeric - dof_grubler).max(0);
+        let redundant_joint_ids = match j_mat_opt {
+            Some(ref j_mat) if redundant_constraints > 0 && total_cols > 0 => {
+                find_redundant_joint_ids(j_mat, &joint_row_spans, total_cols, jacobian_rank, effective_tol)
+            }
+            _ => Vec::new(),
+        };
 
         let mut warnings = Vec::new();
         if !contributing_joints.is_empty() && dof_numeric == 0 {
@@ -2084,6 +2117,7 @@ impl PhysicsWorld {
         if !unconnected_parts.is_empty() || !floating_parts.is_empty() {
             warnings.push("есть свободные детали".to_string());
         }
+        warnings.extend(limit_warnings);
 
         let mut notes = Vec::new();
         notes.push("Chebychev-Grübler-Kutzbach spatial mobility formula: M = 6(N - 1) - sum(c_i), where N includes ground and c_i are joint constraint counts.".to_string());
@@ -2098,8 +2132,20 @@ impl PhysicsWorld {
         ));
         if redundant_constraints > 0 {
             notes.push(format!(
-                "Detected {} redundant constraints (common in planar four-bar linkages, slider-cranks, and overconstrained parallel mechanisms).",
-                redundant_constraints
+                "Detected {} redundant constraints involving joints [{}] (common in planar four-bar linkages, slider-cranks, and overconstrained parallel mechanisms).",
+                redundant_constraints,
+                redundant_joint_ids.join(", ")
+            ));
+        }
+        if !joints_at_limits.is_empty() {
+            let locked_count = joints_at_limits
+                .iter()
+                .filter(|s| s.boundary == "locked")
+                .count();
+            notes.push(format!(
+                "Detected {} joint(s) at or beyond travel limits ({} bilaterally locked with zero-range limits).",
+                joints_at_limits.len(),
+                locked_count
             ));
         }
 
@@ -2107,6 +2153,8 @@ impl PhysicsWorld {
             dof_numeric,
             dof_grubler,
             redundant_constraints,
+            redundant_joint_ids,
+            joints_at_limits,
             grounded_parts: reported_grounded,
             moving_parts,
             floating_parts,
@@ -3088,4 +3136,161 @@ fn segment_segment_dist_sq(
     let c2 = p2 + d2 * t;
     (c1 - c2).norm_squared()
 }
+
+/// Identifies all joints whose constraint rows are linearly dependent with other constraints
+/// via leave-one-joint-out SVD rank comparison at `rank_tol` (`P3-T15`).
+fn find_redundant_joint_ids(
+    j_mat: &DMatrix<f64>,
+    joint_row_spans: &[(&CadJointRecord, usize, usize)],
+    total_cols: usize,
+    full_rank: usize,
+    rank_tol: f64,
+) -> Vec<String> {
+    let total_rows = j_mat.nrows();
+    let mut redundant_ids = Vec::new();
+
+    for &(joint_rec, start_row, rows_k) in joint_row_spans {
+        let remaining_rows = total_rows.saturating_sub(rows_k);
+        let rank_without_k = if remaining_rows == 0 {
+            0
+        } else {
+            let mut j_sub = DMatrix::<f64>::zeros(remaining_rows, total_cols);
+            let mut dst_row = 0;
+            for r in 0..total_rows {
+                if r >= start_row && r < start_row + rows_k {
+                    continue;
+                }
+                j_sub.row_mut(dst_row).copy_from(&j_mat.row(r));
+                dst_row += 1;
+            }
+            let svd_sub = j_sub.svd(false, false);
+            svd_sub
+                .singular_values
+                .iter()
+                .filter(|&&s| s > rank_tol)
+                .count()
+        };
+
+        let dep_rows = (rows_k as i32) - ((full_rank as i32) - (rank_without_k as i32));
+        if dep_rows > 0 {
+            redundant_ids.push(joint_rec.id.clone());
+        }
+    }
+
+    redundant_ids
+}
+
+/// Evaluates whether a `Revolute` or `Prismatic` joint is currently at or beyond its travel `limits` (`P3-T15`).
+fn evaluate_joint_limit_status(
+    joint: &CadJointRecord,
+    pos_a: Vector3<f64>,
+    rot_a: Matrix3<f64>,
+    pos_b: Vector3<f64>,
+    rot_b: Matrix3<f64>,
+) -> Option<(JointLimitStatus, String)> {
+    let (is_revolute, limits) = match joint.joint_type {
+        CadJointType::Revolute {
+            limits: Some(lim), ..
+        } => (true, lim),
+        CadJointType::Prismatic {
+            limits: Some(lim), ..
+        } => (false, lim),
+        _ => return None,
+    };
+
+    let q = joint
+        .joint_type
+        .current_coordinate(pos_a, rot_a, pos_b, rot_b)?;
+    let [min_v, max_v] = limits;
+    let span = (max_v - min_v).abs();
+    let tol = (span * 1e-3).clamp(1e-6, 1e-3);
+    let unit = if is_revolute { "rad" } else { "m" };
+
+    let (boundary, motor_blocked, warning) = if is_zero_range_limits(Some(limits)) {
+        let warn = if is_revolute {
+            format!(
+                "Достигнута граница limits для шарнира '{}': нулевой диапазон хода [{:.2}, {:.2}] deg (заблокирован)",
+                joint.id,
+                min_v.to_degrees(),
+                max_v.to_degrees()
+            )
+        } else {
+            format!(
+                "Достигнута граница limits для шарнира '{}': нулевой диапазон хода [{:.4}, {:.4}] m (заблокирован)",
+                joint.id, min_v, max_v
+            )
+        };
+        ("locked".to_string(), true, warn)
+    } else if q < min_v - tol || (q - min_v).abs() <= tol {
+        let boundary = if q < min_v - tol {
+            "below_min".to_string()
+        } else {
+            "min".to_string()
+        };
+        let blocked = joint.motor.is_some_and(|m| m.target_velocity < -1e-9);
+        let suffix = if blocked {
+            "; привод направлен в упор"
+        } else {
+            ""
+        };
+        let warn = if is_revolute {
+            format!(
+                "Шарнир '{}' достиг нижней границы limits ({:.2} deg <= {:.2} deg){}",
+                joint.id,
+                q.to_degrees(),
+                min_v.to_degrees(),
+                suffix
+            )
+        } else {
+            format!(
+                "Шарнир '{}' достиг нижней границы limits ({:.4} m <= {:.4} m){}",
+                joint.id, q, min_v, suffix
+            )
+        };
+        (boundary, blocked, warn)
+    } else if q > max_v + tol || (q - max_v).abs() <= tol {
+        let boundary = if q > max_v + tol {
+            "above_max".to_string()
+        } else {
+            "max".to_string()
+        };
+        let blocked = joint.motor.is_some_and(|m| m.target_velocity > 1e-9);
+        let suffix = if blocked {
+            "; привод направлен в упор"
+        } else {
+            ""
+        };
+        let warn = if is_revolute {
+            format!(
+                "Шарнир '{}' достиг верхней границы limits ({:.2} deg >= {:.2} deg){}",
+                joint.id,
+                q.to_degrees(),
+                max_v.to_degrees(),
+                suffix
+            )
+        } else {
+            format!(
+                "Шарнир '{}' достиг верхней границы limits ({:.4} m >= {:.4} m){}",
+                joint.id, q, max_v, suffix
+            )
+        };
+        (boundary, blocked, warn)
+    } else {
+        return None;
+    };
+
+    Some((
+        JointLimitStatus {
+            joint_id: joint.id.clone(),
+            joint_type: joint.joint_type.type_name().to_string(),
+            boundary,
+            current_value: q,
+            limits,
+            unit: unit.to_string(),
+            motor_blocked,
+        },
+        warning,
+    ))
+}
+
 

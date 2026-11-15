@@ -779,6 +779,36 @@ pub fn analyze_mechanism(args: &Value, state: &mut EngineState) -> Result<Value,
         Some(&scene_parts),
     )?;
 
+    let k_from_m = unit.from_meters_factor();
+    let joints_at_limits_json: Vec<Value> = report
+        .joints_at_limits
+        .iter()
+        .map(|jl| {
+            let (curr, lim, u_str) = if jl.joint_type == "revolute" {
+                (
+                    jl.current_value.to_degrees(),
+                    [jl.limits[0].to_degrees(), jl.limits[1].to_degrees()],
+                    "deg",
+                )
+            } else {
+                (
+                    jl.current_value * k_from_m,
+                    [jl.limits[0] * k_from_m, jl.limits[1] * k_from_m],
+                    unit.as_str(),
+                )
+            };
+            json!({
+                "joint_id": jl.joint_id,
+                "joint_type": jl.joint_type,
+                "boundary": jl.boundary,
+                "current_value": curr,
+                "limits": lim,
+                "unit": u_str,
+                "motor_blocked": jl.motor_blocked,
+            })
+        })
+        .collect();
+
     let status = if report.warnings.is_empty() {
         "PASS"
     } else {
@@ -790,6 +820,8 @@ pub fn analyze_mechanism(args: &Value, state: &mut EngineState) -> Result<Value,
         "dof_numeric": report.dof_numeric,
         "dof_grubler": report.dof_grubler,
         "redundant_constraints": report.redundant_constraints,
+        "redundant_joint_ids": report.redundant_joint_ids,
+        "joints_at_limits": joints_at_limits_json,
         "grounded_parts": report.grounded_parts,
         "moving_parts": report.moving_parts,
         "floating_parts": report.floating_parts,
@@ -1833,6 +1865,54 @@ mod tests {
 
         let err_tol = analyze_mechanism(&json!({ "rank_tolerance": 0.0 }), &mut state).unwrap_err();
         assert_eq!(err_tol.to_error_body().code, "INVALID_ARGUMENT");
+    }
+
+    #[test]
+    fn test_p3_t15_analyze_mechanism_limits_and_redundant_joints_unit() {
+        let mut state = EngineState::new().expect("EngineState init");
+
+        cad::create_part(
+            &json!({ "name": "Slider", "part_id": "slider_u", "material": "steel_structural_aisi1020", "is_fixed": false }),
+            &mut state,
+        )
+        .unwrap();
+        cad::add_feature_primitive(
+            &json!({ "part_id": "slider_u", "primitive_type": "box", "params": { "width": 20.0, "height": 20.0, "depth": 20.0 } }),
+            &mut state,
+        )
+        .unwrap();
+
+        // Prismatic joint at x = 0 with limits [0.0, 50.0] mm -> at lower limit boundary (0 mm)
+        create_joint(
+            &json!({
+                "joint_id": "j_slide_lim",
+                "joint_type": "prismatic",
+                "part_a": "ground",
+                "part_b": "slider_u",
+                "anchor_a": [0.0, 0.0, 0.0],
+                "anchor_b": [0.0, 0.0, 0.0],
+                "axis": [1.0, 0.0, 0.0],
+                "limits": [0.0, 50.0]
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        let rep_mm = analyze_mechanism(&json!({}), &mut state).expect("analyze mm");
+        assert_eq!(rep_mm["status"], "WARN");
+        assert_eq!(rep_mm["dof_numeric"], 1);
+        assert_eq!(rep_mm["redundant_joint_ids"], json!([]));
+        let lims_mm = rep_mm["joints_at_limits"].as_array().unwrap();
+        assert_eq!(lims_mm.len(), 1);
+        assert_eq!(lims_mm[0]["joint_id"], "j_slide_lim");
+        assert_eq!(lims_mm[0]["boundary"], "min");
+        assert_eq!(lims_mm[0]["unit"], "mm");
+        assert!((lims_mm[0]["limits"][1].as_f64().unwrap() - 50.0).abs() < 1e-6);
+
+        let rep_m = analyze_mechanism(&json!({ "length_unit": "m" }), &mut state).expect("analyze m");
+        let lims_m = rep_m["joints_at_limits"].as_array().unwrap();
+        assert_eq!(lims_m[0]["unit"], "m");
+        assert!((lims_m[0]["limits"][1].as_f64().unwrap() - 0.05).abs() < 1e-9);
     }
 }
 

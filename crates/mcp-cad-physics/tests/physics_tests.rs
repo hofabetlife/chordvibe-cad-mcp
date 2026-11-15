@@ -1116,6 +1116,8 @@ fn test_p3_t9_analyze_mechanism_benchmarks() {
         assert_eq!(rep.dof_numeric, 1, "Revolute to ground must have DOF=1");
         assert_eq!(rep.dof_grubler, 1);
         assert_eq!(rep.redundant_constraints, 0);
+        assert!(rep.redundant_joint_ids.is_empty());
+        assert!(rep.joints_at_limits.is_empty());
         assert_eq!(rep.moving_parts, vec!["pendulum"]);
         assert!(rep.floating_parts.is_empty());
         assert!(rep.unconnected_parts.is_empty());
@@ -1276,6 +1278,15 @@ fn test_p3_t9_analyze_mechanism_benchmarks() {
         assert_eq!(rep.dof_numeric, 1, "Planar 4-bar numeric DOF must be 1");
         assert_eq!(rep.dof_grubler, -2, "Planar 4-bar spatial Grübler DOF must be -2");
         assert_eq!(rep.redundant_constraints, 3, "Planar 4-bar redundant constraints must be 3");
+        assert_eq!(
+            rep.redundant_joint_ids,
+            vec![
+                "j1_ground_crank",
+                "j2_crank_coupler",
+                "j3_coupler_rocker",
+                "j4_rocker_ground"
+            ]
+        );
         assert!(rep.floating_parts.is_empty());
         assert!(rep.unconnected_parts.is_empty());
     }
@@ -1374,6 +1385,10 @@ fn test_p3_t9_analyze_mechanism_benchmarks() {
         assert_eq!(rep.dof_numeric, 1, "Slider-crank numeric DOF must be 1");
         assert_eq!(rep.dof_grubler, -2, "Slider-crank spatial Grübler DOF must be -2");
         assert_eq!(rep.redundant_constraints, 3, "Slider-crank redundant constraints must be 3");
+        assert_eq!(
+            rep.redundant_joint_ids,
+            vec!["j1_sc_rev", "j2_sc_rev", "j3_sc_rev", "j4_sc_prism"]
+        );
     }
 
     // 7. Two wheels on Revolute + Gear constraint -> 1 DOF
@@ -1647,6 +1662,207 @@ fn test_p3_t10_benchmark_check_interference_10_parts_45_pairs() {
         "10-part (45-pair) interference check took {:.3} ms (expected < 250 ms)",
         report.elapsed_ms
     );
+}
+
+#[test]
+fn test_p3_t15_redundant_joint_attribution_and_active_limits() {
+    // 1. Selective attribution of redundant_joint_ids: 2-link open chain + duplicate joint
+    {
+        let mut world = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
+        let link1 = create_test_box("link1", "Link 1", 0.1, 0.02, 0.02);
+        let link2 = create_test_box("link2", "Link 2", 0.1, 0.02, 0.02);
+        world
+            .add_part_with_options(&link1, true, ColliderType::ConvexHull, Some([0.05, 0.0, 0.0]), None)
+            .expect("link1");
+        world
+            .add_part_with_options(&link2, true, ColliderType::ConvexHull, Some([0.15, 0.0, 0.0]), None)
+            .expect("link2");
+
+        world
+            .add_joint(
+                "j_base",
+                "ground",
+                "link1",
+                CadJointType::Revolute {
+                    anchor_a: [0.0, 0.0, 0.0],
+                    anchor_b: [-0.05, 0.0, 0.0],
+                    axis: [0.0, 0.0, 1.0],
+                    limits: None,
+                },
+                None,
+            )
+            .expect("j_base");
+        world
+            .add_joint(
+                "j_arm",
+                "link1",
+                "link2",
+                CadJointType::Revolute {
+                    anchor_a: [0.05, 0.0, 0.0],
+                    anchor_b: [-0.05, 0.0, 0.0],
+                    axis: [0.0, 0.0, 1.0],
+                    limits: None,
+                },
+                None,
+            )
+            .expect("j_arm");
+        world
+            .add_joint(
+                "j_arm_dup",
+                "link1",
+                "link2",
+                CadJointType::Revolute {
+                    anchor_a: [0.05, 0.0, 0.0],
+                    anchor_b: [-0.05, 0.0, 0.0],
+                    axis: [0.0, 0.0, 1.0],
+                    limits: None,
+                },
+                None,
+            )
+            .expect("j_arm_dup");
+
+        let rep = world.analyze_mechanism(None, None).expect("redundant chain");
+        assert_eq!(rep.dof_numeric, 2);
+        assert_eq!(rep.dof_grubler, -3);
+        assert_eq!(rep.redundant_constraints, 5);
+        assert_eq!(rep.redundant_joint_ids, vec!["j_arm", "j_arm_dup"]);
+    }
+
+    // 2. Revolute joint strictly inside limits -> no limit warning
+    {
+        let mut world = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
+        let arm = create_test_box("arm", "Arm", 0.1, 0.02, 0.02);
+        world.add_part(&arm, true).expect("arm");
+        world
+            .add_joint(
+                "j_hinge",
+                "ground",
+                "arm",
+                CadJointType::Revolute {
+                    anchor_a: [0.0, 0.0, 0.0],
+                    anchor_b: [0.0, 0.0, 0.0],
+                    axis: [0.0, 0.0, 1.0],
+                    limits: Some([-std::f64::consts::FRAC_PI_4, std::f64::consts::FRAC_PI_4]),
+                },
+                None,
+            )
+            .expect("j_hinge");
+
+        let rep = world.analyze_mechanism(None, None).expect("inside limits");
+        assert_eq!(rep.dof_numeric, 1);
+        assert!(rep.joints_at_limits.is_empty());
+        assert!(rep.warnings.is_empty(), "Unexpected warnings: {:?}", rep.warnings);
+    }
+
+    // 3. Revolute joint driven to upper limit by simulation -> warning + joints_at_limits + motor_blocked
+    {
+        let mut world = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
+        let arm = create_test_box("arm_lim", "Arm", 0.2, 0.02, 0.02);
+        world.add_part(&arm, true).expect("arm_lim");
+        let max_rad = 30.0_f64.to_radians();
+        world
+            .add_joint(
+                "j_rev_lim",
+                "ground",
+                "arm_lim",
+                CadJointType::Revolute {
+                    anchor_a: [0.0, 0.0, 0.0],
+                    anchor_b: [0.0, 0.0, 0.0],
+                    axis: [0.0, 0.0, 1.0],
+                    limits: Some([-max_rad, max_rad]),
+                },
+                Some(MotorConfig::new(5.0, 200.0)),
+            )
+            .expect("j_rev_lim");
+
+        let summary = world.simulate(0.5, 0.005);
+        assert!(summary.success);
+
+        let rep = world.analyze_mechanism(None, None).expect("at upper limit");
+        assert_eq!(rep.joints_at_limits.len(), 1, "Expected joint at limit: {:?}", rep);
+        let lim = &rep.joints_at_limits[0];
+        assert_eq!(lim.joint_id, "j_rev_lim");
+        assert_eq!(lim.joint_type, "revolute");
+        assert_eq!(lim.unit, "rad");
+        assert!(
+            lim.boundary == "max" || lim.boundary == "above_max",
+            "Expected max/above_max, got {} (value={:.4}, limits={:?})",
+            lim.boundary,
+            lim.current_value,
+            lim.limits
+        );
+        assert!(lim.motor_blocked);
+        assert!(rep.warnings.iter().any(|w| w.contains("limits") && w.contains("j_rev_lim")));
+    }
+
+    // 4. Prismatic joint at lower limit without motor -> boundary = "min", motor_blocked = false
+    {
+        let mut world = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
+        let slider = create_test_box("slider_min", "Slider", 0.04, 0.04, 0.04);
+        world
+            .add_part_with_options(
+                &slider,
+                true,
+                ColliderType::Cube,
+                Some([-0.05, 0.0, 0.0]),
+                None,
+            )
+            .expect("slider_min");
+        world
+            .add_joint(
+                "j_prism_min",
+                "ground",
+                "slider_min",
+                CadJointType::Prismatic {
+                    anchor_a: [0.0, 0.0, 0.0],
+                    anchor_b: [0.0, 0.0, 0.0],
+                    axis: [1.0, 0.0, 0.0],
+                    limits: Some([-0.05, 0.10]),
+                },
+                None,
+            )
+            .expect("j_prism_min");
+
+        let rep = world.analyze_mechanism(None, None).expect("prismatic at min");
+        assert_eq!(rep.dof_numeric, 1);
+        assert_eq!(rep.joints_at_limits.len(), 1);
+        assert_eq!(rep.joints_at_limits[0].joint_id, "j_prism_min");
+        assert_eq!(rep.joints_at_limits[0].boundary, "min");
+        assert_eq!(rep.joints_at_limits[0].unit, "m");
+        assert!(!rep.joints_at_limits[0].motor_blocked);
+        assert!(rep.warnings.iter().any(|w| w.contains("limits") && w.contains("j_prism_min")));
+    }
+
+    // 5. Zero-range limits [0.0, 0.0] -> bilaterally locked (DOF = 0, boundary = "locked")
+    {
+        let mut world = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
+        let arm = create_test_box("arm_zero", "Arm Zero", 0.1, 0.02, 0.02);
+        world.add_part(&arm, true).expect("arm_zero");
+        world
+            .add_joint(
+                "j_zero_lim",
+                "ground",
+                "arm_zero",
+                CadJointType::Revolute {
+                    anchor_a: [0.0, 0.0, 0.0],
+                    anchor_b: [0.0, 0.0, 0.0],
+                    axis: [0.0, 0.0, 1.0],
+                    limits: Some([0.0, 0.0]),
+                },
+                None,
+            )
+            .expect("j_zero_lim");
+
+        let rep = world.analyze_mechanism(None, None).expect("zero-range limits");
+        assert_eq!(rep.dof_numeric, 0);
+        assert_eq!(rep.dof_grubler, 0);
+        assert_eq!(rep.joint_constraints_count, 6);
+        assert_eq!(rep.joints_at_limits.len(), 1);
+        assert_eq!(rep.joints_at_limits[0].boundary, "locked");
+        assert!(rep.joints_at_limits[0].motor_blocked);
+        assert!(rep.warnings.iter().any(|w| w.contains("DOF=0")));
+        assert!(rep.warnings.iter().any(|w| w.contains("limits") && w.contains("j_zero_lim")));
+    }
 }
 
 

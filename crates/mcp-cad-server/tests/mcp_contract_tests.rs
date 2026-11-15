@@ -10262,6 +10262,11 @@ async fn test_mcp_p3_t9_analyze_mechanism_and_requirement_contract() {
     assert_eq!(fourbar_res["dof_numeric"], 1);
     assert_eq!(fourbar_res["dof_grubler"], -2);
     assert_eq!(fourbar_res["redundant_constraints"], 3);
+    assert_eq!(
+        fourbar_res["redundant_joint_ids"],
+        json!(["j1", "j2", "j3", "j4"])
+    );
+    assert_eq!(fourbar_res["joints_at_limits"], json!([]));
     assert_eq!(fourbar_res["jacobian_rank"], 17);
     assert_eq!(fourbar_res["floating_parts"], json!([]));
     assert_eq!(fourbar_res["unconnected_parts"], json!([]));
@@ -10345,6 +10350,119 @@ async fn test_mcp_p3_t9_analyze_mechanism_and_requirement_contract() {
         .as_str()
         .unwrap()
         .contains("analyze_mechanism"));
+}
+
+#[tokio::test]
+async fn test_mcp_p3_t15_analyze_mechanism_limits_and_redundant_joints() {
+    let state = EngineState::new()
+        .expect("EngineState initialization failed")
+        .into_shared();
+
+    // 1. Create a slider part and attach a prismatic joint with limits [0, 50] mm (starts at 0 mm = min boundary)
+    rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4050,
+            "method": "tools/call",
+            "params": {
+                "name": "create_part",
+                "arguments": {
+                    "part_id": "slider_p15",
+                    "name": "Slider",
+                    "material": "steel_structural_aisi1020",
+                    "is_fixed": false
+                }
+            }
+        }),
+    )
+    .await;
+    rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4051,
+            "method": "tools/call",
+            "params": {
+                "name": "add_feature_primitive",
+                "arguments": {
+                    "part_id": "slider_p15",
+                    "primitive_type": "box",
+                    "params": { "width": 20.0, "height": 20.0, "depth": 20.0 }
+                }
+            }
+        }),
+    )
+    .await;
+    rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4052,
+            "method": "tools/call",
+            "params": {
+                "name": "create_joint",
+                "arguments": {
+                    "joint_id": "j_prism_p15",
+                    "joint_type": "prismatic",
+                    "part_a": "ground",
+                    "part_b": "slider_p15",
+                    "anchor_a": [0.0, 0.0, 0.0],
+                    "anchor_b": [0.0, 0.0, 0.0],
+                    "axis": [1.0, 0.0, 0.0],
+                    "limits": [0.0, 50.0]
+                }
+            }
+        }),
+    )
+    .await;
+
+    let resp_mm = parse_content(
+        &rpc_call(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4053,
+                "method": "tools/call",
+                "params": { "name": "analyze_mechanism", "arguments": {} }
+            }),
+        )
+        .await,
+    );
+    assert_eq!(resp_mm["status"], "WARN");
+    assert_eq!(resp_mm["dof_numeric"], 1);
+    assert_eq!(resp_mm["redundant_joint_ids"], json!([]));
+    let lims = resp_mm["joints_at_limits"].as_array().unwrap();
+    assert_eq!(lims.len(), 1);
+    assert_eq!(lims[0]["joint_id"], "j_prism_p15");
+    assert_eq!(lims[0]["boundary"], "min");
+    assert_eq!(lims[0]["unit"], "mm");
+    assert!((lims[0]["limits"][1].as_f64().unwrap() - 50.0).abs() < 1e-6);
+    assert!(resp_mm["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|w| w.as_str().unwrap().contains("limits")));
+
+    // 2. Verify length_unit: "m" override scales prismatic limits to meters
+    let resp_m = parse_content(
+        &rpc_call(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4054,
+                "method": "tools/call",
+                "params": {
+                    "name": "analyze_mechanism",
+                    "arguments": { "length_unit": "m" }
+                }
+            }),
+        )
+        .await,
+    );
+    assert_eq!(resp_m["length_unit"], "m");
+    assert_eq!(resp_m["joints_at_limits"][0]["unit"], "m");
+    assert!((resp_m["joints_at_limits"][0]["limits"][1].as_f64().unwrap() - 0.05).abs() < 1e-9);
 }
 
 #[tokio::test]

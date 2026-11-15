@@ -52,7 +52,7 @@ mcp-cad/
 │   ├── BENCH_BASELINE_RUST.md    # Базовая линия 15 задач бенчмарка против нативного Rust-сервера
 │   ├── adr/0001-geometry-kernel.md # ADR выбора геометрического ядра (manifold-rust + monstertruck)
 │   ├── adr/0002-fe-mesher.md        # ADR выбора генератора сетки МКЭ (fe_snap + TET10, P3-T5)
-│   └── agent_tasks/              # Детальные отчёты о выполнении задач P0-T1..T12, P1-T1..T4, P2-T1..T40, P3-T1..T14
+│   └── agent_tasks/              # Детальные отчёты о выполнении задач P0-T1..T12, P1-T1..T4, P2-T1..T40, P3-T1..T15
 ├── spikes/
 │   ├── manifold_rust/            # Прототип ядра manifold-rust v0.19.2 (Pure Rust CSG + face_id)
 │   ├── monstertruck_brep/        # Прототип B-Rep ядра monstertruck v0.4.1 (fillet + ISO 10303-21 STEP)
@@ -135,7 +135,7 @@ graph TD
 - Интеграция с `rapier3d`: автоматическое построение твёрдых тел (`RigidBodyType::Dynamic` при `!part.is_fixed` и `RigidBodyType::Fixed` при `part.is_fixed == true`) и коллайдеров (`Collider`), расчёт массы и тензора инерции по объёму сетки и плотности материала $\rho$.
 - Статические мировые якоря `"ground"` и `"world"` (регистронезависимые, защищены от удаления и переопределения в `create_part` / `delete_part`).
 - 5 типов шарниров (`CadJointType`): `Revolute` (ось, пределы углов `limits` в `deg`, мотор угловой скорости `rad/s` и момента `N·m`), `Prismatic` (ось, пределы хода `limits` в `mm`/`m`, мотор линейной скорости `m/s` и силы `N`), `Spherical`, `Fixed`, `Gear` (кинематическая зубчатая передача с отношением `ratio` или `teeth_a / teeth_b` и осями `axis_a`, `axis_b`).
-- Кинематический анализ подвижности механизма (`analyze_mechanism`, `P3-T9`): расчёт числа степеней свободы по пространственной формуле Чебышёва–Грюблера–Кутцбаха ($M = 6(N-1) - \sum c_i$) и численного ранга линеаризованного якобиана связей $J$ через SVD (`nalgebra`: $\text{DOF} = 6 N_{\text{moving}} - \text{rank}(J)$) с выявлением избыточных связей (`redundant_constraints`), несвязанных и «висящих» деталей (`floating_parts`, `unconnected_parts`).
+- Кинематический анализ подвижности механизма (`analyze_mechanism`, `P3-T9`, `P3-T15`): расчёт числа степеней свободы по пространственной формуле Чебышёва–Грюблера–Кутцбаха ($M = 6(N-1) - \sum c_i$) и численного ранга линеаризованного якобиана связей $J$ через SVD (`nalgebra`: $\text{DOF} = 6 N_{\text{moving}} - \text{rank}(J)$) с выявлением избыточных связей (`redundant_constraints`), атрибуцией линейно зависимых шарниров (`redundant_joint_ids` через leave-one-joint-out SVD), диагностикой достижения/выхода за пределы хода `limits` (`joints_at_limits`, включая `motor_blocked` и двустороннюю блокировку при нулевом диапазоне `[c, c]`), а также несвязанных и «висящих» деталей (`floating_parts`, `unconnected_parts`).
 - Статическая детекция интерференции и развёртка хода шарниров (`check_interference`, `sweep_joint`, `P3-T10`): двухфазная проверка попарного пересечения тел сборки (broad-phase `AABB` + narrow-phase `csg_intersection` с вычислением `intersection_volume` и `penetration_depth`, а при отсутствии пересечения — точного минимального евклидова зазора `clearance` между треугольниками сеток), фильтрация смежных по шарниру деталей (`ignore_adjacent`) и дискретное сканирование диапазона углов/хода `Revolute` и `Prismatic` шарниров (`[from, to]`, `steps`) до первого столкновения без мутации сцены.
 
 #### `crates/mcp-cad-fea` (Конечно-элементный анализ прочности)
@@ -296,15 +296,15 @@ graph TD
    - Любая ошибка параметров возвращается как `Result<T, CadError / ServerError>` и преобразуется в структурированный JSON `ErrorEnvelope`.
 2. **Чистота потока `stdout` в режиме `stdio`**:
    - В режиме `--mode stdio` поток `stdout` используется **исключительно** для сообщений JSON-RPC 2.0. Любой вывод логов (`tracing`, `eprintln!`) направляется строго в `std::io::stderr`.
-3. **Статус автоматического тестирования (`mcp-cad-server` и `clippy` актуализированы в `P3-T14` от 15.11.2026; остальные крейты и TS — аудит `P3-T13` от 14.11.2026)**:
-   - **Rust Workspace (проверено по крейтам) — 309 тестов (307 PASS, 2 FAIL, 0 ignored)**:
-     - `mcp-cad-core`: **129 тестов** (`74` юнит-теста в `--lib` + `55` в интеграционных суитах `csg_invariants`, `dag_tests`, `primitive_invariants`, `tessellation_tests`) — **129 PASS**;
-     - `mcp-cad-server`: **131 тест** (`59` юнит-тестов модулей + `1` `bench_suite` + `1` `gear_kinematic_test` + `13` `qa_wide_scan` + `57` в `mcp_contract_tests.rs`, где `56` проходят и `1` падает — `test_mcp_open_preview_window`, отслеживается в `P3-T20`; `P3-T14` ✅ DONE; суиты `mcp_contract_tests` и `qa_wide_scan` прогнаны с `MCP_CAD_DISABLE_GUI_SPAWN=1 -- --test-threads=1` — см. `P3-T23`);
-     - `mcp-cad-fea`: **21 тест** (`8` юнит-тестов в `--lib` + `2` в `fea_benchmarks` + `11` в `fea_tests`) — **21 PASS**;
-     - `mcp-cad-physics`: **18 тестов** (`physics_tests.rs`: `17` проходят, `1` падает — `test_p3_t10_sweep_joint_hinged_arm_hitting_fixed_wall`, отслеживается в `P3-T19`);
-     - `mcp-cad-viewer`: **10 тестов** (`viewer_tests.rs`) — **10 PASS**.
-   - **TypeScript Suite (`npx tsx --test src/cad/__tests__/analyze_mechanism.test.ts`) — 11 тестов (100% PASS)**, `npm run lint` (`tsc --noEmit`) — 0 ошибок (`src/cad/cad_engine.test.ts` отсутствует в рабочей копии — см. `P3-T22`).
-   - **Линтер Rust (`cargo clippy --workspace --all-targets -- -D warnings`, проверено на `rustc 1.97.1`) — 0 ошибок, 0 предупреждений** (`P3-T13`, `P3-T14` ✅ DONE).
+3. **Статус автоматического тестирования (`mcp-cad-physics`, `--lib` и `mcp_contract_tests` в `mcp-cad-server`, TS-суит и `clippy` актуализированы в `P3-T15` от 15.11.2026; прочие таргеты `mcp-cad-server` — `P3-T14` от 15.11.2026; `mcp-cad-core`/`fea`/`viewer` — аудит `P3-T13` от 14.11.2026)**:
+   - **Rust Workspace (проверено по крейтам) — 312 тестов (310 PASS, 2 FAIL, 0 ignored)**:
+     - `mcp-cad-core`: **129 тестов** (`74` юнит-теста в `--lib` + `55` в интеграционных суитах `csg_invariants`, `dag_tests`, `primitive_invariants`, `tessellation_tests`) — **129 PASS** (`P3-T13`);
+     - `mcp-cad-server`: **133 теста** (`60/60` юнит-тестов `--lib` и `57/58` в `mcp_contract_tests.rs` при `MCP_CAD_DISABLE_GUI_SPAWN=1 -- --test-threads=1` — **117/118 PASS** в `P3-T15`, единственное падение `test_mcp_open_preview_window` отслеживается в `P3-T20`; плюс `1` `bench_suite` + `1` `gear_kinematic_test` + `13` `qa_wide_scan` — **15/15 PASS** в `P3-T14`, см. `P3-T23`);
+     - `mcp-cad-fea`: **21 тест** (`8` юнит-тестов в `--lib` + `2` в `fea_benchmarks` + `11` в `fea_tests`) — **21 PASS** (`P3-T13`);
+     - `mcp-cad-physics`: **19 тестов** (`physics_tests.rs`: `18` проходят, `1` падает — `test_p3_t10_sweep_joint_hinged_arm_hitting_fixed_wall`, отслеживается в `P3-T19`; `P3-T15` ✅ DONE);
+     - `mcp-cad-viewer`: **10 тестов** (`viewer_tests.rs`) — **10 PASS** (`P3-T13`).
+   - **TypeScript Suite (`npx tsx --test src/cad/__tests__/analyze_mechanism.test.ts`) — 12 тестов (12 PASS)**, `npm run lint` (`tsc --noEmit`) — 0 ошибок (`P3-T15`; `src/cad/cad_engine.test.ts` отсутствует в рабочей копии — см. `P3-T22`).
+   - **Линтер Rust (`cargo clippy --workspace --all-targets -- -D warnings`, проверено в `P3-T15`) — 0 ошибок, 0 предупреждений** (`EXIT: 0`).
 
 ---
 
@@ -351,7 +351,7 @@ graph TD
 | 35 | `get_part_load_cases` | Физика | Извлечение динамических нагрузок на деталь `part_id` из последней симуляции (`select = "peak_force" \| "peak_torque" \| time_s`): реакции во всех подключённых шарнирах (`force`, `torque`, `anchor_local`), инерционные ускорения (`linear_acceleration`, `angular_acceleration`) и невязка равновесия Даламбера в локальной СК детали (`P3-T6`) |
 | 36 | `run_fea_from_simulation` | МКЭ / Физика | Квазистатический расчёт прочности детали `part_id` по нагрузкам из последней симуляции (`select`, `load_radius`, `mesh_density`, `element_order`, `fea_case`, `convergence_study`): распределение сил и моментов шарниров парой сил по именованным граням или сфере `load_radius`, объёмные силы инерции Даламбера, минимальное 6-DOF закрепление по схеме **3-2-1** и блок `source` (`P3-T7`) |
 | 37 | `check_gear_strength` | Расчёт передач | Аналитическая проверка изгибной прочности зубьев прямозубых шестерён по Льюису (с динамическим фактором Барта $K_v$) и контактной прочности / питтинга по Герцу / AGMA / ISO 6336 (`P3-T8`) |
-| 38 | `analyze_mechanism` | Физика / Кинематика | Кинематический анализ степеней свободы механизма по Грюблеру и SVD ранга матрицы Якоби связей (`dof_numeric`, `dof_grubler`, `redundant_constraints`, `floating_parts`, `unconnected_parts`), интегрирован с требованием `mechanism_dof` (`P3-T9`) |
+| 38 | `analyze_mechanism` | Физика / Кинематика | Кинематический анализ степеней свободы механизма по Грюблеру и SVD ранга матрицы Якоби связей (`dof_numeric`, `dof_grubler`, `redundant_constraints`, `redundant_joint_ids`, `joints_at_limits`, `floating_parts`, `unconnected_parts`), учёт упоров `limits` и интеграция с требованием `mechanism_dof` (`P3-T9`, `P3-T15`) |
 | 39 | `check_interference` | Физика / Кинематика | Проверка попарной геометрической интерференции и минимальных зазоров между деталями (broad-phase `AABB` + narrow-phase `csg_intersection`, `intersection_volume`, `penetration_depth`, `clearance`, `ignore_adjacent`), интегрирована с требованием `no_interference` (`P3-T10`) |
 | 40 | `sweep_joint` | Физика / Кинематика | Пошаговое сканирование угла/хода шарнира `Revolute` или `Prismatic` (`joint_id`, `from`, `to`, `steps`, `ignore_adjacent`) для поиска угла/позиции первого столкновения (`first_collision_value`), безопасного диапазона хода (`safe_travel_range`) и минимального зазора (`min_clearance`) без мутации сцены (`P3-T10`) |
 

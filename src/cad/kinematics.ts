@@ -278,11 +278,23 @@ export function runPhysicsSimulationTrajectory(
   };
 }
 
+export interface JointLimitStatus {
+  joint_id: string;
+  joint_type: string;
+  boundary: 'min' | 'max' | 'below_min' | 'above_max' | 'locked';
+  current_value: number;
+  limits: [number, number];
+  unit: string;
+  motor_blocked: boolean;
+}
+
 export interface MechanismAnalysisReport {
   status: 'PASS' | 'WARN';
   dof_numeric: number;
   dof_grubler: number;
   redundant_constraints: number;
+  redundant_joint_ids: string[];
+  joints_at_limits: JointLimitStatus[];
   grounded_parts: string[];
   moving_parts: string[];
   floating_parts: string[];
@@ -354,12 +366,45 @@ function mat3Vec3(m: Mat3, v: Vec3): Vec3 {
   ];
 }
 
+function transpose3(m: Mat3): Mat3 {
+  return [
+    [m[0][0], m[1][0], m[2][0]],
+    [m[0][1], m[1][1], m[2][1]],
+    [m[0][2], m[1][2], m[2][2]],
+  ];
+}
+
+function normalizeOrDefault3(a: Vec3, fallback: Vec3): Vec3 {
+  const n = norm3(a);
+  return n > 1e-12 ? [a[0] / n, a[1] / n, a[2] / n] : fallback;
+}
+
 function orthonormalBasis(u: Vec3): [Vec3, Vec3, Vec3] {
   const z = normalize3(u);
   const vRef: Vec3 = Math.abs(z[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
   const x = normalize3(sub3(vRef, scale3(z, dot3(vRef, z))));
   const y = normalize3(cross3(z, x));
   return [x, y, z];
+}
+
+function isZeroRangeLimits(limits?: [number, number]): boolean {
+  return limits !== undefined && Math.abs(limits[1] - limits[0]) <= 1e-9;
+}
+
+function unwrapAngleNearLimits(theta: number, limits: [number, number]): number {
+  const mid = 0.5 * (limits[0] + limits[1]);
+  const tau = 2 * Math.PI;
+  let best = theta;
+  let bestDist = Math.abs(theta - mid);
+  for (const shift of [-tau, tau]) {
+    const cand = theta + shift;
+    const dist = Math.abs(cand - mid);
+    if (dist < bestDist - 1e-12) {
+      best = cand;
+      bestDist = dist;
+    }
+  }
+  return best;
 }
 
 function jointConstraintCount(type: KinematicJoint['type']): number {
@@ -374,6 +419,131 @@ function jointConstraintCount(type: KinematicJoint['type']): number {
     case 'gear':
       return 1;
   }
+}
+
+function effectiveJointConstraintCount(j: KinematicJoint): number {
+  if (
+    (j.type === 'revolute' || j.type === 'prismatic') &&
+    isZeroRangeLimits(j.limits)
+  ) {
+    return 6;
+  }
+  return jointConstraintCount(j.type);
+}
+
+function evaluateJointLimitStatusTS(
+  j: KinematicJoint,
+  poseA: { pos: Vec3; rot: Mat3 },
+  poseB: { pos: Vec3; rot: Mat3 }
+): { status: JointLimitStatus; warning: string } | null {
+  if ((j.type !== 'revolute' && j.type !== 'prismatic') || !j.limits) {
+    return null;
+  }
+  const isRevolute = j.type === 'revolute';
+  const [minV, maxV] = j.limits;
+  let q: number;
+  if (isRevolute) {
+    const uA = normalizeOrDefault3(j.axis || [0, 0, 1], [0, 0, 1]);
+    const [xLoc, yLoc] = orthonormalBasis(uA);
+    const rRel = mat3Mul(transpose3(poseA.rot), poseB.rot);
+    const rotX = mat3Vec3(rRel, xLoc);
+    const rawTheta = Math.atan2(dot3(yLoc, rotX), dot3(xLoc, rotX));
+    const poseTheta =
+      Math.abs(rawTheta) <= 1e-9 && Math.abs(j.currentAngleRad) > 1e-9
+        ? j.currentAngleRad
+        : rawTheta;
+    q = unwrapAngleNearLimits(poseTheta, j.limits);
+  } else {
+    const uA = normalizeOrDefault3(j.axis || [1, 0, 0], [1, 0, 0]);
+    const zA = mat3Vec3(poseA.rot, uA);
+    const anchorA: Vec3 = j.anchor || [0, 0, 0];
+    const anchorB: Vec3 = j.anchorB ?? [0, 0, 0];
+    const pAW = add3(poseA.pos, mat3Vec3(poseA.rot, anchorA));
+    const pBW = add3(poseB.pos, mat3Vec3(poseB.rot, anchorB));
+    const poseS = dot3(sub3(pBW, pAW), zA);
+    q =
+      Math.abs(poseS) <= 1e-9 && Math.abs(j.currentAngleRad) > 1e-9
+        ? j.currentAngleRad
+        : poseS;
+  }
+
+  const span = Math.abs(maxV - minV);
+  const tol = Math.min(1e-3, Math.max(1e-6, span * 1e-3));
+  const unit = isRevolute ? 'rad' : 'm';
+  const radToDeg = 180 / Math.PI;
+  const motorSign = j.motorEnabled ? Math.sign(j.motorSpeedRpm) : 0;
+
+  let boundary: JointLimitStatus['boundary'];
+  let motorBlocked = false;
+  let warning: string;
+
+  if (isZeroRangeLimits(j.limits)) {
+    boundary = 'locked';
+    motorBlocked = true;
+    warning = isRevolute
+      ? `Достигнута граница limits для шарнира '${j.id}': нулевой диапазон хода [${(minV * radToDeg).toFixed(2)}, ${(maxV * radToDeg).toFixed(2)}] deg (заблокирован)`
+      : `Достигнута граница limits для шарнира '${j.id}': нулевой диапазон хода [${minV.toFixed(4)}, ${maxV.toFixed(4)}] m (заблокирован)`;
+  } else if (q < minV - tol || Math.abs(q - minV) <= tol) {
+    boundary = q < minV - tol ? 'below_min' : 'min';
+    motorBlocked = motorSign < 0;
+    const suffix = motorBlocked ? '; привод направлен в упор' : '';
+    warning = isRevolute
+      ? `Шарнир '${j.id}' достиг нижней границы limits (${(q * radToDeg).toFixed(2)} deg <= ${(minV * radToDeg).toFixed(2)} deg)${suffix}`
+      : `Шарнир '${j.id}' достиг нижней границы limits (${q.toFixed(4)} m <= ${minV.toFixed(4)} m)${suffix}`;
+  } else if (q > maxV + tol || Math.abs(q - maxV) <= tol) {
+    boundary = q > maxV + tol ? 'above_max' : 'max';
+    motorBlocked = motorSign > 0;
+    const suffix = motorBlocked ? '; привод направлен в упор' : '';
+    warning = isRevolute
+      ? `Шарнир '${j.id}' достиг верхней границы limits (${(q * radToDeg).toFixed(2)} deg >= ${(maxV * radToDeg).toFixed(2)} deg)${suffix}`
+      : `Шарнир '${j.id}' достиг верхней границы limits (${q.toFixed(4)} m >= ${maxV.toFixed(4)} m)${suffix}`;
+  } else {
+    return null;
+  }
+
+  return {
+    status: {
+      joint_id: j.id,
+      joint_type: j.type,
+      boundary,
+      current_value: q,
+      limits: [minV, maxV],
+      unit,
+      motor_blocked: motorBlocked,
+    },
+    warning,
+  };
+}
+
+function findRedundantJointIdsTS(
+  jMat: number[][],
+  jointRowSpans: { joint: KinematicJoint; startRow: number; rows: number }[],
+  totalCols: number,
+  fullRank: number,
+  rankTol: number
+): string[] {
+  const totalRows = jMat.length;
+  const redundantIds: string[] = [];
+
+  for (const span of jointRowSpans) {
+    const remainingRows = totalRows - span.rows;
+    let rankWithoutK = 0;
+    if (remainingRows > 0) {
+      const jSub: number[][] = [];
+      for (let r = 0; r < totalRows; r++) {
+        if (r >= span.startRow && r < span.startRow + span.rows) continue;
+        jSub.push(jMat[r]);
+      }
+      const svSub = computeSingularValues(jSub, remainingRows, totalCols);
+      rankWithoutK = svSub.filter((s) => s > rankTol).length;
+    }
+    const depRows = span.rows - (fullRank - rankWithoutK);
+    if (depRows > 0) {
+      redundantIds.push(span.joint.id);
+    }
+  }
+
+  return redundantIds;
 }
 
 /**
@@ -578,7 +748,7 @@ export function analyzeMechanism(
   });
 
   const totalRows = contributingJoints.reduce(
-    (acc, j) => acc + jointConstraintCount(j.type),
+    (acc, j) => acc + effectiveJointConstraintCount(j),
     0
   );
   const numMoving = movingParts.length;
@@ -605,8 +775,22 @@ export function analyzeMechanism(
   let jacobianRank = 0;
   let singularValues: number[] = [];
   let effectiveTol = options?.rankTolerance ?? 1e-6;
+  const jointsAtLimits: JointLimitStatus[] = [];
+  const limitWarnings: string[] = [];
+  const jointRowSpans: { joint: KinematicJoint; startRow: number; rows: number }[] = [];
+  let jMatBuilt: number[][] | null = null;
 
-  if (totalRows > 0 && totalCols > 0) {
+  if (totalRows === 0 || totalCols === 0) {
+    for (const j of contributingJoints) {
+      const poseA = getPose(normPart(j.partA));
+      const poseB = getPose(normPart(j.partB));
+      const limRes = evaluateJointLimitStatusTS(j, poseA, poseB);
+      if (limRes) {
+        jointsAtLimits.push(limRes.status);
+        limitWarnings.push(limRes.warning);
+      }
+    }
+  } else {
     const jMat: number[][] = Array.from({ length: totalRows }, () =>
       new Array(totalCols).fill(0)
     );
@@ -637,10 +821,17 @@ export function analyzeMechanism(
       const colB = movingIndex.get(nb);
       const poseA = getPose(na);
       const poseB = getPose(nb);
+      const limRes = evaluateJointLimitStatusTS(j, poseA, poseB);
+      if (limRes) {
+        jointsAtLimits.push(limRes.status);
+        limitWarnings.push(limRes.warning);
+      }
+
       const anchorA: Vec3 = j.anchor || [0, 0, 0];
       const anchorB: Vec3 = j.anchorB ?? [0, 0, 0];
       const dA = mat3Vec3(poseA.rot, anchorA);
       const dB = mat3Vec3(poseB.rot, anchorB);
+      const startRow = curRow;
 
       if (j.type === 'fixed') {
         for (let k = 0; k < 3; k++) {
@@ -679,7 +870,13 @@ export function analyzeMechanism(
         addVec(curRow + 3, colB, true, xA);
         addVec(curRow + 4, colA, true, scale3(yA, -1));
         addVec(curRow + 4, colB, true, yA);
-        curRow += 5;
+        if (isZeroRangeLimits(j.limits)) {
+          addVec(curRow + 5, colA, true, scale3(zA, -1));
+          addVec(curRow + 5, colB, true, zA);
+          curRow += 6;
+        } else {
+          curRow += 5;
+        }
       } else if (j.type === 'prismatic') {
         for (let k = 0; k < 3; k++) {
           const ek = eBasis[k];
@@ -699,7 +896,15 @@ export function analyzeMechanism(
         addVec(curRow + 4, colA, true, cross3(yA, relBFromA));
         addVec(curRow + 4, colB, false, yA);
         addVec(curRow + 4, colB, true, cross3(dB, yA));
-        curRow += 5;
+        if (isZeroRangeLimits(j.limits)) {
+          addVec(curRow + 5, colA, false, scale3(zA, -1));
+          addVec(curRow + 5, colA, true, cross3(zA, relBFromA));
+          addVec(curRow + 5, colB, false, zA);
+          addVec(curRow + 5, colB, true, cross3(dB, zA));
+          curRow += 6;
+        } else {
+          curRow += 5;
+        }
       } else if (j.type === 'gear') {
         const ratio = j.gearRatio ?? 1.0;
         const zA = mat3Vec3(poseA.rot, normalize3(j.axis || [0, 0, 1]));
@@ -708,8 +913,11 @@ export function analyzeMechanism(
         addVec(curRow, colB, true, zB);
         curRow += 1;
       }
+
+      jointRowSpans.push({ joint: j, startRow, rows: curRow - startRow });
     }
 
+    jMatBuilt = jMat;
     singularValues = computeSingularValues(jMat, totalRows, totalCols);
     const sMax = singularValues[0] ?? 0;
     effectiveTol =
@@ -721,6 +929,16 @@ export function analyzeMechanism(
   const dofNumeric = 6 * numMoving - jacobianRank;
   const dofGrubler = 6 * numMoving - totalRows;
   const redundantConstraints = Math.max(0, dofNumeric - dofGrubler);
+  const redundantJointIds =
+    jMatBuilt && redundantConstraints > 0 && totalCols > 0
+      ? findRedundantJointIdsTS(
+          jMatBuilt,
+          jointRowSpans,
+          totalCols,
+          jacobianRank,
+          effectiveTol
+        )
+      : [];
 
   const warnings: string[] = [];
   if (contributingJoints.length > 0 && dofNumeric === 0) {
@@ -733,6 +951,7 @@ export function analyzeMechanism(
   if (unconnectedParts.length > 0 || floatingParts.length > 0) {
     warnings.push('есть свободные детали');
   }
+  warnings.push(...limitWarnings);
 
   const notes: string[] = [
     'Chebychev-Grübler-Kutzbach spatial mobility formula: M = 6(N - 1) - sum(c_i), where N includes ground and c_i are joint constraint counts.',
@@ -741,7 +960,13 @@ export function analyzeMechanism(
   ];
   if (redundantConstraints > 0) {
     notes.push(
-      `Detected ${redundantConstraints} redundant constraints (common in planar four-bar linkages, slider-cranks, and overconstrained parallel mechanisms).`
+      `Detected ${redundantConstraints} redundant constraints involving joints [${redundantJointIds.join(', ')}] (common in planar four-bar linkages, slider-cranks, and overconstrained parallel mechanisms).`
+    );
+  }
+  if (jointsAtLimits.length > 0) {
+    const lockedCount = jointsAtLimits.filter((s) => s.boundary === 'locked').length;
+    notes.push(
+      `Detected ${jointsAtLimits.length} joint(s) at or beyond travel limits (${lockedCount} bilaterally locked with zero-range limits).`
     );
   }
 
@@ -750,6 +975,8 @@ export function analyzeMechanism(
     dof_numeric: dofNumeric,
     dof_grubler: dofGrubler,
     redundant_constraints: redundantConstraints,
+    redundant_joint_ids: redundantJointIds,
+    joints_at_limits: jointsAtLimits,
     grounded_parts: reportedGrounded,
     moving_parts: movingParts,
     floating_parts: floatingParts,

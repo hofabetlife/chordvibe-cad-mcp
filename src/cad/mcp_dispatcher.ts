@@ -1409,6 +1409,7 @@ export function executeMcpToolOnEngineState(
         throw new Error(`create_joint part_b '${partB}' does not exist`);
       }
 
+      let parsedLimits: [number, number] | undefined;
       if (params.limits !== undefined && params.limits !== null) {
         if (!Array.isArray(params.limits) || params.limits.length !== 2) {
           throw new Error("create_joint 'limits' must be a 2-element array [min, max]");
@@ -1417,6 +1418,17 @@ export function executeMcpToolOnEngineState(
         const l1 = Number(params.limits[1]);
         if (!Number.isFinite(l0) || !Number.isFinite(l1) || l0 > l1) {
           throw new Error(`create_joint 'limits' [min, max] invalid: [${l0}, ${l1}]`);
+        }
+        if (jointType === 'revolute') {
+          const limUnit = String(params.limits_unit ?? 'deg').toLowerCase();
+          parsedLimits =
+            limUnit === 'rad'
+              ? [l0, l1]
+              : [(l0 * Math.PI) / 180, (l1 * Math.PI) / 180];
+        } else if (jointType === 'prismatic') {
+          const lenUnit = String(params.length_unit ?? 'mm').toLowerCase();
+          const kToM = lenUnit === 'm' ? 1.0 : 0.001;
+          parsedLimits = [l0 * kToM, l1 * kToM];
         }
       }
 
@@ -1443,6 +1455,7 @@ export function executeMcpToolOnEngineState(
           : jointType === 'prismatic'
             ? [1, 0, 0]
             : [0, 0, 1],
+        limits: parsedLimits,
         motorSpeedRpm: Number(params.motor_speed_rpm ?? 0),
         motorTorqueNm: Number(params.motor_torque_nm ?? 25),
         motorEnabled: Boolean(params.motor_enabled ?? false),
@@ -1530,6 +1543,11 @@ export function executeMcpToolOnEngineState(
     }
 
     case 'analyze_mechanism': {
+      const rawUnit = String(params.length_unit ?? 'mm').toLowerCase();
+      if (rawUnit !== 'mm' && rawUnit !== 'm') {
+        throw new Error(`Unsupported length_unit '${rawUnit}'. Supported: mm, m`);
+      }
+      const kLen = rawUnit === 'mm' ? 1000.0 : 1.0;
       const partIds = Array.isArray(params.part_ids)
         ? params.part_ids.map(String)
         : undefined;
@@ -1541,13 +1559,31 @@ export function executeMcpToolOnEngineState(
         partIds,
         rankTolerance,
       });
+      const jointsAtLimits = report.joints_at_limits.map((jl) => {
+        if (jl.joint_type === 'revolute') {
+          const radToDeg = 180 / Math.PI;
+          return {
+            ...jl,
+            current_value: jl.current_value * radToDeg,
+            limits: [jl.limits[0] * radToDeg, jl.limits[1] * radToDeg] as [number, number],
+            unit: 'deg',
+          };
+        }
+        return {
+          ...jl,
+          current_value: jl.current_value * kLen,
+          limits: [jl.limits[0] * kLen, jl.limits[1] * kLen] as [number, number],
+          unit: rawUnit,
+        };
+      });
       response = {
         ...report,
-        length_unit: 'mm',
+        joints_at_limits: jointsAtLimits,
+        length_unit: rawUnit,
         units: {
-          length: 'mm',
-          area: 'mm^2',
-          volume: 'mm^3',
+          length: rawUnit,
+          area: `${rawUnit}^2`,
+          volume: `${rawUnit}^3`,
           mass: 'kg',
           force: 'N',
           stress: 'MPa',

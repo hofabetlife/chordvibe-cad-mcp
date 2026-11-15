@@ -332,6 +332,53 @@ fn add_vec_to_jacobian(
     }
 }
 
+/// Builds a right-handed orthonormal basis `(x_loc, y_loc, z_unit)` from a local axis vector.
+fn local_orthonormal_basis(axis: [f64; 3], default_axis: Vector3<f64>) -> (Vector3<f64>, Vector3<f64>, Vector3<f64>) {
+    let local_axis = Vector3::from(axis);
+    let norm = local_axis.norm();
+    let u = if norm > 1e-12 {
+        local_axis / norm
+    } else {
+        default_axis
+    };
+    let (x, y) = perpendicular_axes(&u);
+    (x, y, u)
+}
+
+/// Computes two unit axes `(x, y)` orthogonal to unit vector `z` with `x × y = z`.
+fn perpendicular_axes(z: &Vector3<f64>) -> (Vector3<f64>, Vector3<f64>) {
+    let v_ref = if z.x.abs() < 0.9 {
+        Vector3::new(1.0, 0.0, 0.0)
+    } else {
+        Vector3::new(0.0, 1.0, 0.0)
+    };
+    let x = (v_ref - v_ref.dot(z) * z).normalize();
+    let y = z.cross(&x).normalize();
+    (x, y)
+}
+
+/// Unwraps an angle in `[-pi, pi]` by multiples of `2*pi` to lie closest to the midpoint of `limits`.
+fn unwrap_angle_near_limits(theta: f64, limits: [f64; 2]) -> f64 {
+    let mid = 0.5 * (limits[0] + limits[1]);
+    let mut best = theta;
+    let mut best_dist = (theta - mid).abs();
+    for shift in [-std::f64::consts::TAU, std::f64::consts::TAU] {
+        let cand = theta + shift;
+        let dist = (cand - mid).abs();
+        if dist < best_dist - 1e-12 {
+            best = cand;
+            best_dist = dist;
+        }
+    }
+    best
+}
+
+/// Returns `true` when joint `limits` collapse to a zero-width travel interval `[c, c]`.
+#[must_use]
+pub fn is_zero_range_limits(limits: Option<[f64; 2]>) -> bool {
+    matches!(limits, Some([min, max]) if (max - min).abs() <= 1e-9)
+}
+
 impl CadJointType {
     /// Canonical lowercase string identifier for the joint type.
     #[must_use]
@@ -359,6 +406,59 @@ impl CadJointType {
             Self::Prismatic { .. } => 5,
             Self::Spherical { .. } => 3,
             Self::Gear { .. } => 1,
+        }
+    }
+
+    /// Effective number of constraint rows enforced in the kinematic Jacobian, accounting for
+    /// degenerate zero-range `limits: Some([c, c])` on `Revolute` / `Prismatic` joints (6 rows).
+    #[must_use]
+    pub fn effective_constraints_count(&self) -> usize {
+        match self {
+            Self::Revolute { limits, .. } | Self::Prismatic { limits, .. }
+                if is_zero_range_limits(*limits) =>
+            {
+                6
+            }
+            _ => self.constraints_count(),
+        }
+    }
+
+    /// Computes the current relative joint coordinate (`rad` for `Revolute`, `m` for `Prismatic`),
+    /// or `None` for joints without a 1-DOF scalar coordinate (`Fixed`, `Spherical`, `Gear`).
+    #[must_use]
+    pub fn current_coordinate(
+        &self,
+        pos_a: Vector3<f64>,
+        rot_a: Matrix3<f64>,
+        pos_b: Vector3<f64>,
+        rot_b: Matrix3<f64>,
+    ) -> Option<f64> {
+        match self {
+            Self::Revolute { axis, limits, .. } => {
+                let (x_loc, y_loc, _) =
+                    local_orthonormal_basis(*axis, Vector3::new(0.0, 0.0, 1.0));
+                let r_rel = rot_a.transpose() * rot_b;
+                let rotated_x = r_rel * x_loc;
+                let raw_theta = y_loc.dot(&rotated_x).atan2(x_loc.dot(&rotated_x));
+                let theta = match limits {
+                    Some(lim) => unwrap_angle_near_limits(raw_theta, *lim),
+                    None => raw_theta,
+                };
+                Some(theta)
+            }
+            Self::Prismatic {
+                anchor_a,
+                anchor_b,
+                axis,
+                ..
+            } => {
+                let (_, _, u_a) = local_orthonormal_basis(*axis, Vector3::new(1.0, 0.0, 0.0));
+                let z_a = rot_a * u_a;
+                let p_a_w = pos_a + rot_a * Vector3::from(*anchor_a);
+                let p_b_w = pos_b + rot_b * Vector3::from(*anchor_b);
+                Some((p_b_w - p_a_w).dot(&z_a))
+            }
+            Self::Fixed { .. } | Self::Spherical { .. } | Self::Gear { .. } => None,
         }
     }
 
@@ -423,7 +523,7 @@ impl CadJointType {
                 anchor_a,
                 anchor_b,
                 axis,
-                ..
+                limits,
             } => {
                 let d_a = rot_a * Vector3::from(*anchor_a);
                 let d_b = rot_b * Vector3::from(*anchor_b);
@@ -441,21 +541,9 @@ impl CadJointType {
                     add_vec_to_jacobian(j_mat, r, col_b, true, &(-d_b.cross(ek)));
                 }
                 // Construct orthonormal axes perpendicular to hinge axis in world space
-                let local_axis = Vector3::from(*axis);
-                let norm = local_axis.norm();
-                let u_a = if norm > 1e-12 {
-                    local_axis / norm
-                } else {
-                    Vector3::new(0.0, 0.0, 1.0)
-                };
+                let (_, _, u_a) = local_orthonormal_basis(*axis, Vector3::new(0.0, 0.0, 1.0));
                 let z_a = rot_a * u_a;
-                let v_ref = if z_a.x.abs() < 0.9 {
-                    Vector3::new(1.0, 0.0, 0.0)
-                } else {
-                    Vector3::new(0.0, 1.0, 0.0)
-                };
-                let x_a = (v_ref - v_ref.dot(&z_a) * z_a).normalize();
-                let y_a = z_a.cross(&x_a).normalize();
+                let (x_a, y_a) = perpendicular_axes(&z_a);
 
                 // Rows 3, 4: lock out-of-axis rotations
                 // Row 3: x_a . (theta_b - theta_a) = 0
@@ -466,28 +554,24 @@ impl CadJointType {
                 add_vec_to_jacobian(j_mat, start_row + 4, col_a, true, &(-y_a));
                 add_vec_to_jacobian(j_mat, start_row + 4, col_b, true, &y_a);
 
-                5
+                if is_zero_range_limits(*limits) {
+                    // Row 5: zero-width limits [c, c] bilaterally lock rotation about z_a
+                    add_vec_to_jacobian(j_mat, start_row + 5, col_a, true, &(-z_a));
+                    add_vec_to_jacobian(j_mat, start_row + 5, col_b, true, &z_a);
+                    6
+                } else {
+                    5
+                }
             }
             Self::Prismatic {
                 anchor_b,
                 axis,
+                limits,
                 ..
             } => {
-                let local_axis = Vector3::from(*axis);
-                let norm = local_axis.norm();
-                let u_a = if norm > 1e-12 {
-                    local_axis / norm
-                } else {
-                    Vector3::new(0.0, 0.0, 1.0)
-                };
+                let (_, _, u_a) = local_orthonormal_basis(*axis, Vector3::new(1.0, 0.0, 0.0));
                 let z_a = rot_a * u_a;
-                let v_ref = if z_a.x.abs() < 0.9 {
-                    Vector3::new(1.0, 0.0, 0.0)
-                } else {
-                    Vector3::new(0.0, 1.0, 0.0)
-                };
-                let x_a = (v_ref - v_ref.dot(&z_a) * z_a).normalize();
-                let y_a = z_a.cross(&x_a).normalize();
+                let (x_a, y_a) = perpendicular_axes(&z_a);
 
                 let e = [
                     Vector3::new(1.0, 0.0, 0.0),
@@ -517,25 +601,22 @@ impl CadJointType {
                 add_vec_to_jacobian(j_mat, start_row + 4, col_b, false, &y_a);
                 add_vec_to_jacobian(j_mat, start_row + 4, col_b, true, &(d_b.cross(&y_a)));
 
-                5
+                if is_zero_range_limits(*limits) {
+                    // Row 5: zero-width limits [c, c] bilaterally lock translation along z_a
+                    add_vec_to_jacobian(j_mat, start_row + 5, col_a, false, &(-z_a));
+                    add_vec_to_jacobian(j_mat, start_row + 5, col_a, true, &(z_a.cross(&(r_b - pos_a))));
+                    add_vec_to_jacobian(j_mat, start_row + 5, col_b, false, &z_a);
+                    add_vec_to_jacobian(j_mat, start_row + 5, col_b, true, &(d_b.cross(&z_a)));
+                    6
+                } else {
+                    5
+                }
             }
             Self::Gear { ratio, axis_a, axis_b } => {
-                let local_a = Vector3::from(*axis_a);
-                let norm_a = local_a.norm();
-                let u_a = if norm_a > 1e-12 {
-                    local_a / norm_a
-                } else {
-                    Vector3::new(0.0, 0.0, 1.0)
-                };
+                let (_, _, u_a) = local_orthonormal_basis(*axis_a, Vector3::new(0.0, 0.0, 1.0));
                 let z_a = rot_a * u_a;
 
-                let local_b = Vector3::from(*axis_b);
-                let norm_b = local_b.norm();
-                let u_b = if norm_b > 1e-12 {
-                    local_b / norm_b
-                } else {
-                    Vector3::new(0.0, 0.0, 1.0)
-                };
+                let (_, _, u_b) = local_orthonormal_basis(*axis_b, Vector3::new(0.0, 0.0, 1.0));
                 let z_b = rot_b * u_b;
 
                 // Row 0: ratio * (theta_a . z_a) + 1.0 * (theta_b . z_b) = 0
@@ -565,7 +646,26 @@ pub fn quat_to_matrix(q: [f64; 4]) -> Matrix3<f64> {
     )
 }
 
-/// Kinematic summary of a mechanism degree-of-freedom and mobility analysis (`P3-T9`).
+/// Diagnostic status for a `Revolute` or `Prismatic` joint at or beyond its travel `limits` (`P3-T15`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JointLimitStatus {
+    /// Joint identifier.
+    pub joint_id: String,
+    /// Joint type (`"revolute"` or `"prismatic"`).
+    pub joint_type: String,
+    /// Reached or exceeded boundary (`"min"`, `"max"`, `"below_min"`, `"above_max"`, or `"locked"`).
+    pub boundary: String,
+    /// Current joint coordinate (`rad` for `revolute`, `m` for `prismatic` internally).
+    pub current_value: f64,
+    /// Configured travel limits `[min, max]`.
+    pub limits: [f64; 2],
+    /// Unit of `current_value` and `limits` (`"rad"`/`"deg"` or `"m"`/`"mm"`).
+    pub unit: String,
+    /// True if a configured motor drives into the active limit stop (or `min == max`).
+    pub motor_blocked: bool,
+}
+
+/// Kinematic summary of a mechanism degree-of-freedom and mobility analysis (`P3-T9`, `P3-T15`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MechanismAnalysisReport {
     /// Numerically computed degrees of freedom via SVD rank analysis of the constraint Jacobian: `DOF = 6(N - 1) - rank(J)`.
@@ -574,6 +674,10 @@ pub struct MechanismAnalysisReport {
     pub dof_grubler: i32,
     /// Count of redundant/overconstrained kinematic constraints: `max(0, dof_numeric - dof_grubler)`.
     pub redundant_constraints: i32,
+    /// Sorted IDs of joints whose constraint rows are linearly dependent when `redundant_constraints > 0` (`P3-T15`).
+    pub redundant_joint_ids: Vec<String>,
+    /// Joints currently at or beyond their travel `limits` (`P3-T15`).
+    pub joints_at_limits: Vec<JointLimitStatus>,
     /// List of grounded/fixed parts acting as the inertial reference frame.
     pub grounded_parts: Vec<String>,
     /// List of active moving bodies.
@@ -594,8 +698,8 @@ pub struct MechanismAnalysisReport {
     pub singular_values: Vec<f64>,
     /// Effective singular value cutoff threshold used for numerical rank determination.
     pub rank_tolerance: f64,
-    /// Warnings regarding mechanism locking, under-actuation, or floating bodies.
+    /// Warnings regarding mechanism locking, under-actuation, active limit stops, or floating bodies.
     pub warnings: Vec<String>,
-    /// Technical notes explaining Grübler formula, SVD tolerance, and constraints.
+    /// Technical notes explaining Grübler formula, SVD tolerance, redundant joints, and constraints.
     pub notes: Vec<String>,
 }

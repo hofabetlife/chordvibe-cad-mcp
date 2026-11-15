@@ -1448,7 +1448,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         // 38. analyze_mechanism
         ToolDefinition {
             name: "analyze_mechanism".to_string(),
-            description: "Analyzes mechanism mobility, degrees of freedom (DOF), redundant/overconstrained constraints, and floating/unconnected parts using both the Chebychev-Grübler-Kutzbach formula and SVD rank decomposition of the linearized constraint Jacobian. Units: DOF counts, constraint counts, Jacobian dimensions/rank, singular values, and rank_tolerance are dimensionless (internal geometry uses SI meters and radians). Example: {\"part_ids\": [\"crank\", \"coupler\", \"rocker\"]}. Common errors: PART_NOT_FOUND (unknown part_id in part_ids), INVALID_ARGUMENT (non-positive rank_tolerance or invalid part_ids array). Next step: review warnings (e.g. DOF=0 locking, DOF>1 without motors, or floating/unconnected parts), add missing joints via 'create_joint', or evaluate 'mechanism_dof' requirements via 'check_requirements'.".to_string(),
+            description: "Analyzes mechanism mobility, degrees of freedom (DOF), redundant/overconstrained constraints (including 'redundant_joint_ids'), active travel 'limits' stops ('joints_at_limits'), and floating/unconnected parts using both the Chebychev-Grübler-Kutzbach formula and SVD rank decomposition of the linearized constraint Jacobian. Units: DOF counts, constraint counts, Jacobian dimensions/rank, singular values, and rank_tolerance are dimensionless; 'joints_at_limits' reports 'deg' for revolute joints and active 'length_unit' ('mm' by default, or 'm') for prismatic joints. Example: {\"part_ids\": [\"crank\", \"coupler\", \"rocker\"]}. Common errors: PART_NOT_FOUND (unknown part_id in part_ids), INVALID_ARGUMENT (non-positive rank_tolerance or invalid part_ids array). Next step: review warnings (e.g. DOF=0 locking, DOF>1 without motors, active limits boundaries, or floating/unconnected parts), inspect 'redundant_joint_ids', add missing joints via 'create_joint', or evaluate 'mechanism_dof' requirements via 'check_requirements'.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1460,6 +1460,11 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     "rank_tolerance": {
                         "type": "number",
                         "description": "Optional dimensionless SVD singular-value cutoff threshold (> 0) for numerical Jacobian rank determination; defaults to max(rows, cols) * max(s_max, 1.0) * 1e-7"
+                    },
+                    "length_unit": {
+                        "type": "string",
+                        "enum": ["mm", "m"],
+                        "description": "Optional per-call length unit override ('mm' or 'm'; defaults to session length_unit) used for prismatic 'joints_at_limits' values"
                     }
                 }
             }),

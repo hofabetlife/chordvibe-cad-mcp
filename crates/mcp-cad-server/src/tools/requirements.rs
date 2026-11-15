@@ -573,6 +573,8 @@ fn evaluate_single_requirement(
                         "margin": margin,
                         "dof_grubler": report.dof_grubler,
                         "redundant_constraints": report.redundant_constraints,
+                        "redundant_joint_ids": report.redundant_joint_ids,
+                        "joints_at_limits": report.joints_at_limits,
                         "floating_parts": report.floating_parts,
                         "unconnected_parts": report.unconnected_parts,
                         "warnings": report.warnings,

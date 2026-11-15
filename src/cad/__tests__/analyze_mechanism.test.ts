@@ -177,7 +177,47 @@ describe('P3-T9: analyze_mechanism (Chebychev-Grübler-Kutzbach & Jacobian SVD)'
     assert.equal(rep.dof_numeric, 1);
     assert.equal(rep.dof_grubler, 1);
     assert.equal(rep.redundant_constraints, 0);
+    assert.deepEqual(rep.redundant_joint_ids, []);
+    assert.deepEqual(rep.joints_at_limits, []);
     assert.equal(rep.status, 'PASS');
+  });
+
+  it('8. P3-T15: redundant_joint_ids excludes independent joints and joints_at_limits flags boundary stops', () => {
+    const parts = [
+      makeDummyPart('link1', [0.05, 0, 0]),
+      makeDummyPart('link2', [0.15, 0, 0]),
+    ];
+    const jBase = makeJoint('j_base', 'revolute', 'ground', 'link1', [0, 0, 0], [-0.05, 0, 0], [0, 0, 1]);
+    jBase.limits = [-Math.PI / 4, Math.PI / 4];
+    const jArm = makeJoint('j_arm', 'revolute', 'link1', 'link2', [0.05, 0, 0], [-0.05, 0, 0], [0, 0, 1]);
+    const jArmDup = makeJoint('j_arm_dup', 'revolute', 'link1', 'link2', [0.05, 0, 0], [-0.05, 0, 0], [0, 0, 1]);
+
+    const repInside = analyzeMechanism(parts, [jBase, jArm, jArmDup]);
+    assert.equal(repInside.dof_numeric, 2);
+    assert.equal(repInside.redundant_constraints, 5);
+    assert.deepEqual(repInside.redundant_joint_ids, ['j_arm', 'j_arm_dup']);
+    assert.deepEqual(repInside.joints_at_limits, []);
+
+    // Push jBase to upper limit with motor enabled in positive direction
+    parts[0].rotation = [0, 0, Math.PI / 4];
+    jBase.motorEnabled = true;
+    jBase.motorSpeedRpm = 10;
+    const repAtMax = analyzeMechanism([parts[0]], [jBase]);
+    assert.equal(repAtMax.status, 'WARN');
+    assert.equal(repAtMax.joints_at_limits.length, 1);
+    assert.equal(repAtMax.joints_at_limits[0].joint_id, 'j_base');
+    assert.equal(repAtMax.joints_at_limits[0].boundary, 'max');
+    assert.equal(repAtMax.joints_at_limits[0].motor_blocked, true);
+    assert.ok(repAtMax.warnings.some((w) => w.includes('limits') && w.includes('j_base')));
+
+    // Zero-range limits [0, 0] lock DOF to 0
+    parts[0].rotation = [0, 0, 0];
+    jBase.limits = [0, 0];
+    jBase.motorEnabled = false;
+    const repLocked = analyzeMechanism([parts[0]], [jBase]);
+    assert.equal(repLocked.dof_numeric, 0);
+    assert.equal(repLocked.joints_at_limits[0].boundary, 'locked');
+    assert.ok(repLocked.warnings.some((w) => w.includes('DOF=0')));
   });
 });
 

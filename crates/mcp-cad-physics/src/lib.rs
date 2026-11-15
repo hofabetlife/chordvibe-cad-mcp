@@ -8,7 +8,9 @@ pub mod simulator;
 pub mod telemetry;
 
 pub use error::PhysicsError;
-pub use joint::{CadJointType, MechanismAnalysisReport, MotorConfig, quat_to_matrix};
+pub use joint::{
+    CadJointType, JointLimitStatus, MechanismAnalysisReport, MotorConfig, quat_to_matrix,
+};
 pub use rigid_body::{ColliderType, create_collider_builder, create_rigid_body_builder};
 pub use simulator::{CadJointRecord, PhysicsWorld};
 pub use telemetry::{
