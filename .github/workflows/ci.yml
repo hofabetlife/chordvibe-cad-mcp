@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+env:
+  CARGO_TERM_COLOR: always
+  WGPU_BACKEND: vulkan
+  LIBGL_ALWAYS_SOFTWARE: "1"
+  MCP_CAD_DISABLE_GUI_SPAWN: "1"
+
+jobs:
+  rust:
+    name: Rust Build & Test (1.91)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install headless Vulkan / Mesa system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            libvulkan1 \
+            mesa-vulkan-drivers \
+            libegl1 \
+            libgl1-mesa-dri
+
+      - name: Install Rust 1.91 toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91"
+
+      - name: Cache Cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-1.91-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-1.91-
+
+      - name: Build Rust workspace
+        run: cargo build --workspace
+
+      - name: Run Rust workspace tests (core, physics, fea, viewer)
+        run: cargo test --workspace --exclude mcp-cad-server --no-fail-fast
+
+      - name: Run mcp-cad-server tests sequentially (headless / P3-T23)
+        run: cargo test -p mcp-cad-server --no-fail-fast -- --test-threads=1
+
+  clippy:
+    name: Rust Clippy Linter
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install headless Vulkan / Mesa system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            libvulkan1 \
+            mesa-vulkan-drivers \
+            libegl1 \
+            libgl1-mesa-dri
+
+      - name: Install Rust 1.91 toolchain with clippy
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91"
+          components: clippy
+
+      - name: Cache Cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-clippy-1.91-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-clippy-1.91-
+            ${{ runner.os }}-cargo-1.91-
+
+      - name: Run cargo clippy across workspace and all targets
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  web:
+    name: Web Studio Lint, Build & Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install npm dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install --no-audit --no-fund
+          fi
+
+      - name: Run TypeScript typecheck (lint)
+        run: npm run lint
+
+      - name: Run Vite production build
+        run: npm run build
+
+      - name: Run TypeScript CAD & Mechanism test suites
+        run: npm test

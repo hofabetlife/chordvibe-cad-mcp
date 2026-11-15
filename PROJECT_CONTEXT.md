@@ -39,6 +39,7 @@ $$\text{Требования (Requirements)} \longrightarrow \text{Проект�
 mcp-cad/
 ├── Cargo.toml                    # Корневой манифест workspace
 ├── rust-toolchain.toml           # Фиксация компилятора Rust 1.91 (clippy, rustfmt)
+├── .github/workflows/ci.yml      # GitHub Actions CI (rust, clippy, web)
 ├── PROJECT_CONTEXT.md            # Единый источник правды (архитектура и принятые решения)
 ├── TASKS.md                      # Актуальный бэклог задач и сводный реестр выполненных фаз
 ├── docs/
@@ -52,7 +53,7 @@ mcp-cad/
 │   ├── BENCH_BASELINE_RUST.md    # Базовая линия 15 задач бенчмарка против нативного Rust-сервера
 │   ├── adr/0001-geometry-kernel.md # ADR выбора геометрического ядра (manifold-rust + monstertruck)
 │   ├── adr/0002-fe-mesher.md        # ADR выбора генератора сетки МКЭ (fe_snap + TET10, P3-T5)
-│   └── agent_tasks/              # Детальные отчёты о выполнении задач P0-T1..T12, P1-T1..T4, P2-T1..T40, P3-T1..T21
+│   └── agent_tasks/              # Детальные отчёты о выполнении задач P0-T1..T12, P1-T1..T4, P2-T1..T40, P3-T1..T22
 ├── spikes/
 │   ├── manifold_rust/            # Прототип ядра manifold-rust v0.19.2 (Pure Rust CSG + face_id)
 │   ├── monstertruck_brep/        # Прототип B-Rep ядра monstertruck v0.4.1 (fillet + ISO 10303-21 STEP)
@@ -296,16 +297,19 @@ graph TD
    - Любая ошибка параметров возвращается как `Result<T, CadError / ServerError>` и преобразуется в структурированный JSON `ErrorEnvelope`.
 2. **Чистота потока `stdout` в режиме `stdio`**:
    - В режиме `--mode stdio` поток `stdout` используется **исключительно** для сообщений JSON-RPC 2.0. Любой вывод логов (`tracing`, `eprintln!`) направляется строго в `std::io::stderr`.
-3. **Статус автоматического тестирования (`spikes/monstertruck_brep` и `clippy` workspace актуализированы в `P3-T21` от 15.11.2026; `mcp_contract_tests` и `mcp-cad-server --lib` — `P3-T20`; `mcp-cad-physics` и TS-суит — `P3-T19`; `spikes/manifold_rust` — `P3-T18`; `mcp-cad-core` и `qa_wide_scan` — `P3-T17`; `bench_suite`/`gear_kinematic_test` — `P3-T14`; `mcp-cad-fea`/`viewer` — аудит `P3-T13`)**:
-   - **Проверено в `P3-T21` после финальной правки `spikes/monstertruck_brep/src/main.rs`**:
+3. **Статус автоматического тестирования (CI/тулчейн и TS-суит актуализированы в `P3-T22` от 15.11.2026; `spikes/monstertruck_brep` — `P3-T21`; `mcp_contract_tests` и `mcp-cad-server --lib` — `P3-T20`; `mcp-cad-physics` — `P3-T19`; `spikes/manifold_rust` — `P3-T18`; `mcp-cad-core` и `qa_wide_scan` — `P3-T17`; `bench_suite`/`gear_kinematic_test` — `P3-T14`; `mcp-cad-fea`/`viewer` — аудит `P3-T13`)**:
+   - **Проверено в `P3-T22` после восстановления `rust-toolchain.toml` (`1.91`), `.github/workflows/ci.yml` и актуализации `src/cad/cad_engine.test.ts` / `package.json`**:
+     - **Линтер Rust (`cargo clippy --workspace --all-targets -- -D warnings` на `rustc 1.91.1`) — 0 ошибок, 0 предупреждений** (`exit 0`);
+     - **TypeScript Lint & Build (`npm run lint` = `tsc --noEmit`, `npm run build` = `vite build`)** — 0 ошибок (`exit 0`);
+     - **TypeScript Suite (`npm test` = `npx --yes tsx --test src/cad/cad_engine.test.ts src/cad/__tests__/analyze_mechanism.test.ts`) — 52/52 PASS** (`37/37` в `cad_engine.test.ts` + `15/15` в `analyze_mechanism.test.ts`, `0 failed`).
+   - **Проверено ранее в `P3-T21` после финальной правки `spikes/monstertruck_brep/src/main.rs`**:
      - `spikes/monstertruck_brep`: `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (`0 passed; 0 failed`), `cargo run` (все 5 секций без паник, `validate_mesh: PASS`, `watertight=true`, STEP export `233470 bytes`) — все **PASS** (`exit 0`);
-     - **Линтер Rust (`cargo clippy --workspace --all-targets -- -D warnings`) — 0 ошибок, 0 предупреждений** (`exit 0`).
+     - `cargo clippy --workspace --all-targets -- -D warnings` — **0 ошибок, 0 предупреждений** (`exit 0`).
    - **Проверено ранее в `P3-T20` после финальной правки `crates/mcp-cad-server/tests/mcp_contract_tests.rs`**:
      - `mcp-cad-server`: `mcp_contract_tests` — **59/59 PASS** (`0 failed`, при `MCP_CAD_DISABLE_GUI_SPAWN=1 -- --test-threads=1`, включая актуализированный `test_mcp_open_preview_window`);
      - `mcp-cad-server --lib`: **61/61 PASS** (`0 failed`, при `MCP_CAD_DISABLE_GUI_SPAWN=1 -- --test-threads=1`).
    - **Проверено ранее в `P3-T19` после финальной правки `physics_tests.rs`, `src/cad/kinematics.ts` и `src/cad/__tests__/analyze_mechanism.test.ts`**:
-     - `mcp-cad-physics`: **23/23 PASS** (`tests/physics_tests.rs`: `23 passed; 0 failed`, включая `test_p3_t10_sweep_joint_hinged_arm_hitting_fixed_wall`);
-     - **TypeScript Suite (`npx tsx --test src/cad/__tests__/analyze_mechanism.test.ts`) — 15/15 PASS**, `tsc --noEmit` — 0 ошибок (`src/cad/cad_engine.test.ts` отсутствует — см. `P3-T22`).
+     - `mcp-cad-physics`: **23/23 PASS** (`tests/physics_tests.rs`: `23 passed; 0 failed`, включая `test_p3_t10_sweep_joint_hinged_arm_hitting_fixed_wall`).
    - **Проверено ранее в `P3-T18` после финальной правки `spikes/manifold_rust/src/main.rs`**:
      - `spikes/manifold_rust`: `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (`0 passed; 0 failed`), `cargo run` — все **PASS** (`exit 0`).
    - **Проверено ранее в `P3-T17` после финальной правки ядра/сервера**:

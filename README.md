@@ -6,7 +6,7 @@
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux-blue.svg?logo=windows&logoColor=white)](https://www.microsoft.com/windows)
 [![Dependencies](https://img.shields.io/badge/dependencies-Zero%20C%2B%2B%20%2F%20Pure%20Rust-brightgreen.svg)](Cargo.toml)
 [![Protocol](https://img.shields.io/badge/MCP-2024--11--05-blueviolet.svg)](https://modelcontextprotocol.io)
-[![Tests](https://img.shields.io/badge/tests-Rust%20149%2F154%20(5%20ignored)%20%7C%20TS%2025%2F26-yellow.svg)](TASKS.md)
+[![Tests](https://img.shields.io/badge/tests-Rust%20Workspace%20PASS%20%7C%20TS%2052%2F52-brightgreen.svg)](TASKS.md)
 [![License](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-blue.svg)](LICENSE)
 
 **Первая в мире автономная инженерная среда 3D CAD/CAE на чистом Rust под Windows, спроектированная под прямое управление ИИ-агентами по протоколу Model Context Protocol (MCP).**
@@ -306,25 +306,30 @@ graph TD
 
 > [!IMPORTANT]
 > **Требуемая версия Rust и фактическое состояние тестов:**
-> - Для сборки и тестирования требуется **Rust $\ge 1.91$** (зафиксирован в [`rust-toolchain.toml`](rust-toolchain.toml)).
-> - **Rust Workspace (`cargo test --workspace --no-fail-fast`)**: 154 теста — **149 проходят, 0 падают, 5 помечены `#[ignore]`** (краевые случаи качества сетки примитивов в `primitive_invariants.rs`, задача `P0-T10`).
-> - **TypeScript / Web Studio (`npx tsx --test src/cad/cad_engine.test.ts`)**: 26 тестов — **25 проходят, 1 падает** (`AssertionError: 5 !== 4` в тесте №17 `FEA_QUICK_LOAD_PRESETS`, задача `TS-FIX-01`).
-> - **Clippy (`cargo clippy --workspace --all-targets -- -D warnings`)**: выявляет предупреждения/ошибки в `mcp-cad-core` (отслеживаются в CI и бэклоге).
-> - Актуальный источник истины по статусу тестов и задач — [`TASKS.md`](TASKS.md) и [`VERIFICATION_REPORT.md`](VERIFICATION_REPORT.md) (отчёты в каталоге `qa/` устарели).
+> - Для сборки и тестирования используется **Rust `1.91`** (зафиксирован в [`rust-toolchain.toml`](rust-toolchain.toml) с компонентами `rustfmt`, `clippy`; зависимости в `Cargo.lock` требуют `rustc >= 1.89`, проверено на `rustc 1.91.1` и `rustc 1.97.1`).
+> - **Rust Workspace**: тесты всех 5 крейтов (`mcp-cad-core`, `mcp-cad-physics`, `mcp-cad-fea`, `mcp-cad-viewer`, `mcp-cad-server`) проходят без ошибок (`0 failed`); для `mcp-cad-server` в текущей версии требуется `MCP_CAD_DISABLE_GUI_SPAWN=1` и `-- --test-threads=1` (см. [`TASKS.md`](TASKS.md) `P3-T23` и [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+> - **TypeScript / Web Studio (`npm test`)**: **52/52 PASS** (`37` тестов в [`src/cad/cad_engine.test.ts`](src/cad/cad_engine.test.ts) + `15` тестов в [`src/cad/__tests__/analyze_mechanism.test.ts`](src/cad/__tests__/analyze_mechanism.test.ts)), `npm run lint` (`tsc --noEmit`) — **0 ошибок**.
+> - **Clippy (`cargo clippy --workspace --all-targets -- -D warnings`)**: **0 ошибок, 0 предупреждений** во всех 5 крейтах workspace (строгий гейт в CI).
+> - Актуальный источник истины по статусу тестов, точным счётчикам и открытым задачам — [`TASKS.md`](TASKS.md) и [`PROJECT_CONTEXT.md`](PROJECT_CONTEXT.md) (раздел 7; исторические отчёты в каталоге `qa/` устарели).
 
 Запуск всего набора тестов (требуется **Rust $\ge 1.91$**):
 ```bash
 # Windows (PowerShell):
-cargo test --workspace --no-fail-fast
+cargo test --workspace --exclude mcp-cad-server --no-fail-fast
+$env:MCP_CAD_DISABLE_GUI_SPAWN="1"; cargo test -p mcp-cad-server --no-fail-fast -- --test-threads=1
 
 # Linux / Headless CI (с программным драйвером Vulkan Lavapipe):
-WGPU_BACKEND=vulkan LIBGL_ALWAYS_SOFTWARE=1 cargo test --workspace --no-fail-fast
+WGPU_BACKEND=vulkan LIBGL_ALWAYS_SOFTWARE=1 MCP_CAD_DISABLE_GUI_SPAWN=1 cargo test --workspace --exclude mcp-cad-server --no-fail-fast
+WGPU_BACKEND=vulkan LIBGL_ALWAYS_SOFTWARE=1 MCP_CAD_DISABLE_GUI_SPAWN=1 cargo test -p mcp-cad-server --no-fail-fast -- --test-threads=1
 ```
 Проверка линтером Clippy и тесты веб-клиента:
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
 npm run lint
-npx tsx --test src/cad/cad_engine.test.ts
+npm run build
+npm test
+# или напрямую через tsx:
+npx tsx --test src/cad/cad_engine.test.ts src/cad/__tests__/analyze_mechanism.test.ts
 ```
 
 ---
@@ -334,16 +339,20 @@ npx tsx --test src/cad/cad_engine.test.ts
 ```
 chordvibe-cad-mcp/
 ├── Cargo.toml                    # Корневой workspace-манифест
+├── rust-toolchain.toml           # Фиксация тулчейна Rust 1.91 (rustfmt, clippy)
+├── .github/workflows/ci.yml      # GitHub Actions CI (rust, clippy, web)
 ├── PRD.md                        # Документ требований к продукту
-├── PROJECT_CONTEXT.md            # Контекст и соглашения разработки
+├── PROJECT_CONTEXT.md            # Единый источник правды по архитектуре и контрактам
+├── TASKS.md                      # Актуальный бэклог и реестр задач
 ├── README.md                     # Главная страница (данный файл)
 ├── docs/
 │   ├── ARCHITECTURE.md           # Глубокий архитектурный обзор
-│   ├── MCP_API_REFERENCE.md      # Исчерпывающий справочник всех 28 инструментов
+│   ├── MCP_API_REFERENCE.md      # Исчерпывающий справочник инструментов MCP
 │   └── CLAUDE_DESKTOP_SETUP.md   # Руководство по подключению к Claude Desktop
 ├── examples/
 │   ├── bracket_design.json       # Пример проекта силового L-кронштейна
 │   └── crank_mechanism.json      # Пример проекта кривошипно-шатунного механизма
+├── src/cad/                      # TypeScript CAD/kinematics/FEA слой и тесты (cad_engine.test.ts, __tests__/)
 └── crates/
     ├── mcp-cad-core/             # Геометрическое ядро, Solid DAG, материалы, STL
     ├── mcp-cad-physics/          # Физика кинематики и сочленений Rapier3D
