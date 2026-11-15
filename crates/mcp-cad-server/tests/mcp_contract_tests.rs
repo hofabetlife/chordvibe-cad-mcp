@@ -693,27 +693,181 @@ async fn test_mcp_sse_endpoints() {
 
 #[tokio::test]
 async fn test_mcp_open_preview_window() {
+    struct PreviewTestCleanup {
+        prev_disable_spawn: Option<std::ffi::OsString>,
+        did_override_env: bool,
+        output_dir_existed: bool,
+        stl_paths: Vec<std::path::PathBuf>,
+    }
+
+    impl Drop for PreviewTestCleanup {
+        fn drop(&mut self) {
+            for path in &self.stl_paths {
+                let _ = std::fs::remove_file(path);
+            }
+            if !self.output_dir_existed {
+                let _ = std::fs::remove_dir("./output");
+            }
+            if self.did_override_env {
+                match &self.prev_disable_spawn {
+                    Some(prev) => std::env::set_var("MCP_CAD_DISABLE_GUI_SPAWN", prev),
+                    None => std::env::remove_var("MCP_CAD_DISABLE_GUI_SPAWN"),
+                }
+            }
+        }
+    }
+
+    let output_dir_existed = std::path::Path::new("./output").exists();
+    let prev_disable_spawn = std::env::var_os("MCP_CAD_DISABLE_GUI_SPAWN");
+    let already_disabled = prev_disable_spawn
+        .as_deref()
+        .and_then(|v| v.to_str())
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !already_disabled {
+        std::env::set_var("MCP_CAD_DISABLE_GUI_SPAWN", "1");
+    }
+    let mut cleanup = PreviewTestCleanup {
+        prev_disable_spawn,
+        did_override_env: !already_disabled,
+        output_dir_existed,
+        stl_paths: Vec::new(),
+    };
+
     let state = EngineState::new()
         .expect("EngineState initialization failed")
         .into_shared();
 
-    // Call open_preview_window in headless mode
-    let req = json!({
-        "jsonrpc": "2.0",
-        "id": 100,
-        "method": "tools/call",
-        "params": {
-            "name": "open_preview_window",
-            "arguments": {}
-        }
-    });
+    // 1. Empty scene must return status = "empty" (P2-T37)
+    let empty_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 100,
+            "method": "tools/call",
+            "params": {
+                "name": "open_preview_window",
+                "arguments": {}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(empty_resp["id"], 100);
+    let empty_val = parse_content(&empty_resp);
+    assert_eq!(empty_val["status"], "empty");
+    assert!(
+        !empty_val["message"].as_str().unwrap_or("").is_empty(),
+        "Expected informative message for empty preview scene"
+    );
 
-    let resp = rpc_call(&state, req).await;
-    assert_eq!(resp["id"], 100);
-    assert!(resp["result"]["content"].is_array());
-    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-    let val: Value = serde_json::from_str(text).unwrap();
-    assert_eq!(val["status"], "headless");
+    // 2. Part without features also has empty geometry -> status = "empty"
+    let create_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 101,
+            "method": "tools/call",
+            "params": {
+                "name": "create_part",
+                "arguments": {
+                    "name": "Preview Test Box",
+                    "material": "steel_structural_aisi1020"
+                }
+            }
+        }),
+    )
+    .await;
+    let part_id = parse_content(&create_resp)["part_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let empty_part_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 102,
+            "method": "tools/call",
+            "params": {
+                "name": "open_preview_window",
+                "arguments": { "part_id": part_id }
+            }
+        }),
+    )
+    .await;
+    let empty_part_val = parse_content(&empty_part_resp);
+    assert_eq!(empty_part_val["status"], "empty");
+
+    // 3. With geometry and MCP_CAD_DISABLE_GUI_SPAWN=1, exports preview STL and returns "headless"
+    let add_box_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 103,
+            "method": "tools/call",
+            "params": {
+                "name": "add_feature_primitive",
+                "arguments": {
+                    "part_id": part_id,
+                    "primitive_type": "box",
+                    "params": {
+                        "width": 20.0,
+                        "height": 10.0,
+                        "depth": 10.0
+                    }
+                }
+            }
+        }),
+    )
+    .await;
+    let _ = parse_content(&add_box_resp);
+
+    for (req_id, args) in [
+        (104, json!({ "part_id": part_id })),
+        (105, json!({})),
+    ] {
+        let resp = rpc_call(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "tools/call",
+                "params": {
+                    "name": "open_preview_window",
+                    "arguments": args
+                }
+            }),
+        )
+        .await;
+        assert_eq!(resp["id"], req_id);
+        let val = parse_content(&resp);
+        assert_eq!(val["status"], "headless");
+
+        let stl_path_str = val["stl_path"]
+            .as_str()
+            .expect("headless open_preview_window response must include 'stl_path'");
+        let stl_path = std::path::PathBuf::from(stl_path_str);
+        cleanup.stl_paths.push(stl_path.clone());
+        assert!(
+            stl_path.exists(),
+            "Preview STL file must exist at {}",
+            stl_path.display()
+        );
+        let meta = std::fs::metadata(&stl_path).expect("Preview STL metadata must be readable");
+        assert!(
+            meta.len() > 84,
+            "Binary preview STL must contain triangles (>84 bytes), got {} bytes",
+            meta.len()
+        );
+        assert!(
+            val["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("capture_viewport"),
+            "Expected headless message to reference capture_viewport, got: {}",
+            val["message"]
+        );
+    }
 }
 
 #[tokio::test]
