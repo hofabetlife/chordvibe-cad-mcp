@@ -1080,3 +1080,361 @@ fn test_dag_boolean_union_intersection_and_inspection() {
         assert!(face.triangles_count > 0, "Face must contain at least 1 triangle");
     }
 }
+
+fn assert_strict_helical_mesh(
+    mesh: &mcp_cad_core::topology::TriangleMesh,
+    expected_genus: Option<i32>,
+    label: &str,
+) {
+    let report = mcp_cad_core::diagnostics::validate_mesh_strict(mesh, expected_genus);
+    assert_eq!(
+        report.status, "PASS",
+        "{label} failed validate_mesh_strict: {:?}",
+        report.issues
+    );
+    assert!(report.topology.is_watertight, "{label} must be watertight");
+    assert_eq!(report.topology.boundary_edges_count, 0, "{label} boundary edges");
+    assert_eq!(report.topology.non_manifold_edges_count, 0, "{label} non-manifold edges");
+    assert_eq!(report.geometry.self_intersections_count, 0, "{label} self intersections");
+    assert_eq!(report.geometry.lt_1_deg_count, 0, "{label} <1 deg slivers");
+    assert!(
+        report.geometry.lt_5_deg_ratio <= 0.01,
+        "{label} <5 deg sliver ratio {}",
+        report.geometry.lt_5_deg_ratio
+    );
+    if let Some(g) = expected_genus {
+        assert!((report.topology.genus - (g as f64)).abs() < 1e-6, "{label} genus");
+    }
+    assert!(
+        mesh.faces.iter().any(|f| f.role == "helical_groove"),
+        "{label} must preserve helical_groove face"
+    );
+    let known_ids: std::collections::HashSet<u32> = mesh.faces.iter().map(|f| f.id).collect();
+    assert!(
+        mesh.face_ids.iter().all(|fid| known_ids.contains(fid)),
+        "{label} all triangle face_ids must reference FaceInfo"
+    );
+}
+
+#[test]
+fn test_p3_t17_off_axis_and_tilted_hex_nut_helical_groove() {
+    // 1. Chamfered hex nut transformed off-Z and tilted BEFORE CutHelicalGroove (local centered start_z=-4)
+    let mut nut_tilted = FeatureTree::new();
+    nut_tilted.add_feature(
+        FeatureOp::AddPolygonPrism {
+            sides: 6,
+            height: 8.0,
+            width_across_flats: None,
+            radius: Some(9.0),
+            chamfer: Some(0.8),
+            position: None,
+            rotation_deg: None,
+        },
+        None,
+    );
+    nut_tilted.add_feature(
+        FeatureOp::CutHole {
+            center: [0.0, 0.0, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            radius: 4.5,
+            depth: 12.0,
+            keyway_width: None,
+            keyway_depth: None,
+        },
+        None,
+    );
+    let base_bore_vol = nut_tilted.evaluate().unwrap().volume();
+
+    nut_tilted.add_feature(
+        FeatureOp::Transform {
+            translation: [25.0, -18.0, 12.0],
+            rotation_deg: [35.0, -22.0, 48.0],
+            scale: [1.0, 1.0, 1.0],
+        },
+        None,
+    );
+    nut_tilted.add_feature(
+        FeatureOp::CutHelicalGroove {
+            helix_radius: 4.5,
+            groove_radius: 0.8,
+            pitch: 2.0,
+            height: 8.0,
+            start_z: -4.0,
+            starts: 1,
+            is_right_hand: true,
+            profile_type: "metric_60".to_string(),
+        },
+        None,
+    );
+    let mesh_tilted = nut_tilted.evaluate().unwrap();
+    assert_strict_helical_mesh(&mesh_tilted, Some(1), "Tilted transformed hex nut");
+    assert!(mesh_tilted.faces.iter().any(|f| f.role == "hole_wall"));
+    assert!(mesh_tilted.faces.iter().any(|f| f.role == "cap_top"));
+    assert!(mesh_tilted.faces.iter().any(|f| f.role == "cap_bottom"));
+    assert!(
+        mesh_tilted.volume() < base_bore_vol,
+        "Internal thread cut must reduce solid volume relative to unthreaded bore"
+    );
+
+    // 2. Upright off-Z shifted hex nut (rotation = [0, 0, 0])
+    let mut nut_xy = FeatureTree::new();
+    nut_xy.add_feature(
+        FeatureOp::AddPolygonPrism {
+            sides: 6,
+            height: 8.0,
+            width_across_flats: None,
+            radius: Some(9.0),
+            chamfer: Some(0.8),
+            position: Some([22.0, -14.0, 0.0]),
+            rotation_deg: None,
+        },
+        None,
+    );
+    nut_xy.add_feature(
+        FeatureOp::CutHole {
+            center: [22.0, -14.0, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            radius: 4.5,
+            depth: 12.0,
+            keyway_width: None,
+            keyway_depth: None,
+        },
+        None,
+    );
+    nut_xy.add_feature(
+        FeatureOp::CutHelicalGroove {
+            helix_radius: 4.5,
+            groove_radius: 0.8,
+            pitch: 2.0,
+            height: 8.0,
+            start_z: -4.0,
+            starts: 1,
+            is_right_hand: true,
+            profile_type: "metric_60".to_string(),
+        },
+        None,
+    );
+    let mesh_xy = nut_xy.evaluate().unwrap();
+    assert_strict_helical_mesh(&mesh_xy, Some(1), "XY-shifted upright hex nut");
+    assert!((mesh_xy.volume() - mesh_tilted.volume()).abs() < 1e-2);
+
+    // 3. Direct tilted prism + tilted CutHole (no Transform op) + CutHelicalGroove
+    let mut nut_direct = FeatureTree::new();
+    let tilt_axis = nalgebra::Vector3::new(1.0, 0.0, 1.0).normalize();
+    nut_direct.add_feature(
+        FeatureOp::AddPolygonPrism {
+            sides: 6,
+            height: 8.0,
+            width_across_flats: None,
+            radius: Some(9.0),
+            chamfer: Some(0.8),
+            position: Some([-12.0, 16.0, 7.0]),
+            rotation_deg: Some([0.0, 45.0, 0.0]),
+        },
+        None,
+    );
+    nut_direct.add_feature(
+        FeatureOp::CutHole {
+            center: [-12.0, 16.0, 7.0],
+            normal: [tilt_axis[0], tilt_axis[1], tilt_axis[2]],
+            radius: 4.5,
+            depth: 14.0,
+            keyway_width: None,
+            keyway_depth: None,
+        },
+        None,
+    );
+    nut_direct.add_feature(
+        FeatureOp::CutHelicalGroove {
+            helix_radius: 4.5,
+            groove_radius: 0.8,
+            pitch: 2.0,
+            height: 8.0,
+            start_z: -4.0,
+            starts: 1,
+            is_right_hand: true,
+            profile_type: "metric_60".to_string(),
+        },
+        None,
+    );
+    let mesh_direct = nut_direct.evaluate().unwrap();
+    assert_strict_helical_mesh(&mesh_direct, Some(1), "Direct tilted AddPolygonPrism + CutHole nut");
+    assert!((mesh_direct.volume() - mesh_xy.volume()).abs() < 1e-2);
+
+    // 4. Flipped 180 deg around X via Transform
+    let mut nut_flipped = FeatureTree::new();
+    nut_flipped.add_feature(
+        FeatureOp::AddPolygonPrism {
+            sides: 6,
+            height: 8.0,
+            width_across_flats: None,
+            radius: Some(9.0),
+            chamfer: Some(0.8),
+            position: None,
+            rotation_deg: None,
+        },
+        None,
+    );
+    nut_flipped.add_feature(
+        FeatureOp::CutHole {
+            center: [0.0, 0.0, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            radius: 4.5,
+            depth: 12.0,
+            keyway_width: None,
+            keyway_depth: None,
+        },
+        None,
+    );
+    nut_flipped.add_feature(
+        FeatureOp::Transform {
+            translation: [0.0, 0.0, 5.0],
+            rotation_deg: [180.0, 0.0, 0.0],
+            scale: [1.0, 1.0, 1.0],
+        },
+        None,
+    );
+    nut_flipped.add_feature(
+        FeatureOp::CutHelicalGroove {
+            helix_radius: 4.5,
+            groove_radius: 0.8,
+            pitch: 2.0,
+            height: 8.0,
+            start_z: -4.0,
+            starts: 1,
+            is_right_hand: true,
+            profile_type: "metric_60".to_string(),
+        },
+        None,
+    );
+    let mesh_flipped = nut_flipped.evaluate().unwrap();
+    assert_strict_helical_mesh(&mesh_flipped, Some(1), "180-deg flipped hex nut");
+}
+
+#[test]
+fn test_p3_t17_off_axis_and_tilted_drill_bit_helical_groove() {
+    // 1. Drill bit (cylinder [0, 110] + cone [110, 130]) transformed off-Z & tilted BEFORE CutHelicalGroove
+    let mut drill = FeatureTree::new();
+    drill.add_feature(
+        FeatureOp::AddCylinder {
+            radius: 10.0,
+            height: 110.0,
+            segments: 32,
+            position: Some([0.0, 0.0, 55.0]),
+            rotation_deg: None,
+        },
+        None,
+    );
+    drill.add_feature(
+        FeatureOp::AddCone {
+            radius_bottom: 10.0,
+            radius_top: 0.0,
+            height: 20.0,
+            segments: 32,
+            position: Some([0.0, 0.0, 110.0]),
+            rotation_deg: None,
+        },
+        None,
+    );
+    let blank_vol = drill.evaluate().unwrap().volume();
+
+    drill.add_feature(
+        FeatureOp::Transform {
+            translation: [-30.0, 40.0, 15.0],
+            rotation_deg: [45.0, 30.0, -15.0],
+            scale: [1.0, 1.0, 1.0],
+        },
+        None,
+    );
+    drill.add_feature(
+        FeatureOp::CutHelicalGroove {
+            helix_radius: 10.0,
+            groove_radius: 3.0,
+            pitch: 45.0,
+            height: 90.0,
+            start_z: 20.0,
+            starts: 2,
+            is_right_hand: true,
+            profile_type: "circular".to_string(),
+        },
+        None,
+    );
+    let drill_mesh = drill.evaluate().unwrap();
+    assert_strict_helical_mesh(&drill_mesh, Some(0), "Transformed tilted drill bit");
+    assert!(drill_mesh
+        .faces
+        .iter()
+        .any(|f| f.kind == mcp_cad_core::topology::FaceKind::Cone));
+    assert!(drill_mesh
+        .faces
+        .iter()
+        .any(|f| f.kind == mcp_cad_core::topology::FaceKind::Cylinder));
+    assert!(drill_mesh.volume() < blank_vol);
+
+    // 2. 90-degree horizontal cylinder directly tilted via position/rotation_deg
+    let mut horiz = FeatureTree::new();
+    horiz.add_feature(
+        FeatureOp::AddCylinder {
+            radius: 8.0,
+            height: 40.0,
+            segments: 32,
+            position: Some([10.0, 20.0, 30.0]),
+            rotation_deg: Some([0.0, 90.0, 0.0]),
+        },
+        None,
+    );
+    horiz.add_feature(
+        FeatureOp::CutHelicalGroove {
+            helix_radius: 8.0,
+            groove_radius: 1.5,
+            pitch: 12.0,
+            height: 36.0,
+            start_z: -18.0,
+            starts: 1,
+            is_right_hand: false,
+            profile_type: "circular".to_string(),
+        },
+        None,
+    );
+    let horiz_mesh = horiz.evaluate().unwrap();
+    assert_strict_helical_mesh(&horiz_mesh, Some(0), "90-deg horizontal cylinder flute");
+
+    // 3. Tilted cylinder + coaxial tilted cone constructed directly at pose (tests try_union_coaxial_cone too)
+    let mut direct_drill = FeatureTree::new();
+    direct_drill.add_feature(
+        FeatureOp::AddCylinder {
+            radius: 6.0,
+            height: 60.0,
+            segments: 24,
+            position: Some([30.0, -10.0, 5.0]),
+            rotation_deg: Some([0.0, 90.0, 0.0]),
+        },
+        None,
+    );
+    direct_drill.add_feature(
+        FeatureOp::AddCone {
+            radius_bottom: 6.0,
+            radius_top: 0.0,
+            height: 12.0,
+            segments: 24,
+            position: Some([60.0, -10.0, 5.0]),
+            rotation_deg: Some([0.0, 90.0, 0.0]),
+        },
+        None,
+    );
+    direct_drill.add_feature(
+        FeatureOp::CutHelicalGroove {
+            helix_radius: 6.0,
+            groove_radius: 1.4,
+            pitch: 20.0,
+            height: 55.0,
+            start_z: 10.0,
+            starts: 2,
+            is_right_hand: true,
+            profile_type: "circular".to_string(),
+        },
+        None,
+    );
+    let direct_drill_mesh = direct_drill.evaluate().unwrap();
+    assert_strict_helical_mesh(&direct_drill_mesh, Some(0), "Direct horizontal cylinder+cone drill");
+}

@@ -232,14 +232,14 @@ graph TD
 ---
 
 ### 5.6. `[DECISION-MESH-QUALITY-CBO]` Геометрические инварианты примитивов, двухфазная постобработка CSG, конформная винтовая нарезка и барьерные правила CBO (`R1`–`R5`)
-- **Связанные задачи**: `P0-T1`..`P0-T10`, `P2-T15`, `P2-T20`, `P2-T23`, `P2-T25`, `P2-T28`, `P2-T31`, `P3-T11`.
+- **Связанные задачи**: `P0-T1`..`P0-T10`, `P2-T15`, `P2-T20`, `P2-T23`, `P2-T25`, `P2-T28`, `P2-T31`, `P3-T11`, `P3-T17`.
 - **Почему принято и что реализовано**:
   1. **Ориентация крышек и избавление от игольчатых треугольников (`Sliver Triangles`, `< 1°` и `< 5°`)**:
      - Исправлен обход колец в `add_bridged_ring_strip_2d` и `add_halving_ring_transition_2d` (`P0-T1`), гарантирующий внешние нормали ($\mathbf{n}\cdot(\pm\mathbf{Z}) > 0$) и положительный объём `signed_volume() > 0`.
      - Внедрено конформное геометрическое разрежение колец 2-к-1 (и 3-к-1 для нечётного числа сегментов) к полюсам конусов (`create_cone`), торцевым крышкам неполных тел вращения (`create_revolve` с точками Штейнера Бойера–Уотсона и флипами Делоне) и коническим фаскам многогранных призм (`create_polygon_prism`), а также удвоение колец 1-к-2 (`add_doubling_ring_transition_2d`) и точная радиальная проекция O-grid вокруг болтовых отверстий и пропорциональное масштабирование зазоров `safe_clamp` для малых колёсных дисков (`create_wheel_rim`, `P0-T5`, `P0-T6`, `P0-T10`, `P2-T15`, `P2-T23`, `P3-T11`).
   2. **Двухфазная постобработка BSP-CSG и соосный манифольдный генератор `cut_helical_groove` (`crates/mcp-cad-core/src/csg.rs`, `P0-T7`, `P3-T11`)**:
      - Классическое разбиение полигонов плоскостями BSP порождает избыточные коллинеарные вершины и узкие клинья на касательных пересечениях (например, `cut_hole`). Реализован конвейер `optimize_csg_mesh_quality` (слияние копланарных треугольников одной грани в выпуклые квады до клиппинга, коалесценция нетронутых поддеревьев, удаление избыточных вершин на рёбрах через 1-ring ear-clipping и Link-Condition edge collapse, вставка точек Штейнера в вееры к дугам отверстий и флипы Делоне), обеспечивающий выполнение тождеств объёма $V(A \cup B) + V(A \cap B) = V(A) + V(B)$ с точностью $< 1\%$ и `t_junctions_count == 0`.
-     - Для соосных операций сверления, конической заточки и винтовой нарезки (`try_cut_coaxial_through_bore`, `try_union_coaxial_cone`, `try_cut_coaxial_helical_groove`, `P3-T11`) реализовано прямое построение водонепроницаемого 2-многообразия в цилиндрических координатах $(r(\theta, z), \theta, z)$ с удвоением колец 1-к-2 на торцевых крышках и плавным сбегом канавки, что полностью исключает открытые граничные рёбра и клиновидные треугольники (`0.00% < 5°`, `genus = 1` на `T08_hex_nut_m10` и `genus = 0` на спиральном сверле с конической вершиной).
+     - Для соосных операций сверления, конической заточки и винтовой нарезки (`try_cut_coaxial_through_bore`, `try_union_coaxial_cone`, `try_cut_coaxial_helical_groove`, `P3-T11`, `P3-T17`) реализовано прямое построение водонепроницаемого 2-многообразия в цилиндрических координатах $(r(\theta, z), \theta, z)$ с удвоением колец 1-к-2 на торцевых крышках и плавным сбегом канавки, что полностью исключает открытые граничные рёбра и клиновидные треугольники (`0.00% < 5°`, `genus = 1` на `T08_hex_nut_m10` и `genus = 0` на спиральном сверле с конической вершиной). Для заготовок, смещённых с оси `Z` или наклонённых/повёрнутых через `position`/`rotation_deg`/`transform_part`, детектор `detect_coaxial_workpiece_frame` (по нормали `cap_bottom`/`cap_top` и аппроксимации окружности по Косе `fit_circle_center_2d`) и хелпер `execute_coaxial_in_local_frame` переносят меш в локальную СК заготовки и возвращают обратно через `TriangleMesh::apply_rot_and_shift` с сохранением всех `face_ids`, а `default_helical_start_z` при опущенном `start_z` выбирает `bounding_box.min[2]` для прямостоящих деталей и `-0.5 * axial_span` для наклонённых.
   3. **Корректность правил перезаписи Cost-Based Query Optimizer (`crates/mcp-cad-core/src/query_optimizer.rs`, `P0-T9`, `P2-T20`, `P2-T25`, `P2-T28`, `P2-T31`)**:
      - В правилах `R1` (свёртка трансформаций и проталкивание сдвига в корневой примитив, включая `AddSpurGear` и `AddWheelRim`), `R2` (отсечение непересекающихся по AABB вырезов и дубликатов отверстий), `R3` (пакетная группировка вычитаний по Де Моргану), `R4` (замена соосного цилиндра и сквозного отверстия на однопроходный кольцевой `AddRevolve`) и `R5` (слияние шестигранной призмы, отверстия и резьбы) введено понятие **барьерных узлов (`Transform`, аддитивных `Add*`, `BooleanUnionMesh`, `BooleanIntersectionMesh`)**: оптимизатор никогда не переносит и не группирует вычитания (`CutHole`) через промежуточную трансформацию или добавленную бобышку.
      - Оценка `estimate_primitive_aabb` учитывает точный описанный радиус $N$-угольника $R = \frac{w}{2\cos(\pi/\text{sides})}$, габариты шестерён/ободов со ступицами и матрицу поворота Эйлера `rotation_deg`.
@@ -296,15 +296,17 @@ graph TD
    - Любая ошибка параметров возвращается как `Result<T, CadError / ServerError>` и преобразуется в структурированный JSON `ErrorEnvelope`.
 2. **Чистота потока `stdout` в режиме `stdio`**:
    - В режиме `--mode stdio` поток `stdout` используется **исключительно** для сообщений JSON-RPC 2.0. Любой вывод логов (`tracing`, `eprintln!`) направляется строго в `std::io::stderr`.
-3. **Статус автоматического тестирования (`mcp-cad-physics`, `--lib` и `mcp_contract_tests` в `mcp-cad-server`, TS-суит и `clippy` актуализированы в `P3-T16` от 15.11.2026; прочие таргеты `mcp-cad-server` — `P3-T14` от 15.11.2026; `mcp-cad-core`/`fea`/`viewer` — аудит `P3-T13` от 14.11.2026)**:
-   - **Rust Workspace (проверено по крейтам) — 317 тестов (315 PASS, 2 FAIL, 0 ignored)**:
-     - `mcp-cad-core`: **129 тестов** (`74` юнит-теста в `--lib` + `55` в интеграционных суитах `csg_invariants`, `dag_tests`, `primitive_invariants`, `tessellation_tests`) — **129 PASS** (`P3-T13`);
-     - `mcp-cad-server`: **134 теста** (`60/60` юнит-тестов `--lib` и `58/59` в `mcp_contract_tests.rs` при `MCP_CAD_DISABLE_GUI_SPAWN=1 -- --test-threads=1` — **118/119 PASS** в `P3-T16`, новый `test_mcp_p3_t16_sweep_joint_closed_loop_and_lockup` проходит, единственное падение `test_mcp_open_preview_window` отслеживается в `P3-T20`; плюс `1` `bench_suite` + `1` `gear_kinematic_test` + `13` `qa_wide_scan` — **15/15 PASS** в `P3-T14`, см. `P3-T23`);
-     - `mcp-cad-fea`: **21 тест** (`8` юнит-тестов в `--lib` + `2` в `fea_benchmarks` + `11` в `fea_tests`) — **21 PASS** (`P3-T13`);
-     - `mcp-cad-physics`: **23 теста** (`physics_tests.rs`: `22` проходят, `1` падает — `test_p3_t10_sweep_joint_hinged_arm_hitting_fixed_wall`, отслеживается в `P3-T19`; все `4` новых теста `P3-T16` проходят);
-     - `mcp-cad-viewer`: **10 тестов** (`viewer_tests.rs`) — **10 PASS** (`P3-T13`).
-   - **TypeScript Suite (`npx tsx --test src/cad/__tests__/analyze_mechanism.test.ts`) — 15 тестов (15 PASS)**, `npm run lint` (`tsc --noEmit`) — 0 ошибок (`P3-T16`; `src/cad/cad_engine.test.ts` отсутствует в рабочей копии — см. `P3-T22`).
-   - **Линтер Rust (`cargo clippy --workspace --all-targets -- -D warnings`, проверено в `P3-T16`) — 0 ошибок, 0 предупреждений** (`EXIT: 0`).
+3. **Статус автоматического тестирования (`mcp-cad-core`, `--lib` и `qa_wide_scan` в `mcp-cad-server` и `clippy` актуализированы в `P3-T17` от 15.11.2026; `mcp-cad-physics`, `mcp_contract_tests`, TS-суит — `P3-T16` от 15.11.2026; `bench_suite`/`gear_kinematic_test` — `P3-T14`; `mcp-cad-fea`/`viewer` — аудит `P3-T13`)**:
+   - **Проверено в `P3-T17` после финальной правки**:
+     - `mcp-cad-core`: **131 тест** (`74` `--lib` + `10` `csg_invariants` + `16` `dag_tests`, включая 2 новых теста `P3-T17` + `25` `primitive_invariants` + `6` `tessellation_tests`) — **131 PASS**;
+     - `mcp-cad-server`: `--lib` **61/61 PASS** (при `MCP_CAD_DISABLE_GUI_SPAWN=1 -- --test-threads=1`, включая `test_p3_t17_transform_part_then_cut_helical_groove_nut_and_drill`) и `qa_wide_scan` **13/13 PASS** (`MCP_CAD_DISABLE_GUI_SPAWN=1 -- --test-threads=1`);
+     - **Линтер Rust (`cargo clippy --workspace --all-targets -- -D warnings`) — 0 ошибок, 0 предупреждений** (`exit 0`).
+   - **Прочие таргеты/крейты (не перезапускались в `P3-T17`, данные предыдущих прогонов)**:
+     - `mcp-cad-server`: `mcp_contract_tests` — `58/59` (`P3-T16`, единственное падение `test_mcp_open_preview_window` — см. `P3-T20`); `bench_suite` + `gear_kinematic_test` — `2/2` (`P3-T14`);
+     - `mcp-cad-fea`: **21/21 PASS** (`P3-T13`);
+     - `mcp-cad-physics`: **22/23 PASS** (`P3-T16`, единственное падение — `P3-T19`);
+     - `mcp-cad-viewer`: **10/10 PASS** (`P3-T13`);
+     - **TypeScript Suite (`npx tsx --test src/cad/__tests__/analyze_mechanism.test.ts`) — 15/15 PASS**, `tsc --noEmit` — 0 ошибок (`P3-T16`; `src/cad/cad_engine.test.ts` отсутствует — см. `P3-T22`).
 
 ---
 
@@ -321,7 +323,7 @@ graph TD
 | 5 | `cut_hole` | Solid DAG | Вырезает цилиндрическое отверстие вдоль `normal`/`direction` (`radius` или `diameter`, `depth` или `"through": true`, опц. шпоночный паз `keyway_width`/`keyway_depth`). Маркирует стенку как `hole_wall:feat_N` |
 | 6 | `modify_feature` | Solid DAG | Транзакционно изменяет параметры узла `feature_id` и пересобирает DAG (при ошибке выполняет полный откат состояния детали) |
 | 7 | `get_feature_tree` | Solid DAG | Возвращает `part_id`, `revision`, `features_count` и список узлов `dag` с параметрами и меш-операндами, масштабированными в `length_unit` |
-| 8 | `cut_helical_groove` | Solid DAG | Вырезает винтовую канавку сверла (`circular`) или метрическую резьбу 60° (`metric_60`). При опущенном `start_z` автоматически выравнивает начало по `bounding_box.min[2]` |
+| 8 | `cut_helical_groove` | Solid DAG | Вырезает винтовую канавку сверла (`circular`) или метрическую резьбу 60° (`metric_60`), включая смещённые и наклонённые/повёрнутые заготовки. При опущенном `start_z` выбирает `bounding_box.min[2]` для прямостоящих деталей и `-0.5 * axial_span` для наклонённых |
 | 9 | `boolean_difference` | CSG | Булево вычитание `tool_part_id` из `target_part_id` с сохранением именованных граней (`cut:feat_N:<role>`) и обновлением коллайдера |
 | 10 | `tessellate_part` | Топология | Адаптивная тесселяция детали (`coarse`, `medium`, `fine` или `chord_tolerance`). Не инкрементирует `part.revision` и не делает результаты МКЭ `STALE` |
 | 11 | `create_joint` | Физика | Создаёт шарнир (`revolute`, `prismatic`, `spherical`, `fixed`, `gear`) с опциональным пользовательским `joint_id`, пределами `limits` (`deg` или `mm`/`m`) и поддержкой `"ground"`/`"world"` |

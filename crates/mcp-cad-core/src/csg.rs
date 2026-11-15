@@ -2943,6 +2943,7 @@ struct HelicalGrooveParams {
     helix_radius: f64,
     groove_radius: f64,
     pitch: f64,
+    height: f64,
     start_z: f64,
     starts: usize,
     is_right_hand: bool,
@@ -2961,19 +2962,20 @@ impl HelicalGrooveParams {
         let helix_radius = parts[1].parse::<f64>().ok()?;
         let groove_radius = parts[2].parse::<f64>().ok()?;
         let pitch = parts[3].parse::<f64>().ok()?;
-        let _height = parts[4].parse::<f64>().ok()?;
+        let height = parts[4].parse::<f64>().ok()?;
         let start_z = parts[5].parse::<f64>().ok()?;
         let starts = parts[6].parse::<usize>().ok()?.max(1);
         let is_right_hand = parts[7] == "1";
         let turns = parts[8].parse::<f64>().ok()?;
         let is_metric_60 = parts[9].eq_ignore_ascii_case("metric_60");
-        if pitch <= 1e-9 || groove_radius <= 1e-9 || turns <= 0.0 {
+        if pitch <= 1e-9 || height <= 1e-9 || groove_radius <= 1e-9 || turns <= 0.0 {
             return None;
         }
         Some(Self {
             helix_radius,
             groove_radius,
             pitch,
+            height,
             start_z,
             starts,
             is_right_hand,
@@ -3372,9 +3374,321 @@ fn emit_doubled_and_bridged_annulus_cap(
     (inner_ring, thetas)
 }
 
-/// Coaxial fast-path for cutting a Z-axis through-hole (`cut_hole`) in a prismatic/cylindrical solid
-/// whose outer shell lies strictly outside `r_bore`. Preserves the outer shell 100% untouched.
+/// Local axial symmetry frame for a coaxial workpiece (`cap_bottom`, optional `cap_top`,
+/// optional cylindrical `side`/`hole_wall`).
+struct CoaxialWorkpieceFrame {
+    /// Unit symmetry axis pointing from `cap_bottom` toward `cap_top`.
+    axis: Vector3<f64>,
+    /// Point on the symmetry axis lying in the `cap_bottom` plane.
+    origin_bot: Vector3<f64>,
+    /// Total extent of the workpiece projected onto `axis`.
+    axial_span: f64,
+}
+
+/// Builds a right-handed orthonormal basis `(e1, e2)` perpendicular to unit vector `z`.
+fn orthonormal_basis_from_z(z: &Vector3<f64>) -> (Vector3<f64>, Vector3<f64>) {
+    let ref_vec = if z[0].abs() < 0.9 {
+        Vector3::x()
+    } else {
+        Vector3::y()
+    };
+    let e1 = ref_vec.cross(z).normalize();
+    let e2 = z.cross(&e1).normalize();
+    (e1, e2)
+}
+
+/// Fits a 2D circle center `[cx, cy]` via scale-normalized Kåsa least squares and verifies
+/// that the fitted radius and all sample points match `r_expected` within `5e-3 * r_expected`.
+fn fit_circle_center_2d(pts: &[[f64; 2]], r_expected: f64) -> Option<[f64; 2]> {
+    if pts.len() < 3 || !r_expected.is_finite() || r_expected <= 1e-9 {
+        return None;
+    }
+    let inv_n = 1.0 / (pts.len() as f64);
+    let mx = pts.iter().map(|p| p[0]).sum::<f64>() * inv_n;
+    let my = pts.iter().map(|p| p[1]).sum::<f64>() * inv_n;
+    let inv_r = 1.0 / r_expected;
+
+    let mut m = nalgebra::Matrix3::<f64>::zeros();
+    let mut rhs = nalgebra::Vector3::<f64>::zeros();
+    for p in pts {
+        let u = (p[0] - mx) * inv_r;
+        let v = (p[1] - my) * inv_r;
+        let b = u * u + v * v;
+        let row = nalgebra::Vector3::new(2.0 * u, 2.0 * v, 1.0);
+        m += row * row.transpose();
+        rhs += row * b;
+    }
+
+    let sol = m.full_piv_lu().solve(&rhs)?;
+    if !sol.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let uc = sol[0];
+    let vc = sol[1];
+    let rho_sq = sol[2] + uc * uc + vc * vc;
+    if !rho_sq.is_finite() || rho_sq <= 0.0 {
+        return None;
+    }
+    let r_fit = rho_sq.sqrt() * r_expected;
+    let rad_tol = 5e-3 * r_expected;
+    if (r_fit - r_expected).abs() > rad_tol {
+        return None;
+    }
+
+    let cx = mx + uc * r_expected;
+    let cy = my + vc * r_expected;
+    if pts
+        .iter()
+        .any(|p| ((p[0] - cx).hypot(p[1] - cy) - r_expected).abs() > rad_tol)
+    {
+        return None;
+    }
+    Some([cx, cy])
+}
+
+/// Normalizes a 3D array into a finite unit `Vector3<f64>`, returning `None` if zero or non-finite.
+fn unit_vec3(v: [f64; 3]) -> Option<Vector3<f64>> {
+    let vec = Vector3::from(v);
+    let len = vec.norm();
+    if !len.is_finite() || len <= 1e-12 {
+        None
+    } else {
+        Some(vec / len)
+    }
+}
+
+/// Detects the axial symmetry frame of `a` from `cap_bottom` (outward normal `-axis`),
+/// optional `cap_top` (outward normal `+axis`), and an optional reference cylindrical face
+/// (`hole_wall` or `side`).
+fn detect_coaxial_workpiece_frame(
+    a: &TriangleMesh,
+    ref_cyl_face: Option<&FaceInfo>,
+) -> Option<CoaxialWorkpieceFrame> {
+    if a.vertices.is_empty() || a.face_ids.len() != a.indices.len() {
+        return None;
+    }
+    let cap_bot_f = a
+        .faces
+        .iter()
+        .find(|f| f.role == "cap_bottom" && f.kind == FaceKind::Plane)?;
+    let axis = -unit_vec3(cap_bot_f.normal_or_axis)?;
+
+    if let Some(cap_top_f) = a
+        .faces
+        .iter()
+        .find(|f| f.role == "cap_top" && f.kind == FaceKind::Plane)
+    {
+        if unit_vec3(cap_top_f.normal_or_axis)?.dot(&axis) <= 0.999 {
+            return None;
+        }
+    }
+
+    let mut s_min = f64::INFINITY;
+    let mut s_max = f64::NEG_INFINITY;
+    for v in &a.vertices {
+        let s = Vector3::from(v.position).dot(&axis);
+        s_min = s_min.min(s);
+        s_max = s_max.max(s);
+    }
+    let axial_span = s_max - s_min;
+    if !axial_span.is_finite() || axial_span <= 1e-9 {
+        return None;
+    }
+
+    let mut bot_area = 0.0_f64;
+    let mut bot_ctr = Vector3::zeros();
+    for (ti, tri) in a.indices.iter().enumerate() {
+        if a.face_ids[ti] != cap_bot_f.id {
+            continue;
+        }
+        let p0 = Vector3::from(a.vertices[tri[0] as usize].position);
+        let p1 = Vector3::from(a.vertices[tri[1] as usize].position);
+        let p2 = Vector3::from(a.vertices[tri[2] as usize].position);
+        let area = 0.5 * (p1 - p0).cross(&(p2 - p0)).norm();
+        if area > 1e-18 {
+            bot_area += area;
+            bot_ctr += ((p0 + p1 + p2) / 3.0) * area;
+        }
+    }
+    if bot_area <= 1e-18 {
+        return None;
+    }
+    bot_ctr /= bot_area;
+    let s_bot = bot_ctr.dot(&axis);
+    if (s_bot - s_min).abs() > (axial_span * 1e-4).max(1e-6) {
+        return None;
+    }
+
+    let (e1, e2) = orthonormal_basis_from_z(&axis);
+    let [c1, c2] = if let Some(cyl_f) = ref_cyl_face {
+        let r_expected = cyl_f.radius?;
+        if unit_vec3(cyl_f.normal_or_axis)?.dot(&axis).abs() <= 0.999 {
+            return None;
+        }
+        let mut seen = HashSet::new();
+        let mut pts_2d = Vec::new();
+        for (ti, tri) in a.indices.iter().enumerate() {
+            if a.face_ids[ti] != cyl_f.id {
+                continue;
+            }
+            for &vi in tri {
+                if seen.insert(vi) {
+                    let p = Vector3::from(a.vertices[vi as usize].position);
+                    pts_2d.push([p.dot(&e1), p.dot(&e2)]);
+                }
+            }
+        }
+        fit_circle_center_2d(&pts_2d, r_expected)?
+    } else {
+        [bot_ctr.dot(&e1), bot_ctr.dot(&e2)]
+    };
+
+    let origin_bot = axis * s_bot + e1 * c1 + e2 * c2;
+    Some(CoaxialWorkpieceFrame {
+        axis,
+        origin_bot,
+        axial_span,
+    })
+}
+
+/// Proper 3D rotation mapping unit `axis` onto `+Z`.
+fn rotation_to_z(axis: &Vector3<f64>) -> nalgebra::Rotation3<f64> {
+    let dot = axis.dot(&Vector3::z());
+    if dot > 1.0 - 1e-12 {
+        nalgebra::Rotation3::identity()
+    } else if dot < -1.0 + 1e-12 {
+        nalgebra::Rotation3::from_axis_angle(&Vector3::x_axis(), std::f64::consts::PI)
+    } else {
+        nalgebra::Rotation3::rotation_between(
+            &nalgebra::Unit::new_normalize(*axis),
+            &Vector3::z_axis(),
+        )
+        .unwrap_or_else(nalgebra::Rotation3::identity)
+    }
+}
+
+fn is_already_coaxial(frame: &CoaxialWorkpieceFrame) -> bool {
+    (frame.axis - Vector3::z()).norm() < 1e-6
+        && frame.origin_bot[0].hypot(frame.origin_bot[1]) < 1e-6
+}
+
+fn interval_overlap(a0: f64, a1: f64, b0: f64, b1: f64) -> f64 {
+    (a1.min(b1) - a0.max(b0)).max(0.0)
+}
+
+/// Runs a local Z-coaxial CSG fast-path in `frame`'s local coordinate system (placing `origin_bot`
+/// at `[0, 0, target_bot_z]` and `axis` along `+Z`), optionally transforming `b` into the same
+/// local frame when `transform_b` is `true`, then transforms the resulting mesh back to world space.
+fn execute_coaxial_in_local_frame<F>(
+    a: &TriangleMesh,
+    b: &TriangleMesh,
+    is_difference: bool,
+    transform_b: bool,
+    frame: &CoaxialWorkpieceFrame,
+    target_bot_z: f64,
+    local_fn: F,
+) -> Option<TriangleMesh>
+where
+    F: FnOnce(&TriangleMesh, &TriangleMesh, u32, &[FaceInfo]) -> Option<TriangleMesh>,
+{
+    let rot_to_z = rotation_to_z(&frame.axis);
+    let shift = Vector3::new(0.0, 0.0, target_bot_z) - (rot_to_z * frame.origin_bot);
+
+    let mut a_local = a.clone();
+    a_local.apply_rot_and_shift(&rot_to_z, &shift);
+
+    let b_local_owned = if transform_b {
+        let mut bl = b.clone();
+        bl.apply_rot_and_shift(&rot_to_z, &shift);
+        Some(bl)
+    } else {
+        None
+    };
+    let b_local = b_local_owned.as_ref().unwrap_or(b);
+
+    let (id_offset_local, combined_faces_local) =
+        merge_csg_face_registries(&a_local, b_local, is_difference);
+    let mut out = local_fn(&a_local, b_local, id_offset_local, &combined_faces_local)?;
+
+    let rot_to_world = rot_to_z.inverse();
+    let inv_shift = -(rot_to_world * shift);
+    out.apply_rot_and_shift(&rot_to_world, &inv_shift);
+    Some(out)
+}
+
+/// Default `start_z` for `cut_helical_groove` when the caller omits it:
+/// uses world `bounding_box.min[2]` for upright Z-aligned parts (including XY/XYZ-shifted parts)
+/// and centered `-0.5 * axial_span` for tilted/rotated coaxial workpieces.
+pub fn default_helical_start_z(mesh: &TriangleMesh) -> f64 {
+    if mesh.vertices.is_empty() {
+        return 0.0;
+    }
+    let ref_cyl = mesh
+        .faces
+        .iter()
+        .find(|f| f.role == "hole_wall" && f.kind == FaceKind::Cylinder)
+        .or_else(|| {
+            mesh.faces
+                .iter()
+                .find(|f| f.role == "side" && f.kind == FaceKind::Cylinder)
+        });
+    if let Some(frame) = detect_coaxial_workpiece_frame(mesh, ref_cyl) {
+        if (frame.axis - Vector3::z()).norm() >= 1e-6 {
+            return -0.5 * frame.axial_span;
+        }
+    }
+    mesh.bounding_box().min[2]
+}
+
+/// Coaxial fast-path for cutting a through-hole (`cut_hole`) in a prismatic/cylindrical solid
+/// whose outer shell lies strictly outside `r_bore`. Supports arbitrary coaxial axis/offset by
+/// delegating into the workpiece's local Z frame and preserving the outer shell untouched.
 fn try_cut_coaxial_through_bore(
+    a: &TriangleMesh,
+    b: &TriangleMesh,
+    id_offset: u32,
+    combined_faces: &[FaceInfo],
+) -> Option<TriangleMesh> {
+    if b.faces.iter().any(|f| f.role == "keyway_wall") {
+        return None;
+    }
+    if a.faces
+        .iter()
+        .any(|f| f.role == "hole_wall" || f.kind == FaceKind::Helical)
+    {
+        return None;
+    }
+    let b_hole_wall = b.faces.iter().find(|f| {
+        (f.role == "hole_wall" || (f.role == "side" && b.faces.len() == 3 && a.faces.len() > 3))
+            && f.kind == FaceKind::Cylinder
+    })?;
+    let b_axis = unit_vec3(b_hole_wall.normal_or_axis)?;
+
+    let ref_cyl = a
+        .faces
+        .iter()
+        .find(|f| f.role == "side" && f.kind == FaceKind::Cylinder);
+    let frame = detect_coaxial_workpiece_frame(a, ref_cyl)?;
+    if b_axis.dot(&frame.axis).abs() <= 0.999 {
+        return None;
+    }
+
+    if is_already_coaxial(&frame) {
+        try_cut_coaxial_through_bore_local(a, b, id_offset, combined_faces)
+    } else {
+        execute_coaxial_in_local_frame(
+            a,
+            b,
+            true,
+            true,
+            &frame,
+            0.0,
+            try_cut_coaxial_through_bore_local,
+        )
+    }
+}
+
+fn try_cut_coaxial_through_bore_local(
     a: &TriangleMesh,
     b: &TriangleMesh,
     id_offset: u32,
@@ -3690,7 +4004,50 @@ fn emit_cone_from_base_ring(
 
 /// Coaxial fast-path for `csg_union` when attaching a coaxial Z-axis `Cone` `b` onto the circular
 /// top cap of a coaxial cylindrical (plain or helically fluted) body `a`.
+/// Analytical coaxial fast-path for unioning a cone/frustum (`b`) onto the `cap_top` of `a`
+/// in arbitrary workpiece orientation/offset.
 fn try_union_coaxial_cone(
+    a: &TriangleMesh,
+    b: &TriangleMesh,
+    id_offset: u32,
+    combined_faces: &[FaceInfo],
+) -> Option<TriangleMesh> {
+    if a.faces.iter().any(|f| f.role == "hole_wall") {
+        return None;
+    }
+    let b_cone_f = b.faces.iter().find(|f| f.kind == FaceKind::Cone)?;
+    let b_bot_f = b
+        .faces
+        .iter()
+        .find(|f| f.role == "cap_bottom" && f.kind == FaceKind::Plane)?;
+    let b_cone_axis = unit_vec3(b_cone_f.normal_or_axis)?;
+    let b_bot_axis = unit_vec3(b_bot_f.normal_or_axis)?;
+
+    let ref_cyl = a
+        .faces
+        .iter()
+        .find(|f| f.role == "side" && f.kind == FaceKind::Cylinder);
+    let frame = detect_coaxial_workpiece_frame(a, ref_cyl)?;
+    if b_cone_axis.dot(&frame.axis).abs() <= 0.999 || b_bot_axis.dot(&frame.axis) >= -0.999 {
+        return None;
+    }
+
+    if is_already_coaxial(&frame) {
+        try_union_coaxial_cone_local(a, b, id_offset, combined_faces)
+    } else {
+        execute_coaxial_in_local_frame(
+            a,
+            b,
+            false,
+            true,
+            &frame,
+            0.0,
+            try_union_coaxial_cone_local,
+        )
+    }
+}
+
+fn try_union_coaxial_cone_local(
     a: &TriangleMesh,
     b: &TriangleMesh,
     id_offset: u32,
@@ -3704,6 +4061,9 @@ fn try_union_coaxial_cone(
         f.role == "cap_bottom" && f.kind == FaceKind::Plane && f.normal_or_axis[2] < -0.999
     })?;
     let r_cone_bot = b_bot_f.radius.or(b_cone_f.radius)?;
+    if b_bot_f.centroid[0].hypot(b_bot_f.centroid[1]) > (r_cone_bot * 1e-3).max(1e-6) {
+        return None;
+    }
     let b_top_f = b
         .faces
         .iter()
@@ -3782,7 +4142,87 @@ fn try_union_coaxial_cone(
 /// Analytical coaxial helical groove & thread cutter (`cut_helical_groove`) handling:
 /// - Subcase 1: Internal helical thread/groove on a coaxial bored solid (e.g. `T08_hex_nut_m10`, `test_dag_polygon_prism_hex_nut_model`)
 /// - Subcase 2: External helical flute/thread on a coaxial cylinder or cylinder+cone (`test_dag_helical_groove_drill_bit_model`, `DRILL_CONE`, `qa_wide_scan`)
+///
+/// Supports off-Z-axis and tilted/rotated workpieces by transforming `a` into its local axial
+/// symmetry frame, generating the watertight coaxial threaded/fluted mesh, and transforming back.
+/// Returns `None` for non-coaxial or non-cylindrical targets so `csg_difference` falls back to BSP-CSG.
 fn try_cut_coaxial_helical_groove(
+    a: &TriangleMesh,
+    b: &TriangleMesh,
+    id_offset: u32,
+    combined_faces: &[FaceInfo],
+) -> Option<TriangleMesh> {
+    let params = HelicalGrooveParams::from_cutter_mesh(b)?;
+    let ref_cyl = if let Some(hole_wall_f) = a
+        .faces
+        .iter()
+        .find(|f| f.role == "hole_wall" && f.kind == FaceKind::Cylinder)
+    {
+        let r_bore = hole_wall_f.radius?;
+        if (params.helix_radius - r_bore).abs() > params.groove_radius * 1.6 {
+            return None;
+        }
+        hole_wall_f
+    } else {
+        let cyl_side_f = a
+            .faces
+            .iter()
+            .find(|f| f.role == "side" && f.kind == FaceKind::Cylinder)?;
+        if a.faces
+            .iter()
+            .any(|f| f.role == "hole_wall" || f.role.starts_with("side_"))
+        {
+            return None;
+        }
+        let r_cyl = cyl_side_f.radius?;
+        if (params.helix_radius - r_cyl).abs() > params.groove_radius * 1.6 {
+            return None;
+        }
+        cyl_side_f
+    };
+
+    let frame = detect_coaxial_workpiece_frame(a, Some(ref_cyl))?;
+    if is_already_coaxial(&frame) {
+        return try_cut_coaxial_helical_groove_local(a, b, id_offset, combined_faces);
+    }
+
+    let g_min = params.start_z;
+    let g_max = params.start_z + params.height;
+    let tol = 1e-9;
+    let target_bot_z = if (frame.axis - Vector3::z()).norm() < 1e-6
+        && interval_overlap(
+            g_min,
+            g_max,
+            frame.origin_bot[2],
+            frame.origin_bot[2] + frame.axial_span,
+        ) > tol
+    {
+        frame.origin_bot[2]
+    } else {
+        let overlap_centered =
+            interval_overlap(g_min, g_max, -0.5 * frame.axial_span, 0.5 * frame.axial_span);
+        let overlap_base0 = interval_overlap(g_min, g_max, 0.0, frame.axial_span);
+        if overlap_centered >= overlap_base0 && overlap_centered > tol {
+            -0.5 * frame.axial_span
+        } else if overlap_base0 > tol {
+            0.0
+        } else {
+            return None;
+        }
+    };
+
+    execute_coaxial_in_local_frame(
+        a,
+        b,
+        true,
+        false,
+        &frame,
+        target_bot_z,
+        try_cut_coaxial_helical_groove_local,
+    )
+}
+
+fn try_cut_coaxial_helical_groove_local(
     a: &TriangleMesh,
     b: &TriangleMesh,
     id_offset: u32,

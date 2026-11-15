@@ -780,49 +780,12 @@ impl TriangleMesh {
         }
     }
 
-    /// Rotates the mesh around X, Y, Z axes using Roll-Pitch-Yaw angles in degrees.
-    pub fn rotate_rpy_deg(&mut self, roll_deg: f64, pitch_deg: f64, yaw_deg: f64) {
-        let r = roll_deg.to_radians();
-        let p = pitch_deg.to_radians();
-        let y = yaw_deg.to_radians();
-
-        let rot = nalgebra::Rotation3::from_euler_angles(r, p, y);
-
-        for v in &mut self.vertices {
-            let pos = rot * v.pos_vec();
-            let n = rot * v.normal_vec();
-            v.position = [pos.x, pos.y, pos.z];
-            v.normal = [n.x, n.y, n.z];
-        }
-        for face in &mut self.faces {
-            let c = rot * Vector3::new(face.centroid[0], face.centroid[1], face.centroid[2]);
-            let s = rot
-                * Vector3::new(
-                    face.sample_point[0],
-                    face.sample_point[1],
-                    face.sample_point[2],
-                );
-            let n = rot
-                * Vector3::new(
-                    face.normal_or_axis[0],
-                    face.normal_or_axis[1],
-                    face.normal_or_axis[2],
-                );
-            face.centroid = clean_zero_vec3([c.x, c.y, c.z]);
-            face.sample_point = clean_zero_vec3([s.x, s.y, s.z]);
-            face.normal_or_axis = clean_zero_vec3([n.x, n.y, n.z]);
-        }
-    }
-
-    /// Transforms the mesh by rotating by RPY angles in degrees, then translating by translation vector.
-    pub fn transform(&mut self, translation: [f64; 3], rotation_deg: [f64; 3]) {
-        let r = rotation_deg[0].to_radians();
-        let p = rotation_deg[1].to_radians();
-        let y = rotation_deg[2].to_radians();
-
-        let rot = nalgebra::Rotation3::from_euler_angles(r, p, y);
-        let t = Vector3::new(translation[0], translation[1], translation[2]);
-
+    /// Applies an exact rigid transformation `p' = rot * p + t` to all vertices and face descriptors.
+    pub(crate) fn apply_rot_and_shift(
+        &mut self,
+        rot: &nalgebra::Rotation3<f64>,
+        t: &Vector3<f64>,
+    ) {
         for v in &mut self.vertices {
             let pos = rot * v.pos_vec() + t;
             let n = rot * v.normal_vec();
@@ -848,6 +811,27 @@ impl TriangleMesh {
             face.sample_point = clean_zero_vec3([s.x, s.y, s.z]);
             face.normal_or_axis = clean_zero_vec3([n.x, n.y, n.z]);
         }
+    }
+
+    /// Rotates the mesh around X, Y, Z axes using Roll-Pitch-Yaw angles in degrees.
+    pub fn rotate_rpy_deg(&mut self, roll_deg: f64, pitch_deg: f64, yaw_deg: f64) {
+        let r = roll_deg.to_radians();
+        let p = pitch_deg.to_radians();
+        let y = yaw_deg.to_radians();
+
+        let rot = nalgebra::Rotation3::from_euler_angles(r, p, y);
+        self.apply_rot_and_shift(&rot, &Vector3::zeros());
+    }
+
+    /// Transforms the mesh by rotating by RPY angles in degrees, then translating by translation vector.
+    pub fn transform(&mut self, translation: [f64; 3], rotation_deg: [f64; 3]) {
+        let r = rotation_deg[0].to_radians();
+        let p = rotation_deg[1].to_radians();
+        let y = rotation_deg[2].to_radians();
+
+        let rot = nalgebra::Rotation3::from_euler_angles(r, p, y);
+        let t = Vector3::new(translation[0], translation[1], translation[2]);
+        self.apply_rot_and_shift(&rot, &t);
     }
 }
 

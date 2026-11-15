@@ -1911,11 +1911,12 @@ pub fn cut_helical_groove(args: &Value, state: &mut EngineState) -> Result<Value
             .get_mut(part_id)
             .ok_or_else(|| ServerError::PartNotFound(part_id.to_string()))?;
 
-        // When `start_z` is omitted, align the helical sweep start with the bottom face of the part
-        // (`bounding_box.min[2]`) or `-height / 2` if the part is empty (P2-T19).
+        // When `start_z` is omitted, align the helical sweep start with `bounding_box.min[2]`
+        // for upright parts, centered `-0.5 * axial_span` for tilted coaxial workpieces (P3-T17),
+        // or `-height / 2` if the part is empty (P2-T19).
         let start_z = explicit_start_z.unwrap_or_else(|| {
             if !part.mesh().vertices.is_empty() {
-                part.bounding_box().min[2]
+                mcp_cad_core::csg::default_helical_start_z(part.mesh())
             } else {
                 -height * 0.5
             }
@@ -6066,5 +6067,161 @@ mod tests {
         assert!((resp["module"].as_f64().unwrap() - 0.003).abs() < 1e-6);
         assert!((resp["face_width"].as_f64().unwrap() - 0.030).abs() < 1e-6);
         assert!((resp["bending_stress_mpa"].as_f64().unwrap() - 115.02).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_p3_t17_transform_part_then_cut_helical_groove_nut_and_drill() {
+        let mut state = EngineState::new().expect("EngineState init");
+
+        // 1. Hex nut -> transform_part(pos=[25,-15,10], rot=[35,-20,45]) -> cut_helical_groove (omitted start_z)
+        create_part(
+            &json!({ "part_id": "tilted_nut", "name": "Tilted Hex Nut", "material": "steel_structural_aisi1020" }),
+            &mut state,
+        )
+        .unwrap();
+        add_feature_primitive(
+            &json!({ "part_id": "tilted_nut", "primitive_type": "polygon_prism", "radius": 9.0, "height": 8.0, "sides": 6 }),
+            &mut state,
+        )
+        .unwrap();
+        cut_hole(
+            &json!({ "part_id": "tilted_nut", "center": [0.0, 0.0, 0.0], "normal": [0.0, 0.0, 1.0], "radius": 4.5, "depth": 12.0 }),
+            &mut state,
+        )
+        .unwrap();
+        transform_part(
+            &json!({ "part_id": "tilted_nut", "translation": [25.0, -15.0, 10.0], "rotation_deg": [35.0, -20.0, 45.0] }),
+            &mut state,
+        )
+        .unwrap();
+        let nut_groove_resp = cut_helical_groove(
+            &json!({
+                "part_id": "tilted_nut",
+                "helix_radius": 4.5,
+                "groove_radius": 0.8,
+                "pitch": 2.0,
+                "height": 8.0,
+                "starts": 1,
+                "is_right_hand": true,
+                "profile_type": "metric_60"
+            }),
+            &mut state,
+        )
+        .unwrap();
+        let nut_auto_start_z = nut_groove_resp["start_z"].as_f64().unwrap();
+        assert!(
+            (nut_auto_start_z - (-4.0)).abs() < 1e-4,
+            "Tilted nut auto start_z must be -4.0 mm, got {nut_auto_start_z}"
+        );
+        let nut_part = state.parts.get("tilted_nut").unwrap();
+        let nut_rep = mcp_cad_core::diagnostics::validate_mesh_strict(nut_part.mesh(), Some(1));
+        assert_eq!(nut_rep.status, "PASS", "Tilted nut failed strict check: {:?}", nut_rep.issues);
+        assert!(nut_rep.topology.is_watertight);
+        let nut_geom = query_part_geometry(&json!({ "part_id": "tilted_nut" }), &mut state).unwrap();
+        let nut_roles: Vec<&str> = nut_geom["faces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["role"].as_str())
+            .collect();
+        assert!(nut_roles.contains(&"helical_groove"));
+        assert!(nut_roles.contains(&"hole_wall"));
+
+        // 2. Upright shifted nut -> transform_part(pos=[25,-15,10], rot=[0,0,0]) -> cut_helical_groove (omitted start_z)
+        create_part(
+            &json!({ "part_id": "shifted_nut", "name": "Shifted Nut", "material": "steel_structural_aisi1020" }),
+            &mut state,
+        )
+        .unwrap();
+        add_feature_primitive(
+            &json!({ "part_id": "shifted_nut", "primitive_type": "polygon_prism", "radius": 9.0, "height": 8.0, "sides": 6 }),
+            &mut state,
+        )
+        .unwrap();
+        cut_hole(
+            &json!({ "part_id": "shifted_nut", "center": [0.0, 0.0, 0.0], "normal": [0.0, 0.0, 1.0], "radius": 4.5, "depth": 12.0 }),
+            &mut state,
+        )
+        .unwrap();
+        transform_part(
+            &json!({ "part_id": "shifted_nut", "translation": [25.0, -15.0, 10.0], "rotation_deg": [0.0, 0.0, 0.0] }),
+            &mut state,
+        )
+        .unwrap();
+        let shifted_resp = cut_helical_groove(
+            &json!({
+                "part_id": "shifted_nut",
+                "helix_radius": 4.5,
+                "groove_radius": 0.8,
+                "pitch": 2.0,
+                "height": 8.0,
+                "starts": 1,
+                "is_right_hand": true,
+                "profile_type": "metric_60"
+            }),
+            &mut state,
+        )
+        .unwrap();
+        let shifted_auto_start_z = shifted_resp["start_z"].as_f64().unwrap();
+        assert!(
+            (shifted_auto_start_z - 6.0).abs() < 1e-4,
+            "Upright shifted nut auto start_z must be +6.0 mm, got {shifted_auto_start_z}"
+        );
+        let shifted_rep = mcp_cad_core::diagnostics::validate_mesh_strict(
+            state.parts.get("shifted_nut").unwrap().mesh(),
+            Some(1),
+        );
+        assert_eq!(shifted_rep.status, "PASS", "Shifted nut failed strict check: {:?}", shifted_rep.issues);
+
+        // 3. Drill bit (cylinder + cone) -> transform_part -> cut_helical_groove
+        create_part(
+            &json!({ "part_id": "tilted_drill", "name": "Tilted Drill", "material": "steel_4140" }),
+            &mut state,
+        )
+        .unwrap();
+        add_feature_primitive(
+            &json!({ "part_id": "tilted_drill", "primitive_type": "cylinder", "radius": 5.0, "height": 50.0, "segments": 32 }),
+            &mut state,
+        )
+        .unwrap();
+        add_feature_primitive(
+            &json!({ "part_id": "tilted_drill", "primitive_type": "cone", "radius_bottom": 5.0, "radius_top": 0.0, "height": 10.0, "segments": 32, "position": [0.0, 0.0, 25.0] }),
+            &mut state,
+        )
+        .unwrap();
+        transform_part(
+            &json!({ "part_id": "tilted_drill", "translation": [-20.0, 30.0, 12.0], "rotation_deg": [50.0, -25.0, 15.0] }),
+            &mut state,
+        )
+        .unwrap();
+        cut_helical_groove(
+            &json!({
+                "part_id": "tilted_drill",
+                "helix_radius": 5.0,
+                "groove_radius": 1.2,
+                "pitch": 20.0,
+                "height": 42.0,
+                "start_z": -22.0,
+                "starts": 2,
+                "is_right_hand": true,
+                "profile_type": "circular"
+            }),
+            &mut state,
+        )
+        .unwrap();
+        let drill_rep = mcp_cad_core::diagnostics::validate_mesh_strict(
+            state.parts.get("tilted_drill").unwrap().mesh(),
+            Some(0),
+        );
+        assert_eq!(drill_rep.status, "PASS", "Tilted drill failed strict check: {:?}", drill_rep.issues);
+        assert!(drill_rep.topology.is_watertight);
+        let drill_geom = query_part_geometry(&json!({ "part_id": "tilted_drill" }), &mut state).unwrap();
+        let drill_roles: Vec<&str> = drill_geom["faces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["role"].as_str())
+            .collect();
+        assert!(drill_roles.contains(&"helical_groove"));
     }
 }
