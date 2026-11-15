@@ -1,11 +1,11 @@
 # MCP-CAD: План работ и реестр задач (Backlog)
 
 > **Единый источник правды по архитектуре и принятым решениям:** Все фундаментальные архитектурные решения, таблицы систем координат примитивов, семантика Solid DAG и контракты 40 инструментов MCP перенесены и подробно описаны в **[`PROJECT_CONTEXT.md`](PROJECT_CONTEXT.md)** (разделы 4, 5 и 8).  
-> **Пошаговые отчёты о выполненных задачах (`P0-T1..T12`, `P1-T1..T4`, `P2-T1..T40`, `P3-T1..T13`):** хранятся в [`docs/agent_tasks/`](docs/agent_tasks/).  
-> **Текущий статус верификации (14.11.2026):**  
-> - **Rust Workspace (`cargo test --workspace --no-fail-fast`, проверено по крейтам):** **309 тестов: 305 проходят, 4 падают, 0 `ignored`** (`mcp-cad-core`: 129/129, `mcp-cad-fea`: 21/21, `mcp-cad-viewer`: 10/10, `mcp-cad-physics`: 17/18 — `P3-T19`, `mcp-cad-server`: 128/131 — `P3-T14`, `P3-T20`).  
-> - **TypeScript Suite (`npx tsx --test src/cad/__tests__/analyze_mechanism.test.ts`):** **11 тестов, 11 проходят (100% PASS)** (`src/cad/cad_engine.test.ts` отсутствует в рабочей копии — см. `P3-T22`); `npm run lint` (`tsc --noEmit`) — 0 ошибок.  
-> - **Rust Clippy (`cargo clippy --workspace --all-targets -- -D warnings` на `rustc 1.91.1`):** **0 ошибок, 0 предупреждений** во всех 5 крейтах (`P3-T13` ✅ DONE).
+> **Пошаговые отчёты о выполненных задачах (`P0-T1..T12`, `P1-T1..T4`, `P2-T1..T40`, `P3-T1..T14`):** хранятся в [`docs/agent_tasks/`](docs/agent_tasks/).  
+> **Текущий статус верификации (15.11.2026):**  
+> - **Rust Workspace (проверено по крейтам; `mcp-cad-server` актуализирован в `P3-T14` при `MCP_CAD_DISABLE_GUI_SPAWN=1 -- --test-threads=1`, остальные крейты — по аудиту `P3-T13`):** **309 тестов: 307 проходят, 2 падают, 0 `ignored`** (`mcp-cad-core`: 129/129, `mcp-cad-fea`: 21/21, `mcp-cad-viewer`: 10/10, `mcp-cad-physics`: 17/18 — `P3-T19`, `mcp-cad-server`: 130/131 — только `P3-T20`; `P3-T14` ✅ DONE).  
+> - **TypeScript Suite (`npx tsx --test src/cad/__tests__/analyze_mechanism.test.ts`, по аудиту `P3-T13`):** **11 тестов, 11 проходят (100% PASS)** (`src/cad/cad_engine.test.ts` отсутствует в рабочей копии — см. `P3-T22`); `npm run lint` (`tsc --noEmit`) — 0 ошибок.  
+> - **Rust Clippy (`cargo clippy --workspace --all-targets -- -D warnings`, проверено на `rustc 1.97.1`):** **0 ошибок, 0 предупреждений** во всех 5 крейтах (`P3-T13`, `P3-T14` ✅ DONE).
 
 ---
 
@@ -24,7 +24,7 @@
 | **P3-T11** | P3 Calculation | Водонепроницаемость и качество кромок `cut_helical_groove` на внутренней резьбе гайки (`T08_hex_nut_m10`) и спиральном сверле | P0-T7, P1-T2 | M | `mcp-cad-core` | ✅ DONE |
 | **P3-T12** | P3 Calculation | Устранение открытых рёбер BSP-CSG на составной фланцевой втулке и учёт `connected_components` в формуле `genus` (`diagnostics.rs:414`) | P0-T7, P1-T3 | S | `mcp-cad-core` | ✅ DONE |
 | **P3-T13** | P3 Calculation | Устранение предупреждений `clippy` на компиляторе `rustc 1.91.1` в `mcp-cad-core` и `mcp-cad-server` | P0-T12 | S | `mcp-cad-core`, `server` | ✅ DONE |
-| **P3-T14** | P3 Calculation | Синхронизация длины и обязательных токенов `AGENT_INSTRUCTIONS` (`protocol.rs:173`) с контрактными тестами `test_mcp_initialize` и `test_mcp_p2_t10_initialize_instructions_and_tool_descriptions_contract` после расширения `P2-T39` | P2-T10, P2-T39 | S | `mcp-cad-server` | 📋 BACKLOG |
+| **P3-T14** | P3 Calculation | Синхронизация длины и обязательных токенов `AGENT_INSTRUCTIONS` (`protocol.rs:173`) с контрактными тестами `test_mcp_initialize` и `test_mcp_p2_t10_initialize_instructions_and_tool_descriptions_contract` после расширения `P2-T39` | P2-T10, P2-T39 | S | `mcp-cad-server` | ✅ DONE |
 | **P3-T15** | P3 Calculation | Учёт активных упоров (`limits`) шарниров на границе хода и атрибуция избыточных связей (`redundant_joint_ids`) в `analyze_mechanism` | P3-T9 | S | `mcp-cad-physics` | 📋 BACKLOG |
 | **P3-T16** | P3 Calculation | Итеративный геометрический решатель замкнутых кинематических цепей при пошаговом сканировании `sweep_joint` на четырёхзвенниках и кривошипно-ползунных механизмах | P3-T10 | S | `mcp-cad-physics` | 📋 BACKLOG |
 | **P3-T17** | P3 Calculation | Поддержка несоосных и наклонных винтовых канавок `cut_helical_groove` при произвольной ориентации заготовки вне оси `Z` | P3-T11, P1-T4 | S | `mcp-cad-core` | 📋 BACKLOG |
@@ -33,6 +33,7 @@
 | **P3-T20** | P3 Contract | Актуализация контрактного теста `test_mcp_open_preview_window` (`mcp_contract_tests.rs:716`: статус `"empty"` на пустой сцене после `P2-T37` вместо `"headless"`) | P2-T37 | S | `mcp-cad-server` | 📋 BACKLOG |
 | **P3-T21** | P3 Calculation | Актуализация конструктора `TriangleMesh::new` в изолированном спайке `spikes/monstertruck_brep/src/main.rs:60` после добавления полей `face_ids` и `faces` (`P2-T6`) | P1-T3, P2-T6 | S | `spikes/monstertruck_brep` | 📋 BACKLOG |
 | **P3-T22** | P0 Hygiene | Восстановление отсутствующих в рабочей копии файлов CI/тулчейна (`rust-toolchain.toml`, `.github/workflows/ci.yml`) и TS-теста `src/cad/cad_engine.test.ts` (либо актуализация ссылок в `README.md`) | P0-T8 | S | Repo / CI / TS | 📋 BACKLOG |
+| **P3-T23** | P3 Testing | Устранение зависания многопоточного прогона `mcp_contract_tests` и `qa_wide_scan` на Windows (WGPU/GUI-конкуренция) и изоляция побочных записей `qa/results/*.json` и `qa/artifacts/` | P2-T37 | S | `mcp-cad-server` | 📋 BACKLOG |
 | **P4-T0** | P4 Blueprints | Каркас параметрических «рецептов» (`apply_recipe`) и генерация типовых инженерных узлов | P0–P3 | M | `mcp-cad-server` | 📋 BACKLOG |
 
 ---
@@ -224,10 +225,11 @@
   3. На `rustc 1.91.1 (ed61e7d7e 2025-11-07)` команда `cargo clippy --workspace --all-targets -- -D warnings` проходит с кодом `0` (**0 ошибок, 0 предупреждений** во всех 5 крейтах без `#![allow(...)]` на уровне крейтов).
 - **Компонент**: `crates/mcp-cad-core/src/csg.rs`, `crates/mcp-cad-server/src/tools/{metrics.rs, cad.rs, physics.rs}`, `docs/agent_tasks/P3-T13-report.md`
 
-#### P3-T14 [S]: Синхронизация длины и обязательных токенов `AGENT_INSTRUCTIONS` (`protocol.rs:173`) с тестами `test_mcp_initialize` и `test_mcp_p2_t10_initialize_instructions_and_tool_descriptions_contract`
-- **Проблема**: Выявлено при верификации **P3-T6** и подтверждено в аудите **P3-T13**: после расширения `AGENT_INSTRUCTIONS` в `crates/mcp-cad-server/src/protocol.rs:173` в рамках задачи `P2-T39` длина строки `initialize.instructions` выросла до `2602` символов (при лимите `(800..=1650)` в `crates/mcp-cad-server/tests/mcp_contract_tests.rs:4517`), а также падает `test_mcp_initialize` (`mcp_contract_tests.rs:119:5`), так как из текста исчезли обязательные упоминания `docs/AGENT_GUIDE.md` и `get_scene_summary` (а часть токенов `batch_cad_operations`, `query_part_geometry`, `STALE`, `isError` была заменена таблицей координат примитивов).
-- **Что сделать**: Сжать или согласовать `AGENT_INSTRUCTIONS` в `crates/mcp-cad-server/src/protocol.rs` и границы проверки в обоих контрактных тестах (`test_mcp_initialize` и `test_mcp_p2_t10_initialize_instructions_and_tool_descriptions_contract`), чтобы все обязательные ключевые слова и инварианты `P2-T10` и `P2-T39` выполнялись одновременно.
-- **Компонент**: `crates/mcp-cad-server/src/protocol.rs`, `crates/mcp-cad-server/tests/mcp_contract_tests.rs`
+#### P3-T14 [S]: Синхронизация длины и обязательных токенов `AGENT_INSTRUCTIONS` (`protocol.rs:173`) с тестами `test_mcp_initialize` и `test_mcp_p2_t10_initialize_instructions_and_tool_descriptions_contract` — ✅ DONE ([`P3-T14-report.md`](docs/agent_tasks/P3-T14-report.md))
+- **Проверено и подтверждено (синхронизация присутствует в коммите `281a3ed`)**:
+  1. `crates/mcp-cad-server/src/protocol.rs:173-193`: константа `AGENT_INSTRUCTIONS` сжата до `1569` символов (в пределах `800..=1650`) и содержит все обязательные токены `P2-T10` (`docs/AGENT_GUIDE.md`, `get_scene_summary`, `length_unit`, `set_requirements`, `auto_check`, `batch_cad_operations`, `validate_mesh`, `run_fea_analysis`, `query_part_geometry`, `STALE`, `isError`) и `P2-T39` (`SKILL.md`, `crates/`, `[-height/2, +height/2]`, `csg_union`, `csg_difference`, `radius_bottom`, `radius_top`, `cut_helical_groove`, `capture_viewport`, `open_preview_window`).
+  2. Контрактные тесты `test_mcp_initialize` (`mcp_contract_tests.rs:86-123`) и `test_mcp_p2_t10_initialize_instructions_and_tool_descriptions_contract` (`mcp_contract_tests.rs:4495-4633`) проходят полностью (`1 passed; 0 failed` каждый).
+- **Компонент**: `crates/mcp-cad-server/src/protocol.rs`, `crates/mcp-cad-server/tests/mcp_contract_tests.rs`, `docs/agent_tasks/P3-T14-report.md`
 
 #### P3-T15 [S]: Учёт активных упоров (`limits`) шарниров на границе хода и атрибуция избыточных связей (`redundant_joint_ids`) в `analyze_mechanism`
 - **Проблема**: Выявлено при выполнении **P3-T9** ([`docs/agent_tasks/P3-T9-report.md`](docs/agent_tasks/P3-T9-report.md)):
@@ -270,6 +272,11 @@
 - **Проблема**: Выявлено при аудите **P3-T13** ([`docs/agent_tasks/P3-T13-report.md`](docs/agent_tasks/P3-T13-report.md)): в текущей рабочей копии отсутствуют файлы `rust-toolchain.toml` и `.github/workflows/ci.yml` (заявленные выполненными в `P0-T8`), а также `src/cad/cad_engine.test.ts` (на который ссылаются `README.md:327`, `TASKS.md` и `PROJECT_CONTEXT.md:306`; фактически в `src/cad/__tests__/` есть только `analyze_mechanism.test.ts` с 11 тестами).
 - **Что сделать**: Либо восстановить `rust-toolchain.toml`, `.github/workflows/ci.yml` и актуальный TS-тест, либо синхронизировать ссылки в `README.md`, `PROJECT_CONTEXT.md` и `TASKS.md` с реальным составом репозитория.
 - **Компонент**: `rust-toolchain.toml`, `.github/workflows/ci.yml`, `src/cad/`, `README.md`
+
+#### P3-T23 [S]: Устранение зависания многопоточного прогона `mcp_contract_tests` и `qa_wide_scan` на Windows (WGPU/GUI-конкуренция) и изоляция побочных записей `qa/results/*.json`
+- **Проблема**: Выявлено при верификации **P3-T14** ([`docs/agent_tasks/P3-T14-report.md`](docs/agent_tasks/P3-T14-report.md)): при запуске `cargo test -p mcp-cad-server --test mcp_contract_tests` и `cargo test -p mcp-cad-server --test qa_wide_scan` в многопоточном режиме по умолчанию на Windows (без `-- --test-threads=1` и `MCP_CAD_DISABLE_GUI_SPAWN=1`) тест-раннер зависает после первых нескольких тестов (конкурентная инициализация WGPU / `OffscreenRenderer` между потоками). При последовательном запуске с `MCP_CAD_DISABLE_GUI_SPAWN=1 -- --test-threads=1` оба суита завершаются штатно (`57.86s` и `18.78s`). Кроме того, `qa_wide_scan` при запуске перезаписывает отслеживаемые в Git файлы `qa/results/*.json` и создаёт каталог `qa/artifacts/`.
+- **Что сделать**: Сериализовать инициализацию/использование WGPU-рендерера в интеграционных тестах (либо автоматически отключать GUI-спавн под `#[cfg(test)]` и использовать `std::sync::Mutex` / общий ленивый рендерер), а также писать тестовые прогоны `qa_wide_scan` во временный каталог вместо модификации отслеживаемых `qa/results/*.json`.
+- **Компонент**: `crates/mcp-cad-server/tests/{mcp_contract_tests.rs, qa_wide_scan.rs}`, `crates/mcp-cad-server/src/tools/render.rs`
 
 ---
 
@@ -356,4 +363,5 @@
 | **P3-T11** | P3 Calculation | Водонепроницаемость (`is_watertight = true`, `genus = 1`) и полное устранение игольчатых граней (`0.00% < 5°`) в `cut_helical_groove` на гайке М10 (`T08_hex_nut_m10`) и спиральном сверле с конической вершиной | §4.2, §5.6, §7 | [`P3-T11-report.md`](docs/agent_tasks/P3-T11-report.md) |
 | **P3-T12** | P3 Calculation | Устранение открытых рёбер BSP-CSG на составной фланцевой втулке (`union + difference`) и учёт `connected_components` в формуле рода Эйлера–Пуанкаре $g = (2k - \chi)/2$ (`diagnostics.rs`) | §5.6, §7 | [`P3-T12-report.md`](docs/agent_tasks/P3-T12-report.md) |
 | **P3-T13** | P3 Calculation | Аудит и подтверждение отсутствия предупреждений `cargo clippy --workspace --all-targets -- -D warnings` на `rustc 1.91.1` в `mcp-cad-core` и `mcp-cad-server` (`EarClippedTriangle`, `metrics.rs`, `cad.rs`, `physics.rs`) | §7 | [`P3-T13-report.md`](docs/agent_tasks/P3-T13-report.md) |
+| **P3-T14** | P3 Calculation | Проверка и подтверждение синхронизации длины (`1569` симв.) и всех обязательных токенов `P2-T10`/`P2-T39` в `AGENT_INSTRUCTIONS` (`protocol.rs:173`) с прохождением `test_mcp_initialize` и `test_mcp_p2_t10_initialize_instructions_and_tool_descriptions_contract` | §5.8, §7 | [`P3-T14-report.md`](docs/agent_tasks/P3-T14-report.md) |
 | **TS-FIX-01** | TS Suite | Синхронизация числа пресетов МКЭ (5) и импортов типов в `src/cad/{cad_engine.test.ts, primitives.ts}` | §7 | — |

@@ -52,7 +52,7 @@ mcp-cad/
 │   ├── BENCH_BASELINE_RUST.md    # Базовая линия 15 задач бенчмарка против нативного Rust-сервера
 │   ├── adr/0001-geometry-kernel.md # ADR выбора геометрического ядра (manifold-rust + monstertruck)
 │   ├── adr/0002-fe-mesher.md        # ADR выбора генератора сетки МКЭ (fe_snap + TET10, P3-T5)
-│   └── agent_tasks/              # Детальные отчёты о выполнении задач P0-T1..T12, P1-T1..T4, P2-T1..T40, P3-T1..T13
+│   └── agent_tasks/              # Детальные отчёты о выполнении задач P0-T1..T12, P1-T1..T4, P2-T1..T40, P3-T1..T14
 ├── spikes/
 │   ├── manifold_rust/            # Прототип ядра manifold-rust v0.19.2 (Pure Rust CSG + face_id)
 │   ├── monstertruck_brep/        # Прототип B-Rep ядра monstertruck v0.4.1 (fillet + ISO 10303-21 STEP)
@@ -296,15 +296,15 @@ graph TD
    - Любая ошибка параметров возвращается как `Result<T, CadError / ServerError>` и преобразуется в структурированный JSON `ErrorEnvelope`.
 2. **Чистота потока `stdout` в режиме `stdio`**:
    - В режиме `--mode stdio` поток `stdout` используется **исключительно** для сообщений JSON-RPC 2.0. Любой вывод логов (`tracing`, `eprintln!`) направляется строго в `std::io::stderr`.
-3. **Статус автоматического тестирования (аудит `P3-T13` от 14.11.2026)**:
-   - **Rust Workspace (`cargo test --workspace --no-fail-fast`, проверено по крейтам) — 309 тестов (305 PASS, 4 FAIL, 0 ignored)**:
+3. **Статус автоматического тестирования (`mcp-cad-server` и `clippy` актуализированы в `P3-T14` от 15.11.2026; остальные крейты и TS — аудит `P3-T13` от 14.11.2026)**:
+   - **Rust Workspace (проверено по крейтам) — 309 тестов (307 PASS, 2 FAIL, 0 ignored)**:
      - `mcp-cad-core`: **129 тестов** (`74` юнит-теста в `--lib` + `55` в интеграционных суитах `csg_invariants`, `dag_tests`, `primitive_invariants`, `tessellation_tests`) — **129 PASS**;
-     - `mcp-cad-server`: **131 тест** (`59` юнит-тестов модулей + `1` `bench_suite` + `1` `gear_kinematic_test` + `13` `qa_wide_scan` + `57` в `mcp_contract_tests.rs`, где `54` проходят и `3` падают — отслеживаются в `P3-T14` и `P3-T20`);
+     - `mcp-cad-server`: **131 тест** (`59` юнит-тестов модулей + `1` `bench_suite` + `1` `gear_kinematic_test` + `13` `qa_wide_scan` + `57` в `mcp_contract_tests.rs`, где `56` проходят и `1` падает — `test_mcp_open_preview_window`, отслеживается в `P3-T20`; `P3-T14` ✅ DONE; суиты `mcp_contract_tests` и `qa_wide_scan` прогнаны с `MCP_CAD_DISABLE_GUI_SPAWN=1 -- --test-threads=1` — см. `P3-T23`);
      - `mcp-cad-fea`: **21 тест** (`8` юнит-тестов в `--lib` + `2` в `fea_benchmarks` + `11` в `fea_tests`) — **21 PASS**;
      - `mcp-cad-physics`: **18 тестов** (`physics_tests.rs`: `17` проходят, `1` падает — `test_p3_t10_sweep_joint_hinged_arm_hitting_fixed_wall`, отслеживается в `P3-T19`);
      - `mcp-cad-viewer`: **10 тестов** (`viewer_tests.rs`) — **10 PASS**.
    - **TypeScript Suite (`npx tsx --test src/cad/__tests__/analyze_mechanism.test.ts`) — 11 тестов (100% PASS)**, `npm run lint` (`tsc --noEmit`) — 0 ошибок (`src/cad/cad_engine.test.ts` отсутствует в рабочей копии — см. `P3-T22`).
-   - **Линтер Rust (`cargo clippy --workspace --all-targets -- -D warnings` на `rustc 1.91.1`) — 0 ошибок, 0 предупреждений** (`P3-T13` ✅ DONE).
+   - **Линтер Rust (`cargo clippy --workspace --all-targets -- -D warnings`, проверено на `rustc 1.97.1`) — 0 ошибок, 0 предупреждений** (`P3-T13`, `P3-T14` ✅ DONE).
 
 ---
 
