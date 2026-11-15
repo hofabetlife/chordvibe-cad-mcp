@@ -184,6 +184,7 @@ DO NOT read Rust source files in crates/ — all coordinates and contracts are s
 2. DAG & SPECIAL TOOLS:
 - 1st add_feature_primitive creates base; subsequent calls on same part_id auto-apply csg_union (never overwrite).
 - cut_hole (through:true, keyway_width/depth) & cut_helical_groove (profile_type: circular|metric_60; start_z auto-aligns to bounding_box.min[2]) auto-apply csg_difference.
+- apply_recipe: flanged_bushing | stepped_shaft | gear_transmission.
 3. GUI VS HEADLESS:
 - capture_viewport: offscreen Base64 PNG for AI (works headless).
 - open_preview_window: WGPU 3D window for user (auto-spawns --stl in stdio mode).

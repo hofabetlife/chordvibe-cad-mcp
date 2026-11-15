@@ -1,8 +1,14 @@
 # MCP-CAD: План работ и реестр задач (Backlog)
 
-> **Единый источник правды по архитектуре и принятым решениям:** Все фундаментальные архитектурные решения, таблицы систем координат примитивов, семантика Solid DAG и контракты 40 инструментов MCP перенесены и подробно описаны в **[`PROJECT_CONTEXT.md`](PROJECT_CONTEXT.md)** (разделы 4, 5 и 8).  
-> **Пошаговые отчёты о выполненных задачах (`P0-T1..T12`, `P1-T1..T4`, `P2-T1..T40`, `P3-T1..T24`):** хранятся в [`docs/agent_tasks/`](docs/agent_tasks/).  
+> **Единый источник правды по архитектуре и принятым решениям:** Все фундаментальные архитектурные решения, таблицы систем координат примитивов, семантика Solid DAG и контракты 41 инструмента MCP перенесены и подробно описаны в **[`PROJECT_CONTEXT.md`](PROJECT_CONTEXT.md)** (разделы 4, 5 и 8).  
+> **Пошаговые отчёты о выполненных задачах (`P0-T1..T12`, `P1-T1..T4`, `P2-T1..T40`, `P3-T1..T24`, `P4-T0`):** хранятся в [`docs/agent_tasks/`](docs/agent_tasks/).  
 > **Текущий статус верификации (15.11.2026):**  
+> - **Проверено в `P4-T0` после внедрения 41-го инструмента `apply_recipe` (`flanged_bushing`, `stepped_shaft`, `gear_transmission`), обновления `AGENT_INSTRUCTIONS`, `BUG-021`, TS-слоя и документации:**  
+>   - `cargo test -p mcp-cad-server --no-fail-fast`: **140/140 PASS** (`--lib`: `65/65` в `61.31s`, `mcp_contract_tests`: `60/60` в `41.51s`, `qa_wide_scan`: `13/13` в `8.52s`, `bench_suite`: `1/1` в `5.64s`, `gear_kinematic_test`: `1/1` в `0.57s`, `0 failed`);  
+>   - `cargo clippy --workspace --all-targets -- -D warnings`: **PASS** (`0` ошибок, `0` предупреждений во всех 5 крейтах, `7.40s`, `exit 0`);  
+>   - `npm run lint` (`tsc --noEmit`): **PASS** (`0` ошибок, `exit 0`);  
+>   - `npm run build` (`vite build`): **PASS** (`1592` модулей, `4.16s`, `exit 0`);  
+>   - `npm test` (`npx --yes tsx --test src/cad/cad_engine.test.ts src/cad/__tests__/analyze_mechanism.test.ts`): **52/52 PASS** (`31.48s`, `0 failed`).  
 > - **Проверено в `P3-T24` после синхронизации счётчиков инструментов (`40` Rust / `31` TS), обновления `BUG-021`, фиксации `package-lock.json` и настройки `npm ci` в CI:**  
 >   - `npm ci --dry-run`: **PASS** (`up to date in 457ms`, `exit 0`);  
 >   - `npm run lint` (`tsc --noEmit`): **PASS** (`0` ошибок, `exit 0`);  
@@ -71,7 +77,7 @@
 | **P3-T22** | P0 Hygiene | Восстановление отсутствующих в рабочей копии файлов CI/тулчейна (`rust-toolchain.toml`, `.github/workflows/ci.yml`) и актуализация TS-теста `src/cad/cad_engine.test.ts`, `package.json`, `README.md` | P0-T8 | S | Repo / CI / TS | ✅ DONE |
 | **P3-T23** | P3 Testing | Устранение зависания многопоточного прогона `mcp_contract_tests` и `qa_wide_scan` на Windows (WGPU/GUI-конкуренция) и изоляция побочных записей `qa/results/*.json` и `qa/artifacts/` | P2-T37 | S | `mcp-cad-server`, `viewer` | ✅ DONE |
 | **P3-T24** | P2 Docs / CI | Синхронизация устаревших счётчиков `28 Tools` / `28 инструментов` в `README.md`, `docs/{CLAUDE_DESKTOP_SETUP,ANTIGRAVITY_SETUP,ARCHITECTURE}.md` и `src/cad/{native_bridge,workbenches}.ts` с 40 инструментами Rust MCP-сервера и фиксация `package-lock.json` для `npm ci` | P3-T22 | S | Docs / TS / CI | ✅ DONE |
-| **P4-T0** | P4 Blueprints | Каркас параметрических «рецептов» (`apply_recipe`) и генерация типовых инженерных узлов | P0–P3 | M | `mcp-cad-server` | 📋 BACKLOG |
+| **P4-T0** | P4 Blueprints | Каркас параметрических «рецептов» (`apply_recipe`) и генерация типовых инженерных узлов | P0–P3 | M | `mcp-cad-server` | ✅ DONE |
 
 ---
 
@@ -340,9 +346,9 @@
 
 ### Фаза 4: Рецепты и Заготовки (P4)
 
-#### P4-T0 [M]: Каркас «рецептов» и три заготовки
-- **Что сделать**: Внедрить инструмент `apply_recipe` для быстрой генерации проверенных типовых машиностроительных узлов (фланцевая втулка с разболтовкой, ступенчатый вал со шпоночным пазом, зубчатая передача на общей раме).
-- **Компонент**: `crates/mcp-cad-server/src/tools/`
+#### P4-T0 [M]: Каркас «рецептов» и три заготовки — ✅ ВЫПОЛНЕНО (15.11.2026)
+- **Что сделано**: Внедрён 41-й MCP-инструмент [`apply_recipe`](crates/mcp-cad-server/src/tools/recipes.rs) с поддержкой трёх машиностроительных заготовок (`flanged_bushing`, `stepped_shaft`, `gear_transmission`), поддержкой `length_unit` (`"mm"`/`"m"`), структурированными ошибками `ErrorEnvelope`, обязательным прохождением `validate_mesh`, `check_scale_sanity`, `attach_auto_check_if_enabled` и полным транзакционным откатом `EngineState` / `physics_world` при ошибке. Синхронизированы счётчики `41` инструмента в `tools/mod.rs`, `protocol.rs` (`AGENT_INSTRUCTIONS`), `mcp_contract_tests.rs`, TS/UI (`native_bridge.ts`, `workbenches.ts`, `CadRightSidebar.tsx`, `cad_engine.test.ts` `BUG-021`), `run_preview.{bat,ps1}` и всей документации. Подробности и протокол прогона — [`docs/agent_tasks/P4-T0-report.md`](docs/agent_tasks/P4-T0-report.md).
+- **Компонент**: `crates/mcp-cad-server/src/tools/{recipes.rs, mod.rs}`, `crates/mcp-cad-server/src/protocol.rs`, `crates/mcp-cad-server/tests/mcp_contract_tests.rs`, Docs / TS / Scripts, [`docs/agent_tasks/P4-T0-report.md`](docs/agent_tasks/P4-T0-report.md)
 
 ---
 
@@ -432,4 +438,5 @@
 | **P3-T22** | P0 Hygiene | Восстановление `rust-toolchain.toml` (`1.91`), актуализация `.github/workflows/ci.yml`, восстановление и адаптация `src/cad/cad_engine.test.ts` (`37/37` + `15/15` в `analyze_mechanism.test.ts`), добавление `npm test` в `package.json` и синхронизация `README.md` / `PROJECT_CONTEXT.md` | §2, §7 | [`P3-T22-report.md`](docs/agent_tasks/P3-T22-report.md) |
 | **P3-T23** | P3 Testing | Общий потокобезопасный `OffscreenRenderer::shared()` (`WGPU_INIT_LOCK` + `render_lock`), автоотключение GUI-спавна и временный STL для тестовых бинарников в `open_preview_window`, RAII-изоляция `qa_wide_scan` во временный каталог (`QaDirGuard`), снятие `-- --test-threads=1` в CI и `README.md` (`135/135 PASS` многопоточно) | §7 | [`P3-T23-report.md`](docs/agent_tasks/P3-T23-report.md) |
 | **P3-T24** | P2 Docs / CI | Синхронизация счётчиков и таблиц инструментов (`40` Rust / `31` TS) в `README.md`, `docs/{CLAUDE_DESKTOP_SETUP,ANTIGRAVITY_SETUP,ARCHITECTURE,MCP_API_REFERENCE}.md`, TS/UI (`native_bridge.ts`, `workbenches.ts`, `App.tsx`, `CadRightSidebar.tsx`) и скриптах запуска, обновление `BUG-021`, синхронизация и фиксация `package-lock.json` для `npm ci` (`cache: "npm"` в CI) | §7, §8 | [`P3-T24-report.md`](docs/agent_tasks/P3-T24-report.md) |
+| **P4-T0** | P4 Blueprints | 41-й MCP-инструмент `apply_recipe` (`flanged_bushing`, `stepped_shaft`, `gear_transmission`) с транзакционным откатом, `validate_mesh`, `length_unit`, `auto_check` и полной синхронизацией счётчиков/документации (`41` Rust / `31` TS) | §7, §8 | [`P4-T0-report.md`](docs/agent_tasks/P4-T0-report.md) |
 | **TS-FIX-01** | TS Suite | Синхронизация числа пресетов МКЭ (5) и импортов типов в `src/cad/{cad_engine.test.ts, primitives.ts}` | §7 | — |

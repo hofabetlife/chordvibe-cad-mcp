@@ -13,7 +13,7 @@
 
 [Быстрый старт](#-быстрый-старт-quick-start) •
 [Подключение к ИИ](#-подключение-к-популярным-ии-клиентам) •
-[Инструменты MCP](#-сводная-таблица-инструментов-mcp-40-tools) •
+[Инструменты MCP](#-сводная-таблица-инструментов-mcp-41-tools) •
 [AI-Native Возможности](#-ai-native-cad-experience) •
 [Архитектура](#-архитектура-системы) •
 [Примеры промптов](#-готовые-промпты-для-ии-агентов)
@@ -167,7 +167,7 @@ docker run --rm -p 8080:8080 mcp-cad-server
    - **Name**: `cad-engine`
    - **Type**: `command`
    - **Command**: `C:\Users\<username>\Documents\chordvibe-cad-mcp\target\release\mcp-cad-server.exe --mode stdio`
-4. Нажмите **Save**. Зеленый индикатор подтвердит доступность всех 40 инструментов.
+4. Нажмите **Save**. Зеленый индикатор подтвердит доступность всех 41 инструментов (полный Rust MCP).
 
 ---
 
@@ -206,7 +206,7 @@ MCP-CAD Engine спроектирован специально для преод
 
 ---
 
-## 🛠️ Сводная таблица инструментов MCP (40 Tools)
+## 🛠️ Сводная таблица инструментов MCP (41 Tools)
 
 | № | Имя инструмента | Входные параметры | Выходные данные | Назначение |
 |:---:|---|---|---|---|
@@ -250,9 +250,10 @@ MCP-CAD Engine спроектирован специально для преод
 | **38** | `analyze_mechanism` | `part_ids?: [str]`, `rank_tolerance?: num`, `length_unit?: str` | `{ dof_numeric: int, dof_grubler: int, redundant_constraints: int, redundant_joint_ids: [...], joints_at_limits: [...], ... }` | Анализ степеней свободы (Грюблер и SVD Якобиана), упоров `limits` и связности механизма |
 | **39** | `check_interference` | `part_ids?: [str]`, `ignore_adjacent?: bool`, `pairs?: [[str, str]]`, `length_unit?: str` | `{ has_interference: bool, interfering_pairs_count: int, min_clearance: num, pairs: [...] }` | Попарная проверка геометрической интерференции и зазоров (`AABB` + `csg_intersection`) |
 | **40** | `sweep_joint` | `joint_id: str`, `from: num`, `to: num`, `steps: int`, `ignore_adjacent?: bool`, `angle_unit?: str`, `length_unit?: str` | `{ status: "PASS"\|"FAIL", collision_detected: bool, safe_travel_range: obj, min_clearance: num, lockup_detected: bool, ... }` | Пошаговое сканирование хода шарнира (включая замкнутые контуры) с детекцией коллизий и заклинивания |
+| **41** | `apply_recipe` | `recipe: "flanged_bushing"\|"stepped_shaft"\|"gear_transmission"`, `params?: obj`, `length_unit?: "mm"\|"m"` | `{ status: "recipe_applied", recipe: str, created_parts: [str], created_joints: [str], details: obj, ... }` | Атомарно построить типовой узел/сборку из параметрического рецепта с проверкой `validate_mesh` |
 
 > [!TIP]
-> Полная документация с примерами JSON-RPC запросов и ответов для всех 40 инструментов представлена в документе [Справочник API инструментов MCP](docs/MCP_API_REFERENCE.md).
+> Полная документация с примерами JSON-RPC запросов и ответов для всех 41 инструментов представлена в документе [Справочник API инструментов MCP](docs/MCP_API_REFERENCE.md).
 
 ---
 

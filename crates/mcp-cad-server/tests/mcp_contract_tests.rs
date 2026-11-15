@@ -141,8 +141,8 @@ async fn test_mcp_tools_list() {
         .as_array()
         .expect("tools must be an array");
 
-    // Must declare all 40 tools
-    assert_eq!(tools.len(), 40, "Server must expose exactly 40 MCP tools");
+    // Must declare all 41 tools
+    assert_eq!(tools.len(), 41, "Server must expose exactly 41 MCP tools");
 
     let expected_tools = [
         "create_part",
@@ -185,6 +185,7 @@ async fn test_mcp_tools_list() {
         "analyze_mechanism",
         "check_interference",
         "sweep_joint",
+        "apply_recipe",
     ];
 
     let mut found_names = HashSet::new();
@@ -2562,7 +2563,7 @@ async fn test_bug015_create_joint_and_create_part_schema_contract() {
     })).await;
 
     let tools = list_resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 40, "tools/list must expose all 40 MCP tools");
+    assert_eq!(tools.len(), 41, "tools/list must expose all 41 MCP tools");
 
     let create_part_tool = tools.iter().find(|t| t["name"] == "create_part").unwrap();
     assert!(
@@ -4720,7 +4721,7 @@ async fn test_mcp_p2_t10_initialize_instructions_and_tool_descriptions_contract(
     let tools = list_resp["result"]["tools"]
         .as_array()
         .expect("tools must be an array");
-    assert_eq!(tools.len(), 40);
+    assert_eq!(tools.len(), 41);
 
     for tool in tools {
         let name = tool["name"].as_str().unwrap();
@@ -11021,6 +11022,273 @@ async fn test_mcp_p3_t16_sweep_joint_closed_loop_and_lockup() {
     let lock_deg = lk_res["lockup_angle_deg"].as_f64().unwrap();
     assert!((lock_deg - 90.0).abs() < 0.05, "Expected lockup at 90 deg, got {lock_deg}");
     assert_eq!(lk_res["samples"][18]["locked_up"], true);
+}
+
+#[tokio::test]
+async fn test_mcp_p4_t0_apply_recipe_all_recipes_units_errors_and_auto_check() {
+    let state = EngineState::new()
+        .expect("EngineState initialization failed")
+        .into_shared();
+
+    // 1. Unknown recipe -> structured ErrorEnvelope (isError = true)
+    let unknown_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5001,
+            "method": "tools/call",
+            "params": {
+                "name": "apply_recipe",
+                "arguments": { "recipe": "nonexistent_assembly" }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(unknown_resp["result"]["isError"], true);
+    let err_text = unknown_resp["result"]["content"][0]["text"].as_str().unwrap();
+    let err_env: Value = serde_json::from_str(err_text).unwrap();
+    assert_eq!(err_env["error"]["code"], "INVALID_ARGUMENT");
+    assert_eq!(err_env["error"]["param"], "recipe");
+
+    // 2. Invalid geometric invariant on flanged_bushing -> structured ErrorEnvelope + rollback
+    let bad_bushing_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5002,
+            "method": "tools/call",
+            "params": {
+                "name": "apply_recipe",
+                "arguments": {
+                    "recipe": "flanged_bushing",
+                    "params": {
+                        "part_id": "bad_bushing",
+                        "bore_diameter": 35.0,
+                        "sleeve_outer_diameter": 30.0
+                    }
+                }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(bad_bushing_resp["result"]["isError"], true);
+    let bad_text = bad_bushing_resp["result"]["content"][0]["text"].as_str().unwrap();
+    let bad_env: Value = serde_json::from_str(bad_text).unwrap();
+    assert_eq!(bad_env["error"]["code"], "INVALID_ARGUMENT");
+    let parts_after_err = parse_content(
+        &rpc_call(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5003,
+                "method": "tools/call",
+                "params": { "name": "list_parts", "arguments": {} }
+            }),
+        )
+        .await,
+    );
+    assert_eq!(parts_after_err["parts"].as_array().unwrap().len(), 0);
+
+    // 3. Flanged bushing in mm + stepped_shaft in meters + gear_transmission
+    let bushing_res = parse_content(
+        &rpc_call(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5004,
+                "method": "tools/call",
+                "params": {
+                    "name": "apply_recipe",
+                    "arguments": {
+                        "recipe": "flanged_bushing",
+                        "params": {
+                            "part_id": "bushing_1",
+                            "bore_diameter": 36.0,
+                            "sleeve_outer_diameter": 48.0,
+                            "flange_diameter": 80.0,
+                            "pcd_diameter": 64.0,
+                            "bolt_holes_count": 4
+                        }
+                    }
+                }
+            }),
+        )
+        .await,
+    );
+    assert_eq!(bushing_res["status"], "recipe_applied");
+    assert_eq!(bushing_res["length_unit"], "mm");
+    assert_eq!(bushing_res["created_parts"], json!(["bushing_1"]));
+    let bushing_mesh = parse_content(
+        &rpc_call(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5005,
+                "method": "tools/call",
+                "params": {
+                    "name": "validate_mesh",
+                    "arguments": { "part_id": "bushing_1" }
+                }
+            }),
+        )
+        .await,
+    );
+    assert_eq!(bushing_mesh["topology"]["is_watertight"], true);
+    assert_eq!(bushing_mesh["topology"]["boundary_edges_count"], 0);
+
+    // Enable auto_check requirements (no_interference across bushing_1 + shaft_m) and run stepped_shaft in length_unit="m"
+    let req_set_res = parse_content(
+        &rpc_call(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5006,
+                "method": "tools/call",
+                "params": {
+                    "name": "set_requirements",
+                    "arguments": {
+                        "scope": "scene",
+                        "auto_check": true,
+                        "requirements": [
+                            { "id": "req_no_int", "type": "no_interference", "ignore_adjacent": true }
+                        ]
+                    }
+                }
+            }),
+        )
+        .await,
+    );
+    assert_eq!(req_set_res["auto_check"], true);
+
+    let shaft_res = parse_content(
+        &rpc_call(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5007,
+                "method": "tools/call",
+                "params": {
+                    "name": "apply_recipe",
+                    "arguments": {
+                        "recipe": "stepped_shaft",
+                        "length_unit": "m",
+                        "params": {
+                            "part_id": "shaft_m",
+                            "steps": [
+                                { "diameter": 0.024, "length": 0.030 },
+                                { "diameter": 0.032, "length": 0.040 }
+                            ],
+                            "keyway_step_index": 0
+                        }
+                    }
+                }
+            }),
+        )
+        .await,
+    );
+    assert_eq!(shaft_res["status"], "recipe_applied");
+    assert_eq!(shaft_res["length_unit"], "m");
+    assert_eq!(shaft_res["requirements_status"]["status"], "PASS");
+    let shaft_mesh = parse_content(
+        &rpc_call(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5008,
+                "method": "tools/call",
+                "params": {
+                    "name": "validate_mesh",
+                    "arguments": { "part_id": "shaft_m" }
+                }
+            }),
+        )
+        .await,
+    );
+    assert_eq!(shaft_mesh["topology"]["is_watertight"], true);
+    assert_eq!(shaft_mesh["topology"]["boundary_edges_count"], 0);
+
+    rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 50080,
+            "method": "tools/call",
+            "params": { "name": "delete_part", "arguments": { "part_id": "bushing_1" } }
+        }),
+    )
+    .await;
+    rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 50081,
+            "method": "tools/call",
+            "params": { "name": "delete_part", "arguments": { "part_id": "shaft_m" } }
+        }),
+    )
+    .await;
+
+    // Gear transmission recipe + validate_mesh on all 3 generated parts + analyze_mechanism
+    let gear_res = parse_content(
+        &rpc_call(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5009,
+                "method": "tools/call",
+                "params": {
+                    "name": "apply_recipe",
+                    "arguments": {
+                        "recipe": "gear_transmission",
+                        "params": {
+                            "id_prefix": "tx1",
+                            "module": 2.0,
+                            "teeth_pinion": 18,
+                            "teeth_gear": 36,
+                            "motor_velocity_rad_s": 5.0
+                        }
+                    }
+                }
+            }),
+        )
+        .await,
+    );
+    assert_eq!(gear_res["status"], "recipe_applied");
+    assert_eq!(gear_res["details"]["motor_active"], true);
+    for pid in ["tx1_frame", "tx1_pinion", "tx1_gear"] {
+        let vm = parse_content(
+            &rpc_call(
+                &state,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 5010,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "validate_mesh",
+                        "arguments": { "part_id": pid }
+                    }
+                }),
+            )
+            .await,
+        );
+        assert_eq!(vm["topology"]["is_watertight"], true, "Part {pid} must be watertight");
+        assert_eq!(vm["topology"]["boundary_edges_count"], 0, "Part {pid} must have 0 boundary edges");
+    }
+
+    let mech = parse_content(
+        &rpc_call(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5011,
+                "method": "tools/call",
+                "params": { "name": "analyze_mechanism", "arguments": {} }
+            }),
+        )
+        .await,
+    );
+    assert_eq!(mech["dof_numeric"], 1);
+    assert_eq!(mech["redundant_constraints"], 0);
 }
 
 

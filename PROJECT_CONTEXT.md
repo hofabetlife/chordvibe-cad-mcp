@@ -44,7 +44,7 @@ mcp-cad/
 ├── TASKS.md                      # Актуальный бэклог задач и сводный реестр выполненных фаз
 ├── docs/
 │   ├── AGENT_GUIDE.md            # Операционное руководство для ИИ-агента (<= 2 стр.)
-│   ├── MCP_API_REFERENCE.md      # Полный справочник схем и примеров всех 40 MCP-инструментов
+│   ├── MCP_API_REFERENCE.md      # Полный справочник схем и примеров всех 41 MCP-инструментов
 │   ├── UNITS.md                  # Аудит и спецификация контракта единиц измерения [DECISION-UNITS-1]
 │   ├── FACE_NAMING_DESIGN.md     # Архитектура топологического именования граней [DECISION-FACES-1..4]
 │   ├── FEA_ACCURACY.md           # Матрица базовой точности МКЭ на 4 аналитических эталонах (P3-T1, P3-T4)
@@ -297,8 +297,12 @@ graph TD
    - Любая ошибка параметров возвращается как `Result<T, CadError / ServerError>` и преобразуется в структурированный JSON `ErrorEnvelope`.
 2. **Чистота потока `stdout` в режиме `stdio`**:
    - В режиме `--mode stdio` поток `stdout` используется **исключительно** для сообщений JSON-RPC 2.0. Любой вывод логов (`tracing`, `eprintln!`) направляется строго в `std::io::stderr`.
-3. **Статус автоматического тестирования (`mcp-cad-server`, `mcp-cad-viewer` и `clippy` актуализированы в `P3-T23` от 15.11.2026; документация/TS-счётчики/lockfile и CI `npm ci` — `P3-T24`; CI/тулчейн и TS-суит — `P3-T22`; `spikes/monstertruck_brep` — `P3-T21`; `mcp-cad-physics` — `P3-T19`; `spikes/manifold_rust` — `P3-T18`; `mcp-cad-core` — `P3-T17`; `mcp-cad-fea` — аудит `P3-T13`)**:
-   - **Проверено в `P3-T24` после синхронизации счётчиков инструментов (`40` Rust / `31` TS), фиксации `package-lock.json` и настройки `npm ci` в `.github/workflows/ci.yml`:**
+3. **Статус автоматического тестирования (`mcp-cad-server`, `clippy`, `lint`, `build` и TS-суит актуализированы в `P4-T0` от 15.11.2026; документация/TS-счётчики/lockfile — `P3-T24`; CI/тулчейн — `P3-T22`; `mcp-cad-viewer` — `P3-T23`; `spikes/monstertruck_brep` — `P3-T21`; `mcp-cad-physics` — `P3-T19`; `spikes/manifold_rust` — `P3-T18`; `mcp-cad-core` — `P3-T17`; `mcp-cad-fea` — аудит `P3-T13`)**:
+   - **Проверено в `P4-T0` после внедрения 41-го MCP-инструмента `apply_recipe` и полной синхронизации счётчиков (`41` Rust / `31` TS):**
+     - `mcp-cad-server` (`cargo test -p mcp-cad-server --no-fail-fast`): **140/140 PASS** (`--lib`: **65/65** в `61.31s`, `mcp_contract_tests`: **60/60** в `41.51s`, `qa_wide_scan`: **13/13** в `8.52s`, `bench_suite`: **1/1** в `5.64s`, `gear_kinematic_test`: **1/1** в `0.57s`, `0 failed`);
+     - `cargo clippy --workspace --all-targets -- -D warnings`: **0 ошибок, 0 предупреждений** (`7.40s`, `exit 0`);
+     - `npm run lint`: **0 ошибок** (`exit 0`); `npm run build`: **PASS** (`1592` модулей, `4.16s`); `npm test`: **52/52 PASS** (`31.48s`, `0 failed`).
+   - **Проверено ранее в `P3-T24` после синхронизации счётчиков инструментов (`40` Rust / `31` TS), фиксации `package-lock.json` и настройки `npm ci` в `.github/workflows/ci.yml`:**
      - `npm ci --dry-run`: **PASS** (`exit 0`); `npm run lint` (`tsc --noEmit`): **0 ошибок**; `npm run build` (`vite build`): **PASS** (`4.12s`); `npm test`: **52/52 PASS** (`37/37` в `cad_engine.test.ts` + `15/15` в `analyze_mechanism.test.ts`); `cargo clippy --workspace --all-targets -- -D warnings`: **0 ошибок, 0 предупреждений** (`exit 0`).
    - **Проверено в `P3-T23` после финальных правок `OffscreenRenderer::shared()`, `open_preview_window`, `qa_wide_scan.rs` и `.github/workflows/ci.yml`:**
      - `mcp-cad-server` (`cargo test -p mcp-cad-server --no-fail-fast` в **многопоточном режиме без `-- --test-threads=1` и без ручного `MCP_CAD_DISABLE_GUI_SPAWN=1`**, подтверждено двумя прогонами): **135/135 PASS** (`--lib`: **61/61**, `mcp_contract_tests`: **59/59**, `qa_wide_scan`: **13/13**, `bench_suite`: **1/1**, `gear_kinematic_test`: **1/1**, `0 failed`; прогон 1: `35.86s` / `15.98s` / `10.20s` / `6.96s` / `0.74s`; прогон 2: `31.95s` / `14.66s` / `9.41s` / `6.41s` / `0.60s`), при этом `qa/results/*.json` и `qa/artifacts/` в репозитории остаются чистыми;
@@ -322,7 +326,7 @@ graph TD
 
 ---
 
-## 8. Спецификация контрактов всех 40 инструментов MCP (Tools API)
+## 8. Спецификация контрактов всех 41 инструментов MCP (Tools API)
 
 Полные JSON-схемы и примеры запросов/ответов приведены в [`docs/MCP_API_REFERENCE.md`](docs/MCP_API_REFERENCE.md). Все линейные размеры по умолчанию принимаются и возвращаются в **`mm`** (`[DECISION-UNITS-1]`).
 
@@ -368,6 +372,7 @@ graph TD
 | 38 | `analyze_mechanism` | Физика / Кинематика | Кинематический анализ степеней свободы механизма по Грюблеру и SVD ранга матрицы Якоби связей (`dof_numeric`, `dof_grubler`, `redundant_constraints`, `redundant_joint_ids`, `joints_at_limits`, `floating_parts`, `unconnected_parts`), учёт упоров `limits` и интеграция с требованием `mechanism_dof` (`P3-T9`, `P3-T15`) |
 | 39 | `check_interference` | Физика / Кинематика | Проверка попарной геометрической интерференции и минимальных зазоров между деталями (broad-phase `AABB` + narrow-phase `csg_intersection`, `intersection_volume`, `penetration_depth`, `clearance`, `ignore_adjacent`), интегрирована с требованием `no_interference` (`P3-T10`) |
 | 40 | `sweep_joint` | Физика / Кинематика | Пошаговое сканирование угла/хода шарнира `Revolute` или `Prismatic` (`joint_id`, `from`, `to`, `steps`, `ignore_adjacent`) для поиска угла/позиции первого столкновения (`first_collision_value`), безопасного диапазона хода (`safe_travel_range`) и минимального зазора (`min_clearance`) без мутации сцены; поддерживает замкнутые контуры (`closed_loop_detected`, `lockup_detected`, `lockup_step`, `lockup_value`, `max_closure_residual`) (`P3-T10`, `P3-T16`) |
+| 41 | `apply_recipe` | Рецепты / Автоматизация | Атомарное построение типовых узлов и сборок (`flanged_bushing`, `stepped_shaft`, `gear_transmission`) с поддержкой `length_unit` (`"mm"`/`"m"`), валидацией `validate_mesh`, `check_scale_sanity`, `auto_check` требований, регистрацией в `physics_world` и полным транзакционным откатом при ошибке (`P4-T0`) |
 
 ---
 

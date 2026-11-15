@@ -2,7 +2,7 @@ import { MeshGeometryData, RenderMode } from '../types/cad';
 import { parseStlBuffer } from './primitives';
 import { MCP_TOOLS_CATALOG } from './mcp_dispatcher';
 
-export const RUST_MCP_TOOLS_COUNT = 40;
+export const RUST_MCP_TOOLS_COUNT = 41;
 export const TS_MCP_TOOLS_COUNT = MCP_TOOLS_CATALOG.length;
 
 export type EngineRuntimeMode =

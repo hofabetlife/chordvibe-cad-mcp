@@ -57,6 +57,7 @@
    - [38. `analyze_mechanism`](#38-analyze_mechanism)
    - [39. `check_interference`](#39-check_interference)
    - [40. `sweep_joint`](#40-sweep_joint)
+   - [41. `apply_recipe`](#41-apply_recipe)
 
 ---
 
@@ -2206,6 +2207,53 @@
       "to": 90.0,
       "steps": 18,
       "ignore_adjacent": true
+    }
+  }
+}
+```
+
+---
+
+### 41. `apply_recipe`
+
+Атомарно строит проверенную водонепроницаемую CAD-деталь или кинематическую сборку по одному из именованных параметрических машиностроительных рецептов (`P4-T0`). Перед возвратом ответа выполняет `validate_mesh` для каждой созданной детали, объединяет предупреждения `check_scale_sanity`, поддерживает переопределение `length_unit` (`"mm"` / `"m"`), прикладывает `auto_check` требований (если включён) и выполняет полный транзакционный откат состояния `EngineState` / `physics_world` при любой ошибке.
+
+#### Поддерживаемые рецепты (`recipe`)
+- `"flanged_bushing"`: фланцевая втулка со сквозным центральным отверстием и болтовой разболтовкой на фланце (`bottom` | `top` | `center`).
+- `"stepped_shaft"`: многоступенчатый вал вращения (`revolve`) с внешним шпоночным пазом на выбранной ступени (`keyway_step_index`).
+- `"gear_transmission"`: прямозубая эвольвентная передача (`pinion` + `gear`) на общей зафиксированной раме (`frame`) с двумя вращательными шарнирами (`revolute`), зубчатым зацеплением (`gear`) и опциональным приводом (`motor_velocity_rad_s`).
+
+#### Входные параметры
+| Параметр | Тип | Обязательный | Описание |
+|---|---|:---:|---|
+| `recipe` | `"flanged_bushing" \| "stepped_shaft" \| "gear_transmission"` | **Да** | Имя инженерного рецепта |
+| `length_unit` | `"mm" \| "m"` | Нет | Переопределение единицы длины для этого вызова (по умолчанию активная единица сессии) |
+| `params` | `object` | Нет | Параметры рецепта (материалы, размеры в активном `length_unit`, префиксы ID, угловая скорость мотора в `rad/s`, момент в `N*m`; опущенные поля используют инженерные значения по умолчанию) |
+
+#### Выходные поля
+- `status`: `"recipe_applied"`.
+- `recipe`: имя применённого рецепта.
+- `created_parts`: массив ID созданных деталей.
+- `created_joints`: массив ID созданных шарниров (непустой для `"gear_transmission"`).
+- `details`: геометрические параметры, результаты `mesh_validation` и созданные шарниры.
+- `length_unit`, `units`, `warnings`, и опционально блоки `requirements_status` / `failed_requirements` (если включён `auto_check`).
+
+#### Пример запроса
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 41,
+  "method": "tools/call",
+  "params": {
+    "name": "apply_recipe",
+    "arguments": {
+      "recipe": "flanged_bushing",
+      "params": {
+        "part_id": "bushing_1",
+        "bore_diameter": 16.0,
+        "flange_diameter": 64.0,
+        "bolt_holes_count": 4
+      }
     }
   }
 }

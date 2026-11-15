@@ -1134,7 +1134,7 @@ export const CadRightSidebar: React.FC<CadRightSidebarProps> = ({
                     </button>
                   </div>
                   <p className="text-[11px] text-[#94a3b8]">
-                    Все {MCP_TOOLS_CATALOG.length} TS (40 Rust) MCP инструментов, 8 параметрических примитивов и 10
+                    Все {MCP_TOOLS_CATALOG.length} TS (41 Rust) MCP инструментов, 8 параметрических примитивов и 10
                     топологических исправлений (BUG-001..010) верифицированы.
                   </p>
                 </div>

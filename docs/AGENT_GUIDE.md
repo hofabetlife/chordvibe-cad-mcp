@@ -46,8 +46,8 @@
 3. **Объявление требований (`set_requirements` / `check_requirements`)**:
    - До или сразу после создания детали объявите инженерные ограничения (`bbox_max`, `bbox_min`, `mass_max`, `mesh_valid`, `min_safety_factor`, `mechanism_dof`) через `set_requirements` с флагом `"auto_check": true`.
    - При `auto_check: true` каждый мутирующий вызов (`add_feature_primitive`, `cut_hole`, `modify_feature`, `boolean_*`, `transform_part`, `batch_cad_operations`) автоматически возвращает `requirements_status: {passed, failed, stale}` и список нарушений `failed_requirements`.
-4. **Транзакции (`batch_cad_operations`)**:
-   - Объединяйте серию шагов построения детали в `batch_cad_operations`. При ошибке любого шага батч прерывается и атомарно откатывает состояние сцены к исходному.
+4. **Транзакции (`batch_cad_operations`) и рецепты (`apply_recipe`)**:
+   - Объединяйте серию шагов построения детали в `batch_cad_operations` или используйте параметрические рецепты `apply_recipe` (`flanged_bushing`, `stepped_shaft`, `gear_transmission`). При ошибке оба инструмента атомарно откатывают состояние сцены.
 5. **Обязательный `validate_mesh` после булевых операций и вырезов**:
    - После `boolean_difference`, `boolean_union`, `boolean_intersection`, `cut_hole` и `cut_helical_groove` обязательно вызывайте `validate_mesh` (или контролируйте требование `mesh_valid`). В обычном режиме `strict_slivers: false` микро-треугольники сложных винтовых канавок выводятся в `warnings`, сохраняя статус `PASS` (`is_valid_solid: true`, `fea_ready: true`).
 6. **Расчёт прочности (FEA) только после валидной сетки и по именованным граням**:

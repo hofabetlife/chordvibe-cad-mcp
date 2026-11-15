@@ -5,6 +5,7 @@ pub mod fea;
 pub mod metrics;
 pub mod physics;
 pub mod project;
+pub mod recipes;
 pub mod render;
 pub mod requirements;
 
@@ -14,7 +15,7 @@ use crate::error::ServerError;
 use crate::protocol::{ToolCallResult, ToolDefinition};
 use crate::state::EngineState;
 
-/// Returns the complete registry of all 40 MCP engineering tools with strict input schemas,
+/// Returns the complete registry of all 41 MCP engineering tools with strict input schemas,
 /// explicit unit contracts, usage examples, common errors, and recommended next steps.
 pub fn list_tools() -> Vec<ToolDefinition> {
     vec![
@@ -1546,6 +1547,181 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "required": ["joint_id", "from", "to", "steps"]
             }),
         },
+        // 41. apply_recipe
+        ToolDefinition {
+            name: "apply_recipe".to_string(),
+            description: "Applies a named parametric engineering recipe ('flanged_bushing', 'stepped_shaft', or 'gear_transmission') to atomically build verified watertight CAD parts and (for assemblies) coupled Rapier3D kinematic joints with transactional rollback on error. Units: linear parameters use active length_unit ('mm' by default, or 'm'), angles in deg, angular velocity in rad/s, torque in N*m, counts/ratios are dimensionless. Example: {\"recipe\": \"flanged_bushing\", \"params\": {\"bore_diameter\": 16.0, \"flange_diameter\": 64.0, \"bolt_holes_count\": 4}}. Common errors: INVALID_ARGUMENT (unknown recipe or invalid parameter invariants), PART_ALREADY_EXISTS (target part_id already exists), GEOMETRY_ERROR (mesh validation failed). Next step: call 'validate_mesh', 'query_part_geometry', 'run_fea_analysis', or (for gear_transmission) 'analyze_mechanism' and 'run_physics_simulation'.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "recipe": {
+                        "type": "string",
+                        "enum": ["flanged_bushing", "stepped_shaft", "gear_transmission"],
+                        "description": "Named engineering recipe to build ('flanged_bushing', 'stepped_shaft', or 'gear_transmission')"
+                    },
+                    "length_unit": {
+                        "type": "string",
+                        "enum": ["mm", "m"],
+                        "description": "Optional per-call length unit override ('mm' or 'm'; defaults to session length_unit)"
+                    },
+                    "params": {
+                        "type": "object",
+                        "description": "Recipe-specific parameter overrides in active length_unit (omitted fields use sensible engineering defaults)",
+                        "properties": {
+                            "length_unit": {
+                                "type": "string",
+                                "enum": ["mm", "m"],
+                                "description": "Optional per-call length unit override inside params ('mm' or 'm')"
+                            },
+                            "part_id": {
+                                "type": "string",
+                                "description": "Target part ID for single-part recipes (default: recipe name)"
+                            },
+                            "name": {
+                                "type": "string",
+                                "description": "Human-readable part name for single-part recipes"
+                            },
+                            "material": {
+                                "type": "string",
+                                "description": "Engineering material ID (default: 'steel_structural_aisi1020' or 'steel_high_strength_4140' for shaft)"
+                            },
+                            "is_fixed": {
+                                "type": "boolean",
+                                "description": "Whether the created single part is fixed in physics_world (default: false)"
+                            },
+                            "sleeve_outer_diameter": {
+                                "type": "number",
+                                "description": "Outer sleeve diameter of flanged_bushing in active length_unit (default: 30 mm)"
+                            },
+                            "sleeve_length": {
+                                "type": "number",
+                                "description": "Total axial sleeve length of flanged_bushing in active length_unit (default: 50 mm)"
+                            },
+                            "bore_diameter": {
+                                "type": "number",
+                                "description": "Central axial bore diameter in active length_unit (default: 16 mm for flanged_bushing, <=10 mm for gear_transmission)"
+                            },
+                            "flange_diameter": {
+                                "type": "number",
+                                "description": "Flange outer diameter of flanged_bushing in active length_unit (default: 64 mm)"
+                            },
+                            "flange_thickness": {
+                                "type": "number",
+                                "description": "Flange axial thickness of flanged_bushing in active length_unit (default: 10 mm)"
+                            },
+                            "flange_position": {
+                                "type": "string",
+                                "enum": ["bottom", "top", "center"],
+                                "description": "Axial flange placement along sleeve ('bottom', 'top', or 'center'; default: 'bottom')"
+                            },
+                            "pcd_diameter": {
+                                "type": "number",
+                                "description": "Bolt circle diameter (PCD) on flange in active length_unit (default: 48 mm)"
+                            },
+                            "bolt_holes_count": {
+                                "type": "integer",
+                                "description": "Number of flange bolt holes (dimensionless count in 0..=24; default: 4)"
+                            },
+                            "bolt_hole_diameter": {
+                                "type": "number",
+                                "description": "Diameter of each flange bolt hole in active length_unit (default: 6.6 mm)"
+                            },
+                            "steps": {
+                                "type": "array",
+                                "description": "Ordered cylindrical shaft sections [{diameter, length}] for stepped_shaft",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "diameter": {
+                                            "type": "number",
+                                            "description": "Step outer diameter in active length_unit (> 0)"
+                                        },
+                                        "length": {
+                                            "type": "number",
+                                            "description": "Step axial length in active length_unit (> 0)"
+                                        }
+                                    },
+                                    "required": ["diameter", "length"]
+                                }
+                            },
+                            "keyway_step_index": {
+                                "type": "integer",
+                                "description": "Zero-based index into 'steps' receiving the external keyway slot (dimensionless; default: 0)"
+                            },
+                            "keyway_width": {
+                                "type": "number",
+                                "description": "External keyway width in active length_unit"
+                            },
+                            "keyway_depth": {
+                                "type": "number",
+                                "description": "Radial keyway depth from step outer cylinder in active length_unit"
+                            },
+                            "keyway_length": {
+                                "type": "number",
+                                "description": "Axial keyway slot length in active length_unit (< step length)"
+                            },
+                            "id_prefix": {
+                                "type": "string",
+                                "description": "Identifier prefix for gear_transmission parts and joints (default: 'gear_tx')"
+                            },
+                            "frame_id": {
+                                "type": "string",
+                                "description": "Override part ID for fixed baseplate frame in gear_transmission"
+                            },
+                            "pinion_id": {
+                                "type": "string",
+                                "description": "Override part ID for pinion gear in gear_transmission"
+                            },
+                            "gear_id": {
+                                "type": "string",
+                                "description": "Override part ID for driven gear in gear_transmission"
+                            },
+                            "frame_material": {
+                                "type": "string",
+                                "description": "Optional material ID for the baseplate frame (defaults to 'material')"
+                            },
+                            "module": {
+                                "type": "number",
+                                "description": "Spur gear tooth module m in active length_unit (default: 2.0 mm)"
+                            },
+                            "teeth_pinion": {
+                                "type": "integer",
+                                "description": "Number of teeth on the pinion (dimensionless count in 8..=200; default: 20)"
+                            },
+                            "teeth_gear": {
+                                "type": "integer",
+                                "description": "Number of teeth on the driven gear (dimensionless count in 8..=200; default: 40)"
+                            },
+                            "face_width": {
+                                "type": "number",
+                                "description": "Gear face width in active length_unit (default: 15 mm)"
+                            },
+                            "pressure_angle_deg": {
+                                "type": "number",
+                                "description": "Involute pressure angle in deg (10..=35; default: 20.0)"
+                            },
+                            "frame_thickness": {
+                                "type": "number",
+                                "description": "Baseplate frame thickness in active length_unit (default: 12 mm)"
+                            },
+                            "frame_clearance": {
+                                "type": "number",
+                                "description": "Axial clearance between gears and baseplate in active length_unit (default: 4 mm)"
+                            },
+                            "motor_velocity_rad_s": {
+                                "type": "number",
+                                "description": "Optional target angular velocity for the pinion revolute motor in rad/s"
+                            },
+                            "motor_max_torque_nm": {
+                                "type": "number",
+                                "description": "Optional maximum torque for the pinion motor in N*m (default: 100.0)"
+                            }
+                        }
+                    }
+                },
+                "required": ["recipe"]
+            }),
+        },
     ]
 }
 
@@ -1716,6 +1892,10 @@ pub fn dispatch_tool(
         }
         "sweep_joint" => {
             let res = physics::sweep_joint(args, state)?;
+            ToolCallResult::json(&res).map_err(ServerError::Json)
+        }
+        "apply_recipe" => {
+            let res = recipes::apply_recipe(args, state)?;
             ToolCallResult::json(&res).map_err(ServerError::Json)
         }
         other => Err(ServerError::ToolNotFound(other.to_string())),

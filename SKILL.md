@@ -52,6 +52,7 @@ This skill defines the canonical coordinate systems, parametric FeatureTree DAG 
 | **`analyze_mechanism`** | Анализ степеней свободы механизма (Грюблер и SVD) | `part_ids`, `rank_tolerance` | Вычисляет подвижность по Грюблеру $M = 6(N-1)-\sum c_i$ и численный ранг Якобиана через SVD (`dof_numeric`), находит `redundant_constraints` и «висящие» детали (`floating_parts`). Работает с `mechanism_dof` в `check_requirements`. |
 | **`check_interference`** | Проверка статической интерференции и зазоров сборки | `part_ids`, `ignore_adjacent: boolean` | Двухфазная детекция пересечений (AABB + `csg_intersection`), возвращает `intersection_volume`, `penetration_depth` и точный евклидов зазор `clearance`. Активирует требование `no_interference` в `check_requirements`. |
 | **`sweep_joint`** | Пошаговое сканирование хода шарнира до столкновения | `joint_id`, `from`, `to`, `steps`, `ignore_adjacent` | Дискретно прокатывает шарнир `Revolute` или `Prismatic` по диапазону `[from, to]`, находя угол/координату первого удара (`first_collision_value`), безопасный ход (`safe_travel_range`) и минимальный зазор (`min_clearance`) без мутации сцены. |
+| **`apply_recipe`** | Построение типовых узлов и сборок из рецептов | `recipe: "flanged_bushing" \| "stepped_shaft" \| "gear_transmission"`, `params`, `length_unit` | Атомарно создаёт водонепроницаемые детали/сборки (втулка с разболтовкой, ступенчатый вал со шпонкой, зубчатая передача на раме с шарнирами) с проверкой `validate_mesh` и откатом при ошибке. |
 
 ---
 

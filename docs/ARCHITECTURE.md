@@ -30,7 +30,7 @@ C:\Users\<username>\Documents\chordvibe-cad-mcp\
 ├── README.md                     # Главная страница документации
 ├── docs/                         # Техническая документация
 │   ├── ARCHITECTURE.md           # Архитектурный обзор (данный документ)
-│   ├── MCP_API_REFERENCE.md      # Полный справочник 40 инструментов MCP
+│   ├── MCP_API_REFERENCE.md      # Полный справочник 41 инструмента MCP
 │   └── CLAUDE_DESKTOP_SETUP.md   # Руководство по интеграции с Claude Desktop
 ├── examples/                     # Готовые инженерные сценарии
 │   ├── bracket_design.json       # Проект кронштейна с расчетом прочности
@@ -184,7 +184,7 @@ pub struct EngineState {
   - `initialize`: согласование версии протокола и манифеста возможностей сервера (`capabilities.tools`).
   - `notifications/initialized`: подтверждение готовности клиента.
   - `ping`: проверка доступности.
-  - `tools/list`: отдача массива из 40 строгих JSON-Schema определений инструментов.
+  - `tools/list`: отдача массива из 41 строгого JSON-Schema определения инструментов.
   - `tools/call`: исполнение указанного инструмента с аргументами.
 - **Поддерживаемые транспорты**:
   - **Stdio Loop**: Чтение строк JSON-RPC из `stdin` и немедленный сброс (`flush`) ответов в `stdout`.
