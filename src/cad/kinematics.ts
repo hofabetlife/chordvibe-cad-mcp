@@ -1022,6 +1022,8 @@ export interface SweepStepResult {
   min_clearance?: number;
   max_penetration_depth: number;
   total_intersection_volume: number;
+  closure_residual: number;
+  locked_up: boolean;
 }
 
 export interface JointSweepReport {
@@ -1042,6 +1044,13 @@ export interface JointSweepReport {
   min_clearance_value?: number;
   safe_travel_range?: [number, number];
   margin_to_collision?: number;
+  closed_loop_detected: boolean;
+  lockup_detected: boolean;
+  lockup_step?: number;
+  lockup_value?: number;
+  lockup_angle_deg?: number;
+  lockup_angle_rad?: number;
+  max_closure_residual: number;
   samples: SweepStepResult[];
 }
 
@@ -1524,6 +1533,7 @@ export function sweepJoint(
   }
 
   const basePart = parts.find((p) => p.id === baseId);
+  const drivenId = baseId === joint.partA ? joint.partB : joint.partA;
   const basePos: Vec3 = basePart ? [...basePart.position] : [0, 0, 0];
   const baseRot: Mat3 = basePart
     ? eulerToMat3(basePart.rotation)
@@ -1535,8 +1545,32 @@ export function sweepJoint(
 
   const localAnchor: Vec3 =
     baseId === joint.partA ? joint.anchor || [0, 0, 0] : joint.anchorB ?? [0, 0, 0];
+  const drivenAnchor: Vec3 =
+    drivenId === joint.partA ? joint.anchor || [0, 0, 0] : joint.anchorB ?? [0, 0, 0];
   const pivotWorld: Vec3 = add3(basePos, mat3Vec3(baseRot, localAnchor));
-  const axisWorld: Vec3 = normalize3(mat3Vec3(baseRot, joint.axis || [0, 0, 1]));
+  const axisLocalRef: Vec3 = normalize3(joint.axis || [0, 0, 1]);
+  const axisWorld: Vec3 = normalize3(mat3Vec3(baseRot, axisLocalRef));
+
+  // Detect whether the swept joint belongs to a closed kinematic loop (P3-T16).
+  let touchesBoundary = 0;
+  let touchesExternalOrGround = false;
+  let internalJointsCount = 0;
+  for (const j of joints) {
+    if (j.id === jointId) continue;
+    const aIn = movingSubtree.has(j.partA);
+    const bIn = movingSubtree.has(j.partB);
+    if (aIn && bIn) {
+      internalJointsCount++;
+    } else if (aIn !== bIn) {
+      touchesBoundary++;
+      const other = aIn ? j.partB : j.partA;
+      if (other !== baseId) {
+        touchesExternalOrGround = true;
+      }
+    }
+  }
+  const isClosedLoop =
+    touchesBoundary > 0 || internalJointsCount > Math.max(0, movingSubtree.size - 1);
 
   const isRevolute = joint.type === 'revolute';
   const samples: SweepStepResult[] = [];
@@ -1548,81 +1582,234 @@ export function sweepJoint(
   let minClearanceValue: number | undefined = undefined;
   let safeStart: number | undefined = undefined;
   let safeEnd: number | undefined = undefined;
+  let lockupStep: number | undefined = undefined;
+  let lockupValue: number | undefined = undefined;
+  let maxClosureResidual = 0;
 
-  for (let stepIdx = 0; stepIdx <= steps; stepIdx++) {
-    const t = stepIdx / steps;
-    const val = from + (to - from) * t;
+  if (!isClosedLoop) {
+    for (let stepIdx = 0; stepIdx <= steps; stepIdx++) {
+      const t = stepIdx / steps;
+      const val = from + (to - from) * t;
 
-    const stepParts: CadPart[] = parts.map((p) => {
-      if (!movingSubtree.has(p.id) || isGround(p.id)) {
-        return p;
+      const stepParts: CadPart[] = parts.map((p) => {
+        if (!movingSubtree.has(p.id) || isGround(p.id)) {
+          return p;
+        }
+        if (isRevolute) {
+          const deltaRot = axisAngleToMat3(axisWorld, val * sign);
+          const rel = sub3(p.position, pivotWorld);
+          const newPos = add3(pivotWorld, mat3Vec3(deltaRot, rel));
+          const newRotMat = mat3Mul(deltaRot, eulerToMat3(p.rotation));
+          return {
+            ...p,
+            position: newPos,
+            rotation: mat3ToEulerXYZ(newRotMat),
+          };
+        } else {
+          const deltaTrans = scale3(axisWorld, val * sign);
+          return {
+            ...p,
+            position: add3(p.position, deltaTrans),
+          };
+        }
+      });
+
+      const rep = checkInterference(stepParts, joints, {
+        partIds: options.partIds,
+        ignoreAdjacent,
+      });
+
+      const interferingPairs: [string, string][] = rep.pairs
+        .filter((pr) => pr.intersects)
+        .map((pr) => [pr.a, pr.b]);
+
+      if (interferingPairs.length > 0) {
+        if (firstCollisionStep === undefined) {
+          firstCollisionStep = stepIdx;
+          firstCollisionValue = val;
+          firstCollisionPairs = [...interferingPairs];
+        }
+      } else if (firstCollisionStep === undefined) {
+        if (safeStart === undefined) safeStart = val;
+        safeEnd = val;
       }
-      if (isRevolute) {
-        const deltaRot = axisAngleToMat3(axisWorld, val * sign);
-        const rel = sub3(p.position, pivotWorld);
-        const newPos = add3(pivotWorld, mat3Vec3(deltaRot, rel));
-        const newRotMat = mat3Mul(deltaRot, eulerToMat3(p.rotation));
+
+      if (rep.min_clearance !== undefined) {
+        if (minClearance === undefined || rep.min_clearance < minClearance) {
+          minClearance = rep.min_clearance;
+          minClearanceStep = stepIdx;
+          minClearanceValue = val;
+        }
+      }
+
+      samples.push({
+        step: stepIdx,
+        value: val,
+        angle_deg: isRevolute ? (val * 180) / Math.PI : undefined,
+        angle_rad: isRevolute ? val : undefined,
+        interfering_pairs: interferingPairs,
+        min_clearance: rep.min_clearance,
+        max_penetration_depth: rep.max_penetration_depth,
+        total_intersection_volume: rep.total_intersection_volume,
+        closure_residual: 0,
+        locked_up: false,
+      });
+    }
+  } else {
+    const baseIsFixed = isGround(baseId);
+    const includeBaseAsFree = !baseIsFixed && touchesExternalOrGround;
+    const freePartsSet = new Set<string>();
+    if (includeBaseAsFree) {
+      const q = [baseId, drivenId];
+      for (const s of q) {
+        if (!isGround(s)) freePartsSet.add(s);
+      }
+      const fullAdj = new Map<string, string[]>();
+      for (const j of joints) {
+        if (!fullAdj.has(j.partA)) fullAdj.set(j.partA, []);
+        if (!fullAdj.has(j.partB)) fullAdj.set(j.partB, []);
+        fullAdj.get(j.partA)!.push(j.partB);
+        fullAdj.get(j.partB)!.push(j.partA);
+      }
+      const bfs = [...freePartsSet];
+      while (bfs.length > 0) {
+        const cur = bfs.shift()!;
+        for (const nxt of fullAdj.get(cur) || []) {
+          if (!isGround(nxt) && !freePartsSet.has(nxt)) {
+            freePartsSet.add(nxt);
+            bfs.push(nxt);
+          }
+        }
+      }
+    } else {
+      for (const pid of movingSubtree) {
+        if (pid !== drivenId && !isGround(pid)) {
+          freePartsSet.add(pid);
+        }
+      }
+    }
+    const freeParts = Array.from(freePartsSet).sort();
+
+    const solver = createClosedLoopSolverTS(
+      parts,
+      joints,
+      joint,
+      baseId,
+      drivenId,
+      sign,
+      localAnchor,
+      drivenAnchor,
+      axisLocalRef,
+      freeParts,
+      includeBaseAsFree,
+      isGround
+    );
+
+    for (let stepIdx = 0; stepIdx <= steps; stepIdx++) {
+      const t = stepIdx / steps;
+      const val = from + (to - from) * t;
+
+      if (lockupStep !== undefined) {
+        samples.push({
+          step: stepIdx,
+          value: val,
+          angle_deg: isRevolute ? (val * 180) / Math.PI : undefined,
+          angle_rad: isRevolute ? val : undefined,
+          interfering_pairs: [],
+          min_clearance: undefined,
+          max_penetration_depth: 0,
+          total_intersection_volume: 0,
+          closure_residual: solver.lastFailedResidual,
+          locked_up: true,
+        });
+        continue;
+      }
+
+      const stepOutcome = solver.advanceTo(val);
+      if (stepOutcome.residual > maxClosureResidual) {
+        maxClosureResidual = stepOutcome.residual;
+      }
+      if (!stepOutcome.ok) {
+        lockupStep = stepIdx;
+        lockupValue = val;
+        samples.push({
+          step: stepIdx,
+          value: val,
+          angle_deg: isRevolute ? (val * 180) / Math.PI : undefined,
+          angle_rad: isRevolute ? val : undefined,
+          interfering_pairs: [],
+          min_clearance: undefined,
+          max_penetration_depth: 0,
+          total_intersection_volume: 0,
+          closure_residual: stepOutcome.residual,
+          locked_up: true,
+        });
+        continue;
+      }
+
+      const stepParts: CadPart[] = parts.map((p) => {
+        const pose = solver.poses.get(p.id);
+        if (!pose || isGround(p.id)) {
+          return p;
+        }
         return {
           ...p,
-          position: newPos,
-          rotation: mat3ToEulerXYZ(newRotMat),
+          position: [...pose.pos] as Vec3,
+          rotation: mat3ToEulerXYZ(pose.rot),
         };
-      } else {
-        const deltaTrans = scale3(axisWorld, val * sign);
-        return {
-          ...p,
-          position: add3(p.position, deltaTrans),
-        };
+      });
+
+      const rep = checkInterference(stepParts, joints, {
+        partIds: options.partIds,
+        ignoreAdjacent,
+      });
+
+      const interferingPairs: [string, string][] = rep.pairs
+        .filter((pr) => pr.intersects)
+        .map((pr) => [pr.a, pr.b]);
+
+      if (interferingPairs.length > 0) {
+        if (firstCollisionStep === undefined) {
+          firstCollisionStep = stepIdx;
+          firstCollisionValue = val;
+          firstCollisionPairs = [...interferingPairs];
+        }
+      } else if (firstCollisionStep === undefined) {
+        if (safeStart === undefined) safeStart = val;
+        safeEnd = val;
       }
-    });
 
-    const rep = checkInterference(stepParts, joints, {
-      partIds: options.partIds,
-      ignoreAdjacent,
-    });
-
-    const interferingPairs: [string, string][] = rep.pairs
-      .filter((pr) => pr.intersects)
-      .map((pr) => [pr.a, pr.b]);
-
-    if (interferingPairs.length > 0) {
-      if (firstCollisionStep === undefined) {
-        firstCollisionStep = stepIdx;
-        firstCollisionValue = val;
-        firstCollisionPairs = [...interferingPairs];
+      if (rep.min_clearance !== undefined && interferingPairs.length === 0) {
+        if (minClearance === undefined || rep.min_clearance < minClearance) {
+          minClearance = rep.min_clearance;
+          minClearanceStep = stepIdx;
+          minClearanceValue = val;
+        }
       }
-    } else if (firstCollisionStep === undefined) {
-      if (safeStart === undefined) safeStart = val;
-      safeEnd = val;
+
+      samples.push({
+        step: stepIdx,
+        value: val,
+        angle_deg: isRevolute ? (val * 180) / Math.PI : undefined,
+        angle_rad: isRevolute ? val : undefined,
+        interfering_pairs: interferingPairs,
+        min_clearance: rep.min_clearance,
+        max_penetration_depth: rep.max_penetration_depth,
+        total_intersection_volume: rep.total_intersection_volume,
+        closure_residual: stepOutcome.residual,
+        locked_up: false,
+      });
     }
-
-    if (rep.min_clearance !== undefined) {
-      if (minClearance === undefined || rep.min_clearance < minClearance) {
-        minClearance = rep.min_clearance;
-        minClearanceStep = stepIdx;
-        minClearanceValue = val;
-      }
-    }
-
-    samples.push({
-      step: stepIdx,
-      value: val,
-      angle_deg: isRevolute ? (val * 180) / Math.PI : undefined,
-      angle_rad: isRevolute ? val : undefined,
-      interfering_pairs: interferingPairs,
-      min_clearance: rep.min_clearance,
-      max_penetration_depth: rep.max_penetration_depth,
-      total_intersection_volume: rep.total_intersection_volume,
-    });
   }
 
+  const lockupDetected = lockupStep !== undefined;
   const safeTravelRange: [number, number] | undefined =
     safeStart !== undefined && safeEnd !== undefined ? [safeStart, safeEnd] : undefined;
   const marginToCollision: number | undefined =
     firstCollisionValue !== undefined ? Math.abs(firstCollisionValue - from) : undefined;
 
   return {
-    status: firstCollisionStep === undefined ? 'PASS' : 'FAIL',
+    status: firstCollisionStep === undefined && !lockupDetected ? 'PASS' : 'FAIL',
     joint_id: jointId,
     joint_type: joint.type,
     from,
@@ -1642,7 +1829,744 @@ export function sweepJoint(
     min_clearance_value: minClearanceValue,
     safe_travel_range: safeTravelRange,
     margin_to_collision: marginToCollision,
+    closed_loop_detected: isClosedLoop,
+    lockup_detected: lockupDetected,
+    lockup_step: lockupStep,
+    lockup_value: lockupValue,
+    lockup_angle_deg:
+      isRevolute && lockupValue !== undefined ? (lockupValue * 180) / Math.PI : undefined,
+    lockup_angle_rad: isRevolute ? lockupValue : undefined,
+    max_closure_residual: maxClosureResidual,
     samples,
+  };
+}
+
+interface PoseTS {
+  pos: Vec3;
+  rot: Mat3;
+}
+
+function mat3ToScaledAxisTS(m: Mat3): Vec3 {
+  const trace = m[0][0] + m[1][1] + m[2][2];
+  let x = 0, y = 0, z = 0, w = 1;
+  if (trace > 0) {
+    const s = Math.sqrt(trace + 1.0) * 2;
+    w = 0.25 * s;
+    x = (m[2][1] - m[1][2]) / s;
+    y = (m[0][2] - m[2][0]) / s;
+    z = (m[1][0] - m[0][1]) / s;
+  } else if (m[0][0] > m[1][1] && m[0][0] > m[2][2]) {
+    const s = Math.sqrt(1.0 + m[0][0] - m[1][1] - m[2][2]) * 2;
+    w = (m[2][1] - m[1][2]) / s;
+    x = 0.25 * s;
+    y = (m[0][1] + m[1][0]) / s;
+    z = (m[0][2] + m[2][0]) / s;
+  } else if (m[1][1] > m[2][2]) {
+    const s = Math.sqrt(1.0 + m[1][1] - m[0][0] - m[2][2]) * 2;
+    w = (m[0][2] - m[2][0]) / s;
+    x = (m[0][1] + m[1][0]) / s;
+    y = 0.25 * s;
+    z = (m[1][2] + m[2][1]) / s;
+  } else {
+    const s = Math.sqrt(1.0 + m[2][2] - m[0][0] - m[1][1]) * 2;
+    w = (m[1][0] - m[0][1]) / s;
+    x = (m[0][2] + m[2][0]) / s;
+    y = (m[1][2] + m[2][1]) / s;
+    z = 0.25 * s;
+  }
+  if (w < 0) {
+    x = -x; y = -y; z = -z; w = -w;
+  }
+  const vNorm = Math.hypot(x, y, z);
+  const theta = 2 * Math.atan2(vNorm, w);
+  const k = vNorm > 1e-12 ? theta / vNorm : 2.0;
+  return [x * k, y * k, z * k];
+}
+
+function solveDampedSvdStepTS(
+  jMat: number[][],
+  phi: number[],
+  rows: number,
+  cols: number,
+  lambdaRatio: number
+): { dx: number[]; sMax: number } {
+  const dx = new Array(cols).fill(0);
+  if (rows === 0 || cols === 0) return { dx, sMax: 1.0 };
+
+  const transpose = rows < cols;
+  // Orthogonalize columns of `matWork` (height `h`, width `w`) and apply same rotations to `orthOther` (`w x w`)
+  const h = transpose ? cols : rows;
+  const w = transpose ? rows : cols;
+
+  const workCols: number[][] = Array.from({ length: w }, (_, j) =>
+    Array.from({ length: h }, (__, i) => (transpose ? jMat[j][i] : jMat[i][j]))
+  );
+  const rightCols: number[][] = Array.from({ length: w }, (_, j) => {
+    const col = new Array(w).fill(0);
+    col[j] = 1;
+    return col;
+  });
+
+  const maxSweeps = 40;
+  for (let sweep = 0; sweep < maxSweeps; sweep++) {
+    let changed = false;
+    for (let p = 0; p < w; p++) {
+      for (let q = p + 1; q < w; q++) {
+        let app = 0, aqq = 0, apq = 0;
+        const up = workCols[p];
+        const uq = workCols[q];
+        for (let i = 0; i < h; i++) {
+          app += up[i] * up[i];
+          aqq += uq[i] * uq[i];
+          apq += up[i] * uq[i];
+        }
+        if (Math.abs(apq) <= 1e-15 * Math.sqrt(Math.max(1e-30, app * aqq))) {
+          continue;
+        }
+        changed = true;
+        const tau = (aqq - app) / (2 * apq);
+        const t =
+          tau >= 0
+            ? 1 / (tau + Math.sqrt(1 + tau * tau))
+            : -1 / (-tau + Math.sqrt(1 + tau * tau));
+        const c = 1 / Math.sqrt(1 + t * t);
+        const s = t * c;
+        for (let i = 0; i < h; i++) {
+          const vip = up[i];
+          const viq = uq[i];
+          up[i] = c * vip - s * viq;
+          uq[i] = s * vip + c * viq;
+        }
+        const vp = rightCols[p];
+        const vq = rightCols[q];
+        for (let i = 0; i < w; i++) {
+          const rrp = vp[i];
+          const rrq = vq[i];
+          vp[i] = c * rrp - s * rrq;
+          vq[i] = s * rrp + c * rrq;
+        }
+      }
+    }
+    if (!changed) break;
+  }
+
+  const sigmas = workCols.map((col) => Math.hypot(...col));
+  let sMax = 0;
+  for (const s of sigmas) if (s > sMax) sMax = s;
+  sMax = Math.max(sMax, 1e-12);
+  const lambda = Math.max(lambdaRatio * sMax, 1e-12);
+
+  for (let k = 0; k < w; k++) {
+    const s = sigmas[k];
+    const denom = s * s + lambda * lambda;
+    if (denom <= 0) continue;
+    if (!transpose) {
+      let uDotPhi = 0;
+      const uk = workCols[k];
+      for (let i = 0; i < rows; i++) uDotPhi += uk[i] * phi[i];
+      const coeff = -uDotPhi / denom;
+      const vk = rightCols[k];
+      for (let j = 0; j < cols; j++) dx[j] += coeff * vk[j];
+    } else {
+      let uDotPhi = 0;
+      const uk = rightCols[k];
+      for (let i = 0; i < rows; i++) uDotPhi += uk[i] * phi[i];
+      const coeff = -uDotPhi / denom;
+      const vk = workCols[k];
+      for (let j = 0; j < cols; j++) dx[j] += coeff * vk[j];
+    }
+  }
+
+  return { dx, sMax };
+}
+
+function createClosedLoopSolverTS(
+  parts: CadPart[],
+  joints: KinematicJoint[],
+  drivenJoint: KinematicJoint,
+  referenceId: string,
+  drivenId: string,
+  sign: number,
+  anchorRef: Vec3,
+  anchorDriven: Vec3,
+  axisLocalRef: Vec3,
+  freeParts: string[],
+  drivenAsConstraint: boolean,
+  isGround: (id: string) => boolean
+) {
+  const partMap = new Map<string, CadPart>();
+  for (const p of parts) partMap.set(p.id, p);
+
+  const getInitPose = (pid: string): PoseTS => {
+    const p = partMap.get(pid);
+    if (!p || pid.toLowerCase() === 'ground' || pid.toLowerCase() === 'world') {
+      return {
+        pos: [0, 0, 0],
+        rot: [
+          [1, 0, 0],
+          [0, 1, 0],
+          [0, 0, 1],
+        ],
+      };
+    }
+    return { pos: [...p.position] as Vec3, rot: eulerToMat3(p.rotation) };
+  };
+
+  const poses = new Map<string, PoseTS>();
+  const freeSet = new Set(freeParts);
+  const freeIndex = new Map<string, number>();
+  freeParts.forEach((id, i) => freeIndex.set(id, i));
+
+  interface LoopEntryTS {
+    joint: KinematicJoint;
+    initRelRot: Mat3;
+    initCoord?: number;
+    isDrivenConstraint: boolean;
+    gearThetaA: number;
+    gearThetaB: number;
+  }
+
+  const activeJoints: LoopEntryTS[] = [];
+  const scalePoints: Vec3[] = [];
+  const sortedJoints = joints.slice().sort((a, b) => a.id.localeCompare(b.id));
+
+  for (const j of sortedJoints) {
+    const isDriven = j.id === drivenJoint.id;
+    if (isDriven && !drivenAsConstraint) continue;
+    const touchesFree = freeSet.has(j.partA) || freeSet.has(j.partB);
+    const touchesDrivenOnly =
+      freeParts.length === 0 && !isDriven && (j.partA === drivenId || j.partB === drivenId);
+    if (!touchesFree && !touchesDrivenOnly && !isDriven) continue;
+
+    if (!poses.has(j.partA)) poses.set(j.partA, getInitPose(j.partA));
+    if (!poses.has(j.partB)) poses.set(j.partB, getInitPose(j.partB));
+    const pa = poses.get(j.partA)!;
+    const pb = poses.get(j.partB)!;
+    scalePoints.push(add3(pa.pos, mat3Vec3(pa.rot, j.anchor || [0, 0, 0])));
+    scalePoints.push(add3(pb.pos, mat3Vec3(pb.rot, j.anchorB ?? [0, 0, 0])));
+
+    const initRelRot = mat3Mul(transpose3(pa.rot), pb.rot);
+    let initCoord: number | undefined = undefined;
+    if (j.type === 'revolute') {
+      const [xLoc, yLoc] = orthonormalBasis(j.axis || [0, 0, 1]);
+      const rotX = mat3Vec3(initRelRot, xLoc);
+      initCoord = Math.atan2(dot3(yLoc, rotX), dot3(xLoc, rotX));
+    } else if (j.type === 'prismatic') {
+      const zA = mat3Vec3(pa.rot, normalizeOrDefault3(j.axis || [1, 0, 0], [1, 0, 0]));
+      const pAW = add3(pa.pos, mat3Vec3(pa.rot, j.anchor || [0, 0, 0]));
+      const pBW = add3(pb.pos, mat3Vec3(pb.rot, j.anchorB ?? [0, 0, 0]));
+      initCoord = dot3(sub3(pBW, pAW), zA);
+    }
+
+    activeJoints.push({
+      joint: j,
+      initRelRot,
+      initCoord,
+      isDrivenConstraint: isDriven,
+      gearThetaA: 0,
+      gearThetaB: 0,
+    });
+  }
+
+  if (!poses.has(referenceId)) poses.set(referenceId, getInitPose(referenceId));
+  if (!poses.has(drivenId)) poses.set(drivenId, getInitPose(drivenId));
+  const ref0 = poses.get(referenceId)!;
+  const drv0 = poses.get(drivenId)!;
+  scalePoints.push(add3(ref0.pos, mat3Vec3(ref0.rot, anchorRef)));
+  scalePoints.push(add3(drv0.pos, mat3Vec3(drv0.rot, anchorDriven)));
+
+  let maxSpan = 0;
+  for (let i = 0; i < scalePoints.length; i++) {
+    for (let j = i + 1; j < scalePoints.length; j++) {
+      const d = norm3(sub3(scalePoints[i], scalePoints[j]));
+      if (d > maxSpan) maxSpan = d;
+    }
+  }
+  const charLen = maxSpan > 1e-6 ? Math.min(100, Math.max(1e-3, maxSpan)) : 0.1;
+  const posTol = Math.min(5e-4, Math.max(2e-5, charLen * 1e-3));
+  const rotTol = 1e-3;
+  const pivotWorld = add3(ref0.pos, mat3Vec3(ref0.rot, anchorRef));
+  const worldAxis = normalize3(mat3Vec3(ref0.rot, axisLocalRef));
+  const isRevolute = drivenJoint.type === 'revolute';
+
+  let currentQ = 0;
+  let lastFailedResidual = 0;
+
+  const drivenWorldPose = (qVal: number): PoseTS => {
+    const qEff = qVal * sign;
+    if (isRevolute) {
+      const deltaRot = axisAngleToMat3(worldAxis, qEff);
+      const rk = mat3Mul(deltaRot, drv0.rot);
+      const pk = sub3(pivotWorld, mat3Vec3(rk, anchorDriven));
+      return { pos: pk, rot: rk };
+    } else {
+      const rk = drv0.rot;
+      const pk = add3(
+        sub3(pivotWorld, mat3Vec3(rk, anchorDriven)),
+        scale3(worldAxis, qEff)
+      );
+      return { pos: pk, rot: rk };
+    }
+  };
+
+  const clonePoses = (src: Map<string, PoseTS>): Map<string, PoseTS> => {
+    const dst = new Map<string, PoseTS>();
+    for (const [k, v] of src.entries()) {
+      dst.set(k, {
+        pos: [...v.pos] as Vec3,
+        rot: [
+          [...v.rot[0]] as Vec3,
+          [...v.rot[1]] as Vec3,
+          [...v.rot[2]] as Vec3,
+        ],
+      });
+    }
+    return dst;
+  };
+
+  const totalRows = activeJoints.reduce(
+    (acc, e) => acc + (e.isDrivenConstraint ? 6 : effectiveJointConstraintCount(e.joint)),
+    0
+  );
+  const totalCols = 6 * freeParts.length;
+  const eBasis: Vec3[] = [
+    [1, 0, 0],
+    [0, 1, 0],
+    [0, 0, 1],
+  ];
+
+  const evaluateSystem = (
+    qVal: number,
+    curPoses: Map<string, PoseTS>,
+    basePoses: Map<string, PoseTS>,
+    baseGears: [number, number][],
+    buildJac: boolean
+  ) => {
+    const phiPhys = new Array(totalRows).fill(0);
+    const phiScaled = new Array(totalRows).fill(0);
+    const jMat: number[][] | null = buildJac
+      ? Array.from({ length: totalRows }, () => new Array(totalCols).fill(0))
+      : null;
+
+    const addVec = (r: number, colIdx: number | undefined, isRot: boolean, v: Vec3) => {
+      if (!jMat || colIdx === undefined) return;
+      const base = 6 * colIdx + (isRot ? 3 : 0);
+      jMat[r][base] += v[0];
+      jMat[r][base + 1] += v[1];
+      jMat[r][base + 2] += v[2];
+    };
+
+    const scaleJacRows = (startR: number, endR: number, factor: number) => {
+      if (!jMat) return;
+      for (let r = startR; r < endR; r++) {
+        for (let c = 0; c < totalCols; c++) jMat[r][c] *= factor;
+      }
+    };
+
+    const invLen = 1.0 / charLen;
+    let maxPosErr = 0;
+    let maxRotErr = 0;
+    let row = 0;
+
+    for (let jIdx = 0; jIdx < activeJoints.length; jIdx++) {
+      const entry = activeJoints[jIdx];
+      if (entry.isDrivenConstraint) {
+        const pa = curPoses.get(referenceId)!;
+        const pb = curPoses.get(drivenId)!;
+        const colA = freeIndex.get(referenceId);
+        const colB = freeIndex.get(drivenId);
+        const qEff = qVal * sign;
+        const sLoc: Vec3 = isRevolute ? [0, 0, 0] : scale3(axisLocalRef, qEff);
+        const effAnchorA = add3(anchorRef, sLoc);
+        const rA = add3(pa.pos, mat3Vec3(pa.rot, effAnchorA));
+        const rB = add3(pb.pos, mat3Vec3(pb.rot, anchorDriven));
+        const dp = sub3(rA, rB);
+
+        const rel0 = mat3Mul(transpose3(ref0.rot), drv0.rot);
+        const targetRel = isRevolute
+          ? mat3Mul(axisAngleToMat3(axisLocalRef, qEff), rel0)
+          : rel0;
+        const rErr = mat3Mul(pb.rot, transpose3(mat3Mul(pa.rot, targetRel)));
+        const drot = mat3ToScaledAxisTS(rErr);
+
+        for (let k = 0; k < 3; k++) {
+          maxPosErr = Math.max(maxPosErr, Math.abs(dp[k]));
+          maxRotErr = Math.max(maxRotErr, Math.abs(drot[k]));
+          phiPhys[row + k] = dp[k];
+          phiScaled[row + k] = dp[k] * invLen;
+          phiPhys[row + 3 + k] = drot[k];
+          phiScaled[row + 3 + k] = drot[k];
+        }
+        if (jMat) {
+          const dA = mat3Vec3(pa.rot, effAnchorA);
+          const dB = mat3Vec3(pb.rot, anchorDriven);
+          for (let k = 0; k < 3; k++) {
+            const ek = eBasis[k];
+            addVec(row + k, colA, false, ek);
+            addVec(row + k, colA, true, cross3(dA, ek));
+            addVec(row + k, colB, false, scale3(ek, -1));
+            addVec(row + k, colB, true, scale3(cross3(dB, ek), -1));
+            addVec(row + 3 + k, colA, true, scale3(ek, -1));
+            addVec(row + 3 + k, colB, true, ek);
+          }
+          scaleJacRows(row, row + 3, invLen);
+        }
+        row += 6;
+        continue;
+      }
+
+      const j = entry.joint;
+      const pa = curPoses.get(j.partA)!;
+      const pb = curPoses.get(j.partB)!;
+      const colA = freeIndex.get(j.partA);
+      const colB = freeIndex.get(j.partB);
+      const anchorA: Vec3 = j.anchor || [0, 0, 0];
+      const anchorB: Vec3 = j.anchorB ?? [0, 0, 0];
+      const dA = mat3Vec3(pa.rot, anchorA);
+      const dB = mat3Vec3(pb.rot, anchorB);
+
+      if (j.type === 'fixed') {
+        const dp = sub3(add3(pa.pos, dA), add3(pb.pos, dB));
+        const drot = mat3ToScaledAxisTS(
+          mat3Mul(pb.rot, transpose3(mat3Mul(pa.rot, entry.initRelRot)))
+        );
+        for (let k = 0; k < 3; k++) {
+          maxPosErr = Math.max(maxPosErr, Math.abs(dp[k]));
+          maxRotErr = Math.max(maxRotErr, Math.abs(drot[k]));
+          phiPhys[row + k] = dp[k];
+          phiScaled[row + k] = dp[k] * invLen;
+          phiPhys[row + 3 + k] = drot[k];
+          phiScaled[row + 3 + k] = drot[k];
+        }
+        if (jMat) {
+          for (let k = 0; k < 3; k++) {
+            const ek = eBasis[k];
+            addVec(row + k, colA, false, ek);
+            addVec(row + k, colA, true, cross3(dA, ek));
+            addVec(row + k, colB, false, scale3(ek, -1));
+            addVec(row + k, colB, true, scale3(cross3(dB, ek), -1));
+            addVec(row + 3 + k, colA, true, scale3(ek, -1));
+            addVec(row + 3 + k, colB, true, ek);
+          }
+          scaleJacRows(row, row + 3, invLen);
+        }
+        row += 6;
+      } else if (j.type === 'spherical') {
+        const dp = sub3(add3(pa.pos, dA), add3(pb.pos, dB));
+        for (let k = 0; k < 3; k++) {
+          maxPosErr = Math.max(maxPosErr, Math.abs(dp[k]));
+          phiPhys[row + k] = dp[k];
+          phiScaled[row + k] = dp[k] * invLen;
+        }
+        if (jMat) {
+          for (let k = 0; k < 3; k++) {
+            const ek = eBasis[k];
+            addVec(row + k, colA, false, ek);
+            addVec(row + k, colA, true, cross3(dA, ek));
+            addVec(row + k, colB, false, scale3(ek, -1));
+            addVec(row + k, colB, true, scale3(cross3(dB, ek), -1));
+          }
+          scaleJacRows(row, row + 3, invLen);
+        }
+        row += 3;
+      } else if (j.type === 'revolute') {
+        const dp = sub3(add3(pa.pos, dA), add3(pb.pos, dB));
+        for (let k = 0; k < 3; k++) {
+          maxPosErr = Math.max(maxPosErr, Math.abs(dp[k]));
+          phiPhys[row + k] = dp[k];
+          phiScaled[row + k] = dp[k] * invLen;
+        }
+        const uA = normalizeOrDefault3(j.axis || [0, 0, 1], [0, 0, 1]);
+        const zA = mat3Vec3(pa.rot, uA);
+        const [xA, yA] = orthonormalBasis(zA);
+        const zB = mat3Vec3(pb.rot, uA);
+        const r3 = -dot3(yA, zB);
+        const r4 = dot3(xA, zB);
+        const axErr = Math.atan2(norm3(cross3(zA, zB)), dot3(zA, zB));
+        maxRotErr = Math.max(maxRotErr, axErr);
+        phiPhys[row + 3] = r3;
+        phiScaled[row + 3] = r3;
+        phiPhys[row + 4] = r4;
+        phiScaled[row + 4] = r4;
+
+        const hasZero = isZeroRangeLimits(j.limits);
+        if (hasZero) {
+          const [xLoc, yLoc] = orthonormalBasis(uA);
+          const rRel = mat3Mul(transpose3(pa.rot), pb.rot);
+          const rotX = mat3Vec3(rRel, xLoc);
+          const cur = Math.atan2(dot3(yLoc, rotX), dot3(xLoc, rotX));
+          const target = j.limits ? j.limits[0] : (entry.initCoord ?? 0);
+          const diff = (((cur - target + Math.PI) % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI) - Math.PI;
+          maxRotErr = Math.max(maxRotErr, Math.abs(diff));
+          phiPhys[row + 5] = diff;
+          phiScaled[row + 5] = diff;
+        }
+        if (jMat) {
+          for (let k = 0; k < 3; k++) {
+            const ek = eBasis[k];
+            addVec(row + k, colA, false, ek);
+            addVec(row + k, colA, true, cross3(dA, ek));
+            addVec(row + k, colB, false, scale3(ek, -1));
+            addVec(row + k, colB, true, scale3(cross3(dB, ek), -1));
+          }
+          addVec(row + 3, colA, true, scale3(xA, -1));
+          addVec(row + 3, colB, true, xA);
+          addVec(row + 4, colA, true, scale3(yA, -1));
+          addVec(row + 4, colB, true, yA);
+          if (hasZero) {
+            addVec(row + 5, colA, true, scale3(zA, -1));
+            addVec(row + 5, colB, true, zA);
+          }
+          scaleJacRows(row, row + 3, invLen);
+        }
+        row += hasZero ? 6 : 5;
+      } else if (j.type === 'prismatic') {
+        const uA = normalizeOrDefault3(j.axis || [1, 0, 0], [1, 0, 0]);
+        const zA = mat3Vec3(pa.rot, uA);
+        const [xA, yA] = orthonormalBasis(zA);
+        const drot = mat3ToScaledAxisTS(
+          mat3Mul(pb.rot, transpose3(mat3Mul(pa.rot, entry.initRelRot)))
+        );
+        for (let k = 0; k < 3; k++) {
+          maxRotErr = Math.max(maxRotErr, Math.abs(drot[k]));
+          phiPhys[row + k] = drot[k];
+          phiScaled[row + k] = drot[k];
+        }
+        const rA = add3(pa.pos, dA);
+        const rB = add3(pb.pos, dB);
+        const deltaR = sub3(rB, rA);
+        const p3 = dot3(xA, deltaR);
+        const p4 = dot3(yA, deltaR);
+        maxPosErr = Math.max(maxPosErr, Math.abs(p3), Math.abs(p4));
+        phiPhys[row + 3] = p3;
+        phiScaled[row + 3] = p3 * invLen;
+        phiPhys[row + 4] = p4;
+        phiScaled[row + 4] = p4 * invLen;
+
+        const hasZero = isZeroRangeLimits(j.limits);
+        if (hasZero) {
+          const target = j.limits ? j.limits[0] : (entry.initCoord ?? 0);
+          const p5 = dot3(deltaR, zA) - target;
+          maxPosErr = Math.max(maxPosErr, Math.abs(p5));
+          phiPhys[row + 5] = p5;
+          phiScaled[row + 5] = p5 * invLen;
+        }
+        if (jMat) {
+          for (let k = 0; k < 3; k++) {
+            const ek = eBasis[k];
+            addVec(row + k, colA, true, scale3(ek, -1));
+            addVec(row + k, colB, true, ek);
+          }
+          const relBFromA = sub3(rB, pa.pos);
+          addVec(row + 3, colA, false, scale3(xA, -1));
+          addVec(row + 3, colA, true, cross3(xA, relBFromA));
+          addVec(row + 3, colB, false, xA);
+          addVec(row + 3, colB, true, cross3(dB, xA));
+          addVec(row + 4, colA, false, scale3(yA, -1));
+          addVec(row + 4, colA, true, cross3(yA, relBFromA));
+          addVec(row + 4, colB, false, yA);
+          addVec(row + 4, colB, true, cross3(dB, yA));
+          if (hasZero) {
+            addVec(row + 5, colA, false, scale3(zA, -1));
+            addVec(row + 5, colA, true, cross3(zA, relBFromA));
+            addVec(row + 5, colB, false, zA);
+            addVec(row + 5, colB, true, cross3(dB, zA));
+          }
+          scaleJacRows(row + 3, hasZero ? row + 6 : row + 5, invLen);
+        }
+        row += hasZero ? 6 : 5;
+      } else if (j.type === 'gear') {
+        const ratio = j.gearRatio ?? 1.0;
+        const uA = normalizeOrDefault3(j.axis || [0, 0, 1], [0, 0, 1]);
+        const uB = normalizeOrDefault3(j.axis || [0, 0, 1], [0, 0, 1]);
+        const paBase = basePoses.get(j.partA)!;
+        const pbBase = basePoses.get(j.partB)!;
+        const dta = dot3(
+          mat3ToScaledAxisTS(mat3Mul(pa.rot, transpose3(paBase.rot))),
+          mat3Vec3(paBase.rot, uA)
+        );
+        const dtb = dot3(
+          mat3ToScaledAxisTS(mat3Mul(pb.rot, transpose3(pbBase.rot))),
+          mat3Vec3(pbBase.rot, uB)
+        );
+        const r0 = ratio * (baseGears[jIdx][0] + dta) + (baseGears[jIdx][1] + dtb);
+        maxRotErr = Math.max(maxRotErr, Math.abs(r0));
+        phiPhys[row] = r0;
+        phiScaled[row] = r0;
+        if (jMat) {
+          addVec(row, colA, true, scale3(mat3Vec3(pa.rot, uA), ratio));
+          addVec(row, colB, true, mat3Vec3(pb.rot, uB));
+        }
+        row += 1;
+      }
+    }
+
+    if (jMat) {
+      for (let idx = 0; idx < freeParts.length; idx++) {
+        const baseCol = 6 * idx;
+        for (let c = 0; c < 3; c++) {
+          for (let r = 0; r < totalRows; r++) {
+            jMat[r][baseCol + c] *= charLen;
+          }
+        }
+      }
+    }
+
+    let physNorm = 0;
+    let scaledNorm = 0;
+    for (let i = 0; i < totalRows; i++) {
+      physNorm += phiPhys[i] * phiPhys[i];
+      scaledNorm += phiScaled[i] * phiScaled[i];
+    }
+    return {
+      phiScaled,
+      physNorm: Math.sqrt(physNorm),
+      scaledNorm: Math.sqrt(scaledNorm),
+      maxPosErr,
+      maxRotErr,
+      jMat,
+    };
+  };
+
+  const commitGears = (basePoses: Map<string, PoseTS>, baseGears: [number, number][]) => {
+    for (let i = 0; i < activeJoints.length; i++) {
+      const entry = activeJoints[i];
+      if (entry.joint.type === 'gear') {
+        const uA = normalizeOrDefault3(entry.joint.axis || [0, 0, 1], [0, 0, 1]);
+        const paCur = poses.get(entry.joint.partA)!;
+        const pbCur = poses.get(entry.joint.partB)!;
+        const paBase = basePoses.get(entry.joint.partA)!;
+        const pbBase = basePoses.get(entry.joint.partB)!;
+        const dta = dot3(
+          mat3ToScaledAxisTS(mat3Mul(paCur.rot, transpose3(paBase.rot))),
+          mat3Vec3(paBase.rot, uA)
+        );
+        const dtb = dot3(
+          mat3ToScaledAxisTS(mat3Mul(pbCur.rot, transpose3(pbBase.rot))),
+          mat3Vec3(pbBase.rot, uA)
+        );
+        entry.gearThetaA = baseGears[i][0] + dta;
+        entry.gearThetaB = baseGears[i][1] + dtb;
+      }
+    }
+  };
+
+  const solveSingleQ = (qVal: number): { ok: boolean; residual: number } => {
+    const basePoses = clonePoses(poses);
+    const baseGears: [number, number][] = activeJoints.map((e) => [e.gearThetaA, e.gearThetaB]);
+
+    if (!drivenAsConstraint) {
+      poses.set(drivenId, drivenWorldPose(qVal));
+    }
+    if (totalRows === 0) return { ok: true, residual: 0 };
+
+    if (freeParts.length === 0) {
+      const ev = evaluateSystem(qVal, poses, basePoses, baseGears, false);
+      if (ev.maxPosErr <= posTol && ev.maxRotErr <= rotTol) {
+        return { ok: true, residual: ev.physNorm };
+      }
+      return { ok: false, residual: ev.physNorm };
+    }
+
+    let lambdaFactor = 1e-9;
+    const maxIters = 50;
+
+    for (let iter = 0; iter < maxIters; iter++) {
+      const ev = evaluateSystem(qVal, poses, basePoses, baseGears, true);
+      if (ev.maxPosErr <= posTol && ev.maxRotErr <= rotTol && ev.scaledNorm <= 1e-4) {
+        commitGears(basePoses, baseGears);
+        return { ok: true, residual: ev.physNorm };
+      }
+
+      let accepted = false;
+      let tryLambda = lambdaFactor;
+      for (let dampTry = 0; dampTry < 7; dampTry++) {
+        const { dx } = solveDampedSvdStepTS(
+          ev.jMat!,
+          ev.phiScaled,
+          totalRows,
+          totalCols,
+          tryLambda
+        );
+        let stepNorm = 0;
+        for (const v of dx) stepNorm += v * v;
+        stepNorm = Math.sqrt(stepNorm);
+        if (stepNorm > 0.5) {
+          const s = 0.5 / stepNorm;
+          for (let i = 0; i < dx.length; i++) dx[i] *= s;
+        }
+
+        for (const alpha of [1.0, 0.5, 0.25]) {
+          const trialPoses = clonePoses(poses);
+          for (let idx = 0; idx < freeParts.length; idx++) {
+            const pid = freeParts[idx];
+            const base = 6 * idx;
+            const pose = trialPoses.get(pid);
+            if (!pose) continue;
+            pose.pos[0] += dx[base] * charLen * alpha;
+            pose.pos[1] += dx[base + 1] * charLen * alpha;
+            pose.pos[2] += dx[base + 2] * charLen * alpha;
+            const dth: Vec3 = [
+              dx[base + 3] * alpha,
+              dx[base + 4] * alpha,
+              dx[base + 5] * alpha,
+            ];
+            const ang = norm3(dth);
+            if (ang > 1e-14) {
+              pose.rot = mat3Mul(axisAngleToMat3(dth, ang), pose.rot);
+            }
+          }
+
+          const trialEv = evaluateSystem(qVal, trialPoses, basePoses, baseGears, false);
+          if (trialEv.scaledNorm < ev.scaledNorm - 1e-14) {
+            for (const [k, v] of trialPoses.entries()) poses.set(k, v);
+            lambdaFactor = Math.max(1e-11, Math.min(100, tryLambda * 0.3));
+            accepted = true;
+            break;
+          }
+        }
+        if (accepted) break;
+        tryLambda *= 10.0;
+      }
+      if (!accepted) break;
+    }
+
+    const finalEv = evaluateSystem(qVal, poses, basePoses, baseGears, false);
+    if (finalEv.maxPosErr <= posTol && finalEv.maxRotErr <= rotTol) {
+      commitGears(basePoses, baseGears);
+      return { ok: true, residual: finalEv.physNorm };
+    }
+    const restored = clonePoses(basePoses);
+    for (const [k, v] of restored.entries()) poses.set(k, v);
+    return { ok: false, residual: finalEv.physNorm };
+  };
+
+  return {
+    poses,
+    get lastFailedResidual() {
+      return lastFailedResidual;
+    },
+    advanceTo(qTarget: number): { ok: boolean; residual: number } {
+      const dqTotal = qTarget - currentQ;
+      if (Math.abs(dqTotal) <= 1e-12 && Math.abs(currentQ) <= 1e-12) {
+        return solveSingleQ(qTarget);
+      }
+      const maxSub = isRevolute ? (3.0 * Math.PI) / 180 : Math.max(1e-4, charLen * 0.05);
+      const nSub = Math.min(2000, Math.max(1, Math.ceil(Math.abs(dqTotal) / maxSub)));
+      const qStart = currentQ;
+      let lastRes = 0;
+      for (let s = 1; s <= nSub; s++) {
+        const qSub = qStart + (dqTotal * s) / nSub;
+        const res = solveSingleQ(qSub);
+        if (!res.ok) {
+          lastFailedResidual = res.residual;
+          return res;
+        }
+        currentQ = qSub;
+        lastRes = res.residual;
+      }
+      return { ok: true, residual: lastRes };
+    },
   };
 }
 

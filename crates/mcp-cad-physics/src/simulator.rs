@@ -13,7 +13,7 @@ use rapier3d::prelude::*;
 use crate::error::PhysicsError;
 use crate::joint::{
     CadJointType, JointLimitStatus, MechanismAnalysisReport, MotorConfig, is_zero_range_limits,
-    quat_to_matrix,
+    local_orthonormal_basis, perpendicular_axes, quat_to_matrix,
 };
 use crate::rigid_body::{ColliderType, create_collider_builder, create_rigid_body_builder};
 use crate::telemetry::{
@@ -2633,6 +2633,34 @@ impl PhysicsWorld {
             }
         }
 
+        // Detect whether the swept joint belongs to a closed kinematic loop (`P3-T16`).
+        let mut m_drv_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        m_drv_set.insert(driven_part_id.clone());
+        for dp in &downstream_parts {
+            m_drv_set.insert(dp.clone());
+        }
+        let mut touches_boundary = 0usize;
+        let mut touches_external_or_ground = false;
+        let mut internal_joints_count = 0usize;
+        for (jid, jrec) in &sim_world.joints {
+            if jid == joint_id {
+                continue;
+            }
+            let a_in = m_drv_set.contains(&jrec.part_a);
+            let b_in = m_drv_set.contains(&jrec.part_b);
+            if a_in && b_in {
+                internal_joints_count += 1;
+            } else if a_in != b_in {
+                touches_boundary += 1;
+                let other = if a_in { &jrec.part_b } else { &jrec.part_a };
+                if other != &reference_part_id {
+                    touches_external_or_ground = true;
+                }
+            }
+        }
+        let is_closed_loop =
+            touches_boundary > 0 || internal_joints_count > m_drv_set.len().saturating_sub(1);
+
         let (pos_ref_0, rot_ref_0) = sim_world.get_world_pose_vectors(&reference_part_id);
         let (pos_drv_0, rot_drv_0) = sim_world.get_world_pose_vectors(&driven_part_id);
         let rot_drv_0_inv = rot_drv_0.transpose();
@@ -2662,95 +2690,268 @@ impl PhysicsWorld {
         let mut min_clearance: Option<f64> = None;
         let mut min_clearance_step: Option<usize> = None;
         let mut min_clearance_value: Option<f64> = None;
+        let mut lockup_step: Option<usize> = None;
+        let mut lockup_value: Option<f64> = None;
+        let mut max_closure_residual = 0.0_f64;
 
-        for step_idx in 0..=steps {
-            let alpha = (step_idx as f64) / (steps as f64);
-            let q_val = from + alpha * (to - from);
+        if !is_closed_loop {
+            for step_idx in 0..=steps {
+                let alpha = (step_idx as f64) / (steps as f64);
+                let q_val = from + alpha * (to - from);
 
-            let (rot_drv_k, pos_drv_k) = if is_revolute {
-                let delta_rot =
-                    nalgebra::Rotation3::from_axis_angle(&world_axis, q_val).into_inner();
-                let rk = delta_rot * rot_drv_0;
-                let pk = pivot_world - rk * anchor_driven;
-                (rk, pk)
+                let (rot_drv_k, pos_drv_k) = if is_revolute {
+                    let delta_rot =
+                        nalgebra::Rotation3::from_axis_angle(&world_axis, q_val).into_inner();
+                    let rk = delta_rot * rot_drv_0;
+                    let pk = pivot_world - rk * anchor_driven;
+                    (rk, pk)
+                } else {
+                    let rk = rot_drv_0;
+                    let pk =
+                        pivot_world - rk * anchor_driven + world_axis.into_inner() * q_val;
+                    (rk, pk)
+                };
+
+                let quat_drv_k = mat_to_quat_arr(&rot_drv_k);
+                let _ = sim_world.set_part_pose(
+                    &driven_part_id,
+                    [pos_drv_k.x, pos_drv_k.y, pos_drv_k.z],
+                    quat_drv_k,
+                );
+
+                // Update any downstream parts rigidly relative to driven_part_id
+                let rel_rot = rot_drv_k * rot_drv_0_inv;
+                for (d_id, p0, r0) in &downstream_initial_poses {
+                    let rk = rel_rot * r0;
+                    let pk = pos_drv_k + rel_rot * (p0 - pos_drv_0);
+                    let qk = mat_to_quat_arr(&rk);
+                    let _ = sim_world.set_part_pose(d_id, [pk.x, pk.y, pk.z], qk);
+                }
+
+                let step_report = sim_world.check_interference_with_parts(
+                    None,
+                    ignore_adjacent,
+                    None,
+                    scene_parts,
+                )?;
+
+                let step_interfering: Vec<PairInterferenceResult> = step_report
+                    .pairs
+                    .iter()
+                    .filter(|p| p.intersects)
+                    .cloned()
+                    .collect();
+                let intersects = !step_interfering.is_empty();
+
+                if intersects && first_collision_step.is_none() {
+                    first_collision_step = Some(step_idx);
+                    first_collision_value = Some(q_val);
+                    first_collision_pairs = step_interfering.clone();
+                }
+
+                if !intersects {
+                    if let Some(clr) = step_report.min_clearance {
+                        let is_smaller = match min_clearance {
+                            None => true,
+                            Some(prev) => clr < prev,
+                        };
+                        if is_smaller {
+                            min_clearance = Some(clr);
+                            min_clearance_step = Some(step_idx);
+                            min_clearance_value = Some(q_val);
+                        }
+                    }
+                }
+
+                samples.push(SweepStepResult {
+                    step_index: step_idx,
+                    value: q_val,
+                    intersects,
+                    interfering_pairs_count: step_interfering.len(),
+                    min_clearance: if intersects {
+                        Some(0.0)
+                    } else {
+                        step_report.min_clearance
+                    },
+                    max_penetration_depth: step_report.max_penetration_depth,
+                    max_intersection_volume: step_report.max_intersection_volume,
+                    interfering_pairs: step_interfering,
+                    closure_residual: 0.0,
+                    locked_up: false,
+                });
+            }
+        } else {
+            // Closed-loop iterative constraint solver (`P3-T16`)
+            let ref_is_fixed = is_fixed_or_ground(&reference_part_id, &sim_world);
+            let include_ref_as_free = !ref_is_fixed && touches_external_or_ground;
+
+            let mut free_parts: Vec<String> = if include_ref_as_free {
+                let mut visited = std::collections::HashSet::new();
+                let mut queue = std::collections::VecDeque::new();
+                let mut list = Vec::new();
+                for start in [&reference_part_id, &driven_part_id] {
+                    if !is_fixed_or_ground(start, &sim_world) && visited.insert(start.clone()) {
+                        list.push(start.clone());
+                        queue.push_back(start.clone());
+                    }
+                }
+                while let Some(curr) = queue.pop_front() {
+                    for jrec in sim_world.joints.values() {
+                        let next_opt = if jrec.part_a == curr {
+                            Some(&jrec.part_b)
+                        } else if jrec.part_b == curr {
+                            Some(&jrec.part_a)
+                        } else {
+                            None
+                        };
+                        if let Some(next_id) = next_opt {
+                            if !is_fixed_or_ground(next_id, &sim_world)
+                                && visited.insert(next_id.clone())
+                            {
+                                list.push(next_id.clone());
+                                queue.push_back(next_id.clone());
+                            }
+                        }
+                    }
+                }
+                list
             } else {
-                let rk = rot_drv_0;
-                let pk =
-                    pivot_world - rk * anchor_driven + world_axis.into_inner() * q_val;
-                (rk, pk)
+                downstream_parts.clone()
             };
+            free_parts.sort();
 
-            let quat_drv_k = mat_to_quat_arr(&rot_drv_k);
-            let _ = sim_world.set_part_pose(
+            let mut solver_ctx = ClosedLoopSolver::new(
+                &sim_world,
+                joint_id,
+                &reference_part_id,
                 &driven_part_id,
-                [pos_drv_k.x, pos_drv_k.y, pos_drv_k.z],
-                quat_drv_k,
+                is_revolute,
+                anchor_ref,
+                anchor_driven,
+                axis_vec.normalize(),
+                pos_ref_0,
+                rot_ref_0,
+                pos_drv_0,
+                rot_drv_0,
+                free_parts,
+                include_ref_as_free,
             );
 
-            // Update any downstream parts rigidly relative to driven_part_id
-            let rel_rot = rot_drv_k * rot_drv_0_inv;
-            for (d_id, p0, r0) in &downstream_initial_poses {
-                let rk = rel_rot * r0;
-                let pk = pos_drv_k + rel_rot * (p0 - pos_drv_0);
-                let qk = mat_to_quat_arr(&rk);
-                let _ = sim_world.set_part_pose(d_id, [pk.x, pk.y, pk.z], qk);
-            }
+            for step_idx in 0..=steps {
+                let alpha = (step_idx as f64) / (steps as f64);
+                let q_val = from + alpha * (to - from);
 
-            let step_report = sim_world.check_interference_with_parts(
-                None,
-                ignore_adjacent,
-                None,
-                scene_parts,
-            )?;
+                if lockup_step.is_some() {
+                    // Once locked up along the monotonic sweep, subsequent steps remain unreachable.
+                    let residual = solver_ctx.last_failed_residual;
+                    samples.push(SweepStepResult {
+                        step_index: step_idx,
+                        value: q_val,
+                        intersects: false,
+                        interfering_pairs_count: 0,
+                        min_clearance: None,
+                        max_penetration_depth: 0.0,
+                        max_intersection_volume: 0.0,
+                        interfering_pairs: Vec::new(),
+                        closure_residual: residual,
+                        locked_up: true,
+                    });
+                    continue;
+                }
 
-            let step_interfering: Vec<PairInterferenceResult> = step_report
-                .pairs
-                .iter()
-                .filter(|p| p.intersects)
-                .cloned()
-                .collect();
-            let intersects = !step_interfering.is_empty();
+                match solver_ctx.advance_to(q_val) {
+                    Ok(residual) => {
+                        if residual > max_closure_residual {
+                            max_closure_residual = residual;
+                        }
+                        for (pid, (pk, rk)) in &solver_ctx.poses {
+                            if !is_fixed_or_ground(pid, &sim_world) {
+                                let qk = mat_to_quat_arr(rk);
+                                let _ = sim_world.set_part_pose(pid, [pk.x, pk.y, pk.z], qk);
+                            }
+                        }
 
-            if intersects && first_collision_step.is_none() {
-                first_collision_step = Some(step_idx);
-                first_collision_value = Some(q_val);
-                first_collision_pairs = step_interfering.clone();
-            }
+                        let step_report = sim_world.check_interference_with_parts(
+                            None,
+                            ignore_adjacent,
+                            None,
+                            scene_parts,
+                        )?;
 
-            if !intersects {
-                if let Some(clr) = step_report.min_clearance {
-                    let is_smaller = match min_clearance {
-                        None => true,
-                        Some(prev) => clr < prev,
-                    };
-                    if is_smaller {
-                        min_clearance = Some(clr);
-                        min_clearance_step = Some(step_idx);
-                        min_clearance_value = Some(q_val);
+                        let step_interfering: Vec<PairInterferenceResult> = step_report
+                            .pairs
+                            .iter()
+                            .filter(|p| p.intersects)
+                            .cloned()
+                            .collect();
+                        let intersects = !step_interfering.is_empty();
+
+                        if intersects && first_collision_step.is_none() {
+                            first_collision_step = Some(step_idx);
+                            first_collision_value = Some(q_val);
+                            first_collision_pairs = step_interfering.clone();
+                        }
+
+                        if !intersects {
+                            if let Some(clr) = step_report.min_clearance {
+                                let is_smaller = match min_clearance {
+                                    None => true,
+                                    Some(prev) => clr < prev,
+                                };
+                                if is_smaller {
+                                    min_clearance = Some(clr);
+                                    min_clearance_step = Some(step_idx);
+                                    min_clearance_value = Some(q_val);
+                                }
+                            }
+                        }
+
+                        samples.push(SweepStepResult {
+                            step_index: step_idx,
+                            value: q_val,
+                            intersects,
+                            interfering_pairs_count: step_interfering.len(),
+                            min_clearance: if intersects {
+                                Some(0.0)
+                            } else {
+                                step_report.min_clearance
+                            },
+                            max_penetration_depth: step_report.max_penetration_depth,
+                            max_intersection_volume: step_report.max_intersection_volume,
+                            interfering_pairs: step_interfering,
+                            closure_residual: residual,
+                            locked_up: false,
+                        });
+                    }
+                    Err(residual) => {
+                        if residual > max_closure_residual {
+                            max_closure_residual = residual;
+                        }
+                        lockup_step = Some(step_idx);
+                        lockup_value = Some(q_val);
+                        samples.push(SweepStepResult {
+                            step_index: step_idx,
+                            value: q_val,
+                            intersects: false,
+                            interfering_pairs_count: 0,
+                            min_clearance: None,
+                            max_penetration_depth: 0.0,
+                            max_intersection_volume: 0.0,
+                            interfering_pairs: Vec::new(),
+                            closure_residual: residual,
+                            locked_up: true,
+                        });
                     }
                 }
             }
-
-            samples.push(SweepStepResult {
-                step_index: step_idx,
-                value: q_val,
-                intersects,
-                interfering_pairs_count: step_interfering.len(),
-                min_clearance: if intersects {
-                    Some(0.0)
-                } else {
-                    step_report.min_clearance
-                },
-                max_penetration_depth: step_report.max_penetration_depth,
-                max_intersection_volume: step_report.max_intersection_volume,
-                interfering_pairs: step_interfering,
-            });
         }
 
         let collision_detected = first_collision_step.is_some();
-        let safe_travel_range = match first_collision_value {
-            Some(v_col) => (v_col - from).abs(),
-            None => (to - from).abs(),
+        let lockup_detected = lockup_step.is_some();
+        let safe_travel_range = match (first_collision_value, lockup_value) {
+            (Some(v_col), _) => (v_col - from).abs(),
+            (None, Some(v_lock)) => (v_lock - from).abs(),
+            (None, None) => (to - from).abs(),
         };
         let margin_to_collision = if collision_detected {
             Some(safe_travel_range)
@@ -2759,7 +2960,7 @@ impl PhysicsWorld {
         };
 
         let elapsed_ms = start_time.elapsed().as_secs_f64() * 1000.0;
-        let status = if collision_detected {
+        let status = if collision_detected || lockup_detected {
             "FAIL".to_string()
         } else {
             "PASS".to_string()
@@ -2784,10 +2985,669 @@ impl PhysicsWorld {
             safe_travel_range,
             margin_to_collision,
             ignore_adjacent,
+            closed_loop_detected: is_closed_loop,
+            lockup_detected,
+            lockup_step,
+            lockup_value,
+            max_closure_residual,
             samples,
             elapsed_ms,
         })
     }
+}
+
+struct LoopJointEntry {
+    record: CadJointRecord,
+    initial_rel_rot: Matrix3<f64>,
+    initial_coord: Option<f64>,
+    is_driven_constraint: bool,
+    gear_theta_a: f64,
+    gear_theta_b: f64,
+}
+
+struct ClosedLoopSolver {
+    reference_part_id: String,
+    driven_part_id: String,
+    is_revolute: bool,
+    anchor_ref: Vector3<f64>,
+    anchor_driven: Vector3<f64>,
+    local_axis_ref: Vector3<f64>,
+    rot_ref_0: Matrix3<f64>,
+    rot_drv_0: Matrix3<f64>,
+    pivot_world: Vector3<f64>,
+    world_axis: nalgebra::Unit<Vector3<f64>>,
+    driven_as_constraint: bool,
+    free_parts: Vec<String>,
+    free_index: HashMap<String, usize>,
+    joints: Vec<LoopJointEntry>,
+    poses: HashMap<String, (Vector3<f64>, Matrix3<f64>)>,
+    char_len: f64,
+    pos_tol: f64,
+    rot_tol: f64,
+    current_q: f64,
+    last_failed_residual: f64,
+}
+
+impl ClosedLoopSolver {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        world: &PhysicsWorld,
+        driven_joint_id: &str,
+        reference_part_id: &str,
+        driven_part_id: &str,
+        is_revolute: bool,
+        anchor_ref: Vector3<f64>,
+        anchor_driven: Vector3<f64>,
+        local_axis_ref: Vector3<f64>,
+        pos_ref_0: Vector3<f64>,
+        rot_ref_0: Matrix3<f64>,
+        pos_drv_0: Vector3<f64>,
+        rot_drv_0: Matrix3<f64>,
+        free_parts: Vec<String>,
+        driven_as_constraint: bool,
+    ) -> Self {
+        let free_set: std::collections::HashSet<String> = free_parts.iter().cloned().collect();
+        let free_index: HashMap<String, usize> = free_parts
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), i))
+            .collect();
+
+        let mut poses: HashMap<String, (Vector3<f64>, Matrix3<f64>)> = HashMap::new();
+        let mut joint_ids: Vec<String> = world.joints.keys().cloned().collect();
+        joint_ids.sort();
+
+        let mut joints = Vec::new();
+        let mut points_for_scale: Vec<Vector3<f64>> = Vec::new();
+
+        for jid in joint_ids {
+            let Some(rec) = world.joints.get(&jid) else {
+                continue;
+            };
+            let is_driven = jid == driven_joint_id;
+            if is_driven && !driven_as_constraint {
+                continue;
+            }
+            let touches_free = free_set.contains(&rec.part_a) || free_set.contains(&rec.part_b);
+            let touches_driven_only = free_parts.is_empty()
+                && !is_driven
+                && (rec.part_a == driven_part_id || rec.part_b == driven_part_id);
+            if !touches_free && !touches_driven_only && !is_driven {
+                continue;
+            }
+
+            let (pa, ra) = *poses
+                .entry(rec.part_a.clone())
+                .or_insert_with(|| world.get_world_pose_vectors(&rec.part_a));
+            let (pb, rb) = *poses
+                .entry(rec.part_b.clone())
+                .or_insert_with(|| world.get_world_pose_vectors(&rec.part_b));
+
+            let aa = Vector3::from(rec.joint_type.anchor_a());
+            let ab = Vector3::from(rec.joint_type.anchor_b());
+            points_for_scale.push(pa + ra * aa);
+            points_for_scale.push(pb + rb * ab);
+
+            let initial_rel_rot = ra.transpose() * rb;
+            let initial_coord = rec.joint_type.current_coordinate(pa, ra, pb, rb);
+
+            joints.push(LoopJointEntry {
+                record: rec.clone(),
+                initial_rel_rot,
+                initial_coord,
+                is_driven_constraint: is_driven,
+                gear_theta_a: 0.0,
+                gear_theta_b: 0.0,
+            });
+        }
+
+        poses
+            .entry(reference_part_id.to_string())
+            .or_insert((pos_ref_0, rot_ref_0));
+        poses
+            .entry(driven_part_id.to_string())
+            .or_insert((pos_drv_0, rot_drv_0));
+        points_for_scale.push(pos_ref_0 + rot_ref_0 * anchor_ref);
+        points_for_scale.push(pos_drv_0 + rot_drv_0 * anchor_driven);
+
+        let mut max_span = 0.0_f64;
+        for i in 0..points_for_scale.len() {
+            for j in (i + 1)..points_for_scale.len() {
+                let d = (points_for_scale[i] - points_for_scale[j]).norm();
+                if d > max_span {
+                    max_span = d;
+                }
+            }
+        }
+        let char_len = if max_span > 1e-6 {
+            max_span.clamp(1e-3, 100.0)
+        } else {
+            0.1
+        };
+        let pos_tol = (char_len * 1e-3).clamp(2e-5, 5e-4);
+        let rot_tol = 1e-3;
+
+        let pivot_world = pos_ref_0 + rot_ref_0 * anchor_ref;
+        let world_axis = nalgebra::Unit::new_normalize(rot_ref_0 * local_axis_ref);
+
+        Self {
+            reference_part_id: reference_part_id.to_string(),
+            driven_part_id: driven_part_id.to_string(),
+            is_revolute,
+            anchor_ref,
+            anchor_driven,
+            local_axis_ref,
+            rot_ref_0,
+            rot_drv_0,
+            pivot_world,
+            world_axis,
+            driven_as_constraint,
+            free_parts,
+            free_index,
+            joints,
+            poses,
+            char_len,
+            pos_tol,
+            rot_tol,
+            current_q: 0.0,
+            last_failed_residual: 0.0,
+        }
+    }
+
+    fn driven_world_pose(&self, q_val: f64) -> (Vector3<f64>, Matrix3<f64>) {
+        if self.is_revolute {
+            let delta_rot =
+                nalgebra::Rotation3::from_axis_angle(&self.world_axis, q_val).into_inner();
+            let rk = delta_rot * self.rot_drv_0;
+            let pk = self.pivot_world - rk * self.anchor_driven;
+            (pk, rk)
+        } else {
+            let rk = self.rot_drv_0;
+            let pk = self.pivot_world - rk * self.anchor_driven
+                + self.world_axis.into_inner() * q_val;
+            (pk, rk)
+        }
+    }
+
+    fn advance_to(&mut self, q_target: f64) -> Result<f64, f64> {
+        let dq_total = q_target - self.current_q;
+        if dq_total.abs() <= 1e-12 && self.current_q.abs() <= 1e-12 {
+            return self.solve_single_q(q_target);
+        }
+
+        let max_substep = if self.is_revolute {
+            3.0_f64.to_radians()
+        } else {
+            (self.char_len * 0.05).max(1e-4)
+        };
+        let n_sub = ((dq_total.abs() / max_substep).ceil() as usize).clamp(1, 2000);
+        let q_start = self.current_q;
+        let mut last_res = 0.0;
+
+        for s in 1..=n_sub {
+            let q_sub = q_start + dq_total * (s as f64) / (n_sub as f64);
+            match self.solve_single_q(q_sub) {
+                Ok(res) => {
+                    self.current_q = q_sub;
+                    last_res = res;
+                }
+                Err(res) => {
+                    self.last_failed_residual = res;
+                    return Err(res);
+                }
+            }
+        }
+        Ok(last_res)
+    }
+
+    fn solve_single_q(&mut self, q_val: f64) -> Result<f64, f64> {
+        let base_poses = self.poses.clone();
+        let base_gears: Vec<(f64, f64)> = self
+            .joints
+            .iter()
+            .map(|j| (j.gear_theta_a, j.gear_theta_b))
+            .collect();
+
+        if !self.driven_as_constraint {
+            let drv_pose = self.driven_world_pose(q_val);
+            self.poses.insert(self.driven_part_id.clone(), drv_pose);
+        }
+
+        let total_rows: usize = self
+            .joints
+            .iter()
+            .map(|j| {
+                if j.is_driven_constraint {
+                    6
+                } else {
+                    j.record.joint_type.effective_constraints_count()
+                }
+            })
+            .sum();
+
+        if total_rows == 0 {
+            return Ok(0.0);
+        }
+
+        let n_free = self.free_parts.len();
+        if n_free == 0 {
+            let eval = self.evaluate_system(q_val, &self.poses, &base_poses, &base_gears, false);
+            if eval.max_pos_err <= self.pos_tol && eval.max_rot_err <= self.rot_tol {
+                return Ok(eval.phys_norm);
+            }
+            return Err(eval.phys_norm);
+        }
+
+        let total_cols = 6 * n_free;
+        let max_iters = 50usize;
+        let mut lambda_factor = 1e-9_f64;
+
+        for _iter in 0..max_iters {
+            let eval = self.evaluate_system(q_val, &self.poses, &base_poses, &base_gears, true);
+            if eval.max_pos_err <= self.pos_tol
+                && eval.max_rot_err <= self.rot_tol
+                && eval.scaled_norm <= 1e-4
+            {
+                self.commit_gear_angles(&base_poses, &base_gears);
+                return Ok(eval.phys_norm);
+            }
+
+            let j_mat = eval.j_scaled.expect("jacobian requested");
+            let svd = j_mat.svd(true, true);
+            let s_vals = &svd.singular_values;
+            let s_max = s_vals.as_slice().first().copied().unwrap_or(0.0).max(1e-12);
+            let (Some(u_mat), Some(v_t_mat)) = (svd.u.as_ref(), svd.v_t.as_ref()) else {
+                break;
+            };
+
+            let mut accepted = false;
+            let mut try_lambda = (lambda_factor * s_max).max(1e-12);
+
+            for _damp_try in 0..7 {
+                let mut dx_scaled = nalgebra::DVector::<f64>::zeros(total_cols);
+                let k_sv = s_vals.len();
+                for i in 0..k_sv {
+                    let s = s_vals[i];
+                    let coeff = -s / (s * s + try_lambda * try_lambda);
+                    let u_dot_phi = u_mat.column(i).dot(&eval.phi_scaled);
+                    let v_col = v_t_mat.row(i).transpose();
+                    dx_scaled += v_col * (coeff * u_dot_phi);
+                }
+
+                let step_norm = dx_scaled.norm();
+                if step_norm > 0.5 {
+                    dx_scaled *= 0.5 / step_norm;
+                }
+
+                for alpha in [1.0_f64, 0.5, 0.25] {
+                    let mut trial_poses = self.poses.clone();
+                    for (idx, pid) in self.free_parts.iter().enumerate() {
+                        let base = 6 * idx;
+                        let dp = Vector3::new(
+                            dx_scaled[base] * self.char_len * alpha,
+                            dx_scaled[base + 1] * self.char_len * alpha,
+                            dx_scaled[base + 2] * self.char_len * alpha,
+                        );
+                        let dtheta = Vector3::new(
+                            dx_scaled[base + 3] * alpha,
+                            dx_scaled[base + 4] * alpha,
+                            dx_scaled[base + 5] * alpha,
+                        );
+                        if let Some((p, r)) = trial_poses.get_mut(pid) {
+                            *p += dp;
+                            *r = nalgebra::Rotation3::from_scaled_axis(dtheta).into_inner() * (*r);
+                        }
+                    }
+
+                    let trial_eval =
+                        self.evaluate_system(q_val, &trial_poses, &base_poses, &base_gears, false);
+                    if trial_eval.scaled_norm < eval.scaled_norm - 1e-14 {
+                        self.poses = trial_poses;
+                        lambda_factor = (try_lambda / s_max * 0.3).clamp(1e-11, 1e2);
+                        accepted = true;
+                        break;
+                    }
+                }
+
+                if accepted {
+                    break;
+                }
+                try_lambda *= 10.0;
+            }
+
+            if !accepted {
+                break;
+            }
+        }
+
+        let final_eval = self.evaluate_system(q_val, &self.poses, &base_poses, &base_gears, false);
+        if final_eval.max_pos_err <= self.pos_tol && final_eval.max_rot_err <= self.rot_tol {
+            self.commit_gear_angles(&base_poses, &base_gears);
+            Ok(final_eval.phys_norm)
+        } else {
+            let err_res = final_eval.phys_norm;
+            self.poses = base_poses;
+            Err(err_res)
+        }
+    }
+
+    fn commit_gear_angles(
+        &mut self,
+        base_poses: &HashMap<String, (Vector3<f64>, Matrix3<f64>)>,
+        base_gears: &[(f64, f64)],
+    ) {
+        for (idx, entry) in self.joints.iter_mut().enumerate() {
+            if let CadJointType::Gear { axis_a, axis_b, .. } = &entry.record.joint_type {
+                let (_, ra_cur) = self.poses[&entry.record.part_a];
+                let (_, rb_cur) = self.poses[&entry.record.part_b];
+                let (_, ra_base) = base_poses[&entry.record.part_a];
+                let (_, rb_base) = base_poses[&entry.record.part_b];
+                let (_, _, ua) = local_orthonormal_basis(*axis_a, Vector3::z());
+                let (_, _, ub) = local_orthonormal_basis(*axis_b, Vector3::z());
+                let dta = rotation_vector(ra_cur * ra_base.transpose()).dot(&(ra_base * ua));
+                let dtb = rotation_vector(rb_cur * rb_base.transpose()).dot(&(rb_base * ub));
+                entry.gear_theta_a = base_gears[idx].0 + dta;
+                entry.gear_theta_b = base_gears[idx].1 + dtb;
+            }
+        }
+    }
+
+    fn evaluate_system(
+        &self,
+        q_val: f64,
+        poses: &HashMap<String, (Vector3<f64>, Matrix3<f64>)>,
+        base_poses: &HashMap<String, (Vector3<f64>, Matrix3<f64>)>,
+        base_gears: &[(f64, f64)],
+        build_jacobian: bool,
+    ) -> SystemEvalResult {
+        let total_rows: usize = self
+            .joints
+            .iter()
+            .map(|j| {
+                if j.is_driven_constraint {
+                    6
+                } else {
+                    j.record.joint_type.effective_constraints_count()
+                }
+            })
+            .sum();
+        let total_cols = 6 * self.free_parts.len();
+
+        let mut phi_phys = nalgebra::DVector::<f64>::zeros(total_rows);
+        let mut phi_scaled = nalgebra::DVector::<f64>::zeros(total_rows);
+        let mut j_mat_opt = if build_jacobian {
+            Some(DMatrix::<f64>::zeros(total_rows, total_cols))
+        } else {
+            None
+        };
+
+        let mut max_pos_err = 0.0_f64;
+        let mut max_rot_err = 0.0_f64;
+        let mut row = 0usize;
+        let inv_len = 1.0 / self.char_len;
+
+        for (j_idx, entry) in self.joints.iter().enumerate() {
+            if entry.is_driven_constraint {
+                let (pa, ra) = poses[&self.reference_part_id];
+                let (pb, rb) = poses[&self.driven_part_id];
+                let col_a = self.free_index.get(&self.reference_part_id).copied();
+                let col_b = self.free_index.get(&self.driven_part_id).copied();
+
+                let s_loc = if self.is_revolute {
+                    Vector3::zeros()
+                } else {
+                    self.local_axis_ref * q_val
+                };
+                let eff_anchor_a = self.anchor_ref + s_loc;
+                let r_a = pa + ra * eff_anchor_a;
+                let r_b = pb + rb * self.anchor_driven;
+                let dp = r_a - r_b;
+
+                let rel_0 = self.rot_ref_0.transpose() * self.rot_drv_0;
+                let target_rel = if self.is_revolute {
+                    let axis_unit = nalgebra::Unit::new_normalize(self.local_axis_ref);
+                    nalgebra::Rotation3::from_axis_angle(&axis_unit, q_val).into_inner() * rel_0
+                } else {
+                    rel_0
+                };
+                let r_err = rb * (ra * target_rel).transpose();
+                let drot = rotation_vector(r_err);
+
+                for k in 0..3 {
+                    let pe = dp[k];
+                    let re = drot[k];
+                    max_pos_err = max_pos_err.max(pe.abs());
+                    max_rot_err = max_rot_err.max(re.abs());
+                    phi_phys[row + k] = pe;
+                    phi_scaled[row + k] = pe * inv_len;
+                    phi_phys[row + 3 + k] = re;
+                    phi_scaled[row + 3 + k] = re;
+                }
+
+                if let Some(ref mut j_mat) = j_mat_opt {
+                    let virtual_fixed = CadJointType::Fixed {
+                        anchor_a: [eff_anchor_a.x, eff_anchor_a.y, eff_anchor_a.z],
+                        anchor_b: [self.anchor_driven.x, self.anchor_driven.y, self.anchor_driven.z],
+                    };
+                    virtual_fixed.fill_jacobian_rows(j_mat, row, col_a, col_b, pa, ra, pb, rb);
+                    scale_jacobian_block_rows(j_mat, row..row + 3, total_cols, inv_len);
+                }
+                row += 6;
+                continue;
+            }
+
+            let jrec = &entry.record;
+            let (pa, ra) = poses[&jrec.part_a];
+            let (pb, rb) = poses[&jrec.part_b];
+            let col_a = self.free_index.get(&jrec.part_a).copied();
+            let col_b = self.free_index.get(&jrec.part_b).copied();
+
+            let rows_added = match &jrec.joint_type {
+                CadJointType::Fixed { anchor_a, anchor_b } => {
+                    let dp = (pa + ra * Vector3::from(*anchor_a))
+                        - (pb + rb * Vector3::from(*anchor_b));
+                    let drot = rotation_vector(rb * (ra * entry.initial_rel_rot).transpose());
+                    for k in 0..3 {
+                        max_pos_err = max_pos_err.max(dp[k].abs());
+                        max_rot_err = max_rot_err.max(drot[k].abs());
+                        phi_phys[row + k] = dp[k];
+                        phi_scaled[row + k] = dp[k] * inv_len;
+                        phi_phys[row + 3 + k] = drot[k];
+                        phi_scaled[row + 3 + k] = drot[k];
+                    }
+                    if let Some(ref mut j_mat) = j_mat_opt {
+                        jrec.joint_type
+                            .fill_jacobian_rows(j_mat, row, col_a, col_b, pa, ra, pb, rb);
+                        scale_jacobian_block_rows(j_mat, row..row + 3, total_cols, inv_len);
+                    }
+                    6
+                }
+                CadJointType::Spherical { anchor_a, anchor_b } => {
+                    let dp = (pa + ra * Vector3::from(*anchor_a))
+                        - (pb + rb * Vector3::from(*anchor_b));
+                    for k in 0..3 {
+                        max_pos_err = max_pos_err.max(dp[k].abs());
+                        phi_phys[row + k] = dp[k];
+                        phi_scaled[row + k] = dp[k] * inv_len;
+                    }
+                    if let Some(ref mut j_mat) = j_mat_opt {
+                        jrec.joint_type
+                            .fill_jacobian_rows(j_mat, row, col_a, col_b, pa, ra, pb, rb);
+                        scale_jacobian_block_rows(j_mat, row..row + 3, total_cols, inv_len);
+                    }
+                    3
+                }
+                CadJointType::Revolute {
+                    anchor_a,
+                    anchor_b,
+                    axis,
+                    limits,
+                } => {
+                    let dp = (pa + ra * Vector3::from(*anchor_a))
+                        - (pb + rb * Vector3::from(*anchor_b));
+                    for k in 0..3 {
+                        max_pos_err = max_pos_err.max(dp[k].abs());
+                        phi_phys[row + k] = dp[k];
+                        phi_scaled[row + k] = dp[k] * inv_len;
+                    }
+                    let (_, _, u_a) = local_orthonormal_basis(*axis, Vector3::z());
+                    let z_a = ra * u_a;
+                    let (x_a, y_a) = perpendicular_axes(&z_a);
+                    let z_b = rb * u_a;
+                    let r3 = -y_a.dot(&z_b);
+                    let r4 = x_a.dot(&z_b);
+                    let axis_angle_err = z_a.cross(&z_b).norm().atan2(z_a.dot(&z_b));
+                    max_rot_err = max_rot_err.max(axis_angle_err);
+                    phi_phys[row + 3] = r3;
+                    phi_scaled[row + 3] = r3;
+                    phi_phys[row + 4] = r4;
+                    phi_scaled[row + 4] = r4;
+
+                    let has_zero = is_zero_range_limits(*limits);
+                    if has_zero {
+                        let target = limits
+                            .map(|l| l[0])
+                            .or(entry.initial_coord)
+                            .unwrap_or(0.0);
+                        let cur = jrec
+                            .joint_type
+                            .current_coordinate(pa, ra, pb, rb)
+                            .unwrap_or(target);
+                        let r5 = wrap_angle_pi(cur - target);
+                        max_rot_err = max_rot_err.max(r5.abs());
+                        phi_phys[row + 5] = r5;
+                        phi_scaled[row + 5] = r5;
+                    }
+                    if let Some(ref mut j_mat) = j_mat_opt {
+                        jrec.joint_type
+                            .fill_jacobian_rows(j_mat, row, col_a, col_b, pa, ra, pb, rb);
+                        scale_jacobian_block_rows(j_mat, row..row + 3, total_cols, inv_len);
+                    }
+                    if has_zero { 6 } else { 5 }
+                }
+                CadJointType::Prismatic {
+                    anchor_a,
+                    anchor_b,
+                    axis,
+                    limits,
+                } => {
+                    let (_, _, u_a) = local_orthonormal_basis(*axis, Vector3::x());
+                    let z_a = ra * u_a;
+                    let (x_a, y_a) = perpendicular_axes(&z_a);
+                    let drot = rotation_vector(rb * (ra * entry.initial_rel_rot).transpose());
+                    for k in 0..3 {
+                        max_rot_err = max_rot_err.max(drot[k].abs());
+                        phi_phys[row + k] = drot[k];
+                        phi_scaled[row + k] = drot[k];
+                    }
+                    let r_a = pa + ra * Vector3::from(*anchor_a);
+                    let r_b = pb + rb * Vector3::from(*anchor_b);
+                    let delta_r = r_b - r_a;
+                    let p3 = x_a.dot(&delta_r);
+                    let p4 = y_a.dot(&delta_r);
+                    max_pos_err = max_pos_err.max(p3.abs()).max(p4.abs());
+                    phi_phys[row + 3] = p3;
+                    phi_scaled[row + 3] = p3 * inv_len;
+                    phi_phys[row + 4] = p4;
+                    phi_scaled[row + 4] = p4 * inv_len;
+
+                    let has_zero = is_zero_range_limits(*limits);
+                    if has_zero {
+                        let target = limits
+                            .map(|l| l[0])
+                            .or(entry.initial_coord)
+                            .unwrap_or(0.0);
+                        let p5 = delta_r.dot(&z_a) - target;
+                        max_pos_err = max_pos_err.max(p5.abs());
+                        phi_phys[row + 5] = p5;
+                        phi_scaled[row + 5] = p5 * inv_len;
+                    }
+                    if let Some(ref mut j_mat) = j_mat_opt {
+                        jrec.joint_type
+                            .fill_jacobian_rows(j_mat, row, col_a, col_b, pa, ra, pb, rb);
+                        let pos_end = if has_zero { row + 6 } else { row + 5 };
+                        scale_jacobian_block_rows(j_mat, row + 3..pos_end, total_cols, inv_len);
+                    }
+                    if has_zero { 6 } else { 5 }
+                }
+                CadJointType::Gear {
+                    ratio,
+                    axis_a,
+                    axis_b,
+                } => {
+                    let (_, ra_base) = base_poses[&jrec.part_a];
+                    let (_, rb_base) = base_poses[&jrec.part_b];
+                    let (_, _, ua) = local_orthonormal_basis(*axis_a, Vector3::z());
+                    let (_, _, ub) = local_orthonormal_basis(*axis_b, Vector3::z());
+                    let dta = rotation_vector(ra * ra_base.transpose()).dot(&(ra_base * ua));
+                    let dtb = rotation_vector(rb * rb_base.transpose()).dot(&(rb_base * ub));
+                    let r0 = ratio * (base_gears[j_idx].0 + dta) + (base_gears[j_idx].1 + dtb);
+                    max_rot_err = max_rot_err.max(r0.abs());
+                    phi_phys[row] = r0;
+                    phi_scaled[row] = r0;
+                    if let Some(ref mut j_mat) = j_mat_opt {
+                        jrec.joint_type
+                            .fill_jacobian_rows(j_mat, row, col_a, col_b, pa, ra, pb, rb);
+                    }
+                    1
+                }
+            };
+            row += rows_added;
+        }
+
+        if let Some(ref mut j_mat) = j_mat_opt {
+            for idx in 0..self.free_parts.len() {
+                let base_col = 6 * idx;
+                for c in 0..3 {
+                    for r in 0..total_rows {
+                        j_mat[(r, base_col + c)] *= self.char_len;
+                    }
+                }
+            }
+        }
+
+        let phys_norm = phi_phys.norm();
+        let scaled_norm = phi_scaled.norm();
+
+        SystemEvalResult {
+            phi_scaled,
+            phys_norm,
+            scaled_norm,
+            max_pos_err,
+            max_rot_err,
+            j_scaled: j_mat_opt,
+        }
+    }
+}
+
+struct SystemEvalResult {
+    phi_scaled: nalgebra::DVector<f64>,
+    phys_norm: f64,
+    scaled_norm: f64,
+    max_pos_err: f64,
+    max_rot_err: f64,
+    j_scaled: Option<DMatrix<f64>>,
+}
+
+fn scale_jacobian_block_rows(
+    j_mat: &mut DMatrix<f64>,
+    rows: std::ops::Range<usize>,
+    total_cols: usize,
+    factor: f64,
+) {
+    for r in rows {
+        for c in 0..total_cols {
+            j_mat[(r, c)] *= factor;
+        }
+    }
+}
+
+fn rotation_vector(r: Matrix3<f64>) -> Vector3<f64> {
+    nalgebra::Rotation3::from_matrix_unchecked(r).scaled_axis()
+}
+
+fn wrap_angle_pi(angle: f64) -> f64 {
+    (angle + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI
 }
 
 /// Transforms a `TriangleMesh` by a 3D translation vector and 3x3 rotation matrix.

@@ -374,12 +374,18 @@ pub struct SweepStepResult {
     pub max_intersection_volume: f64,
     /// Intersecting pairs at this step.
     pub interfering_pairs: Vec<PairInterferenceResult>,
+    /// Kinematic loop closure residual norm at this step (`0.0` for open chains, `P3-T16`).
+    #[serde(default)]
+    pub closure_residual: f64,
+    /// True if the closed-loop kinematic solver failed to close the loop within tolerance (`P3-T16`).
+    #[serde(default)]
+    pub locked_up: bool,
 }
 
-/// Complete report returned by [`crate::PhysicsWorld::sweep_joint`] (`P3-T10`).
+/// Complete report returned by [`crate::PhysicsWorld::sweep_joint`] (`P3-T10`, `P3-T16`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JointSweepReport {
-    /// Overall status (`"PASS"` if no collision occurred across the entire sweep, `"FAIL"` if collision detected).
+    /// Overall status (`"PASS"` if no collision and no lockup occurred across the sweep, `"FAIL"` otherwise).
     pub status: String,
     /// Swept joint identifier.
     pub joint_id: String,
@@ -403,19 +409,33 @@ pub struct JointSweepReport {
     pub first_collision_value: Option<f64>,
     /// Intersecting part pairs at the first collision step.
     pub first_collision_pairs: Vec<PairInterferenceResult>,
-    /// Minimum clearance (in meters) observed along the non-colliding steps (`None` if every step collided).
+    /// Minimum clearance (in meters) observed along the non-colliding, non-locked steps (`None` if none).
     pub min_clearance: Option<f64>,
     /// Step index where `min_clearance` was observed.
     pub min_clearance_step: Option<usize>,
     /// Joint coordinate value where `min_clearance` was observed.
     pub min_clearance_value: Option<f64>,
-    /// Travel range before collision `(first_collision_value - from).abs()` if a collision occurred,
-    /// or `(to - from).abs()` if the entire sweep range is collision-free.
+    /// Travel range before collision or lockup (`(v - from).abs()`), or `(to - from).abs()` if clear.
     pub safe_travel_range: f64,
     /// Margin to collision: travel range to first collision when colliding, or `min_clearance` when collision-free.
     pub margin_to_collision: Option<f64>,
     /// Whether pairs directly connected by a joint were ignored.
     pub ignore_adjacent: bool,
+    /// True if the swept joint participates in a closed kinematic loop solved iteratively (`P3-T16`).
+    #[serde(default)]
+    pub closed_loop_detected: bool,
+    /// True if geometric lockup (loop closure failure) occurred along the sweep (`P3-T16`).
+    #[serde(default)]
+    pub lockup_detected: bool,
+    /// Step index `0..=steps` where geometric lockup first occurred (`None` if reachable throughout).
+    #[serde(default)]
+    pub lockup_step: Option<usize>,
+    /// Joint coordinate value (radians or meters) at the first geometric lockup (`None` if reachable).
+    #[serde(default)]
+    pub lockup_value: Option<f64>,
+    /// Maximum kinematic loop closure residual norm across non-locked steps (`0.0` for open chains).
+    #[serde(default)]
+    pub max_closure_residual: f64,
     /// Per-step sweep samples (`steps + 1` entries).
     pub samples: Vec<SweepStepResult>,
     /// Wall-clock execution time in milliseconds.

@@ -1865,4 +1865,464 @@ fn test_p3_t15_redundant_joint_attribution_and_active_limits() {
     }
 }
 
+#[test]
+fn test_p3_t16_sweep_joint_four_bar_full_rotation_and_obstacle() {
+    // Grashof crank-rocker 4-bar:
+    // ground = 0.12 m, crank = 0.04 m, coupler = 0.13 m, rocker = 0.09 m
+    // s + l = 0.04 + 0.13 = 0.17 < p + q = 0.12 + 0.09 = 0.21 -> continuous 360° crank rotation.
+    // Initial geometry (exact 5-12-13 triangle):
+    // A=(0, 0, 0), B=(0, 0.04, 0), C=(0.12, 0.09, 0), D=(0.12, 0, 0).
+    let build_four_bar = |with_wall: bool| {
+        let mut world = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
+        let crank = create_test_box("crank", "Crank", 0.008, 0.04, 0.008);
+        let coupler = create_test_box("coupler", "Coupler", 0.13, 0.008, 0.008);
+        let rocker = create_test_box("rocker", "Rocker", 0.008, 0.09, 0.008);
+
+        world
+            .add_part_with_options(&crank, true, ColliderType::ConvexHull, Some([0.0, 0.02, 0.0]), None)
+            .expect("crank");
+        world
+            .add_part_with_options(
+                &coupler,
+                true,
+                ColliderType::ConvexHull,
+                Some([0.06, 0.065, 0.02]),
+                None,
+            )
+            .expect("coupler");
+        world
+            .add_part_with_options(&rocker, true, ColliderType::ConvexHull, Some([0.12, 0.045, 0.0]), None)
+            .expect("rocker");
+
+        // j1: ground -> crank at A=(0,0,0)
+        world
+            .add_joint(
+                "j1_crank",
+                "ground",
+                "crank",
+                CadJointType::Revolute {
+                    anchor_a: [0.0, 0.0, 0.0],
+                    anchor_b: [0.0, -0.02, 0.0],
+                    axis: [0.0, 0.0, 1.0],
+                    limits: None,
+                },
+                None,
+            )
+            .expect("j1");
+
+        // j2: crank -> coupler at B=(0, 0.04, 0)
+        // coupler is offset in Z by +0.02 purely visually; anchor matches B in world space
+        world
+            .add_joint(
+                "j2_coupler_a",
+                "crank",
+                "coupler",
+                CadJointType::Revolute {
+                    anchor_a: [0.0, 0.02, 0.0],
+                    anchor_b: [-0.06, -0.025, -0.02],
+                    axis: [0.0, 0.0, 1.0],
+                    limits: None,
+                },
+                None,
+            )
+            .expect("j2");
+
+        // j3: coupler -> rocker at C=(0.12, 0.09, 0)
+        world
+            .add_joint(
+                "j3_coupler_b",
+                "coupler",
+                "rocker",
+                CadJointType::Revolute {
+                    anchor_a: [0.06, 0.025, -0.02],
+                    anchor_b: [0.0, 0.045, 0.0],
+                    axis: [0.0, 0.0, 1.0],
+                    limits: None,
+                },
+                None,
+            )
+            .expect("j3");
+
+        // j4: rocker -> ground at D=(0.12, 0, 0)
+        world
+            .add_joint(
+                "j4_rocker",
+                "rocker",
+                "ground",
+                CadJointType::Revolute {
+                    anchor_a: [0.0, -0.045, 0.0],
+                    anchor_b: [0.12, 0.0, 0.0],
+                    axis: [0.0, 0.0, 1.0],
+                    limits: None,
+                },
+                None,
+            )
+            .expect("j4");
+
+        if with_wall {
+            // As crank turns CCW (0 -> +180 deg), rocker swings left (-X) toward the obstacle
+            let wall = create_test_box("wall", "Wall", 0.01, 0.06, 0.02);
+            world
+                .add_part_with_options(
+                    &wall,
+                    false,
+                    ColliderType::ConvexHull,
+                    Some([0.09, 0.075, 0.0]),
+                    None,
+                )
+                .expect("wall");
+        }
+        world
+    };
+
+    // 1. Full 360° sweep without obstacles or false lockup from planar redundant constraints
+    {
+        let world = build_four_bar(false);
+        let rep = world
+            .sweep_joint(
+                "j1_crank",
+                0.0,
+                std::f64::consts::TAU,
+                72,
+                true,
+            )
+            .expect("4-bar full sweep should succeed");
+
+        assert!(rep.closed_loop_detected, "Must detect closed loop");
+        assert!(!rep.lockup_detected, "Grashof 4-bar must not false-lockup");
+        assert_eq!(rep.lockup_step, None);
+        assert_eq!(rep.lockup_value, None);
+        assert_eq!(rep.status, "PASS", "Unexpected failure: collision={}, lockup={}", rep.collision_detected, rep.lockup_detected);
+        assert!(
+            rep.max_closure_residual < 5e-5,
+            "Max closure residual too high: {}",
+            rep.max_closure_residual
+        );
+        assert_eq!(rep.samples.len(), 73);
+        assert!(rep.samples.iter().all(|s| !s.locked_up && s.closure_residual < 5e-5));
+    }
+
+    // 2. Rocker (follower link) hits fixed wall during crank sweep
+    {
+        let world = build_four_bar(true);
+        let rep = world
+            .sweep_joint(
+                "j1_crank",
+                0.0,
+                std::f64::consts::PI,
+                36,
+                true,
+            )
+            .expect("4-bar obstacle sweep");
+
+        assert!(rep.closed_loop_detected);
+        assert!(!rep.lockup_detected);
+        assert_eq!(rep.status, "FAIL");
+        assert!(rep.collision_detected, "Follower rocker must collide with fixed wall");
+        assert!(
+            rep.first_collision_pairs.iter().any(|p| {
+                (p.a == "rocker" && p.b == "wall")
+                    || (p.b == "rocker" && p.a == "wall")
+            }),
+            "Expected rocker-wall collision, got {:?}",
+            rep.first_collision_pairs
+        );
+    }
+}
+
+#[test]
+fn test_p3_t16_sweep_joint_slider_crank_and_obstacle() {
+    // Pythagorean slider-crank: crank = 0.03 m, conrod = 0.05 m.
+    // Initial: A=(0,0,0), B=(0,0.03,0), C=(0.04,0,0). Since 0.03^2 + 0.04^2 = 0.05^2, residual=0.
+    let build_sc = |with_wall: bool| {
+        let mut world = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
+        let crank = create_test_box("sc_crank", "Crank", 0.008, 0.03, 0.008);
+        let conrod = create_test_box("sc_rod", "Rod", 0.05, 0.008, 0.008);
+        let slider = create_test_box("sc_slider", "Slider", 0.02, 0.02, 0.02);
+
+        world
+            .add_part_with_options(&crank, true, ColliderType::ConvexHull, Some([0.0, 0.015, 0.0]), None)
+            .expect("crank");
+        world
+            .add_part_with_options(
+                &conrod,
+                true,
+                ColliderType::ConvexHull,
+                Some([0.02, 0.015, 0.02]),
+                None,
+            )
+            .expect("conrod");
+        world
+            .add_part_with_options(&slider, true, ColliderType::ConvexHull, Some([0.04, 0.0, 0.0]), None)
+            .expect("slider");
+
+        world
+            .add_joint(
+                "j_sc_crank",
+                "ground",
+                "sc_crank",
+                CadJointType::Revolute {
+                    anchor_a: [0.0, 0.0, 0.0],
+                    anchor_b: [0.0, -0.015, 0.0],
+                    axis: [0.0, 0.0, 1.0],
+                    limits: None,
+                },
+                None,
+            )
+            .expect("j1");
+        world
+            .add_joint(
+                "j_sc_pin_b",
+                "sc_crank",
+                "sc_rod",
+                CadJointType::Revolute {
+                    anchor_a: [0.0, 0.015, 0.0],
+                    anchor_b: [-0.02, 0.015, -0.02],
+                    axis: [0.0, 0.0, 1.0],
+                    limits: None,
+                },
+                None,
+            )
+            .expect("j2");
+        world
+            .add_joint(
+                "j_sc_pin_c",
+                "sc_rod",
+                "sc_slider",
+                CadJointType::Revolute {
+                    anchor_a: [0.02, -0.015, -0.02],
+                    anchor_b: [0.0, 0.0, 0.0],
+                    axis: [0.0, 0.0, 1.0],
+                    limits: None,
+                },
+                None,
+            )
+            .expect("j3");
+        world
+            .add_joint(
+                "j_sc_rail",
+                "sc_slider",
+                "ground",
+                CadJointType::Prismatic {
+                    anchor_a: [0.0, 0.0, 0.0],
+                    anchor_b: [0.0, 0.0, 0.0],
+                    axis: [1.0, 0.0, 0.0],
+                    limits: None,
+                },
+                None,
+            )
+            .expect("j4");
+
+        if with_wall {
+            let wall = create_test_box("endstop", "Endstop", 0.01, 0.04, 0.04);
+            world
+                .add_part_with_options(&wall, false, ColliderType::ConvexHull, Some([0.075, 0.0, 0.0]), None)
+                .expect("wall");
+        }
+        world
+    };
+
+    // Full 360° slider-crank rotation
+    {
+        let world = build_sc(false);
+        let rep = world
+            .sweep_joint(
+                "j_sc_crank",
+                0.0,
+                std::f64::consts::TAU,
+                36,
+                true,
+            )
+            .expect("slider-crank full sweep");
+        assert!(rep.closed_loop_detected);
+        assert!(!rep.lockup_detected);
+        assert_eq!(rep.status, "PASS");
+        assert!(rep.max_closure_residual < 5e-5);
+    }
+
+    // Sweeping crank toward -90 deg moves slider from x=0.04 toward x=0.08, hitting wall at x=0.075
+    {
+        let world = build_sc(true);
+        let rep = world
+            .sweep_joint(
+                "j_sc_crank",
+                0.0,
+                -std::f64::consts::FRAC_PI_2,
+                18,
+                true,
+            )
+            .expect("slider-crank obstacle sweep");
+        assert!(rep.closed_loop_detected);
+        assert!(!rep.lockup_detected);
+        assert!(rep.collision_detected, "Slider must hit endstop wall");
+        assert_eq!(rep.status, "FAIL");
+        assert!(
+            rep.first_collision_pairs.iter().any(|p| {
+                (p.a == "sc_slider" && p.b == "endstop")
+                    || (p.b == "sc_slider" && p.a == "endstop")
+            }),
+            "Expected sc_slider-endstop collision, got {:?}",
+            rep.first_collision_pairs
+        );
+    }
+}
+
+#[test]
+fn test_p3_t16_sweep_joint_geometric_lockup_detection() {
+    // Non-Grashof 4-bar: ground L1=0.20, crank L2=0.10, coupler L3=0.12, rocker L4=0.10.
+    // Initial pose along +X: A=(0,0,0), B=(0.10,0,0), C=(0.172, 0.096, 0), D=(0.20,0,0).
+    // Exact check: 0.072^2 + 0.096^2 = 0.12^2 and 0.028^2 + 0.096^2 = 0.10^2.
+    // Analytical lockup angle: cos(theta_lock) = (0.20^2 + 0.10^2 - 0.22^2) / (2*0.20*0.10) = 0.04
+    // => theta_lock = acos(0.04) = 87.707 deg.
+    // Sweeping 0 -> 120 deg in 24 steps (5 deg/step) must lock up at step 18 (90 deg).
+    let mut world = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
+    let crank = create_test_box("lk_crank", "Crank", 0.10, 0.008, 0.008);
+    let coupler = create_test_box("lk_coupler", "Coupler", 0.12, 0.008, 0.008);
+    let rocker = create_test_box("lk_rocker", "Rocker", 0.10, 0.008, 0.008);
+
+    world
+        .add_part_with_options(&crank, true, ColliderType::ConvexHull, Some([0.05, 0.0, 0.0]), None)
+        .expect("crank");
+    world
+        .add_part_with_options(&coupler, true, ColliderType::ConvexHull, Some([0.136, 0.048, 0.02]), None)
+        .expect("coupler");
+    world
+        .add_part_with_options(&rocker, true, ColliderType::ConvexHull, Some([0.186, 0.048, 0.0]), None)
+        .expect("rocker");
+
+    world
+        .add_joint(
+            "j1_lk",
+            "ground",
+            "lk_crank",
+            CadJointType::Revolute {
+                anchor_a: [0.0, 0.0, 0.0],
+                anchor_b: [-0.05, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                limits: None,
+            },
+            None,
+        )
+        .expect("j1");
+    world
+        .add_joint(
+            "j2_lk",
+            "lk_crank",
+            "lk_coupler",
+            CadJointType::Revolute {
+                anchor_a: [0.05, 0.0, 0.0],
+                anchor_b: [-0.036, -0.048, -0.02],
+                axis: [0.0, 0.0, 1.0],
+                limits: None,
+            },
+            None,
+        )
+        .expect("j2");
+    world
+        .add_joint(
+            "j3_lk",
+            "lk_coupler",
+            "lk_rocker",
+            CadJointType::Revolute {
+                anchor_a: [0.036, 0.048, -0.02],
+                anchor_b: [-0.014, 0.048, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                limits: None,
+            },
+            None,
+        )
+        .expect("j3");
+    world
+        .add_joint(
+            "j4_lk",
+            "lk_rocker",
+            "ground",
+            CadJointType::Revolute {
+                anchor_a: [0.014, -0.048, 0.0],
+                anchor_b: [0.20, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                limits: None,
+            },
+            None,
+        )
+        .expect("j4");
+
+    let rep = world
+        .sweep_joint(
+            "j1_lk",
+            0.0,
+            120.0_f64.to_radians(),
+            24,
+            true,
+        )
+        .expect("lockup sweep");
+
+    assert!(rep.closed_loop_detected);
+    assert!(rep.lockup_detected, "Expected geometric lockup past 87.7 deg");
+    assert_eq!(rep.status, "FAIL");
+    assert_eq!(rep.lockup_step, Some(18), "Lockup should trigger at 90 deg (step 18)");
+    let lock_deg = rep.lockup_value.expect("lockup_value").to_degrees();
+    assert!(
+        (lock_deg - 90.0).abs() < 0.05,
+        "Expected lockup at 90 deg, got {lock_deg}"
+    );
+    assert!(rep.samples[18].locked_up);
+    assert!(
+        rep.max_closure_residual > 2e-4,
+        "Expected lockup residual > 2e-4, got {}",
+        rep.max_closure_residual
+    );
+}
+
+#[test]
+fn test_p3_t16_sweep_joint_open_chain_backward_compat() {
+    let mut world = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
+    let arm1 = create_test_box("oc_arm1", "Arm1", 0.10, 0.02, 0.02);
+    let arm2 = create_test_box("oc_arm2", "Arm2", 0.10, 0.02, 0.02);
+    world
+        .add_part_with_options(&arm1, true, ColliderType::ConvexHull, Some([0.05, 0.0, 0.0]), None)
+        .expect("arm1");
+    world
+        .add_part_with_options(&arm2, true, ColliderType::ConvexHull, Some([0.15, 0.0, 0.0]), None)
+        .expect("arm2");
+    world
+        .add_joint(
+            "j1_oc",
+            "ground",
+            "oc_arm1",
+            CadJointType::Revolute {
+                anchor_a: [0.0, 0.0, 0.0],
+                anchor_b: [-0.05, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                limits: None,
+            },
+            None,
+        )
+        .expect("j1");
+    world
+        .add_joint(
+            "j2_oc",
+            "oc_arm1",
+            "oc_arm2",
+            CadJointType::Revolute {
+                anchor_a: [0.05, 0.0, 0.0],
+                anchor_b: [-0.05, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                limits: None,
+            },
+            None,
+        )
+        .expect("j2");
+
+    let rep = world
+        .sweep_joint("j1_oc", 0.0, std::f64::consts::FRAC_PI_2, 10, true)
+        .expect("open chain sweep");
+    assert!(!rep.closed_loop_detected);
+    assert!(!rep.lockup_detected);
+    assert_eq!(rep.lockup_step, None);
+    assert_eq!(rep.lockup_value, None);
+    assert_eq!(rep.max_closure_residual, 0.0);
+    assert_eq!(rep.status, "PASS");
+}
+
 

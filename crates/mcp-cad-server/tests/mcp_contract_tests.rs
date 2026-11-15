@@ -10693,6 +10693,201 @@ async fn test_mcp_p3_t10_check_interference_sweep_joint_and_no_interference_requ
     assert!(sweep_res["min_clearance"].as_f64().unwrap() > 0.0);
 }
 
+#[tokio::test]
+async fn test_mcp_p3_t16_sweep_joint_closed_loop_and_lockup() {
+    // 1. Grashof 4-bar linkage in mm: L1=120, L2=40, L3=130, L4=90 (exact 50-120-130 triangle)
+    let state_ok = EngineState::new().expect("EngineState init").into_shared();
+    for (pid, w, h, d, pos) in [
+        ("crank", 8.0, 40.0, 8.0, [0.0, 20.0, 0.0]),
+        ("coupler", 130.0, 8.0, 8.0, [60.0, 65.0, 20.0]),
+        ("rocker", 8.0, 90.0, 8.0, [120.0, 45.0, 0.0]),
+    ] {
+        rpc_call(
+            &state_ok,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4201,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_part",
+                    "arguments": { "part_id": pid, "name": pid, "material": "steel_1045", "is_fixed": false }
+                }
+            }),
+        )
+        .await;
+        rpc_call(
+            &state_ok,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4202,
+                "method": "tools/call",
+                "params": {
+                    "name": "add_feature_primitive",
+                    "arguments": {
+                        "part_id": pid,
+                        "primitive_type": "box",
+                        "params": { "width": w, "height": h, "depth": d, "position": pos }
+                    }
+                }
+            }),
+        )
+        .await;
+    }
+    for (jid, pa, pb, aa, ab) in [
+        ("j1_crank", "ground", "crank", [0.0, 0.0, 0.0], [0.0, -20.0, 0.0]),
+        ("j2_coupler_a", "crank", "coupler", [0.0, 20.0, 0.0], [-60.0, -25.0, -20.0]),
+        ("j3_coupler_b", "coupler", "rocker", [60.0, 25.0, -20.0], [0.0, 45.0, 0.0]),
+        ("j4_rocker", "rocker", "ground", [0.0, -45.0, 0.0], [120.0, 0.0, 0.0]),
+    ] {
+        rpc_call(
+            &state_ok,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4203,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_joint",
+                    "arguments": {
+                        "joint_id": jid,
+                        "joint_type": "revolute",
+                        "part_a": pa,
+                        "part_b": pb,
+                        "anchor_a": aa,
+                        "anchor_b": ab,
+                        "axis": [0.0, 0.0, 1.0]
+                    }
+                }
+            }),
+        )
+        .await;
+    }
+
+    let ok_res = parse_content(
+        &rpc_call(
+            &state_ok,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4204,
+                "method": "tools/call",
+                "params": {
+                    "name": "sweep_joint",
+                    "arguments": {
+                        "joint_id": "j1_crank",
+                        "from": 0.0,
+                        "to": 360.0,
+                        "steps": 36,
+                        "ignore_adjacent": true
+                    }
+                }
+            }),
+        )
+        .await,
+    );
+    assert_eq!(ok_res["status"], "PASS");
+    assert_eq!(ok_res["closed_loop_detected"], true);
+    assert_eq!(ok_res["lockup_detected"], false);
+    assert!(ok_res["lockup_step"].is_null());
+    assert!(ok_res["lockup_value"].is_null());
+    assert!(ok_res["max_closure_residual"].as_f64().unwrap() < 0.1);
+    assert_eq!(ok_res["samples"].as_array().unwrap().len(), 37);
+
+    // 2. Non-Grashof 4-bar geometric lockup at 90 deg (analytical 87.707 deg)
+    let state_lk = EngineState::new().expect("EngineState init").into_shared();
+    for (pid, w, h, d, pos) in [
+        ("lk_crank", 100.0, 8.0, 8.0, [50.0, 0.0, 0.0]),
+        ("lk_coupler", 120.0, 8.0, 8.0, [136.0, 48.0, 20.0]),
+        ("lk_rocker", 100.0, 8.0, 8.0, [186.0, 48.0, 0.0]),
+    ] {
+        rpc_call(
+            &state_lk,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4210,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_part",
+                    "arguments": { "part_id": pid, "name": pid, "material": "steel_1045", "is_fixed": false }
+                }
+            }),
+        )
+        .await;
+        rpc_call(
+            &state_lk,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4211,
+                "method": "tools/call",
+                "params": {
+                    "name": "add_feature_primitive",
+                    "arguments": {
+                        "part_id": pid,
+                        "primitive_type": "box",
+                        "params": { "width": w, "height": h, "depth": d, "position": pos }
+                    }
+                }
+            }),
+        )
+        .await;
+    }
+    for (jid, pa, pb, aa, ab) in [
+        ("j1_lk", "ground", "lk_crank", [0.0, 0.0, 0.0], [-50.0, 0.0, 0.0]),
+        ("j2_lk", "lk_crank", "lk_coupler", [50.0, 0.0, 0.0], [-36.0, -48.0, -20.0]),
+        ("j3_lk", "lk_coupler", "lk_rocker", [36.0, 48.0, -20.0], [-14.0, 48.0, 0.0]),
+        ("j4_lk", "lk_rocker", "ground", [14.0, -48.0, 0.0], [200.0, 0.0, 0.0]),
+    ] {
+        rpc_call(
+            &state_lk,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4212,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_joint",
+                    "arguments": {
+                        "joint_id": jid,
+                        "joint_type": "revolute",
+                        "part_a": pa,
+                        "part_b": pb,
+                        "anchor_a": aa,
+                        "anchor_b": ab,
+                        "axis": [0.0, 0.0, 1.0]
+                    }
+                }
+            }),
+        )
+        .await;
+    }
+
+    let lk_res = parse_content(
+        &rpc_call(
+            &state_lk,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4213,
+                "method": "tools/call",
+                "params": {
+                    "name": "sweep_joint",
+                    "arguments": {
+                        "joint_id": "j1_lk",
+                        "from": 0.0,
+                        "to": 120.0,
+                        "steps": 24,
+                        "ignore_adjacent": true
+                    }
+                }
+            }),
+        )
+        .await,
+    );
+    assert_eq!(lk_res["status"], "FAIL");
+    assert_eq!(lk_res["closed_loop_detected"], true);
+    assert_eq!(lk_res["lockup_detected"], true);
+    assert_eq!(lk_res["lockup_step"], 18);
+    let lock_deg = lk_res["lockup_angle_deg"].as_f64().unwrap();
+    assert!((lock_deg - 90.0).abs() < 0.05, "Expected lockup at 90 deg, got {lock_deg}");
+    assert_eq!(lk_res["samples"][18]["locked_up"], true);
+}
+
 
 
 

@@ -333,7 +333,7 @@ fn add_vec_to_jacobian(
 }
 
 /// Builds a right-handed orthonormal basis `(x_loc, y_loc, z_unit)` from a local axis vector.
-fn local_orthonormal_basis(axis: [f64; 3], default_axis: Vector3<f64>) -> (Vector3<f64>, Vector3<f64>, Vector3<f64>) {
+pub(crate) fn local_orthonormal_basis(axis: [f64; 3], default_axis: Vector3<f64>) -> (Vector3<f64>, Vector3<f64>, Vector3<f64>) {
     let local_axis = Vector3::from(axis);
     let norm = local_axis.norm();
     let u = if norm > 1e-12 {
@@ -346,7 +346,7 @@ fn local_orthonormal_basis(axis: [f64; 3], default_axis: Vector3<f64>) -> (Vecto
 }
 
 /// Computes two unit axes `(x, y)` orthogonal to unit vector `z` with `x × y = z`.
-fn perpendicular_axes(z: &Vector3<f64>) -> (Vector3<f64>, Vector3<f64>) {
+pub(crate) fn perpendicular_axes(z: &Vector3<f64>) -> (Vector3<f64>, Vector3<f64>) {
     let v_ref = if z.x.abs() < 0.9 {
         Vector3::new(1.0, 0.0, 0.0)
     } else {

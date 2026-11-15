@@ -1197,11 +1197,14 @@ pub fn sweep_joint(args: &Value, state: &mut EngineState) -> Result<Value, Serve
                 "max_penetration_depth": s.max_penetration_depth * k_from_m,
                 "max_intersection_volume": s.max_intersection_volume * k_vol,
                 "interfering_pairs": pairs_s,
+                "closure_residual": s.closure_residual,
+                "locked_up": s.locked_up,
             })
         })
         .collect();
 
     let first_col_val_u = report.first_collision_value.map(|v| v * k_coord_from_si);
+    let lockup_val_u = report.lockup_value.map(|v| v * k_coord_from_si);
     let min_clr_u = report.min_clearance.map(|c| c * k_from_m);
     let min_clr_val_u = report.min_clearance_value.map(|v| v * k_coord_from_si);
     let safe_range_u = report.safe_travel_range * k_coord_from_si;
@@ -1225,6 +1228,11 @@ pub fn sweep_joint(args: &Value, state: &mut EngineState) -> Result<Value, Serve
         "first_collision_step": report.first_collision_step,
         "first_collision_value": first_col_val_u,
         "first_collision_pairs": first_collision_pairs_json,
+        "closed_loop_detected": report.closed_loop_detected,
+        "lockup_detected": report.lockup_detected,
+        "lockup_step": report.lockup_step,
+        "lockup_value": lockup_val_u,
+        "max_closure_residual": report.max_closure_residual,
         "min_clearance": min_clr_u,
         "min_clearance_m": report.min_clearance,
         "min_clearance_step": report.min_clearance_step,
@@ -1247,6 +1255,14 @@ pub fn sweep_joint(args: &Value, state: &mut EngineState) -> Result<Value, Serve
             obj.insert(
                 "first_collision_angle_rad".to_string(),
                 json!(report.first_collision_value),
+            );
+            obj.insert(
+                "lockup_angle_deg".to_string(),
+                json!(report.lockup_value.map(|v| v.to_degrees())),
+            );
+            obj.insert(
+                "lockup_angle_rad".to_string(),
+                json!(report.lockup_value),
             );
         }
     }

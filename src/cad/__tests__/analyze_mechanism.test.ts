@@ -315,6 +315,146 @@ describe('P3-T10: check_interference & sweep_joint', () => {
     assert.equal(rep.interfering_pairs_count, 1);
     console.log(`[BENCHMARK P3-T10] 10 parts (45 pairs) checkInterference: ${elapsedMs.toFixed(2)} ms`);
   });
+
+  it('5. P3-T16: sweepJoint on Grashof 4-bar linkage rotates full 360 deg and detects follower obstacle collision', () => {
+    const crankMesh = createBoxMesh(0.008, 0.04, 0.008);
+    const couplerMesh = createBoxMesh(0.13, 0.008, 0.008);
+    const rockerMesh = createBoxMesh(0.008, 0.09, 0.008);
+    const wallMesh = createBoxMesh(0.01, 0.06, 0.02);
+
+    const buildParts = (withWall: boolean) => {
+      const parts: CadPart[] = [
+        makeDummyPart('crank', [0.0, 0.02, 0.0], false, crankMesh),
+        makeDummyPart('coupler', [0.06, 0.065, 0.02], false, couplerMesh),
+        makeDummyPart('rocker', [0.12, 0.045, 0.0], false, rockerMesh),
+      ];
+      if (withWall) {
+        parts.push(makeDummyPart('wall', [0.09, 0.075, 0.0], true, wallMesh));
+      }
+      return parts;
+    };
+
+    const joints = [
+      makeJoint('j1_crank', 'revolute', 'ground', 'crank', [0, 0, 0], [0, -0.02, 0], [0, 0, 1]),
+      makeJoint('j2_coupler_a', 'revolute', 'crank', 'coupler', [0, 0.02, 0], [-0.06, -0.025, -0.02], [0, 0, 1]),
+      makeJoint('j3_coupler_b', 'revolute', 'coupler', 'rocker', [0.06, 0.025, -0.02], [0, 0.045, 0], [0, 0, 1]),
+      makeJoint('j4_rocker', 'revolute', 'rocker', 'ground', [0, -0.045, 0], [0.12, 0, 0], [0, 0, 1]),
+    ];
+
+    const freeRep = sweepJoint(buildParts(false), joints, {
+      jointId: 'j1_crank',
+      from: 0,
+      to: Math.PI * 2,
+      steps: 72,
+      ignoreAdjacent: true,
+    });
+    assert.equal(freeRep.closed_loop_detected, true);
+    assert.equal(freeRep.lockup_detected, false);
+    assert.equal(freeRep.status, 'PASS');
+    assert.ok(freeRep.max_closure_residual < 1e-4, `residual=${freeRep.max_closure_residual}`);
+    assert.equal(freeRep.samples.length, 73);
+
+    const obsRep = sweepJoint(buildParts(true), joints, {
+      jointId: 'j1_crank',
+      from: 0,
+      to: Math.PI,
+      steps: 36,
+      ignoreAdjacent: true,
+    });
+    assert.equal(obsRep.closed_loop_detected, true);
+    assert.equal(obsRep.lockup_detected, false);
+    assert.equal(obsRep.status, 'FAIL');
+    assert.ok(
+      obsRep.first_collision_pairs.some(
+        ([a, b]) => (a === 'rocker' && b === 'wall') || (a === 'wall' && b === 'rocker')
+      ),
+      `Expected rocker-wall collision, got ${JSON.stringify(obsRep.first_collision_pairs)}`
+    );
+  });
+
+  it('6. P3-T16: sweepJoint on slider-crank completes 360 deg and detects slider-endstop collision', () => {
+    const crankMesh = createBoxMesh(0.008, 0.03, 0.008);
+    const rodMesh = createBoxMesh(0.05, 0.008, 0.008);
+    const sliderMesh = createBoxMesh(0.02, 0.02, 0.02);
+    const wallMesh = createBoxMesh(0.01, 0.04, 0.04);
+
+    const buildParts = (withWall: boolean) => {
+      const parts: CadPart[] = [
+        makeDummyPart('sc_crank', [0.0, 0.015, 0.0], false, crankMesh),
+        makeDummyPart('sc_rod', [0.02, 0.015, 0.02], false, rodMesh),
+        makeDummyPart('sc_slider', [0.04, 0.0, 0.0], false, sliderMesh),
+      ];
+      if (withWall) {
+        parts.push(makeDummyPart('endstop', [0.075, 0.0, 0.0], true, wallMesh));
+      }
+      return parts;
+    };
+
+    const joints = [
+      makeJoint('j_sc_crank', 'revolute', 'ground', 'sc_crank', [0, 0, 0], [0, -0.015, 0], [0, 0, 1]),
+      makeJoint('j_sc_pin_b', 'revolute', 'sc_crank', 'sc_rod', [0, 0.015, 0], [-0.02, 0.015, -0.02], [0, 0, 1]),
+      makeJoint('j_sc_pin_c', 'revolute', 'sc_rod', 'sc_slider', [0.02, -0.015, -0.02], [0, 0, 0], [0, 0, 1]),
+      makeJoint('j_sc_rail', 'prismatic', 'sc_slider', 'ground', [0, 0, 0], [0, 0, 0], [1, 0, 0]),
+    ];
+
+    const freeRep = sweepJoint(buildParts(false), joints, {
+      jointId: 'j_sc_crank',
+      from: 0,
+      to: Math.PI * 2,
+      steps: 36,
+      ignoreAdjacent: true,
+    });
+    assert.equal(freeRep.closed_loop_detected, true);
+    assert.equal(freeRep.lockup_detected, false);
+    assert.equal(freeRep.status, 'PASS');
+    assert.ok(freeRep.max_closure_residual < 1e-4, `residual=${freeRep.max_closure_residual}`);
+
+    const obsRep = sweepJoint(buildParts(true), joints, {
+      jointId: 'j_sc_crank',
+      from: 0,
+      to: -Math.PI / 2,
+      steps: 18,
+      ignoreAdjacent: true,
+    });
+    assert.equal(obsRep.closed_loop_detected, true);
+    assert.equal(obsRep.lockup_detected, false);
+    assert.equal(obsRep.status, 'FAIL');
+    assert.ok(
+      obsRep.first_collision_pairs.some(
+        ([a, b]) => (a === 'sc_slider' && b === 'endstop') || (a === 'endstop' && b === 'sc_slider')
+      ),
+      `Expected sc_slider-endstop collision, got ${JSON.stringify(obsRep.first_collision_pairs)}`
+    );
+  });
+
+  it('7. P3-T16: sweepJoint detects geometric lockup in non-Grashof 4-bar linkage', () => {
+    const parts: CadPart[] = [
+      makeDummyPart('lk_crank', [0.05, 0.0, 0.0], false, createBoxMesh(0.10, 0.008, 0.008)),
+      makeDummyPart('lk_coupler', [0.136, 0.048, 0.02], false, createBoxMesh(0.12, 0.008, 0.008)),
+      makeDummyPart('lk_rocker', [0.186, 0.048, 0.0], false, createBoxMesh(0.10, 0.008, 0.008)),
+    ];
+    const joints = [
+      makeJoint('j1_lk', 'revolute', 'ground', 'lk_crank', [0, 0, 0], [-0.05, 0, 0], [0, 0, 1]),
+      makeJoint('j2_lk', 'revolute', 'lk_crank', 'lk_coupler', [0.05, 0, 0], [-0.036, -0.048, -0.02], [0, 0, 1]),
+      makeJoint('j3_lk', 'revolute', 'lk_coupler', 'lk_rocker', [0.036, 0.048, -0.02], [-0.014, 0.048, 0], [0, 0, 1]),
+      makeJoint('j4_lk', 'revolute', 'lk_rocker', 'ground', [0.014, -0.048, 0], [0.20, 0, 0], [0, 0, 1]),
+    ];
+
+    const rep = sweepJoint(parts, joints, {
+      jointId: 'j1_lk',
+      from: 0,
+      to: (120 * Math.PI) / 180,
+      steps: 24,
+      ignoreAdjacent: true,
+    });
+    assert.equal(rep.closed_loop_detected, true);
+    assert.equal(rep.lockup_detected, true);
+    assert.equal(rep.status, 'FAIL');
+    assert.equal(rep.lockup_step, 18);
+    assert.ok(Math.abs((rep.lockup_angle_deg ?? 0) - 90.0) < 0.05, `got ${rep.lockup_angle_deg}`);
+    assert.equal(rep.samples[18].locked_up, true);
+    assert.ok(rep.max_closure_residual > 2e-4, `residual=${rep.max_closure_residual}`);
+  });
 });
 
 

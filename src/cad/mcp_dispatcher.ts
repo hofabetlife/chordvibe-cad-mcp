@@ -1708,6 +1708,14 @@ export function executeMcpToolOnEngineState(
         first_collision_angle_deg: report.first_collision_angle_deg ?? null,
         first_collision_angle_rad: report.first_collision_angle_rad ?? null,
         first_collision_pairs: report.first_collision_pairs,
+        closed_loop_detected: report.closed_loop_detected,
+        lockup_detected: report.lockup_detected,
+        lockup_step: report.lockup_step ?? null,
+        lockup_value:
+          report.lockup_value !== undefined ? report.lockup_value * fromInternal : null,
+        lockup_angle_deg: report.lockup_angle_deg ?? null,
+        lockup_angle_rad: report.lockup_angle_rad ?? null,
+        max_closure_residual: report.max_closure_residual,
         min_clearance:
           report.min_clearance !== undefined ? report.min_clearance * kLenFromM : null,
         min_clearance_m: report.min_clearance ?? null,
@@ -1739,6 +1747,8 @@ export function executeMcpToolOnEngineState(
           max_penetration_depth_m: s.max_penetration_depth,
           total_intersection_volume: s.total_intersection_volume * kVolFromM3,
           total_intersection_volume_m3: s.total_intersection_volume,
+          closure_residual: s.closure_residual,
+          locked_up: s.locked_up,
         })),
         length_unit: rawLenUnit,
         angle_unit: rawAngUnit,
