@@ -694,8 +694,6 @@ async fn test_mcp_sse_endpoints() {
 #[tokio::test]
 async fn test_mcp_open_preview_window() {
     struct PreviewTestCleanup {
-        prev_disable_spawn: Option<std::ffi::OsString>,
-        did_override_env: bool,
         output_dir_existed: bool,
         stl_paths: Vec<std::path::PathBuf>,
     }
@@ -708,28 +706,11 @@ async fn test_mcp_open_preview_window() {
             if !self.output_dir_existed {
                 let _ = std::fs::remove_dir("./output");
             }
-            if self.did_override_env {
-                match &self.prev_disable_spawn {
-                    Some(prev) => std::env::set_var("MCP_CAD_DISABLE_GUI_SPAWN", prev),
-                    None => std::env::remove_var("MCP_CAD_DISABLE_GUI_SPAWN"),
-                }
-            }
         }
     }
 
     let output_dir_existed = std::path::Path::new("./output").exists();
-    let prev_disable_spawn = std::env::var_os("MCP_CAD_DISABLE_GUI_SPAWN");
-    let already_disabled = prev_disable_spawn
-        .as_deref()
-        .and_then(|v| v.to_str())
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    if !already_disabled {
-        std::env::set_var("MCP_CAD_DISABLE_GUI_SPAWN", "1");
-    }
     let mut cleanup = PreviewTestCleanup {
-        prev_disable_spawn,
-        did_override_env: !already_disabled,
         output_dir_existed,
         stl_paths: Vec::new(),
     };

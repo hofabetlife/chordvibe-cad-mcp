@@ -499,11 +499,10 @@ mod tests {
     use mcp_cad_core::dag::FeatureOp;
     use mcp_cad_physics::joint::MotorConfig;
     use mcp_cad_viewer::offscreen::OffscreenRenderer;
-    use std::sync::Arc;
 
     #[test]
     fn test_get_scene_summary_unit_conversion_and_joints() {
-        let renderer = Arc::new(OffscreenRenderer::new().expect("OffscreenRenderer init"));
+        let renderer = OffscreenRenderer::shared().expect("OffscreenRenderer init");
         let mut state = EngineState::with_renderer(renderer);
 
         let mat = state.materials.get("aluminum_6061_t6").unwrap().clone();
@@ -640,7 +639,7 @@ mod tests {
 
     #[test]
     fn test_p2_t27_get_simulation_metrics_json_length_unit_and_fea_staleness() {
-        let renderer = Arc::new(OffscreenRenderer::new().expect("OffscreenRenderer init"));
+        let renderer = OffscreenRenderer::shared().expect("OffscreenRenderer init");
         let mut state = EngineState::with_renderer(renderer);
 
         crate::tools::cad::create_part(
@@ -742,7 +741,7 @@ mod tests {
 
     #[test]
     fn test_p2_t32_get_simulation_metrics_json_gravity_scaling_and_joints_count() {
-        let renderer = Arc::new(OffscreenRenderer::new().expect("OffscreenRenderer init"));
+        let renderer = OffscreenRenderer::shared().expect("OffscreenRenderer init");
         let mut state = EngineState::with_renderer(renderer);
 
         crate::tools::cad::create_part(

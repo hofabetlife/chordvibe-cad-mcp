@@ -52,11 +52,8 @@ jobs:
       - name: Build Rust workspace
         run: cargo build --workspace
 
-      - name: Run Rust workspace tests (core, physics, fea, viewer)
-        run: cargo test --workspace --exclude mcp-cad-server --no-fail-fast
-
-      - name: Run mcp-cad-server tests sequentially (headless / P3-T23)
-        run: cargo test -p mcp-cad-server --no-fail-fast -- --test-threads=1
+      - name: Run Rust workspace tests
+        run: cargo test --workspace --no-fail-fast
 
   clippy:
     name: Rust Clippy Linter

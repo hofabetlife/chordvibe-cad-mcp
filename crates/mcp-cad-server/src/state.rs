@@ -139,7 +139,7 @@ pub type SharedState = Arc<RwLock<EngineState>>;
 impl EngineState {
     /// Initializes a new engine state with default material database and WGPU renderer.
     pub fn new() -> Result<Self, ServerError> {
-        let offscreen_renderer = Arc::new(OffscreenRenderer::new()?);
+        let offscreen_renderer = OffscreenRenderer::shared()?;
         Ok(Self::with_renderer(offscreen_renderer))
     }
 

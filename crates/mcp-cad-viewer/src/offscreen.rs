@@ -1,6 +1,7 @@
 //! Headless offscreen renderer using WGPU for CAD mesh visualization and FEA colormaps.
 
 use std::sync::mpsc::channel;
+use std::sync::{Arc, Mutex};
 use base64::Engine;
 use wgpu::util::DeviceExt;
 use mcp_cad_core::part::Part;
@@ -132,12 +133,20 @@ pub fn extract_boundary_indices(mesh: &TriangleMesh) -> Vec<u32> {
     line_indices
 }
 
+/// Serializes WGPU instance/adapter/device initialization across threads to prevent
+/// Windows DX12/Vulkan driver contention deadlocks during parallel test runs.
+static WGPU_INIT_LOCK: Mutex<()> = Mutex::new(());
+/// Process-wide shared offscreen renderer reused by [`OffscreenRenderer::shared`].
+static SHARED_RENDERER: Mutex<Option<Arc<OffscreenRenderer>>> = Mutex::new(None);
+
 /// Headless WGPU offscreen renderer for capturing PNG snapshots and Base64 images.
 pub struct OffscreenRenderer {
     /// WGPU Logical Device.
     pub device: wgpu::Device,
     /// WGPU Command Queue.
     pub queue: wgpu::Queue,
+    /// Serializes GPU render/readback passes on a shared device.
+    render_lock: Mutex<()>,
     /// Render pipeline for standard CAD solid shading.
     cad_pipeline: wgpu::RenderPipeline,
     /// Bind group layout for CAD uniforms.
@@ -158,6 +167,8 @@ impl OffscreenRenderer {
     /// Discovers an available GPU adapter (DirectX 12, Vulkan, or software WARP rasterizer)
     /// without requiring an OS display window.
     pub fn new() -> Result<Self, ViewerError> {
+        let _init_guard = WGPU_INIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
@@ -444,6 +455,7 @@ impl OffscreenRenderer {
         Ok(Self {
             device,
             queue,
+            render_lock: Mutex::new(()),
             cad_pipeline,
             cad_bind_group_layout,
             fea_pipeline,
@@ -451,6 +463,22 @@ impl OffscreenRenderer {
             wireframe_pipeline,
             wireframe_bind_group_layout,
         })
+    }
+
+    /// Returns a process-wide shared [`OffscreenRenderer`] instance, initializing it once on
+    /// first use.
+    ///
+    /// Sharing a single GPU device across server states and parallel test threads avoids
+    /// concurrent DX12/Vulkan device creation and destruction deadlocks on Windows while
+    /// keeping render calls serialized via `render_lock`.
+    pub fn shared() -> Result<Arc<Self>, ViewerError> {
+        let mut slot = SHARED_RENDERER.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = slot.as_ref() {
+            return Ok(Arc::clone(existing));
+        }
+        let created = Arc::new(Self::new()?);
+        *slot = Some(Arc::clone(&created));
+        Ok(created)
     }
 
     /// Renders a triangular solid CAD mesh into PNG encoded bytes.
@@ -999,6 +1027,8 @@ impl OffscreenRenderer {
         width: u32,
         height: u32,
     ) -> Result<Vec<u8>, ViewerError> {
+        let _render_guard = self.render_lock.lock().unwrap_or_else(|e| e.into_inner());
+
         let texture_desc = wgpu::TextureDescriptor {
             label: Some("Offscreen Color Texture"),
             size: wgpu::Extent3d {

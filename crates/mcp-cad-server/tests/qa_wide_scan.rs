@@ -17,11 +17,54 @@ use mcp_cad_server::state::EngineState;
 #[allow(dead_code)]
 const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 
-fn qa_base_dir() -> PathBuf {
-    if Path::new("../../qa").exists() {
-        PathBuf::from("../../qa")
+struct QaDirGuard {
+    path: PathBuf,
+    cleanup_on_drop: bool,
+}
+
+impl QaDirGuard {
+    fn join(&self, rel: impl AsRef<Path>) -> PathBuf {
+        self.path.join(rel)
+    }
+}
+
+impl Drop for QaDirGuard {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+/// Returns the base directory for QA output files (`results/` and `artifacts/`).
+///
+/// By default, writes go to an isolated per-test temp directory that is cleaned up on drop
+/// so `cargo test` never dirties tracked `qa/results/*.json` or `qa/artifacts/`.
+/// Set `MCP_CAD_QA_WRITE_REPO=1` to write directly into the repository `qa/` directory.
+fn qa_base_dir() -> QaDirGuard {
+    let write_repo = std::env::var("MCP_CAD_QA_WRITE_REPO")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if write_repo {
+        let path = if Path::new("../../qa").exists() {
+            PathBuf::from("../../qa")
+        } else {
+            PathBuf::from("qa")
+        };
+        QaDirGuard {
+            path,
+            cleanup_on_drop: false,
+        }
     } else {
-        PathBuf::from("qa")
+        let path = std::env::temp_dir().join(format!(
+            "mcp_cad_qa_wide_scan_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        QaDirGuard {
+            path,
+            cleanup_on_drop: true,
+        }
     }
 }
 
@@ -936,7 +979,8 @@ async fn test_wide_scan_functional_matrix_26_tools() {
 
 #[tokio::test]
 async fn test_bug_003_partial_revolve_mesh_and_renders() {
-    let art_dir = qa_base_dir().join("artifacts");
+    let base_dir = qa_base_dir();
+    let art_dir = base_dir.join("artifacts");
     std::fs::create_dir_all(&art_dir).unwrap();
 
     // 1. Hollow rectangular profile at 90, 180, 270, 360 degrees (including CW reversed profile)
@@ -1001,7 +1045,8 @@ async fn test_bug_003_partial_revolve_mesh_and_renders() {
 
 #[test]
 fn test_bug_007_negative_scale_preserves_outward_winding() {
-    let art_dir = qa_base_dir().join("artifacts");
+    let base_dir = qa_base_dir();
+    let art_dir = base_dir.join("artifacts");
     std::fs::create_dir_all(&art_dir).unwrap();
 
     // SKEPTIC cases: 1 negative axis [-1, 1, 1], 2 negative axes [-1, -1, 1], 3 negative axes [-2, -1, -0.5]
@@ -1040,7 +1085,8 @@ fn test_bug_007_negative_scale_preserves_outward_winding() {
 
 #[tokio::test]
 async fn test_bug_005_polygon_prism_chamfer_and_sides_validation() {
-    let art_dir = qa_base_dir().join("artifacts");
+    let base_dir = qa_base_dir();
+    let art_dir = base_dir.join("artifacts");
     std::fs::create_dir_all(&art_dir).unwrap();
 
     for sides in [3, 4, 6, 8, 12] {
@@ -1099,7 +1145,8 @@ async fn test_bug_005_polygon_prism_chamfer_and_sides_validation() {
 
 #[tokio::test]
 async fn test_bug_002_spur_gear_manifold_and_keyway() {
-    let art_dir = qa_base_dir().join("artifacts");
+    let base_dir = qa_base_dir();
+    let art_dir = base_dir.join("artifacts");
     std::fs::create_dir_all(&art_dir).unwrap();
 
     // 1. SKEPTIC grid: teeth in [8, 20, 60], pressure angle in [14.5, 20.0, 25.0]
@@ -1176,7 +1223,8 @@ async fn test_bug_002_spur_gear_manifold_and_keyway() {
 
 #[tokio::test]
 async fn test_bug_004_wheel_rim_manifold_and_renders() {
-    let art_dir = qa_base_dir().join("artifacts");
+    let base_dir = qa_base_dir();
+    let art_dir = base_dir.join("artifacts");
     std::fs::create_dir_all(&art_dir).unwrap();
 
     // 1. SKEPTIC grid: (spokes, bolts) combinations -> expected genus = 1 + spokes + bolts

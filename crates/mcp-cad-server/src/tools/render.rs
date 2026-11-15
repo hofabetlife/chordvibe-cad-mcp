@@ -162,21 +162,40 @@ pub fn open_preview_window(args: &Value, state: &EngineState) -> Result<Value, S
             }));
         }
 
-        // Export target mesh to temporary binary STL
-        let out_dir = std::path::Path::new("./output");
-        let preview_stl_path = if out_dir.exists() || std::fs::create_dir_all(out_dir).is_ok() {
-            out_dir.join("_mcp_preview_live.stl")
+        let running_in_test_binary = cfg!(test)
+            || std::env::current_exe()
+                .ok()
+                .and_then(|exe| {
+                    exe.parent()
+                        .and_then(|p| p.file_name())
+                        .map(|n| n == std::ffi::OsStr::new("deps"))
+                })
+                .unwrap_or(false);
+
+        let disable_spawn = match std::env::var("MCP_CAD_DISABLE_GUI_SPAWN") {
+            Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+            Err(_) => running_in_test_binary,
+        };
+
+        // Export target mesh to temporary binary STL (isolated temp file under tests/headless
+        // so parallel tests never race on `./output`).
+        let preview_stl_path = if running_in_test_binary {
+            std::env::temp_dir().join(format!(
+                "mcp_cad_preview_live_{}.stl",
+                uuid::Uuid::new_v4().simple()
+            ))
         } else {
-            std::env::temp_dir().join("mcp_cad_preview_live.stl")
+            let out_dir = std::path::Path::new("./output");
+            if out_dir.exists() || std::fs::create_dir_all(out_dir).is_ok() {
+                out_dir.join("_mcp_preview_live.stl")
+            } else {
+                std::env::temp_dir().join("mcp_cad_preview_live.stl")
+            }
         };
 
         if let Ok(mut f) = std::fs::File::create(&preview_stl_path) {
             let _ = mcp_cad_core::export_stl::export_stl_binary(&target_mesh, &mut f);
         }
-
-        let disable_spawn = std::env::var("MCP_CAD_DISABLE_GUI_SPAWN")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
 
         if disable_spawn {
             return Ok(json!({

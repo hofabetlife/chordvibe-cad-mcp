@@ -307,7 +307,7 @@ graph TD
 > [!IMPORTANT]
 > **Требуемая версия Rust и фактическое состояние тестов:**
 > - Для сборки и тестирования используется **Rust `1.91`** (зафиксирован в [`rust-toolchain.toml`](rust-toolchain.toml) с компонентами `rustfmt`, `clippy`; зависимости в `Cargo.lock` требуют `rustc >= 1.89`, проверено на `rustc 1.91.1` и `rustc 1.97.1`).
-> - **Rust Workspace**: тесты всех 5 крейтов (`mcp-cad-core`, `mcp-cad-physics`, `mcp-cad-fea`, `mcp-cad-viewer`, `mcp-cad-server`) проходят без ошибок (`0 failed`); для `mcp-cad-server` в текущей версии требуется `MCP_CAD_DISABLE_GUI_SPAWN=1` и `-- --test-threads=1` (см. [`TASKS.md`](TASKS.md) `P3-T23` и [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+> - **Rust Workspace**: тесты всех 5 крейтов (`mcp-cad-core`, `mcp-cad-physics`, `mcp-cad-fea`, `mcp-cad-viewer`, `mcp-cad-server`) проходят без ошибок (`0 failed`) в стандартном многопоточном режиме `cargo test --workspace --no-fail-fast` (задача `P3-T23` выполнена; `qa_wide_scan` изолирован во временный каталог).
 > - **TypeScript / Web Studio (`npm test`)**: **52/52 PASS** (`37` тестов в [`src/cad/cad_engine.test.ts`](src/cad/cad_engine.test.ts) + `15` тестов в [`src/cad/__tests__/analyze_mechanism.test.ts`](src/cad/__tests__/analyze_mechanism.test.ts)), `npm run lint` (`tsc --noEmit`) — **0 ошибок**.
 > - **Clippy (`cargo clippy --workspace --all-targets -- -D warnings`)**: **0 ошибок, 0 предупреждений** во всех 5 крейтах workspace (строгий гейт в CI).
 > - Актуальный источник истины по статусу тестов, точным счётчикам и открытым задачам — [`TASKS.md`](TASKS.md) и [`PROJECT_CONTEXT.md`](PROJECT_CONTEXT.md) (раздел 7; исторические отчёты в каталоге `qa/` устарели).
@@ -315,12 +315,10 @@ graph TD
 Запуск всего набора тестов (требуется **Rust $\ge 1.91$**):
 ```bash
 # Windows (PowerShell):
-cargo test --workspace --exclude mcp-cad-server --no-fail-fast
-$env:MCP_CAD_DISABLE_GUI_SPAWN="1"; cargo test -p mcp-cad-server --no-fail-fast -- --test-threads=1
+cargo test --workspace --no-fail-fast
 
 # Linux / Headless CI (с программным драйвером Vulkan Lavapipe):
-WGPU_BACKEND=vulkan LIBGL_ALWAYS_SOFTWARE=1 MCP_CAD_DISABLE_GUI_SPAWN=1 cargo test --workspace --exclude mcp-cad-server --no-fail-fast
-WGPU_BACKEND=vulkan LIBGL_ALWAYS_SOFTWARE=1 MCP_CAD_DISABLE_GUI_SPAWN=1 cargo test -p mcp-cad-server --no-fail-fast -- --test-threads=1
+WGPU_BACKEND=vulkan LIBGL_ALWAYS_SOFTWARE=1 cargo test --workspace --no-fail-fast
 ```
 Проверка линтером Clippy и тесты веб-клиента:
 ```bash

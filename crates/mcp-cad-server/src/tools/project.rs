@@ -546,10 +546,9 @@ mod tests {
     use super::*;
     use mcp_cad_core::dag::FeatureOp;
     use mcp_cad_viewer::offscreen::OffscreenRenderer;
-    use std::sync::Arc;
 
     fn test_engine_state() -> EngineState {
-        let renderer = Arc::new(OffscreenRenderer::new().expect("OffscreenRenderer init"));
+        let renderer = OffscreenRenderer::shared().expect("OffscreenRenderer init");
         EngineState::with_renderer(renderer)
     }
 
