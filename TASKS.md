@@ -1,9 +1,14 @@
 # MCP-CAD: План работ и реестр задач (Backlog)
 
 > **Единый источник правды по архитектуре и принятым решениям:** Все фундаментальные архитектурные решения, таблицы систем координат примитивов, семантика Solid DAG и контракты 40 инструментов MCP перенесены и подробно описаны в **[`PROJECT_CONTEXT.md`](PROJECT_CONTEXT.md)** (разделы 4, 5 и 8).  
-> **Пошаговые отчёты о выполненных задачах (`P0-T1..T12`, `P1-T1..T4`, `P2-T1..T40`, `P3-T1..T20`):** хранятся в [`docs/agent_tasks/`](docs/agent_tasks/).  
+> **Пошаговые отчёты о выполненных задачах (`P0-T1..T12`, `P1-T1..T4`, `P2-T1..T40`, `P3-T1..T21`):** хранятся в [`docs/agent_tasks/`](docs/agent_tasks/).  
 > **Текущий статус верификации (15.11.2026):**  
-> - **Проверено в `P3-T20` после финальной правки `crates/mcp-cad-server/tests/mcp_contract_tests.rs`:**  
+> - **Проверено в `P3-T21` после финальной правки `spikes/monstertruck_brep/src/main.rs`:**  
+>   - `cargo check --manifest-path spikes/monstertruck_brep/Cargo.toml --all-targets`: **PASS** (`exit 0`, `36.26s`);  
+>   - `cargo clippy --manifest-path spikes/monstertruck_brep/Cargo.toml --all-targets -- -D warnings`: **PASS** (`0` ошибок, `0` предупреждений в `spike-monstertruck-brep`, `23.63s`);  
+>   - `cargo test --manifest-path spikes/monstertruck_brep/Cargo.toml`: **PASS** (`0 passed; 0 failed; 0 ignored`, бинарный спайк без unit-тестов; `cargo run` — `exit 0`, все 5 секций без паник, `validate_mesh: PASS`, `watertight=true`, STEP export `233470 bytes`);  
+>   - `cargo clippy --workspace --all-targets -- -D warnings`: **0 ошибок, 0 предупреждений** во всех 5 крейтах (`exit 0`, `0.40s`).  
+> - **Проверено ранее в `P3-T20` после финальной правки `crates/mcp-cad-server/tests/mcp_contract_tests.rs`:**  
 >   - `$env:MCP_CAD_DISABLE_GUI_SPAWN="1"; cargo test -p mcp-cad-server --test mcp_contract_tests --no-fail-fast -- --test-threads=1`: **59/59 PASS** (`0 failed`, `61.45s`, включая актуализированный `test_mcp_open_preview_window`);  
 >   - `$env:MCP_CAD_DISABLE_GUI_SPAWN="1"; cargo test -p mcp-cad-server --lib --no-fail-fast -- --test-threads=1`: **61/61 PASS** (`0 failed`, `64.19s`);  
 >   - `cargo clippy --workspace --all-targets -- -D warnings`: **0 ошибок, 0 предупреждений** во всех 5 крейтах (`exit 0`, `5.07s`).  
@@ -18,7 +23,7 @@
 > - **Проверено ранее в `P3-T17` (`MCP_CAD_DISABLE_GUI_SPAWN=1`, `-- --test-threads=1` для `mcp-cad-server`):**  
 >   - `cargo test -p mcp-cad-core --no-fail-fast`: **131/131 PASS** (`74` `--lib` + `10` `csg_invariants` + `16` `dag_tests`, включая 2 новых теста `P3-T17` + `25` `primitive_invariants` + `6` `tessellation_tests`);  
 >   - `cargo test -p mcp-cad-server --test qa_wide_scan --no-fail-fast -- --test-threads=1`: **13/13 PASS** (`21.22s`);  
->   - прочие таргеты/крейты не перезапускались в `P3-T17`–`P3-T20` (по прошлым проверкам: в `P3-T14` — `bench_suite`/`gear_kinematic_test` `2/2`; в `P3-T13` — `mcp-cad-fea` `21/21`, `mcp-cad-viewer` `10/10`).
+>   - прочие таргеты/крейты не перезапускались в `P3-T17`–`P3-T21` (по прошлым проверкам: в `P3-T14` — `bench_suite`/`gear_kinematic_test` `2/2`; в `P3-T13` — `mcp-cad-fea` `21/21`, `mcp-cad-viewer` `10/10`).
 
 ---
 
@@ -44,7 +49,7 @@
 | **P3-T18** | P3 Calculation | Актуализация конструктора `TriangleMesh::new` в изолированном спайке `spikes/manifold_rust/src/main.rs:170` после добавления полей `face_ids` и `faces` (`P2-T6`) | P1-T3, P2-T6 | S | `spikes/manifold_rust` | ✅ DONE |
 | **P3-T19** | P3 Calculation | Исправление проверки `min_clearance_step` в тесте `test_p3_t10_sweep_joint_hinged_arm_hitting_fixed_wall` (`physics_tests.rs:1632`: `Some(78)` на `[0°, 90°]` и `Some(27)` на `[0°, 60°]`) и паритет TS-зеркала `sweepJoint` | P3-T10 | S | `mcp-cad-physics`, TS | ✅ DONE |
 | **P3-T20** | P3 Contract | Актуализация контрактного теста `test_mcp_open_preview_window` (`mcp_contract_tests.rs:695`: статус `"empty"` на пустой сцене после `P2-T37` и headless-сценарий при `MCP_CAD_DISABLE_GUI_SPAWN=1`) | P2-T37 | S | `mcp-cad-server` | ✅ DONE |
-| **P3-T21** | P3 Calculation | Актуализация конструктора `TriangleMesh::new` в изолированном спайке `spikes/monstertruck_brep/src/main.rs:60` после добавления полей `face_ids` и `faces` (`P2-T6`) | P1-T3, P2-T6 | S | `spikes/monstertruck_brep` | 📋 BACKLOG |
+| **P3-T21** | P3 Calculation | Актуализация конструктора `TriangleMesh::new` в изолированном спайке `spikes/monstertruck_brep/src/main.rs:60` после добавления полей `face_ids` и `faces` (`P2-T6`) | P1-T3, P2-T6 | S | `spikes/monstertruck_brep` | ✅ DONE |
 | **P3-T22** | P0 Hygiene | Восстановление отсутствующих в рабочей копии файлов CI/тулчейна (`rust-toolchain.toml`, `.github/workflows/ci.yml`) и TS-теста `src/cad/cad_engine.test.ts` (либо актуализация ссылок в `README.md`) | P0-T8 | S | Repo / CI / TS | 📋 BACKLOG |
 | **P3-T23** | P3 Testing | Устранение зависания многопоточного прогона `mcp_contract_tests` и `qa_wide_scan` на Windows (WGPU/GUI-конкуренция) и изоляция побочных записей `qa/results/*.json` и `qa/artifacts/` | P2-T37 | S | `mcp-cad-server` | 📋 BACKLOG |
 | **P4-T0** | P4 Blueprints | Каркас параметрических «рецептов» (`apply_recipe`) и генерация типовых инженерных узлов | P0–P3 | M | `mcp-cad-server` | 📋 BACKLOG |
@@ -285,10 +290,11 @@
   3. Подтверждены `mcp_contract_tests` (`59/59 PASS`, `0 failed`), `mcp-cad-server --lib` (`61/61 PASS`, `0 failed`) и `cargo clippy --workspace --all-targets -- -D warnings` (`0` ошибок, `0` предупреждений).
 - **Компонент**: `crates/mcp-cad-server/tests/mcp_contract_tests.rs`, `docs/agent_tasks/P3-T20-report.md`
 
-#### P3-T21 [S]: Актуализация конструктора `TriangleMesh::new` в изолированном спайке `spikes/monstertruck_brep/src/main.rs:60`
-- **Проблема**: Выявлено при аудите **P3-T13** ([`docs/agent_tasks/P3-T13-report.md`](docs/agent_tasks/P3-T13-report.md)): в изолированном спайке `spikes/monstertruck_brep/src/main.rs:60:20` инициализируется `let mut mesh = TriangleMesh { vertices, indices };` без полей `face_ids` и `faces`, из-за чего `cargo clippy` / `cargo check` завершается ошибкой `error[E0063]: missing fields face_ids and faces in initializer of mcp_cad_core::TriangleMesh`.
-- **Что сделать**: Заменить структурный литерал на `TriangleMesh::new(vertices, indices)` и убедиться, что `cargo clippy --manifest-path spikes/monstertruck_brep/Cargo.toml --all-targets -- -D warnings` проходит без ошибок.
-- **Компонент**: `spikes/monstertruck_brep/src/main.rs`
+#### P3-T21 [S]: Актуализация конструктора `TriangleMesh::new` в изолированном спайке `spikes/monstertruck_brep/src/main.rs:60` — ✅ DONE (`15.11.2026`, см. [`P3-T21-report.md`](docs/agent_tasks/P3-T21-report.md))
+- **Выполнено**:
+  1. В [`spikes/monstertruck_brep/src/main.rs:60`](spikes/monstertruck_brep/src/main.rs#L60) структурный литерал `TriangleMesh { vertices, indices }` заменён на вызов конструктора `TriangleMesh::new(vertices, indices)`.
+  2. Подтверждены `cargo check --manifest-path spikes/monstertruck_brep/Cargo.toml --all-targets` (`exit 0`), `cargo clippy --manifest-path spikes/monstertruck_brep/Cargo.toml --all-targets -- -D warnings` (`0` ошибок, `0` предупреждений), `cargo test --manifest-path spikes/monstertruck_brep/Cargo.toml` (`0 passed; 0 failed`), `cargo run --manifest-path spikes/monstertruck_brep/Cargo.toml` (`exit 0`, все 5 секций без паник) и `cargo clippy --workspace --all-targets -- -D warnings` (`0` ошибок, `0` предупреждений).
+- **Компонент**: `spikes/monstertruck_brep/src/main.rs`, `docs/agent_tasks/P3-T21-report.md`
 
 #### P3-T22 [S]: Восстановление отсутствующих в рабочей копии файлов CI/тулчейна и TS-теста (`rust-toolchain.toml`, `.github/workflows/ci.yml`, `src/cad/cad_engine.test.ts`)
 - **Проблема**: Выявлено при аудите **P3-T13** ([`docs/agent_tasks/P3-T13-report.md`](docs/agent_tasks/P3-T13-report.md)): в текущей рабочей копии отсутствуют файлы `rust-toolchain.toml` и `.github/workflows/ci.yml` (заявленные выполненными в `P0-T8`), а также `src/cad/cad_engine.test.ts` (на который ссылаются `README.md:327`, `TASKS.md` и `PROJECT_CONTEXT.md:306`; фактически в `src/cad/__tests__/` есть только `analyze_mechanism.test.ts` с 11 тестами).
@@ -392,4 +398,5 @@
 | **P3-T18** | P3 Calculation | Актуализация инициализации `TriangleMesh::new(vertices, indices)` в изолированном спайке `spikes/manifold_rust/src/main.rs:170` после добавления полей `face_ids` и `faces` (`P2-T6`) | §5.7, §7 | [`P3-T18-report.md`](docs/agent_tasks/P3-T18-report.md) |
 | **P3-T19** | P3 Calculation | Актуализация проверки `min_clearance_step` в `test_p3_t10_sweep_joint_hinged_arm_hitting_fixed_wall` (`Some(78)` на `[0°, 90°]`, `Some(27)` на `[0°, 60°]`) и синхронизация `&& interferingPairs.length === 0` в TS-ветке `sweepJoint` | §4.3, §7 | [`P3-T19-report.md`](docs/agent_tasks/P3-T19-report.md) |
 | **P3-T20** | P3 Contract | Актуализация контрактного теста `test_mcp_open_preview_window` (`status: "empty"` на пустой сцене/детали без фич, контролируемый headless-сценарий при `MCP_CAD_DISABLE_GUI_SPAWN=1` и cleanup временного STL) | §7, §8 | [`P3-T20-report.md`](docs/agent_tasks/P3-T20-report.md) |
+| **P3-T21** | P3 Calculation | Актуализация инициализации `TriangleMesh::new(vertices, indices)` в изолированном спайке `spikes/monstertruck_brep/src/main.rs:60` после добавления полей `face_ids` и `faces` (`P2-T6`) | §5.7, §7 | [`P3-T21-report.md`](docs/agent_tasks/P3-T21-report.md) |
 | **TS-FIX-01** | TS Suite | Синхронизация числа пресетов МКЭ (5) и импортов типов в `src/cad/{cad_engine.test.ts, primitives.ts}` | §7 | — |

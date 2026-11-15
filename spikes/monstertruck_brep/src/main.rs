@@ -57,7 +57,7 @@ fn polygon_mesh_to_cad_mesh(poly: &PolygonMesh) -> TriangleMesh {
             tri[2].pos as u32,
         ]);
     }
-    let mut mesh = TriangleMesh { vertices, indices };
+    let mut mesh = TriangleMesh::new(vertices, indices);
     mesh.recompute_vertex_normals();
     mesh
 }
