@@ -167,7 +167,7 @@ fn manifold_to_triangle_mesh(m: &Manifold) -> (TriangleMesh, MeshGLP<f64, u32>) 
     for t in 0..mgl.num_tri() {
         indices.push(mgl.get_tri_verts(t));
     }
-    let mut mesh = TriangleMesh { vertices, indices };
+    let mut mesh = TriangleMesh::new(vertices, indices);
     mesh.recompute_vertex_normals();
     (mesh, mgl)
 }

@@ -52,7 +52,7 @@ mcp-cad/
 │   ├── BENCH_BASELINE_RUST.md    # Базовая линия 15 задач бенчмарка против нативного Rust-сервера
 │   ├── adr/0001-geometry-kernel.md # ADR выбора геометрического ядра (manifold-rust + monstertruck)
 │   ├── adr/0002-fe-mesher.md        # ADR выбора генератора сетки МКЭ (fe_snap + TET10, P3-T5)
-│   └── agent_tasks/              # Детальные отчёты о выполнении задач P0-T1..T12, P1-T1..T4, P2-T1..T40, P3-T1..T15
+│   └── agent_tasks/              # Детальные отчёты о выполнении задач P0-T1..T12, P1-T1..T4, P2-T1..T40, P3-T1..T18
 ├── spikes/
 │   ├── manifold_rust/            # Прототип ядра manifold-rust v0.19.2 (Pure Rust CSG + face_id)
 │   ├── monstertruck_brep/        # Прототип B-Rep ядра monstertruck v0.4.1 (fillet + ISO 10303-21 STEP)
@@ -296,8 +296,11 @@ graph TD
    - Любая ошибка параметров возвращается как `Result<T, CadError / ServerError>` и преобразуется в структурированный JSON `ErrorEnvelope`.
 2. **Чистота потока `stdout` в режиме `stdio`**:
    - В режиме `--mode stdio` поток `stdout` используется **исключительно** для сообщений JSON-RPC 2.0. Любой вывод логов (`tracing`, `eprintln!`) направляется строго в `std::io::stderr`.
-3. **Статус автоматического тестирования (`mcp-cad-core`, `--lib` и `qa_wide_scan` в `mcp-cad-server` и `clippy` актуализированы в `P3-T17` от 15.11.2026; `mcp-cad-physics`, `mcp_contract_tests`, TS-суит — `P3-T16` от 15.11.2026; `bench_suite`/`gear_kinematic_test` — `P3-T14`; `mcp-cad-fea`/`viewer` — аудит `P3-T13`)**:
-   - **Проверено в `P3-T17` после финальной правки**:
+3. **Статус автоматического тестирования (`spikes/manifold_rust` и `clippy` workspace актуализированы в `P3-T18` от 15.11.2026; `mcp-cad-core`, `--lib` и `qa_wide_scan` в `mcp-cad-server` — `P3-T17` от 15.11.2026; `mcp-cad-physics`, `mcp_contract_tests`, TS-суит — `P3-T16` от 15.11.2026; `bench_suite`/`gear_kinematic_test` — `P3-T14`; `mcp-cad-fea`/`viewer` — аудит `P3-T13`)**:
+   - **Проверено в `P3-T18` после финальной правки `spikes/manifold_rust/src/main.rs`**:
+     - `spikes/manifold_rust`: `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (`0 passed; 0 failed`), `cargo run` — все **PASS** (`exit 0`);
+     - **Линтер Rust (`cargo clippy --workspace --all-targets -- -D warnings`) — 0 ошибок, 0 предупреждений** (`exit 0`).
+   - **Проверено в `P3-T17` после финальной правки ядра/сервера**:
      - `mcp-cad-core`: **131 тест** (`74` `--lib` + `10` `csg_invariants` + `16` `dag_tests`, включая 2 новых теста `P3-T17` + `25` `primitive_invariants` + `6` `tessellation_tests`) — **131 PASS**;
      - `mcp-cad-server`: `--lib` **61/61 PASS** (при `MCP_CAD_DISABLE_GUI_SPAWN=1 -- --test-threads=1`, включая `test_p3_t17_transform_part_then_cut_helical_groove_nut_and_drill`) и `qa_wide_scan` **13/13 PASS** (`MCP_CAD_DISABLE_GUI_SPAWN=1 -- --test-threads=1`);
      - **Линтер Rust (`cargo clippy --workspace --all-targets -- -D warnings`) — 0 ошибок, 0 предупреждений** (`exit 0`).

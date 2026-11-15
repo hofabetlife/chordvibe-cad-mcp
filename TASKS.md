@@ -1,9 +1,14 @@
 # MCP-CAD: План работ и реестр задач (Backlog)
 
 > **Единый источник правды по архитектуре и принятым решениям:** Все фундаментальные архитектурные решения, таблицы систем координат примитивов, семантика Solid DAG и контракты 40 инструментов MCP перенесены и подробно описаны в **[`PROJECT_CONTEXT.md`](PROJECT_CONTEXT.md)** (разделы 4, 5 и 8).  
-> **Пошаговые отчёты о выполненных задачах (`P0-T1..T12`, `P1-T1..T4`, `P2-T1..T40`, `P3-T1..T17`):** хранятся в [`docs/agent_tasks/`](docs/agent_tasks/).  
+> **Пошаговые отчёты о выполненных задачах (`P0-T1..T12`, `P1-T1..T4`, `P2-T1..T40`, `P3-T1..T18`):** хранятся в [`docs/agent_tasks/`](docs/agent_tasks/).  
 > **Текущий статус верификации (15.11.2026):**  
-> - **Проверено в `P3-T17` после финальной правки кода (`MCP_CAD_DISABLE_GUI_SPAWN=1`, `-- --test-threads=1` для `mcp-cad-server`):**  
+> - **Проверено в `P3-T18` после финальной правки `spikes/manifold_rust/src/main.rs`:**  
+>   - `cargo check --manifest-path spikes/manifold_rust/Cargo.toml --all-targets`: **PASS** (`exit 0`);  
+>   - `cargo clippy --manifest-path spikes/manifold_rust/Cargo.toml --all-targets -- -D warnings`: **PASS** (`0` ошибок, `0` предупреждений);  
+>   - `cargo test --manifest-path spikes/manifold_rust/Cargo.toml`: **PASS** (`0 passed; 0 failed`, бинарный спайк без unit-тестов; `cargo run` — `exit 0`, все 3 секции `watertight=true`);  
+>   - `cargo clippy --workspace --all-targets -- -D warnings`: **0 ошибок, 0 предупреждений** во всех 5 крейтах (`exit 0`).  
+> - **Проверено ранее в `P3-T17` (`MCP_CAD_DISABLE_GUI_SPAWN=1`, `-- --test-threads=1` для `mcp-cad-server`):**  
 >   - `cargo test -p mcp-cad-core --no-fail-fast`: **131/131 PASS** (`74` `--lib` + `10` `csg_invariants` + `16` `dag_tests`, включая 2 новых теста `P3-T17` + `25` `primitive_invariants` + `6` `tessellation_tests`);  
 >   - `cargo test -p mcp-cad-server --lib --no-fail-fast -- --test-threads=1`: **61/61 PASS** (включая новый `test_p3_t17_transform_part_then_cut_helical_groove_nut_and_drill`);  
 >   - `cargo test -p mcp-cad-server --test qa_wide_scan --no-fail-fast -- --test-threads=1`: **13/13 PASS** (`21.22s`);  
@@ -31,7 +36,7 @@
 | **P3-T15** | P3 Calculation | Учёт активных упоров (`limits`) шарниров на границе хода и атрибуция избыточных связей (`redundant_joint_ids`) в `analyze_mechanism` | P3-T9 | S | `mcp-cad-physics` | ✅ DONE |
 | **P3-T16** | P3 Calculation | Итеративный геометрический решатель замкнутых кинематических цепей при пошаговом сканировании `sweep_joint` на четырёхзвенниках и кривошипно-ползунных механизмах | P3-T10 | S | `mcp-cad-physics` | ✅ DONE |
 | **P3-T17** | P3 Calculation | Поддержка несоосных и наклонных винтовых канавок `cut_helical_groove` при произвольной ориентации заготовки вне оси `Z` | P3-T11, P1-T4 | S | `mcp-cad-core`, `server` | ✅ DONE |
-| **P3-T18** | P3 Calculation | Актуализация конструктора `TriangleMesh::new` в изолированном спайке `spikes/manifold_rust/src/main.rs:170` после добавления полей `face_ids` и `faces` (`P2-T6`) | P1-T3, P2-T6 | S | `spikes/manifold_rust` | 📋 BACKLOG |
+| **P3-T18** | P3 Calculation | Актуализация конструктора `TriangleMesh::new` в изолированном спайке `spikes/manifold_rust/src/main.rs:170` после добавления полей `face_ids` и `faces` (`P2-T6`) | P1-T3, P2-T6 | S | `spikes/manifold_rust` | ✅ DONE |
 | **P3-T19** | P3 Calculation | Исправление проверки `min_clearance_step` в тесте `test_p3_t10_sweep_joint_hinged_arm_hitting_fixed_wall` (`physics_tests.rs:1620`: `Some(78)` вместо `Some(27)`) | P3-T10 | S | `mcp-cad-physics` | 📋 BACKLOG |
 | **P3-T20** | P3 Contract | Актуализация контрактного теста `test_mcp_open_preview_window` (`mcp_contract_tests.rs:716`: статус `"empty"` на пустой сцене после `P2-T37` вместо `"headless"`) | P2-T37 | S | `mcp-cad-server` | 📋 BACKLOG |
 | **P3-T21** | P3 Calculation | Актуализация конструктора `TriangleMesh::new` в изолированном спайке `spikes/monstertruck_brep/src/main.rs:60` после добавления полей `face_ids` и `faces` (`P2-T6`) | P1-T3, P2-T6 | S | `spikes/monstertruck_brep` | 📋 BACKLOG |
@@ -255,10 +260,11 @@
   3. **Авто-выбор `start_z` на наклонных заготовках и тесты (`cad.rs`, `dag_tests.rs`)**: добавлена `default_helical_start_z` (для прямостоящих — `bounding_box().min[2]`, для наклонённых соосных — `-0.5 * axial_span`); добавлены тесты на смещённую/повёрнутую гайку и сверло (включая `transform_part` и `Add*` под углом `45°`/`90°`/`180°`) с проверкой `validate_mesh_strict` (`PASS`, `is_watertight = true`, `genus = 1`/`0`).
 - **Компонент**: `crates/mcp-cad-core/src/{csg.rs, topology.rs}`, `crates/mcp-cad-core/tests/dag_tests.rs`, `crates/mcp-cad-server/src/tools/cad.rs`, `docs/agent_tasks/P3-T17-report.md`
 
-#### P3-T18 [S]: Актуализация конструктора `TriangleMesh::new` в изолированном спайке `spikes/manifold_rust/src/main.rs:170` после добавления полей `face_ids` и `faces` (`P2-T6`)
-- **Проблема**: Выявлено при верификации **P3-T12** ([`docs/agent_tasks/P3-T12-report.md`](docs/agent_tasks/P3-T12-report.md)): в изолированном спайке `spikes/manifold_rust/src/main.rs:170` функция конвертации `manifold_to_cad_mesh` инициализирует `TriangleMesh { vertices, indices }` через структурный литерал без полей `face_ids` и `faces`, добавленных в `mcp_cad_core::topology::TriangleMesh` в рамках `P2-T6`, что приводит к ошибке компиляции `error[E0063]: missing fields face_ids and faces in initializer of TriangleMesh` при сборке спайка.
-- **Что сделать**: Заменить структурный литерал `TriangleMesh { vertices, indices }` в `spikes/manifold_rust/src/main.rs:170` на вызов конструктора `TriangleMesh::new(vertices, indices)`.
-- **Компонент**: `spikes/manifold_rust/src/main.rs`
+#### P3-T18 [S]: Актуализация конструктора `TriangleMesh::new` в изолированном спайке `spikes/manifold_rust/src/main.rs:170` после добавления полей `face_ids` и `faces` (`P2-T6`) — ✅ DONE (`15.11.2026`, см. [`P3-T18-report.md`](docs/agent_tasks/P3-T18-report.md))
+- **Выполнено**:
+  1. В `spikes/manifold_rust/src/main.rs:170` (функция `manifold_to_triangle_mesh`) структурный литерал `TriangleMesh { vertices, indices }` заменён на `TriangleMesh::new(vertices, indices)`.
+  2. Подтверждена чистая сборка, отсутствие предупреждений `clippy` и успешный запуск бинарного спайка (`cargo check`, `cargo clippy -- -D warnings`, `cargo test`, `cargo run` на `spikes/manifold_rust/Cargo.toml` — `exit 0`), а также `cargo clippy --workspace --all-targets -- -D warnings` (`0` ошибок, `0` предупреждений).
+- **Компонент**: `spikes/manifold_rust/src/main.rs`, `docs/agent_tasks/P3-T18-report.md`
 
 #### P3-T19 [S]: Исправление проверки `min_clearance_step` в тесте `test_p3_t10_sweep_joint_hinged_arm_hitting_fixed_wall` (`crates/mcp-cad-physics/tests/physics_tests.rs:1620`)
 - **Проблема**: Выявлено при аудите **P3-T13** ([`docs/agent_tasks/P3-T13-report.md`](docs/agent_tasks/P3-T13-report.md)): в тесте `test_p3_t10_sweep_joint_hinged_arm_hitting_fixed_wall` (`crates/mcp-cad-physics/tests/physics_tests.rs:1620:5`) срабатывает паника `assertion left == right failed: left: Some(78), right: Some(27)`. При сканировании `[0°, 90°]` рычаг сталкивается со стеной на шаге `28` (`first_collision_step == Some(28)` проходит), но затем продолжает поворот до `90°` и на выходе за пределы стенки на шаге `78` имеет меньший положительный зазор с другой стороны препятствия, чем на шаге `27`.
@@ -374,4 +380,5 @@
 | **P3-T15** | P3 Calculation | Атрибуция избыточных связей по шарнирам (`redundant_joint_ids` через leave-one-joint-out SVD), диагностика упоров `limits` (`joints_at_limits`, `motor_blocked`, двусторонняя блокировка при нулевом диапазоне `[c, c]`) и синхронизация TS-зеркала/схемы в `analyze_mechanism` | §4.3, §7, §8 | [`P3-T15-report.md`](docs/agent_tasks/P3-T15-report.md) |
 | **P3-T16** | P3 Calculation | Итеративный многотельный решатель замкнутых кинематических цепей (`ClosedLoopSolver` с SVD и continuation sub-stepping) и детекция геометрического заклинивания (`lockup_step`, `lockup_value`, `max_closure_residual`) в `sweep_joint` с зеркалом в TypeScript | §4.3, §7, §8 | [`P3-T16-report.md`](docs/agent_tasks/P3-T16-report.md) |
 | **P3-T17** | P3 Calculation | Поддержка смещённых с оси `Z` и наклонённых/повёрнутых заготовок в `cut_helical_groove` (и смежных соосных операциях `try_cut_coaxial_through_bore`, `try_union_coaxial_cone`) через локальную СК симметрии (`detect_coaxial_workpiece_frame`, `execute_coaxial_in_local_frame`, `apply_rot_and_shift`, `default_helical_start_z`) | §5.6, §7, §8 | [`P3-T17-report.md`](docs/agent_tasks/P3-T17-report.md) |
+| **P3-T18** | P3 Calculation | Актуализация инициализации `TriangleMesh::new(vertices, indices)` в изолированном спайке `spikes/manifold_rust/src/main.rs:170` после добавления полей `face_ids` и `faces` (`P2-T6`) | §5.7, §7 | [`P3-T18-report.md`](docs/agent_tasks/P3-T18-report.md) |
 | **TS-FIX-01** | TS Suite | Синхронизация числа пресетов МКЭ (5) и импортов типов в `src/cad/{cad_engine.test.ts, primitives.ts}` | §7 | — |
