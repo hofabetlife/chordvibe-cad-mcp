@@ -1341,7 +1341,7 @@ export function App() {
     );
   };
 
-  // Unified 28-Tool MCP Dispatcher wired to React State + Live Windows EXE Daemon Sync
+  // Unified 31-Tool TS / 40-Tool Rust MCP Dispatcher wired to React State + Live Windows EXE Daemon Sync
   const handleExecuteMcpTool = (
     toolName: string,
     params: Record<string, any>
@@ -2455,7 +2455,7 @@ export function App() {
         selectedPart={selectedPart}
         isSimulatingPhysics={isSimulatingPhysics}
         fps={fps}
-        mcpToolsCount={28}
+        mcpToolsCount={bridgeStatus.activeToolsCount}
       />
 
       {/* Modal 1: Cut Cylindrical Hole + DIN 6885 Keyway */}

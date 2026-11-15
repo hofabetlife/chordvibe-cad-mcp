@@ -55,6 +55,8 @@
    - [36. `run_fea_from_simulation`](#36-run_fea_from_simulation)
    - [37. `check_gear_strength`](#37-check_gear_strength)
    - [38. `analyze_mechanism`](#38-analyze_mechanism)
+   - [39. `check_interference`](#39-check_interference)
+   - [40. `sweep_joint`](#40-sweep_joint)
 
 ---
 

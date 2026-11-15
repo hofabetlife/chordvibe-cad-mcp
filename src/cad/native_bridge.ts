@@ -1,5 +1,9 @@
 import { MeshGeometryData, RenderMode } from '../types/cad';
 import { parseStlBuffer } from './primitives';
+import { MCP_TOOLS_CATALOG } from './mcp_dispatcher';
+
+export const RUST_MCP_TOOLS_COUNT = 40;
+export const TS_MCP_TOOLS_COUNT = MCP_TOOLS_CATALOG.length;
 
 export type EngineRuntimeMode =
   | 'windows_exe_connected'
@@ -23,7 +27,7 @@ export const DEFAULT_BRIDGE_STATUS: WindowsBridgeStatus = {
   endpointUrl: 'http://127.0.0.1:8080',
   connectedToWindowsExe: false,
   serverVersion: '0.1.0-hybrid-wgpu-sync',
-  activeToolsCount: 28,
+  activeToolsCount: TS_MCP_TOOLS_COUNT,
   lastSyncTimestamp: '00:00:00',
   latencyMs: 0.4,
   rustStlCacheCount: 5,
@@ -224,7 +228,7 @@ export async function probeWindowsMcpServer(
           connectedToWindowsExe: true,
           serverVersion:
             data?.result?.serverInfo?.version || '0.1.0-windows-x64',
-          activeToolsCount: 28,
+          activeToolsCount: RUST_MCP_TOOLS_COUNT,
           lastSyncTimestamp: new Date().toTimeString().slice(0, 8),
           latencyMs,
           rustStlCacheCount: stlMeshCache.size,
@@ -240,7 +244,7 @@ export async function probeWindowsMcpServer(
     endpointUrl: base,
     connectedToWindowsExe: false,
     serverVersion: '0.1.0-hybrid-wgpu-sync',
-    activeToolsCount: 28,
+    activeToolsCount: TS_MCP_TOOLS_COUNT,
     lastSyncTimestamp: new Date().toTimeString().slice(0, 8),
     latencyMs: 0.4,
     rustStlCacheCount: stlMeshCache.size,

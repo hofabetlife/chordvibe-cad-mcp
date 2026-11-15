@@ -53,7 +53,7 @@ mcp-cad/
 │   ├── BENCH_BASELINE_RUST.md    # Базовая линия 15 задач бенчмарка против нативного Rust-сервера
 │   ├── adr/0001-geometry-kernel.md # ADR выбора геометрического ядра (manifold-rust + monstertruck)
 │   ├── adr/0002-fe-mesher.md        # ADR выбора генератора сетки МКЭ (fe_snap + TET10, P3-T5)
-│   └── agent_tasks/              # Детальные отчёты о выполнении задач P0-T1..T12, P1-T1..T4, P2-T1..T40, P3-T1..T22
+│   └── agent_tasks/              # Детальные отчёты о выполнении задач P0-T1..T12, P1-T1..T4, P2-T1..T40, P3-T1..T24
 ├── spikes/
 │   ├── manifold_rust/            # Прототип ядра manifold-rust v0.19.2 (Pure Rust CSG + face_id)
 │   ├── monstertruck_brep/        # Прототип B-Rep ядра monstertruck v0.4.1 (fillet + ISO 10303-21 STEP)
@@ -297,7 +297,9 @@ graph TD
    - Любая ошибка параметров возвращается как `Result<T, CadError / ServerError>` и преобразуется в структурированный JSON `ErrorEnvelope`.
 2. **Чистота потока `stdout` в режиме `stdio`**:
    - В режиме `--mode stdio` поток `stdout` используется **исключительно** для сообщений JSON-RPC 2.0. Любой вывод логов (`tracing`, `eprintln!`) направляется строго в `std::io::stderr`.
-3. **Статус автоматического тестирования (`mcp-cad-server`, `mcp-cad-viewer` и `clippy` актуализированы в `P3-T23` от 15.11.2026; CI/тулчейн и TS-суит — `P3-T22`; `spikes/monstertruck_brep` — `P3-T21`; `mcp-cad-physics` — `P3-T19`; `spikes/manifold_rust` — `P3-T18`; `mcp-cad-core` — `P3-T17`; `mcp-cad-fea` — аудит `P3-T13`)**:
+3. **Статус автоматического тестирования (`mcp-cad-server`, `mcp-cad-viewer` и `clippy` актуализированы в `P3-T23` от 15.11.2026; документация/TS-счётчики/lockfile и CI `npm ci` — `P3-T24`; CI/тулчейн и TS-суит — `P3-T22`; `spikes/monstertruck_brep` — `P3-T21`; `mcp-cad-physics` — `P3-T19`; `spikes/manifold_rust` — `P3-T18`; `mcp-cad-core` — `P3-T17`; `mcp-cad-fea` — аудит `P3-T13`)**:
+   - **Проверено в `P3-T24` после синхронизации счётчиков инструментов (`40` Rust / `31` TS), фиксации `package-lock.json` и настройки `npm ci` в `.github/workflows/ci.yml`:**
+     - `npm ci --dry-run`: **PASS** (`exit 0`); `npm run lint` (`tsc --noEmit`): **0 ошибок**; `npm run build` (`vite build`): **PASS** (`4.12s`); `npm test`: **52/52 PASS** (`37/37` в `cad_engine.test.ts` + `15/15` в `analyze_mechanism.test.ts`); `cargo clippy --workspace --all-targets -- -D warnings`: **0 ошибок, 0 предупреждений** (`exit 0`).
    - **Проверено в `P3-T23` после финальных правок `OffscreenRenderer::shared()`, `open_preview_window`, `qa_wide_scan.rs` и `.github/workflows/ci.yml`:**
      - `mcp-cad-server` (`cargo test -p mcp-cad-server --no-fail-fast` в **многопоточном режиме без `-- --test-threads=1` и без ручного `MCP_CAD_DISABLE_GUI_SPAWN=1`**, подтверждено двумя прогонами): **135/135 PASS** (`--lib`: **61/61**, `mcp_contract_tests`: **59/59**, `qa_wide_scan`: **13/13**, `bench_suite`: **1/1**, `gear_kinematic_test`: **1/1**, `0 failed`; прогон 1: `35.86s` / `15.98s` / `10.20s` / `6.96s` / `0.74s`; прогон 2: `31.95s` / `14.66s` / `9.41s` / `6.41s` / `0.60s`), при этом `qa/results/*.json` и `qa/artifacts/` в репозитории остаются чистыми;
      - `mcp-cad-viewer` (`cargo test -p mcp-cad-viewer --no-fail-fast`): **10/10 PASS** (`tests/viewer_tests.rs`, `16.46s`, `0 failed`);

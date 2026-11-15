@@ -246,7 +246,7 @@ export const CadRightSidebar: React.FC<CadRightSidebarProps> = ({
             }`}
           >
             <Terminal className="w-3.5 h-3.5 text-[#f59e0b]" />
-            <span>MCP (28)</span>
+            <span>MCP ({MCP_TOOLS_CATALOG.length})</span>
           </button>
 
           <button
@@ -935,7 +935,7 @@ export const CadRightSidebar: React.FC<CadRightSidebarProps> = ({
                     JSON-RPC 2.0 Диспетчер инструментов
                   </span>
                   <span className="text-[10px] font-mono text-[#f59e0b]">
-                    28/28 Tools
+                    {MCP_TOOLS_CATALOG.length}/{MCP_TOOLS_CATALOG.length} Tools
                   </span>
                 </div>
 
@@ -1134,7 +1134,7 @@ export const CadRightSidebar: React.FC<CadRightSidebarProps> = ({
                     </button>
                   </div>
                   <p className="text-[11px] text-[#94a3b8]">
-                    Все 28 MCP инструментов, 8 параметрических примитивов и 10
+                    Все {MCP_TOOLS_CATALOG.length} TS (40 Rust) MCP инструментов, 8 параметрических примитивов и 10
                     топологических исправлений (BUG-001..010) верифицированы.
                   </p>
                 </div>

@@ -13,7 +13,7 @@
 
 [Быстрый старт](#-быстрый-старт-quick-start) •
 [Подключение к ИИ](#-подключение-к-популярным-ии-клиентам) •
-[Инструменты MCP](#-сводная-таблица-инструментов-mcp-28-tools) •
+[Инструменты MCP](#-сводная-таблица-инструментов-mcp-40-tools) •
 [AI-Native Возможности](#-ai-native-cad-experience) •
 [Архитектура](#-архитектура-системы) •
 [Примеры промптов](#-готовые-промпты-для-ии-агентов)
@@ -167,7 +167,7 @@ docker run --rm -p 8080:8080 mcp-cad-server
    - **Name**: `cad-engine`
    - **Type**: `command`
    - **Command**: `C:\Users\<username>\Documents\chordvibe-cad-mcp\target\release\mcp-cad-server.exe --mode stdio`
-4. Нажмите **Save**. Зеленый индикатор подтвердит доступность всех 28 инструментов.
+4. Нажмите **Save**. Зеленый индикатор подтвердит доступность всех 40 инструментов.
 
 ---
 
@@ -206,7 +206,7 @@ MCP-CAD Engine спроектирован специально для преод
 
 ---
 
-## 🛠️ Сводная таблица инструментов MCP (28 Tools)
+## 🛠️ Сводная таблица инструментов MCP (40 Tools)
 
 | № | Имя инструмента | Входные параметры | Выходные данные | Назначение |
 |:---:|---|---|---|---|
@@ -229,18 +229,30 @@ MCP-CAD Engine спроектирован специально для преод
 | **17** | `create_joint` | `joint_type: str`, `part_a: str`, `part_b: str`, `anchor_a?: [3]`, `anchor_b?: [3]`, `axis?: [3]`, `limits?: [2]`, `ratio?: num` | `{ joint_id: str }` | Создать сочленение (`revolute`, `prismatic`, `spherical`, `fixed`, `gear`) |
 | **18** | `set_joint_motor` | `joint_id: str`, `target_velocity: num`, `max_force: num` | `{ status: "motor_active" }` | Включить сервопривод скорости на сочленении |
 | **19** | `run_physics_simulation` | `duration_seconds: num`, `step_size_ms?: num` | `{ success: bool, steps_simulated: int, trajectory_summary: obj, peak_joint_forces: obj, collisions: [...] }` | Провести динамическую симуляцию механизма во времени |
-| **20** | `run_fea_analysis` | `part_id: str`, `mesh_density?: str`, `fixed_faces?: [str]`, `fixed_plane?: obj`, `applied_forces?: [...]` | `{ max_von_mises_mpa: num, yield_strength_mpa: num, safety_factor: num, max_displacement_mm: num, status: "PASS"\|"FAIL" }` | Выполнить 3D МКЭ-расчет прочности (TET4) |
+| **20** | `run_fea_analysis` | `part_id: str`, `mesh_density?: str`, `element_order?: 1\|2`, `fixed_faces?: [str]`, `fixed_plane?: obj`, `applied_forces?: [...]`, `convergence_study?: bool` | `{ max_von_mises_mpa: num, yield_strength_mpa: num, safety_factor: num, max_displacement_mm: num, status: "PASS"\|"FAIL" }` | Выполнить 3D МКЭ-расчет прочности (`TET4`/`TET10`) |
 | **21** | `get_fea_heatmap_image` | `part_id: str`, `camera_preset?: str`, `width?: int`, `height?: int` | `{ colormap_legend: obj }` + `image/png` | Получить 3D-снимок тепловой карты напряжений по Мизесу |
 | **22** | `capture_viewport` | `camera_preset?: str`, `part_id?: str`, `width?: int`, `height?: int`, `debug_mode?: bool` | `{ camera_preset: str, format: "image/png" }` + `image/png` | Сделать оффскрин 3D-снимок сцены сборки в высоком разрешении |
 | **23** | `export_stl` | `part_id: str`, `filepath: str`, `binary?: bool`, `quality?: "coarse"\|"medium"\|"fine"`, `chord_tolerance?: num` | `{ file_path: str, triangles_count: int }` | Экспортировать деталь в файл STL с адаптивным контролем качества |
 | **24** | `get_simulation_metrics_json` | *(нет)* | `{ current_metrics: obj }` | Получить агрегированный отчет по всей сцене и расчетам |
-| **25** | `open_preview_window` | `part_id?: str` | `{ status: "preview_window_opened" }` | Открыть или сфокусировать нативное окно 3D-просмотра |
+| **25** | `open_preview_window` | `part_id?: str` | `{ status: "opened"\|"preview_window_opened" }` | Открыть или сфокусировать нативное окно 3D-просмотра |
 | **26** | `import_stl` | `filepath: str`, `name?: str`, `material?: str` | `{ part_id: str, name: str, vertices_count: int, triangles_count: int, status: "stl_imported" }` | Импортировать готовую 3D-модель STL в сцену и 3D-вьюпорт |
-| **27** | `validate_mesh` | `part_id: str`, `expected_genus?: int` | `{ is_watertight: bool, boundary_edges_count: int, non_manifold_edges_count: int, euler_characteristic: int, genus: int, status: "PASS"\|"WARN"\|"FAIL", topology: obj, geometry: obj, angle_stats: obj }` | Топологическая диагностика замкнутости сетки (Watertight, эйлерова характеристика, род $g$, sliver gate) |
+| **27** | `validate_mesh` | `part_id: str`, `expected_genus?: int`, `strict_slivers?: bool` | `{ is_watertight: bool, boundary_edges_count: int, non_manifold_edges_count: int, euler_characteristic: int, genus: int, status: "PASS"\|"WARN"\|"FAIL", topology: obj, geometry: obj, angle_stats: obj }` | Топологическая диагностика замкнутости сетки (Watertight, эйлерова характеристика, род $g$, sliver gate) |
 | **28** | `optimize_feature_tree` | `part_id: str`, `apply?: bool` | `{ status: "optimized", applied: bool, logical_nodes_count: int, physical_nodes_count: int, cost_reduction_pct: num, explain_analyze_text: str, ... }` | Стоимостной оптимизатор дерева операций (`EXPLAIN ANALYZE`): перезапись и сжатие DAG с проверкой инвариантов |
+| **29** | `set_units` | `length_unit: "mm"\|"m"` | `{ status: "units_updated", length_unit: str }` | Переключить активную единицу длины сессии (`"mm"` по умолчанию или `"m"`) |
+| **30** | `save_project` | `path: str`, `project_name?: str` | `{ status: "saved", path: str, schema_version: "1.0.0", file_size_bytes: int, ... }` | Сохранить полное состояние сцены, DAG, шарниры и требования в версионированный JSON |
+| **31** | `load_project` | `path: str` | `{ status: "loaded", path: str, parts_count: int, joints_count: int, ... }` | Транзакционно загрузить проект из JSON с пересборкой геометрии и физики |
+| **32** | `set_requirements` | `requirements: [...]`, `part_id?: str`, `scope?: "part"\|"scene"`, `auto_check?: bool`, `length_unit?: str` | `{ status: "requirements_set", count: int, auto_check: bool, ... }` | Задать инженерные требования (`bbox_max`, `bbox_min`, `mass_max`, `mesh_valid`, `min_safety_factor`, `no_interference`, `mechanism_dof`) |
+| **33** | `check_requirements` | `part_id?: str`, `length_unit?: str` | `{ overall_status: "PASS"\|"FAIL"\|"STALE", passed: int, failed: int, stale: int, results: [...] }` | Проверить зарегистрированные инженерные требования с расчетом запасов и подсказок |
+| **34** | `get_scene_summary` | `length_unit?: "mm"\|"m"` | `{ summary_text: str, length_unit: str, parts: [...], joints: [...], requirements: [...] }` | Компактная текстовая и JSON-сводка всей сцены для ИИ-агента |
+| **35** | `get_part_load_cases` | `part_id: str`, `select?: "peak_force"\|"peak_torque"\|num`, `length_unit?: str` | `{ part_id: str, time_s: num, joint_reactions: [...], inertial_loads: obj, equilibrium_residual: obj }` | Извлечь динамические реакции в шарнирах и инерционные нагрузки на деталь из симуляции |
+| **36** | `run_fea_from_simulation` | `part_id: str`, `select?: str\|num`, `load_radius?: num`, `mesh_density?: str`, `element_order?: 1\|2`, `convergence_study?: bool` | `{ max_von_mises_mpa: num, safety_factor: num, max_displacement_mm: num, source: obj, diagnostics: obj, ... }` | Квазистатический МКЭ-расчет (`TET4`/`TET10`) по нагрузкам симуляции с опорой 3-2-1 |
+| **37** | `check_gear_strength` | `part_id?: str`, `module?: num`, `teeth?: int`, `face_width?: num`, `torque?: num`, `power_kw?: num`, `speed_rpm?: num` | `{ bending_stress_mpa: num, bending_safety_factor: num, contact_stress_mpa: num, contact_safety_factor: num, ... }` | Аналитическая проверка прочности зубьев прямозубых шестерён (Льюис / Барт / Герц-AGMA) |
+| **38** | `analyze_mechanism` | `part_ids?: [str]`, `rank_tolerance?: num`, `length_unit?: str` | `{ dof_numeric: int, dof_grubler: int, redundant_constraints: int, redundant_joint_ids: [...], joints_at_limits: [...], ... }` | Анализ степеней свободы (Грюблер и SVD Якобиана), упоров `limits` и связности механизма |
+| **39** | `check_interference` | `part_ids?: [str]`, `ignore_adjacent?: bool`, `pairs?: [[str, str]]`, `length_unit?: str` | `{ has_interference: bool, interfering_pairs_count: int, min_clearance: num, pairs: [...] }` | Попарная проверка геометрической интерференции и зазоров (`AABB` + `csg_intersection`) |
+| **40** | `sweep_joint` | `joint_id: str`, `from: num`, `to: num`, `steps: int`, `ignore_adjacent?: bool`, `angle_unit?: str`, `length_unit?: str` | `{ status: "PASS"\|"FAIL", collision_detected: bool, safe_travel_range: obj, min_clearance: num, lockup_detected: bool, ... }` | Пошаговое сканирование хода шарнира (включая замкнутые контуры) с детекцией коллизий и заклинивания |
 
 > [!TIP]
-> Полная документация с примерами JSON-RPC запросов и ответов для всех 28 инструментов представлена в документе [Справочник API инструментов MCP](docs/MCP_API_REFERENCE.md).
+> Полная документация с примерами JSON-RPC запросов и ответов для всех 40 инструментов представлена в документе [Справочник API инструментов MCP](docs/MCP_API_REFERENCE.md).
 
 ---
 
@@ -302,7 +314,7 @@ graph TD
 - **Инварианты примитивов и CSG (`mcp-cad-core`)**: Проверка водонепроницаемости (`validate_mesh`), внешней ориентации нормалей, характеристики Эйлера ($\chi = 2 - 2g$), отсутствия вырожденных углов (`Sliver Gate`) и аналитических тождеств объёма.
 - **Аналитическая верификация МКЭ (`mcp-cad-fea`)**: Проверка решения 3D-задач теории упругости на тетраэдрах `TET4` методом сопряжённых градиентов (PCG).
 - **Верификация кинематики (`mcp-cad-physics`)**: Тестирование степеней свободы сочленений Rapier3D, работы моторов и детекции коллизий.
-- **Контрактное и сквозное E2E тестирование MCP (`mcp-cad-server`)**: Проверка обработки всех 28 инструментов и соответствия схеме MCP 2024-11-05 (`mcp_contract_tests`, `qa_wide_scan`, `gear_kinematic_test`).
+- **Контрактное и сквозное E2E тестирование MCP (`mcp-cad-server`)**: Проверка обработки всех 40 инструментов и соответствия схеме MCP 2024-11-05 (`mcp_contract_tests`, `qa_wide_scan`, `gear_kinematic_test`).
 
 > [!IMPORTANT]
 > **Требуемая версия Rust и фактическое состояние тестов:**

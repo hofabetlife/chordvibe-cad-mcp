@@ -42,7 +42,7 @@ export const ENGINEERING_WORKBENCHES: WorkbenchMetadata[] = [
     id: 'optimizer',
     label: 'Оптимизатор и MCP',
     shortLabel: '4. Оптимизатор / MCP',
-    subtitle: 'Cost-Based оптимизация дерева DAG (SQL CBO), 28 MCP-инструментов и QA эталоны',
+    subtitle: 'Cost-Based оптимизация дерева DAG (SQL CBO), 40 Rust / 31 TS MCP-инструментов и QA эталоны',
     accentColor: '#f59e0b',
     leftPanelTitle: 'Операции дерева DAG',
     rightPanelTitle: 'Оптимизатор CBO, MCP и QA',

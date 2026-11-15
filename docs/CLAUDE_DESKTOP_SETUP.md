@@ -94,12 +94,12 @@ Get-Content -Path "$env:APPDATA\Claude\logs\mcp-server-cad-engine.log" -Wait -Ta
 
 1. Полностью перезапустите приложение **Claude Desktop** (закройте окно и завершите процесс в трее).
 2. При открытии Claude в правом нижнем углу поля ввода появится иконка с молотком 🔨 (MCP Tools).
-3. Нажмите на иконку и убедитесь, что в списке отображаются все **28 инженерных инструментов**:
-   - **Управление сборкой и жизненный цикл**: `create_part`, `list_parts`, `delete_part`
+3. Нажмите на иконку и убедитесь, что в списке отображаются все **40 инженерных инструментов**:
+   - **Управление сборкой, единицами, проектами и требованиями**: `create_part`, `list_parts`, `delete_part`, `set_units`, `save_project`, `load_project`, `set_requirements`, `check_requirements`, `get_scene_summary`
    - **Параметрическое моделирование и CSG**: `add_feature_primitive`, `cut_hole`, `cut_helical_groove`, `modify_feature`, `get_feature_tree`, `boolean_difference`, `boolean_union`, `boolean_intersection`, `transform_part`
-   - **Геометрия, топология и материалы**: `tessellate_part`, `query_part_geometry`, `validate_mesh`, `define_material`, `optimize_feature_tree`, `batch_cad_operations`
-   - **Кинематика и динамика**: `create_joint`, `set_joint_motor`, `run_physics_simulation`, `get_simulation_metrics_json`
-   - **МКЭ-анализ прочности (FEA)**: `run_fea_analysis`, `get_fea_heatmap_image`
+   - **Геометрия, топология, материалы и расчёт передач**: `tessellate_part`, `query_part_geometry`, `validate_mesh`, `define_material`, `optimize_feature_tree`, `batch_cad_operations`, `check_gear_strength`
+   - **Кинематика и динамика**: `create_joint`, `set_joint_motor`, `run_physics_simulation`, `get_simulation_metrics_json`, `get_part_load_cases`, `analyze_mechanism`, `check_interference`, `sweep_joint`
+   - **МКЭ-анализ прочности (FEA)**: `run_fea_analysis`, `run_fea_from_simulation`, `get_fea_heatmap_image`
    - **Визуализация, экспорт и импорт**: `capture_viewport`, `open_preview_window`, `export_stl`, `import_stl`
 
 ---

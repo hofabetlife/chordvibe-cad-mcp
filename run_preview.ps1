@@ -1,4 +1,4 @@
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+﻿[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $Host.UI.RawUI.WindowTitle = "MCP-CAD Studio Launcher"
 
 Write-Host "====================================================================" -ForegroundColor Cyan
@@ -42,7 +42,7 @@ if ($npm) {
     Write-Host "====================================================================" -ForegroundColor Yellow
     Write-Host ""
     Write-Host "Для запуска интерактивного Web CAD Studio (с деревом параметров DAG," -ForegroundColor Yellow
-    Write-Host "оптимизатором операций ИИ, 28 MCP-инструментами и кинематикой)" -ForegroundColor Yellow
+    Write-Host "оптимизатором операций ИИ, 40 MCP-инструментами и кинематикой)" -ForegroundColor Yellow
     Write-Host "необходим Node.js." -ForegroundColor Yellow
     Write-Host ""
     Write-Host "Как исправить:" -ForegroundColor Green

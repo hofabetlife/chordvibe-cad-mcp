@@ -30,9 +30,13 @@ import {
   optimizeCadFeatureTree,
 } from './query_optimizer';
 import {
+  DEFAULT_BRIDGE_STATUS,
   GOLDEN_WINDOWS_MAPPINGS,
+  RUST_MCP_TOOLS_COUNT,
+  TS_MCP_TOOLS_COUNT,
   getWindowsWgpuArtifactUrl,
 } from './native_bridge';
+import { ENGINEERING_WORKBENCHES } from './workbenches';
 
 describe('MCP-CAD Core Geometry & Topological Verification Suite', () => {
   it('verifies Z-axis parity with Rust mcp-cad-core and Windows WGPU golden artifacts', () => {
@@ -1079,13 +1083,16 @@ describe('MCP-CAD Core Geometry & Topological Verification Suite', () => {
     assert.ok(emptyMesh.volume < 1e-7 || emptyMesh.triangleCount === 0);
   });
 
-  it('verifies BUG-021: 31 TS MCP tools documentation & contract parity across README, setup guides, architecture, PROJECT_CONTEXT, and API reference', () => {
+  it('verifies BUG-021: 40 Rust / 31 TS MCP tools documentation & contract parity across README, setup guides, architecture, PROJECT_CONTEXT, and API reference', () => {
     // 1. Verify exactly 31 tools in TS catalog with unique names (28 baseline + 3 P3-T9/T10 kinematics tools)
     assert.equal(MCP_TOOLS_CATALOG.length, 31, 'Catalog must contain exactly 31 TS tools');
     const catalogNames = new Set(MCP_TOOLS_CATALOG.map((t) => t.name));
     assert.equal(catalogNames.size, 31, 'All 31 tool names must be unique');
+    assert.equal(TS_MCP_TOOLS_COUNT, 31, 'TS_MCP_TOOLS_COUNT must equal 31');
+    assert.equal(RUST_MCP_TOOLS_COUNT, 40, 'RUST_MCP_TOOLS_COUNT must equal 40');
+    assert.equal(DEFAULT_BRIDGE_STATUS.activeToolsCount, 31, 'DEFAULT_BRIDGE_STATUS must report 31 TS tools in hybrid mode');
 
-    // Expected 28 baseline tools + 3 kinematics tools
+    // Expected 28 baseline tools + 3 kinematics tools in TS catalog
     const EXPECTED_28_TOOLS = [
       'create_part',
       'list_parts',
@@ -1122,14 +1129,28 @@ describe('MCP-CAD Core Geometry & Topological Verification Suite', () => {
       'check_interference',
       'sweep_joint',
     ];
+    const EXPECTED_40_RUST_TOOLS = [
+      ...EXPECTED_31_TS_TOOLS,
+      'set_units',
+      'save_project',
+      'load_project',
+      'set_requirements',
+      'check_requirements',
+      'get_scene_summary',
+      'get_part_load_cases',
+      'run_fea_from_simulation',
+      'check_gear_strength',
+    ];
 
     for (const tool of EXPECTED_31_TS_TOOLS) {
       assert.ok(catalogNames.has(tool), `Missing tool '${tool}' in MCP catalog`);
     }
 
-    // 2. Automated Contract check against README.md
+    // 2. Automated Contract check against README.md (all 40 Rust MCP tools)
     const readmeContent = fs.readFileSync(path.resolve(process.cwd(), 'README.md'), 'utf-8');
-    for (const tool of EXPECTED_28_TOOLS) {
+    assert.ok(readmeContent.includes('40 Tools'), 'README.md must state 40 Tools');
+    assert.ok(readmeContent.includes('40 инструментов'), 'README.md must state 40 инструментов');
+    for (const tool of EXPECTED_40_RUST_TOOLS) {
       assert.ok(
         readmeContent.includes(`\`${tool}\``),
         `README.md missing documented entry for tool '${tool}'`
@@ -1139,10 +1160,10 @@ describe('MCP-CAD Core Geometry & Topological Verification Suite', () => {
     assert.ok(readmeContent.includes('gear'), 'README must document gear joint');
     assert.ok(readmeContent.includes('debug_mode'), 'README must document debug_mode parameter');
 
-    // 3. Automated Contract check against docs/CLAUDE_DESKTOP_SETUP.md
+    // 3. Automated Contract check against docs/CLAUDE_DESKTOP_SETUP.md (all 40 Rust MCP tools)
     const claudeContent = fs.readFileSync(path.resolve(process.cwd(), 'docs/CLAUDE_DESKTOP_SETUP.md'), 'utf-8');
-    assert.ok(claudeContent.includes('28 инженерных инструментов'), 'Claude setup must state 28 tools');
-    for (const tool of EXPECTED_28_TOOLS) {
+    assert.ok(claudeContent.includes('40 инженерных инструментов'), 'Claude setup must state 40 tools');
+    for (const tool of EXPECTED_40_RUST_TOOLS) {
       assert.ok(
         claudeContent.includes(`\`${tool}\``),
         `docs/CLAUDE_DESKTOP_SETUP.md missing tool '${tool}'`
@@ -1152,21 +1173,23 @@ describe('MCP-CAD Core Geometry & Topological Verification Suite', () => {
     // 4. Automated Contract check against docs/ANTIGRAVITY_SETUP.md
     const antigravityContent = fs.readFileSync(path.resolve(process.cwd(), 'docs/ANTIGRAVITY_SETUP.md'), 'utf-8');
     assert.ok(
-      antigravityContent.includes('28 инженерных инструментов'),
-      'Antigravity setup must state 28 tools'
+      antigravityContent.includes('40 инженерных инструментов'),
+      'Antigravity setup must state 40 tools'
     );
 
     // 5. Automated Contract check against docs/ARCHITECTURE.md
     const archContent = fs.readFileSync(path.resolve(process.cwd(), 'docs/ARCHITECTURE.md'), 'utf-8');
+    assert.ok(archContent.includes('40 инструментов MCP'), 'ARCHITECTURE.md must state 40 MCP tools');
+    assert.ok(archContent.includes('40 строгих JSON-Schema'), 'ARCHITECTURE.md must state 40 JSON-Schema tool definitions');
     assert.ok(archContent.includes('Gear'), 'ARCHITECTURE.md must document Gear joint');
     assert.ok(archContent.includes('WheelRim'), 'ARCHITECTURE.md must document WheelRim primitive');
     assert.ok(archContent.includes('SpurGear'), 'ARCHITECTURE.md must document SpurGear primitive');
     assert.ok(archContent.includes('src/cad'), 'ARCHITECTURE.md must document TypeScript CAD layer');
 
-    // 6. Automated Contract check against docs/MCP_API_REFERENCE.md and PROJECT_CONTEXT.md (all 31 TS tools)
+    // 6. Automated Contract check against docs/MCP_API_REFERENCE.md and PROJECT_CONTEXT.md (all 40 Rust tools)
     const apiRefContent = fs.readFileSync(path.resolve(process.cwd(), 'docs/MCP_API_REFERENCE.md'), 'utf-8');
     const projectCtxContent = fs.readFileSync(path.resolve(process.cwd(), 'PROJECT_CONTEXT.md'), 'utf-8');
-    for (const tool of EXPECTED_31_TS_TOOLS) {
+    for (const tool of EXPECTED_40_RUST_TOOLS) {
       assert.ok(
         apiRefContent.includes(`\`${tool}\``),
         `docs/MCP_API_REFERENCE.md missing tool '${tool}'`
@@ -1176,6 +1199,11 @@ describe('MCP-CAD Core Geometry & Topological Verification Suite', () => {
         `PROJECT_CONTEXT.md missing tool '${tool}'`
       );
     }
+
+    // 7. Verify TS workbenches metadata reflects current tool counts without stale '28'
+    const optimizerBench = ENGINEERING_WORKBENCHES.find((w) => w.id === 'optimizer');
+    assert.ok(optimizerBench);
+    assert.ok(!optimizerBench.subtitle.includes('28'), 'Optimizer workbench subtitle must not contain stale 28 count');
   });
 
   it('verifies BUG-022: comprehensive coverage in physics (all joints, limits, 0s/10s), STL I/O edge cases, mid-chain modify_feature, and CSG degeneracies', () => {
