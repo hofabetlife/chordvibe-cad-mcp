@@ -1,12 +1,55 @@
-//! Kinematic and dynamic joints for CAD assemblies.
+//! Kinematic and dynamic joints for CAD assemblies in double precision (`f64`).
 
 use nalgebra::{DMatrix, Matrix3, Vector3};
-use rapier3d::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::error::PhysicsError;
 
-/// High-level CAD joint definitions.
+/// Stable, copyable handle identifying a joint in [`crate::simulator::PhysicsWorld`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct JointHandle(pub usize);
+
+/// Validated `f64` joint descriptor produced by [`CadJointType::build_generic_joint`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JointData {
+    /// Underlying CAD joint specification.
+    pub joint_type: CadJointType,
+    /// Unit primary axis $\hat{\mathbf{z}}$ in local frame of Body A (for axial joints).
+    pub local_axis_a: [f64; 3],
+    /// Unit primary axis $\hat{\mathbf{z}}$ in local frame of Body B (for `Gear` or axial joints).
+    pub local_axis_b: [f64; 3],
+    /// Orthonormal tangent basis vector $\hat{\mathbf{x}}$ perpendicular to `local_axis_a`.
+    pub tangent_u: [f64; 3],
+    /// Orthonormal tangent basis vector $\hat{\mathbf{y}} = \hat{\mathbf{z}} \times \hat{\mathbf{x}}$.
+    pub tangent_v: [f64; 3],
+    /// Local anchor on Body A ($\text{m}$).
+    pub anchor_a: [f64; 3],
+    /// Local anchor on Body B ($\text{m}$).
+    pub anchor_b: [f64; 3],
+    /// Optional travel limits `[min, max]` ($\text{rad}$ for `Revolute`, $\text{m}$ for `Prismatic`).
+    pub limits: Option<[f64; 2]>,
+    /// Optional active velocity motor configuration.
+    pub motor: Option<MotorConfig>,
+    /// Whether collision contacts between the two connected bodies are enabled.
+    pub contacts_enabled: bool,
+}
+
+impl JointData {
+    /// Returns `true` if collision contacts between the two connected bodies are enabled.
+    #[inline]
+    #[must_use]
+    pub const fn contacts_enabled(&self) -> bool {
+        self.contacts_enabled
+    }
+
+    /// Sets whether collision contacts between the two connected bodies are enabled.
+    #[inline]
+    pub fn set_contacts_enabled(&mut self, enabled: bool) {
+        self.contacts_enabled = enabled;
+    }
+}
+
+/// High-level CAD joint definitions in double precision (`f64`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CadJointType {
     /// 1-DOF rotational joint around a specified axis.
@@ -33,7 +76,7 @@ pub enum CadJointType {
         anchor_a: [f64; 3],
         anchor_b: [f64; 3],
     },
-    /// Gear kinematic constraint transmitting rotation between two axes: w_b = -ratio * w_a.
+    /// Gear kinematic constraint transmitting rotation between two axes: $\omega_b \cdot \hat{\mathbf{z}}_b = -\text{ratio}\,(\omega_a \cdot \hat{\mathbf{z}}_a)$.
     Gear {
         ratio: f64,
         axis_a: [f64; 3],
@@ -52,6 +95,7 @@ pub struct MotorConfig {
 
 impl MotorConfig {
     /// Creates a new motor configuration.
+    #[must_use]
     pub fn new(target_velocity: f64, max_force: f64) -> Self {
         Self {
             target_velocity,
@@ -60,9 +104,30 @@ impl MotorConfig {
     }
 }
 
+fn validate_motor_f64(motor: MotorConfig) -> Result<MotorConfig, PhysicsError> {
+    if !motor.target_velocity.is_finite() || !motor.max_force.is_finite() {
+        return Err(PhysicsError::InvalidJointConfiguration(format!(
+            "Motor parameters must be finite numbers, got target_velocity={}, max_force={}",
+            motor.target_velocity, motor.max_force
+        )));
+    }
+    if motor.max_force < 0.0 {
+        return Err(PhysicsError::InvalidJointConfiguration(format!(
+            "Motor max_force must be non-negative, got {}",
+            motor.max_force
+        )));
+    }
+    Ok(motor)
+}
+
 impl CadJointType {
-    /// Builds a Rapier [`GenericJoint`] configured with optional motor control.
-    pub fn build_generic_joint(&self, motor: Option<MotorConfig>) -> Result<GenericJoint, PhysicsError> {
+    /// Validates and builds an `f64` [`JointData`] descriptor configured with optional motor control.
+    pub fn build_generic_joint(&self, motor: Option<MotorConfig>) -> Result<JointData, PhysicsError> {
+        let validated_motor = match motor {
+            Some(m) => Some(validate_motor_f64(m)?),
+            None => None,
+        };
+
         match self {
             CadJointType::Revolute {
                 anchor_a,
@@ -70,45 +135,46 @@ impl CadJointType {
                 axis,
                 limits,
             } => {
-                let axis_vec = vector![axis[0] as Real, axis[1] as Real, axis[2] as Real];
+                if !axis[0].is_finite() || !axis[1].is_finite() || !axis[2].is_finite() {
+                    return Err(PhysicsError::InvalidJointConfiguration(
+                        "Revolute joint axis components must be finite".into(),
+                    ));
+                }
+                let axis_vec = Vector3::new(axis[0], axis[1], axis[2]);
                 let norm = axis_vec.norm();
                 if norm < 1e-7 {
                     return Err(PhysicsError::InvalidJointConfiguration(
                         "Revolute joint axis cannot be a zero vector".into(),
                     ));
                 }
-                let unit_axis = UnitVector::new_normalize(axis_vec);
-
-                let mut builder = RevoluteJointBuilder::new(unit_axis)
-                    .local_anchor1(point![
-                        anchor_a[0] as Real,
-                        anchor_a[1] as Real,
-                        anchor_a[2] as Real
-                    ])
-                    .local_anchor2(point![
-                        anchor_b[0] as Real,
-                        anchor_b[1] as Real,
-                        anchor_b[2] as Real
-                    ]);
+                let unit_axis = axis_vec / norm;
+                let (u, v) = perpendicular_axes(&unit_axis);
 
                 if let Some([min, max]) = limits {
+                    if !min.is_finite() || !max.is_finite() {
+                        return Err(PhysicsError::InvalidJointConfiguration(format!(
+                            "Revolute joint limits [min, max] must be finite: [{min}, {max}]"
+                        )));
+                    }
                     if min > max {
                         return Err(PhysicsError::InvalidJointConfiguration(format!(
                             "Revolute joint limits [min, max] invalid: {min} > {max}"
                         )));
                     }
-                    builder = builder.limits([*min as Real, *max as Real]);
                 }
 
-                if let Some(m) = motor {
-                    builder = builder
-                        .motor_velocity(m.target_velocity as Real, m.max_force as Real)
-                        .motor_max_force(m.max_force as Real);
-                }
-
-                let mut generic: GenericJoint = builder.build().into();
-                generic.set_contacts_enabled(false);
-                Ok(generic)
+                Ok(JointData {
+                    joint_type: self.clone(),
+                    local_axis_a: [unit_axis.x, unit_axis.y, unit_axis.z],
+                    local_axis_b: [unit_axis.x, unit_axis.y, unit_axis.z],
+                    tangent_u: [u.x, u.y, u.z],
+                    tangent_v: [v.x, v.y, v.z],
+                    anchor_a: *anchor_a,
+                    anchor_b: *anchor_b,
+                    limits: *limits,
+                    motor: validated_motor,
+                    contacts_enabled: false,
+                })
             }
             CadJointType::Prismatic {
                 anchor_a,
@@ -116,94 +182,93 @@ impl CadJointType {
                 axis,
                 limits,
             } => {
-                let axis_vec = vector![axis[0] as Real, axis[1] as Real, axis[2] as Real];
+                if !axis[0].is_finite() || !axis[1].is_finite() || !axis[2].is_finite() {
+                    return Err(PhysicsError::InvalidJointConfiguration(
+                        "Prismatic joint axis components must be finite".into(),
+                    ));
+                }
+                let axis_vec = Vector3::new(axis[0], axis[1], axis[2]);
                 let norm = axis_vec.norm();
                 if norm < 1e-7 {
                     return Err(PhysicsError::InvalidJointConfiguration(
                         "Prismatic joint axis cannot be a zero vector".into(),
                     ));
                 }
-                let unit_axis = UnitVector::new_normalize(axis_vec);
-
-                let mut builder = PrismaticJointBuilder::new(unit_axis)
-                    .local_anchor1(point![
-                        anchor_a[0] as Real,
-                        anchor_a[1] as Real,
-                        anchor_a[2] as Real
-                    ])
-                    .local_anchor2(point![
-                        anchor_b[0] as Real,
-                        anchor_b[1] as Real,
-                        anchor_b[2] as Real
-                    ]);
+                let unit_axis = axis_vec / norm;
+                let (u, v) = perpendicular_axes(&unit_axis);
 
                 if let Some([min, max]) = limits {
+                    if !min.is_finite() || !max.is_finite() {
+                        return Err(PhysicsError::InvalidJointConfiguration(format!(
+                            "Prismatic joint limits [min, max] must be finite: [{min}, {max}]"
+                        )));
+                    }
                     if min > max {
                         return Err(PhysicsError::InvalidJointConfiguration(format!(
                             "Prismatic joint limits [min, max] invalid: {min} > {max}"
                         )));
                     }
-                    builder = builder.limits([*min as Real, *max as Real]);
                 }
 
-                if let Some(m) = motor {
-                    builder = builder
-                        .motor_velocity(m.target_velocity as Real, m.max_force as Real)
-                        .motor_max_force(m.max_force as Real);
-                }
-
-                let mut generic: GenericJoint = builder.build().into();
-                generic.set_contacts_enabled(false);
-                Ok(generic)
+                Ok(JointData {
+                    joint_type: self.clone(),
+                    local_axis_a: [unit_axis.x, unit_axis.y, unit_axis.z],
+                    local_axis_b: [unit_axis.x, unit_axis.y, unit_axis.z],
+                    tangent_u: [u.x, u.y, u.z],
+                    tangent_v: [v.x, v.y, v.z],
+                    anchor_a: *anchor_a,
+                    anchor_b: *anchor_b,
+                    limits: *limits,
+                    motor: validated_motor,
+                    contacts_enabled: false,
+                })
             }
             CadJointType::Spherical { anchor_a, anchor_b } => {
-                if motor.is_some() {
+                if validated_motor.is_some() {
                     return Err(PhysicsError::InvalidJointConfiguration(
                         "Motors are not supported on Spherical joints".into(),
                     ));
                 }
 
-                let builder = SphericalJointBuilder::new()
-                    .local_anchor1(point![
-                        anchor_a[0] as Real,
-                        anchor_a[1] as Real,
-                        anchor_a[2] as Real
-                    ])
-                    .local_anchor2(point![
-                        anchor_b[0] as Real,
-                        anchor_b[1] as Real,
-                        anchor_b[2] as Real
-                    ]);
-
-                let mut generic: GenericJoint = builder.build().into();
-                generic.set_contacts_enabled(false);
-                Ok(generic)
+                Ok(JointData {
+                    joint_type: self.clone(),
+                    local_axis_a: [0.0, 0.0, 1.0],
+                    local_axis_b: [0.0, 0.0, 1.0],
+                    tangent_u: [1.0, 0.0, 0.0],
+                    tangent_v: [0.0, 1.0, 0.0],
+                    anchor_a: *anchor_a,
+                    anchor_b: *anchor_b,
+                    limits: None,
+                    motor: None,
+                    contacts_enabled: false,
+                })
             }
             CadJointType::Fixed { anchor_a, anchor_b } => {
-                if motor.is_some() {
+                if validated_motor.is_some() {
                     return Err(PhysicsError::InvalidJointConfiguration(
                         "Motors are not supported on Fixed joints".into(),
                     ));
                 }
 
-                let builder = FixedJointBuilder::new()
-                    .local_anchor1(point![
-                        anchor_a[0] as Real,
-                        anchor_a[1] as Real,
-                        anchor_a[2] as Real
-                    ])
-                    .local_anchor2(point![
-                        anchor_b[0] as Real,
-                        anchor_b[1] as Real,
-                        anchor_b[2] as Real
-                    ]);
-
-                let mut generic: GenericJoint = builder.build().into();
-                generic.set_contacts_enabled(false);
-                Ok(generic)
+                Ok(JointData {
+                    joint_type: self.clone(),
+                    local_axis_a: [0.0, 0.0, 1.0],
+                    local_axis_b: [0.0, 0.0, 1.0],
+                    tangent_u: [1.0, 0.0, 0.0],
+                    tangent_v: [0.0, 1.0, 0.0],
+                    anchor_a: *anchor_a,
+                    anchor_b: *anchor_b,
+                    limits: None,
+                    motor: None,
+                    contacts_enabled: false,
+                })
             }
-            CadJointType::Gear { ratio, axis_a, axis_b } => {
-                if motor.is_some() {
+            CadJointType::Gear {
+                ratio,
+                axis_a,
+                axis_b,
+            } => {
+                if validated_motor.is_some() {
                     return Err(PhysicsError::InvalidJointConfiguration(
                         "Motors are not supported on Gear joints; apply motor to one of the connected Revolute joints".into(),
                     ));
@@ -215,50 +280,51 @@ impl CadJointType {
                     )));
                 }
 
-                let norm_a = (axis_a[0] * axis_a[0] + axis_a[1] * axis_a[1] + axis_a[2] * axis_a[2]).sqrt();
+                let norm_a =
+                    (axis_a[0] * axis_a[0] + axis_a[1] * axis_a[1] + axis_a[2] * axis_a[2]).sqrt();
                 if norm_a < 1e-7 || !norm_a.is_finite() {
                     return Err(PhysicsError::InvalidJointConfiguration(
                         "Gear joint axis_a cannot be a zero vector".into(),
                     ));
                 }
+                let unit_a = Vector3::new(axis_a[0], axis_a[1], axis_a[2]) / norm_a;
 
-                let norm_b = (axis_b[0] * axis_b[0] + axis_b[1] * axis_b[1] + axis_b[2] * axis_b[2]).sqrt();
+                let norm_b =
+                    (axis_b[0] * axis_b[0] + axis_b[1] * axis_b[1] + axis_b[2] * axis_b[2]).sqrt();
                 if norm_b < 1e-7 || !norm_b.is_finite() {
                     return Err(PhysicsError::InvalidJointConfiguration(
                         "Gear joint axis_b cannot be a zero vector".into(),
                     ));
                 }
+                let unit_b = Vector3::new(axis_b[0], axis_b[1], axis_b[2]) / norm_b;
+                let (u, v) = perpendicular_axes(&unit_a);
 
-                let mut generic: GenericJoint = GenericJointBuilder::new(JointAxesMask::empty()).build();
-                generic.set_contacts_enabled(false);
-                Ok(generic)
+                Ok(JointData {
+                    joint_type: self.clone(),
+                    local_axis_a: [unit_a.x, unit_a.y, unit_a.z],
+                    local_axis_b: [unit_b.x, unit_b.y, unit_b.z],
+                    tangent_u: [u.x, u.y, u.z],
+                    tangent_v: [v.x, v.y, v.z],
+                    anchor_a: [0.0, 0.0, 0.0],
+                    anchor_b: [0.0, 0.0, 0.0],
+                    limits: None,
+                    motor: None,
+                    contacts_enabled: false,
+                })
             }
         }
     }
 
-    /// Applies a motor configuration to an existing Rapier [`GenericJoint`].
+    /// Applies a motor configuration to an existing [`JointData`] in `f64`.
     pub fn apply_motor(
         &self,
-        joint: &mut GenericJoint,
+        joint: &mut JointData,
         motor: MotorConfig,
     ) -> Result<(), PhysicsError> {
+        let m = validate_motor_f64(motor)?;
         match self {
-            CadJointType::Revolute { .. } => {
-                joint.set_motor_velocity(
-                    JointAxis::AngX,
-                    motor.target_velocity as Real,
-                    motor.max_force as Real,
-                );
-                joint.set_motor_max_force(JointAxis::AngX, motor.max_force as Real);
-                Ok(())
-            }
-            CadJointType::Prismatic { .. } => {
-                joint.set_motor_velocity(
-                    JointAxis::LinX,
-                    motor.target_velocity as Real,
-                    motor.max_force as Real,
-                );
-                joint.set_motor_max_force(JointAxis::LinX, motor.max_force as Real);
+            CadJointType::Revolute { .. } | CadJointType::Prismatic { .. } => {
+                joint.motor = Some(m);
                 Ok(())
             }
             CadJointType::Spherical { .. } | CadJointType::Fixed { .. } => {
@@ -266,28 +332,22 @@ impl CadJointType {
                     "Cannot set motor on Spherical or Fixed joint".into(),
                 ))
             }
-            CadJointType::Gear { .. } => {
-                Err(PhysicsError::InvalidJointConfiguration(
-                    "Cannot set motor directly on Gear constraint; apply motor to one of the connected Revolute joints".into(),
-                ))
-            }
+            CadJointType::Gear { .. } => Err(PhysicsError::InvalidJointConfiguration(
+                "Cannot set motor directly on Gear constraint; apply motor to one of the connected Revolute joints".into(),
+            )),
         }
     }
 
-    /// Disables motor actuation on an existing Rapier [`GenericJoint`].
-    pub fn disable_motor(&self, joint: &mut GenericJoint) -> Result<(), PhysicsError> {
+    /// Disables motor actuation on an existing [`JointData`] in `f64`.
+    pub fn disable_motor(&self, joint: &mut JointData) -> Result<(), PhysicsError> {
         match self {
-            CadJointType::Revolute { .. } => {
-                joint.set_motor_velocity(JointAxis::AngX, 0.0, 0.0);
-                joint.set_motor_max_force(JointAxis::AngX, 0.0);
+            CadJointType::Revolute { .. } | CadJointType::Prismatic { .. } => {
+                joint.motor = None;
                 Ok(())
             }
-            CadJointType::Prismatic { .. } => {
-                joint.set_motor_velocity(JointAxis::LinX, 0.0, 0.0);
-                joint.set_motor_max_force(JointAxis::LinX, 0.0);
-                Ok(())
-            }
-            CadJointType::Spherical { .. } | CadJointType::Fixed { .. } | CadJointType::Gear { .. } => Ok(()),
+            CadJointType::Spherical { .. }
+            | CadJointType::Fixed { .. }
+            | CadJointType::Gear { .. } => Ok(()),
         }
     }
 

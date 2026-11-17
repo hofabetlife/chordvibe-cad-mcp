@@ -1,4 +1,4 @@
-//! Physics simulation world managing Rapier3D pipelines, bodies, colliders, and joints.
+//! Physics simulation world managing `f64` rigid bodies, colliders, joints, and the multi-body constraint solver.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -7,18 +7,20 @@ use mcp_cad_core::csg::csg_intersection;
 use mcp_cad_core::topology::{BoundingBox, TriangleMesh, Vertex};
 use mcp_cad_core::Part;
 use nalgebra::{DMatrix, Matrix3, Quaternion, UnitQuaternion, Vector3};
-use rapier3d::crossbeam::channel::{Receiver, Sender};
-use rapier3d::prelude::*;
 
 use crate::error::PhysicsError;
 use crate::joint::{
-    CadJointType, JointLimitStatus, MechanismAnalysisReport, MotorConfig, is_zero_range_limits,
-    local_orthonormal_basis, perpendicular_axes, quat_to_matrix,
+    CadJointType, JointHandle, JointLimitStatus, MechanismAnalysisReport, MotorConfig,
+    is_zero_range_limits, local_orthonormal_basis, perpendicular_axes, quat_to_matrix,
 };
-use crate::rigid_body::{ColliderType, create_collider_builder, create_rigid_body_builder};
+use crate::rigid_body::{
+    BodyHandle, BodyRegistry, ColliderHandle, ColliderRegistry, ColliderType,
+    RigidBody as NativeRigidBody, create_collider, create_rigid_body,
+};
+use crate::solver::{MultiBodySolver, SolvedJointRecord, create_solved_joint_record};
 use crate::telemetry::{
-    BodyState, BodyTelemetry, CollisionEventType, CollisionRecord, InterferenceReport,
-    JointLoadCase, JointReactionForce, JointSweepReport, LoadCaseSelector, PairInterferenceResult,
+    BodyState, BodyTelemetry, CollisionRecord, InterferenceReport, JointLoadCase,
+    JointReactionForce, JointSweepReport, LoadCaseSelector, PairInterferenceResult,
     PartInertialLoad, PartLoadCase, SimulationSummary, SweepStepResult,
 };
 
@@ -35,91 +37,38 @@ pub struct CadJointRecord {
     pub joint_type: CadJointType,
     /// Optional motor configuration for actuated joints.
     pub motor: Option<MotorConfig>,
-    /// Rapier impulse joint handle.
-    pub handle: ImpulseJointHandle,
+    /// Native `f64` joint handle.
+    pub handle: JointHandle,
 }
 
-/// Kinematic gear constraint coupling two rotating bodies.
+/// The main physics simulation world managing native `f64` [`BodyRegistry`], [`ColliderRegistry`],
+/// and [`MultiBodySolver`].
 #[derive(Debug, Clone)]
-pub struct GearConstraintRecord {
-    pub id: String,
-    pub part_a: String,
-    pub part_b: String,
-    pub ratio: f64,
-    pub axis_a: Vector3<f64>,
-    pub axis_b: Vector3<f64>,
-}
-
-/// The main physics simulation world wrapping Rapier3D.
 pub struct PhysicsWorld {
-    pipeline: PhysicsPipeline,
-    gravity: Vector<Real>,
     gravity_f64: [f64; 3],
-    integration_parameters: IntegrationParameters,
-    island_manager: IslandManager,
-    broad_phase: DefaultBroadPhase,
-    narrow_phase: NarrowPhase,
-    bodies: RigidBodySet,
-    colliders: ColliderSet,
-    impulse_joints: ImpulseJointSet,
-    multibody_joints: MultibodyJointSet,
-    ccd_solver: CCDSolver,
 
-    // Channels for capturing Rapier collision and contact force events
-    collision_sender: Sender<CollisionEvent>,
-    collision_receiver: Receiver<CollisionEvent>,
-    contact_force_sender: Sender<ContactForceEvent>,
-    contact_force_receiver: Receiver<ContactForceEvent>,
+    /// Native `f64` rigid body registry (`P4-T2`).
+    bodies: BodyRegistry,
+    /// Native `f64` collider registry (`P4-T2`).
+    colliders: ColliderRegistry,
+    /// Native `f64` multi-body constraint and dynamics solver (`P4-T3`).
+    solver: MultiBodySolver,
 
-    // Mappings between CAD part IDs, joints, and Rapier handles
-    part_to_body: HashMap<String, RigidBodyHandle>,
-    body_to_part: HashMap<RigidBodyHandle, String>,
+    // Mappings between CAD part IDs, joints, and native f64 handles
+    part_to_body: HashMap<String, BodyHandle>,
+    body_to_part: HashMap<BodyHandle, String>,
     collider_to_part: HashMap<ColliderHandle, String>,
     part_to_colliders: HashMap<String, Vec<ColliderHandle>>,
+
     part_meshes: HashMap<String, TriangleMesh>,
     joints: HashMap<String, CadJointRecord>,
-    gear_constraints: HashMap<String, GearConstraintRecord>,
+    solved_joints: Vec<SolvedJointRecord>,
+    next_joint_id: usize,
+    step_counter: usize,
+    last_step_succeeded: bool,
 
     // Current elapsed simulation time in seconds
     current_time_s: f64,
-}
-
-impl Clone for PhysicsWorld {
-    fn clone(&self) -> Self {
-        let (collision_sender, collision_receiver) = rapier3d::crossbeam::channel::unbounded();
-        let (contact_force_sender, contact_force_receiver) =
-            rapier3d::crossbeam::channel::unbounded();
-
-        Self {
-            pipeline: PhysicsPipeline::new(),
-            gravity: self.gravity,
-            gravity_f64: self.gravity_f64,
-            integration_parameters: self.integration_parameters,
-            island_manager: self.island_manager.clone(),
-            broad_phase: self.broad_phase.clone(),
-            narrow_phase: self.narrow_phase.clone(),
-            bodies: self.bodies.clone(),
-            colliders: self.colliders.clone(),
-            impulse_joints: self.impulse_joints.clone(),
-            multibody_joints: self.multibody_joints.clone(),
-            ccd_solver: self.ccd_solver.clone(),
-
-            collision_sender,
-            collision_receiver,
-            contact_force_sender,
-            contact_force_receiver,
-
-            part_to_body: self.part_to_body.clone(),
-            body_to_part: self.body_to_part.clone(),
-            collider_to_part: self.collider_to_part.clone(),
-            part_to_colliders: self.part_to_colliders.clone(),
-            part_meshes: self.part_meshes.clone(),
-            joints: self.joints.clone(),
-            gear_constraints: self.gear_constraints.clone(),
-
-            current_time_s: self.current_time_s,
-        }
-    }
 }
 
 impl Default for PhysicsWorld {
@@ -130,73 +79,75 @@ impl Default for PhysicsWorld {
 
 impl PhysicsWorld {
     /// Creates a new physics world with standard Earth gravity $g = [0, -9.81, 0]$ m/s².
+    #[must_use]
     pub fn new() -> Self {
         Self::with_gravity([0.0, -9.81, 0.0])
     }
 
-    /// Creates a new physics world with custom gravity acceleration vector [gx, gy, gz].
+    /// Creates a new physics world with custom gravity acceleration vector `[gx, gy, gz]`.
+    #[must_use]
     pub fn with_gravity(gravity: [f64; 3]) -> Self {
-        let (collision_sender, collision_receiver) = rapier3d::crossbeam::channel::unbounded();
-        let (contact_force_sender, contact_force_receiver) =
-            rapier3d::crossbeam::channel::unbounded();
+        let mut bodies = BodyRegistry::new();
 
-        let integration_parameters = IntegrationParameters {
-            dt: 1.0 / 60.0,
-            ..Default::default()
-        };
-
-        let mut bodies = RigidBodySet::new();
         // Insert a static anchor rigid body for "ground" and "world" references
-        let ground_handle = bodies.insert(RigidBodyBuilder::fixed());
+        let ground_body = NativeRigidBody::new_fixed(
+            "ground",
+            Vector3::zeros(),
+            UnitQuaternion::identity(),
+        );
+        let ground_handle = bodies.insert(ground_body);
+
         let mut part_to_body = HashMap::new();
         let mut body_to_part = HashMap::new();
+
         part_to_body.insert("ground".to_string(), ground_handle);
         part_to_body.insert("world".to_string(), ground_handle);
         body_to_part.insert(ground_handle, "ground".to_string());
 
         Self {
-            pipeline: PhysicsPipeline::new(),
-            gravity: vector![gravity[0] as Real, gravity[1] as Real, gravity[2] as Real],
             gravity_f64: gravity,
-            integration_parameters,
-            island_manager: IslandManager::new(),
-            broad_phase: DefaultBroadPhase::new(),
-            narrow_phase: NarrowPhase::new(),
             bodies,
-            colliders: ColliderSet::new(),
-            impulse_joints: ImpulseJointSet::new(),
-            multibody_joints: MultibodyJointSet::new(),
-            ccd_solver: CCDSolver::new(),
-
-            collision_sender,
-            collision_receiver,
-            contact_force_sender,
-            contact_force_receiver,
-
+            colliders: ColliderRegistry::new(),
+            solver: MultiBodySolver::new(),
             part_to_body,
             body_to_part,
             collider_to_part: HashMap::new(),
             part_to_colliders: HashMap::new(),
             part_meshes: HashMap::new(),
             joints: HashMap::new(),
-            gear_constraints: HashMap::new(),
-
+            solved_joints: Vec::new(),
+            next_joint_id: 0,
+            step_counter: 0,
+            last_step_succeeded: true,
             current_time_s: 0.0,
         }
     }
 
-    /// Sets the gravity acceleration vector [gx, gy, gz].
+    /// Returns an immutable reference to the native `f64` [`BodyRegistry`].
+    #[must_use]
+    pub fn body_registry(&self) -> &BodyRegistry {
+        &self.bodies
+    }
+
+    /// Returns an immutable reference to the native `f64` [`ColliderRegistry`].
+    #[must_use]
+    pub fn collider_registry(&self) -> &ColliderRegistry {
+        &self.colliders
+    }
+
+    /// Sets the gravity acceleration vector `[gx, gy, gz]`.
     pub fn set_gravity(&mut self, gravity: [f64; 3]) {
-        self.gravity = vector![gravity[0] as Real, gravity[1] as Real, gravity[2] as Real];
         self.gravity_f64 = gravity;
     }
 
-    /// Gets the current gravity acceleration vector [gx, gy, gz].
+    /// Gets the current gravity acceleration vector `[gx, gy, gz]`.
+    #[must_use]
     pub fn gravity(&self) -> [f64; 3] {
         self.gravity_f64
     }
 
     /// Current accumulated simulation time in seconds.
+    #[must_use]
     pub fn current_time(&self) -> f64 {
         self.current_time_s
     }
@@ -204,13 +155,16 @@ impl PhysicsWorld {
     /// Resets accumulated simulation time to zero.
     pub fn reset_time(&mut self) {
         self.current_time_s = 0.0;
+        self.step_counter = 0;
+        self.last_step_succeeded = true;
+        self.solver.reset();
     }
 
     /// Adds a CAD [`Part`] into the simulation world.
     ///
     /// For dynamic bodies, defaults to `ColliderType::ConvexHull`.
     /// For static/fixed bodies, defaults to `ColliderType::TriMesh`.
-    pub fn add_part(&mut self, part: &Part, is_dynamic: bool) -> Result<RigidBodyHandle, PhysicsError> {
+    pub fn add_part(&mut self, part: &Part, is_dynamic: bool) -> Result<BodyHandle, PhysicsError> {
         let collider_type = if is_dynamic {
             ColliderType::ConvexHull
         } else {
@@ -227,7 +181,7 @@ impl PhysicsWorld {
         collider_type: ColliderType,
         initial_position: Option<[f64; 3]>,
         initial_rotation: Option<[f64; 4]>,
-    ) -> Result<RigidBodyHandle, PhysicsError> {
+    ) -> Result<BodyHandle, PhysicsError> {
         if self.part_to_body.contains_key(&part.id)
             || part.id.eq_ignore_ascii_case("ground")
             || part.id.eq_ignore_ascii_case("world")
@@ -235,35 +189,33 @@ impl PhysicsWorld {
             return Err(PhysicsError::PartAlreadyExists(part.id.clone()));
         }
 
-        let rb_builder = create_rigid_body_builder(part, is_dynamic, initial_position, initial_rotation);
-        let collider_builder = create_collider_builder(part, collider_type)?;
+        let f64_rb = create_rigid_body(part, is_dynamic, initial_position, initial_rotation);
+        let f64_col = create_collider(part, collider_type)?;
 
-        let rb_handle = self.bodies.insert(rb_builder);
-        let collider_handle = self.colliders.insert_with_parent(
-            collider_builder,
-            rb_handle,
-            &mut self.bodies,
-        );
+        let rb_handle = self.bodies.insert(f64_rb);
+        let col_handle = self
+            .colliders
+            .insert_with_parent(f64_col, rb_handle, &mut self.bodies);
 
         self.part_to_body.insert(part.id.clone(), rb_handle);
         self.body_to_part.insert(rb_handle, part.id.clone());
-        self.collider_to_part.insert(collider_handle, part.id.clone());
+        self.collider_to_part.insert(col_handle, part.id.clone());
         self.part_to_colliders
             .entry(part.id.clone())
             .or_default()
-            .push(collider_handle);
+            .push(col_handle);
+
         self.part_meshes.insert(part.id.clone(), part.mesh.clone());
 
         Ok(rb_handle)
     }
 
     /// Updates the collider and mass properties of a CAD [`Part`] in the physics world
-    /// while preserving its [`RigidBodyHandle`] and all attached joints (`joints`,
-    /// `impulse_joints`, and `gear_constraints`).
+    /// while preserving its [`BodyHandle`] and all attached joints.
     ///
     /// If the part is not yet registered in the physics world, this delegates to
     /// [`Self::add_part`] using `!part.is_fixed` as `is_dynamic`.
-    pub fn update_part_collider(&mut self, part: &Part) -> Result<RigidBodyHandle, PhysicsError> {
+    pub fn update_part_collider(&mut self, part: &Part) -> Result<BodyHandle, PhysicsError> {
         if part.id.eq_ignore_ascii_case("ground") || part.id.eq_ignore_ascii_case("world") {
             return Err(PhysicsError::InvalidJointConfiguration(format!(
                 "Cannot modify geometry of reserved static anchor '{}'",
@@ -280,50 +232,34 @@ impl PhysicsWorld {
         } else {
             ColliderType::TriMesh
         };
-        let collider_builder = create_collider_builder(part, collider_type)?;
+        let new_col = create_collider(part, collider_type)?;
 
+        // Remove old native colliders for this part
         if let Some(old_colliders) = self.part_to_colliders.remove(&part.id) {
             for col_h in old_colliders {
                 self.collider_to_part.remove(&col_h);
-                self.colliders.remove(
-                    col_h,
-                    &mut self.island_manager,
-                    &mut self.bodies,
-                    true,
-                );
+                self.colliders.remove(col_h, &mut self.bodies);
             }
         }
 
+        // Update native f64 RigidBody in place while preserving its BodyHandle and pose
         if let Some(rb) = self.bodies.get_mut(rb_handle) {
-            let target_type = if is_dynamic {
-                RigidBodyType::Dynamic
-            } else {
-                RigidBodyType::Fixed
-            };
-            if rb.body_type() != target_type {
-                rb.set_body_type(target_type, true);
-            }
+            rb.update_mass_properties_from_part(part, is_dynamic);
         }
 
-        let collider_handle = self.colliders.insert_with_parent(
-            collider_builder,
-            rb_handle,
-            &mut self.bodies,
-        );
-        self.collider_to_part.insert(collider_handle, part.id.clone());
+        let col_handle = self
+            .colliders
+            .insert_with_parent(new_col, rb_handle, &mut self.bodies);
+        self.collider_to_part.insert(col_handle, part.id.clone());
         self.part_to_colliders
             .entry(part.id.clone())
             .or_default()
-            .push(collider_handle);
+            .push(col_handle);
+
         self.part_meshes.insert(part.id.clone(), part.mesh.clone());
 
-        if let Some(rb) = self.bodies.get_mut(rb_handle) {
-            rb.recompute_mass_properties_from_colliders(&self.colliders);
-            rb.wake_up(true);
-        }
-
         // Wake up any bodies coupled to this part via joints
-        let coupled_body_handles: Vec<RigidBodyHandle> = self
+        let coupled_body_handles: Vec<BodyHandle> = self
             .joints
             .values()
             .filter(|rec| rec.part_a == part.id || rec.part_b == part.id)
@@ -337,7 +273,7 @@ impl PhysicsWorld {
             .collect();
         for h in coupled_body_handles {
             if let Some(rb) = self.bodies.get_mut(h) {
-                rb.wake_up(true);
+                rb.wake_up();
             }
         }
 
@@ -363,10 +299,12 @@ impl PhysicsWorld {
         if let Some(col_handles) = self.part_to_colliders.remove(part_id) {
             for col_h in col_handles {
                 self.collider_to_part.remove(&col_h);
+                self.colliders.remove(col_h, &mut self.bodies);
             }
         }
+        self.bodies.remove(rb_handle);
 
-        // Clean up attached joints in self.joints
+        // Clean up attached joints in self.joints and self.solved_joints
         let attached_joint_ids: Vec<String> = self
             .joints
             .iter()
@@ -376,23 +314,14 @@ impl PhysicsWorld {
 
         for j_id in attached_joint_ids {
             self.joints.remove(&j_id);
-            self.gear_constraints.remove(&j_id);
         }
-        self.gear_constraints.retain(|_, rec| rec.part_a != part_id && rec.part_b != part_id);
-
-        self.bodies.remove(
-            rb_handle,
-            &mut self.island_manager,
-            &mut self.colliders,
-            &mut self.impulse_joints,
-            &mut self.multibody_joints,
-            true,
-        );
+        self.solved_joints
+            .retain(|rec| rec.part_a != part_id && rec.part_b != part_id);
 
         Ok(())
     }
 
-    /// Adds a kinematic/dynamic joint between two parts.
+    /// Adds a kinematic/dynamic joint between two parts in `f64`.
     pub fn add_joint(
         &mut self,
         joint_id: impl Into<String>,
@@ -400,7 +329,7 @@ impl PhysicsWorld {
         part_b: &str,
         joint_type: CadJointType,
         motor: Option<MotorConfig>,
-    ) -> Result<ImpulseJointHandle, PhysicsError> {
+    ) -> Result<JointHandle, PhysicsError> {
         let j_id = joint_id.into();
         if self.joints.contains_key(&j_id) {
             return Err(PhysicsError::JointAlreadyExists(j_id));
@@ -428,76 +357,94 @@ impl PhysicsWorld {
             .get(&norm_b)
             .ok_or_else(|| PhysicsError::PartNotFound(part_b.to_string()))?;
 
-        let generic_joint = joint_type.build_generic_joint(motor)?;
-        let joint_handle = self
-            .impulse_joints
-            .insert(handle_a, handle_b, generic_joint, true);
+        let joint_data = joint_type.build_generic_joint(motor)?;
+        let joint_handle = JointHandle(self.next_joint_id);
+        self.next_joint_id += 1;
+
+        let solved_rec = create_solved_joint_record(
+            j_id.clone(),
+            joint_handle,
+            norm_a.clone(),
+            norm_b.clone(),
+            handle_a,
+            handle_b,
+            joint_type.clone(),
+            motor,
+            joint_data,
+            &self.bodies,
+        );
+        self.solved_joints.push(solved_rec);
 
         self.joints.insert(
             j_id.clone(),
             CadJointRecord {
-                id: j_id.clone(),
-                part_a: norm_a.clone(),
-                part_b: norm_b.clone(),
-                joint_type: joint_type.clone(),
+                id: j_id,
+                part_a: norm_a,
+                part_b: norm_b,
+                joint_type,
                 motor,
                 handle: joint_handle,
             },
         );
 
-        if let CadJointType::Gear { ratio, axis_a, axis_b } = &joint_type {
-            self.gear_constraints.insert(
-                j_id.clone(),
-                GearConstraintRecord {
-                    id: j_id,
-                    part_a: norm_a,
-                    part_b: norm_b,
-                    ratio: *ratio,
-                    axis_a: Vector3::new(axis_a[0], axis_a[1], axis_a[2]),
-                    axis_b: Vector3::new(axis_b[0], axis_b[1], axis_b[2]),
-                },
-            );
-        }
-
         Ok(joint_handle)
     }
 
     /// Returns a reference to all registered CAD joints.
+    #[must_use]
     pub fn joints(&self) -> &HashMap<String, CadJointRecord> {
         &self.joints
     }
 
-    /// Updates motor actuation on an existing joint.
+    /// Updates motor actuation on an existing joint transactionally.
     pub fn set_joint_motor(
         &mut self,
         joint_id: &str,
         motor: MotorConfig,
     ) -> Result<(), PhysicsError> {
-        let (handle, joint_type) = {
+        let joint_type = {
             let record = self
                 .joints
                 .get(joint_id)
                 .ok_or_else(|| PhysicsError::JointNotFound(joint_id.to_string()))?;
-            (record.handle, record.joint_type.clone())
+            record.joint_type.clone()
         };
 
-        let (body1, body2) = {
-            let joint = self
-                .impulse_joints
-                .get_mut(handle)
-                .ok_or_else(|| PhysicsError::JointNotFound(joint_id.to_string()))?;
+        let s_idx = self
+            .solved_joints
+            .iter()
+            .position(|j| j.id == joint_id)
+            .ok_or_else(|| PhysicsError::JointNotFound(joint_id.to_string()))?;
 
-            joint_type.apply_motor(&mut joint.data, motor)?;
-            (joint.body1, joint.body2)
+        joint_type.apply_motor(&mut self.solved_joints[s_idx].data, motor)?;
+
+        let (body_a, body_b) = (
+            self.solved_joints[s_idx].body_a,
+            self.solved_joints[s_idx].body_b,
+        );
+        let cur_coord = match (self.bodies.get(body_a), self.bodies.get(body_b)) {
+            (Some(ba), Some(bb)) => joint_type
+                .current_coordinate(
+                    ba.position,
+                    ba.rotation_matrix(),
+                    bb.position,
+                    bb.rotation_matrix(),
+                )
+                .unwrap_or(0.0),
+            _ => 0.0,
         };
+
+        self.solved_joints[s_idx].motor = Some(motor);
+        self.solved_joints[s_idx].motor_accum_coord = cur_coord;
+        self.solved_joints[s_idx].motor_saturated = false;
 
         if let Some(record) = self.joints.get_mut(joint_id) {
             record.motor = Some(motor);
         }
 
-        for body_handle in [body1, body2] {
-            if let Some(rb) = self.bodies.get_mut(body_handle) {
-                rb.wake_up(true);
+        for bh in [body_a, body_b] {
+            if let Some(rb) = self.bodies.get_mut(bh) {
+                rb.wake_up();
             }
         }
         Ok(())
@@ -505,31 +452,36 @@ impl PhysicsWorld {
 
     /// Disables motor actuation on an existing joint.
     pub fn disable_joint_motor(&mut self, joint_id: &str) -> Result<(), PhysicsError> {
-        let (handle, joint_type) = {
+        let joint_type = {
             let record = self
                 .joints
                 .get(joint_id)
                 .ok_or_else(|| PhysicsError::JointNotFound(joint_id.to_string()))?;
-            (record.handle, record.joint_type.clone())
+            record.joint_type.clone()
         };
 
-        let (body1, body2) = {
-            let joint = self
-                .impulse_joints
-                .get_mut(handle)
-                .ok_or_else(|| PhysicsError::JointNotFound(joint_id.to_string()))?;
+        let s_idx = self
+            .solved_joints
+            .iter()
+            .position(|j| j.id == joint_id)
+            .ok_or_else(|| PhysicsError::JointNotFound(joint_id.to_string()))?;
 
-            joint_type.disable_motor(&mut joint.data)?;
-            (joint.body1, joint.body2)
-        };
+        joint_type.disable_motor(&mut self.solved_joints[s_idx].data)?;
+        self.solved_joints[s_idx].motor = None;
+        self.solved_joints[s_idx].motor_saturated = false;
+
+        let (body_a, body_b) = (
+            self.solved_joints[s_idx].body_a,
+            self.solved_joints[s_idx].body_b,
+        );
 
         if let Some(record) = self.joints.get_mut(joint_id) {
             record.motor = None;
         }
 
-        for body_handle in [body1, body2] {
-            if let Some(rb) = self.bodies.get_mut(body_handle) {
-                rb.wake_up(true);
+        for bh in [body_a, body_b] {
+            if let Some(rb) = self.bodies.get_mut(bh) {
+                rb.wake_up();
             }
         }
         Ok(())
@@ -537,157 +489,37 @@ impl PhysicsWorld {
 
     /// Removes a joint by identifier.
     pub fn remove_joint(&mut self, joint_id: &str) -> Result<(), PhysicsError> {
-        let record = self
+        let _record = self
             .joints
             .remove(joint_id)
             .ok_or_else(|| PhysicsError::JointNotFound(joint_id.to_string()))?;
 
-        self.impulse_joints.remove(record.handle, true);
-        self.gear_constraints.remove(joint_id);
+        self.solved_joints.retain(|j| j.id != joint_id);
         Ok(())
     }
 
-    /// Executes a single discrete physics integration step of size `dt` seconds.
+    /// Executes a single discrete `f64` physics integration step of size `dt` seconds.
     ///
     /// Returns any collision events that started or stopped during this step.
     pub fn step(&mut self, dt: f64) -> Vec<CollisionRecord> {
-        let step_dt = if dt > 0.0 { dt } else { 1.0 / 60.0 };
-        self.integration_parameters.dt = step_dt as Real;
-
-        let event_handler = ChannelEventCollector::new(
-            self.collision_sender.clone(),
-            self.contact_force_sender.clone(),
-        );
-
-        let physics_hooks = ();
-
-        self.pipeline.step(
-            &self.gravity,
-            &self.integration_parameters,
-            &mut self.island_manager,
-            &mut self.broad_phase,
-            &mut self.narrow_phase,
+        let step_dt = if dt > 0.0 && dt.is_finite() {
+            dt
+        } else {
+            1.0 / 60.0
+        };
+        let next_time = self.current_time_s + step_dt;
+        let (ok, records) = self.solver.step(
             &mut self.bodies,
             &mut self.colliders,
-            &mut self.impulse_joints,
-            &mut self.multibody_joints,
-            &mut self.ccd_solver,
-            None,
-            &physics_hooks,
-            &event_handler,
+            &mut self.solved_joints,
+            self.gravity_f64,
+            step_dt,
+            self.step_counter,
+            next_time,
         );
-
-        // Enforce kinematic gear constraints: w_b = -ratio * w_a
-        for gear in self.gear_constraints.values() {
-            let Some(&handle_a) = self.part_to_body.get(&gear.part_a) else { continue };
-            let Some(&handle_b) = self.part_to_body.get(&gear.part_b) else { continue };
-
-            let (Some(rb_a), Some(rb_b)) = (self.bodies.get(handle_a), self.bodies.get(handle_b)) else { continue };
-
-            let w_a = rb_a.angvel();
-            let w_b = rb_b.angvel();
-
-            let axis_a_norm = if gear.axis_a.norm() > 1e-6 {
-                gear.axis_a.normalize()
-            } else {
-                Vector3::z()
-            };
-            let axis_b_norm = if gear.axis_b.norm() > 1e-6 {
-                gear.axis_b.normalize()
-            } else {
-                Vector3::z()
-            };
-
-            let wa_proj = w_a.x as f64 * axis_a_norm.x + w_a.y as f64 * axis_a_norm.y + w_a.z as f64 * axis_a_norm.z;
-            let wb_proj = w_b.x as f64 * axis_b_norm.x + w_b.y as f64 * axis_b_norm.y + w_b.z as f64 * axis_b_norm.z;
-
-            if wa_proj.abs() > 1e-5 || wb_proj.abs() <= 1e-5 {
-                let target_wb = -gear.ratio * wa_proj;
-                let delta_wb = target_wb - wb_proj;
-                let delta_angvel = vector![
-                    (delta_wb * axis_b_norm.x) as Real,
-                    (delta_wb * axis_b_norm.y) as Real,
-                    (delta_wb * axis_b_norm.z) as Real
-                ];
-
-                if let Some(rb_b_mut) = self.bodies.get_mut(handle_b) {
-                    if rb_b_mut.is_dynamic() {
-                        let new_w = rb_b_mut.angvel() + delta_angvel;
-                        rb_b_mut.set_angvel(new_w, true);
-                    }
-                }
-            } else {
-                let target_wa = -wb_proj / gear.ratio;
-                let delta_wa = target_wa - wa_proj;
-                let delta_angvel = vector![
-                    (delta_wa * axis_a_norm.x) as Real,
-                    (delta_wa * axis_a_norm.y) as Real,
-                    (delta_wa * axis_a_norm.z) as Real
-                ];
-
-                if let Some(rb_a_mut) = self.bodies.get_mut(handle_a) {
-                    if rb_a_mut.is_dynamic() {
-                        let new_w = rb_a_mut.angvel() + delta_angvel;
-                        rb_a_mut.set_angvel(new_w, true);
-                    }
-                }
-            }
-        }
-
-        self.current_time_s += step_dt;
-
-        // Collect contact forces to correlate with collision records
-        let mut contact_force_map: HashMap<(ColliderHandle, ColliderHandle), (Vector3<f64>, f64)> =
-            HashMap::new();
-
-        while let Ok(cf) = self.contact_force_receiver.try_recv() {
-            let norm = Vector3::new(
-                cf.max_force_direction.x as f64,
-                cf.max_force_direction.y as f64,
-                cf.max_force_direction.z as f64,
-            );
-            let mag = cf.max_force_magnitude as f64;
-            contact_force_map.insert((cf.collider1, cf.collider2), (norm, mag));
-        }
-
-        // Drain collision events
-        let mut records = Vec::new();
-
-        while let Ok(event) = self.collision_receiver.try_recv() {
-            let (c1, c2, event_type) = match event {
-                CollisionEvent::Started(c1, c2, _) => (c1, c2, CollisionEventType::Started),
-                CollisionEvent::Stopped(c1, c2, _) => (c1, c2, CollisionEventType::Stopped),
-            };
-
-            let body_a = self
-                .collider_to_part
-                .get(&c1)
-                .cloned()
-                .unwrap_or_else(|| format!("{c1:?}"));
-            let body_b = self
-                .collider_to_part
-                .get(&c2)
-                .cloned()
-                .unwrap_or_else(|| format!("{c2:?}"));
-
-            let (contact_normal, max_impulse) = if let Some((norm, mag)) =
-                contact_force_map.get(&(c1, c2)).or_else(|| contact_force_map.get(&(c2, c1)))
-            {
-                (Some([norm.x, norm.y, norm.z]), Some(*mag))
-            } else {
-                (None, None)
-            };
-
-            records.push(CollisionRecord {
-                time_s: self.current_time_s,
-                body_a,
-                body_b,
-                event_type,
-                contact_normal,
-                max_impulse,
-            });
-        }
-
+        self.last_step_succeeded = ok;
+        self.step_counter += 1;
+        self.current_time_s = next_time;
         records
     }
 
@@ -696,30 +528,25 @@ impl PhysicsWorld {
         &self,
         summary: &mut SimulationSummary,
         time_s: f64,
-        dt: f64,
+        _dt: f64,
     ) {
-        // Bodies
+        // Bodies (read directly from native f64 BodyRegistry)
         for (part_id, &rb_handle) in &self.part_to_body {
             if part_id == "ground" || part_id == "world" {
                 continue;
             }
             if let Some(rb) = self.bodies.get(rb_handle) {
-                let pos = rb.translation();
-                let q = rb.rotation().quaternion();
-                let lv = rb.linvel();
-                let av = rb.angvel();
+                let pos = rb.position;
+                let q = rb.orientation.quaternion();
+                let lv = rb.linear_velocity;
+                let av = rb.angular_velocity;
 
                 let state = BodyState {
                     time_s,
-                    position: [pos.x as f64, pos.y as f64, pos.z as f64],
-                    orientation_quat: [
-                        q.coords.x as f64,
-                        q.coords.y as f64,
-                        q.coords.z as f64,
-                        q.coords.w as f64,
-                    ],
-                    linear_velocity: [lv.x as f64, lv.y as f64, lv.z as f64],
-                    angular_velocity: [av.x as f64, av.y as f64, av.z as f64],
+                    position: [pos.x, pos.y, pos.z],
+                    orientation_quat: [q.coords.x, q.coords.y, q.coords.z, q.coords.w],
+                    linear_velocity: [lv.x, lv.y, lv.z],
+                    angular_velocity: [av.x, av.y, av.z],
                 };
 
                 if let Some(traj) = summary.trajectories.get_mut(part_id) {
@@ -728,32 +555,29 @@ impl PhysicsWorld {
             }
         }
 
-        // Joints
-        let safe_dt = if dt > 0.0 { dt } else { 1.0 / 60.0 };
-        for (joint_id, joint_rec) in &self.joints {
-            if let Some(joint) = self.impulse_joints.get(joint_rec.handle) {
-                let (force, torque) = self.compute_joint_world_wrench_on_part_a(joint, safe_dt);
-                let force_mag = (force[0].powi(2) + force[1].powi(2) + force[2].powi(2)).sqrt();
-                let torque_mag =
-                    (torque[0].powi(2) + torque[1].powi(2) + torque[2].powi(2)).sqrt();
+        // Joints (read exact f64 Lagrange multiplier reactions from SolvedJointRecord)
+        for s_joint in &self.solved_joints {
+            let force = s_joint.last_force_on_a;
+            let torque = s_joint.last_torque_on_a;
+            let force_mag = (force[0].powi(2) + force[1].powi(2) + force[2].powi(2)).sqrt();
+            let torque_mag = (torque[0].powi(2) + torque[1].powi(2) + torque[2].powi(2)).sqrt();
 
-                let reaction = JointReactionForce {
-                    joint_id: joint_id.clone(),
-                    time_s,
-                    force,
-                    torque,
-                    force_magnitude: force_mag,
-                    torque_magnitude: torque_mag,
-                };
+            let reaction = JointReactionForce {
+                joint_id: s_joint.id.clone(),
+                time_s,
+                force,
+                torque,
+                force_magnitude: force_mag,
+                torque_magnitude: torque_mag,
+            };
 
-                if let Some(list) = summary.joint_reactions.get_mut(joint_id) {
-                    list.push(reaction);
-                }
+            if let Some(list) = summary.joint_reactions.get_mut(&s_joint.id) {
+                list.push(reaction);
+            }
 
-                if let Some(peak) = summary.peak_joint_forces.get_mut(joint_id) {
-                    if force_mag > *peak {
-                        *peak = force_mag;
-                    }
+            if let Some(peak) = summary.peak_joint_forces.get_mut(&s_joint.id) {
+                if force_mag > *peak {
+                    *peak = force_mag;
                 }
             }
         }
@@ -764,7 +588,7 @@ impl PhysicsWorld {
     /// Produces a comprehensive [`SimulationSummary`] containing trajectories, joint reactions,
     /// and collision events tailored for AI agent analysis.
     pub fn simulate(&mut self, duration_s: f64, step_size_s: f64) -> SimulationSummary {
-        let dt = if step_size_s > 0.0 {
+        let dt = if step_size_s > 0.0 && step_size_s.is_finite() {
             step_size_s
         } else {
             1.0 / 60.0
@@ -795,6 +619,9 @@ impl PhysicsWorld {
 
         for _ in 0..steps {
             let collisions = self.step(dt);
+            if !self.last_step_succeeded {
+                summary.success = false;
+            }
             summary.collisions.extend(collisions);
             self.record_telemetry_snapshot(&mut summary, self.current_time_s, dt);
         }
@@ -805,7 +632,7 @@ impl PhysicsWorld {
 
     // --- Query and inspection methods ---
 
-    fn get_body(&self, part_id: &str) -> Result<&RigidBody, PhysicsError> {
+    fn get_body(&self, part_id: &str) -> Result<&NativeRigidBody, PhysicsError> {
         let norm_id = if part_id.eq_ignore_ascii_case("ground") {
             "ground"
         } else if part_id.eq_ignore_ascii_case("world") {
@@ -822,7 +649,7 @@ impl PhysicsWorld {
             .ok_or_else(|| PhysicsError::PartNotFound(part_id.to_string()))
     }
 
-    fn get_body_mut(&mut self, part_id: &str) -> Result<&mut RigidBody, PhysicsError> {
+    fn get_body_mut(&mut self, part_id: &str) -> Result<&mut NativeRigidBody, PhysicsError> {
         let norm_id = if part_id.eq_ignore_ascii_case("ground") {
             "ground"
         } else if part_id.eq_ignore_ascii_case("world") {
@@ -840,6 +667,7 @@ impl PhysicsWorld {
     }
 
     /// Returns `true` if a part is registered in the physics world.
+    #[must_use]
     pub fn has_part(&self, part_id: &str) -> bool {
         let norm_id = if part_id.eq_ignore_ascii_case("ground") {
             "ground"
@@ -857,10 +685,23 @@ impl PhysicsWorld {
         Ok(rb.is_dynamic())
     }
 
-    /// Returns the computed mass (in kg) of a registered part's rigid body.
+    /// Returns the computed mass (in kg, `f64`) of a registered part's rigid body.
     pub fn part_mass(&self, part_id: &str) -> Result<f64, PhysicsError> {
         let rb = self.get_body(part_id)?;
-        Ok(rb.mass() as f64)
+        Ok(rb.mass())
+    }
+
+    /// Returns the local-frame center of mass `[cx, cy, cz]` (in meters, `f64`) of a registered part.
+    pub fn part_local_com(&self, part_id: &str) -> Result<[f64; 3], PhysicsError> {
+        let rb = self.get_body(part_id)?;
+        Ok([rb.local_com.x, rb.local_com.y, rb.local_com.z])
+    }
+
+    /// Returns the exact $3 \times 3$ local-frame inertia tensor $I_{\text{loc}}$ ($\text{kg}\cdot\text{m}^2$, `f64`)
+    /// about the part's center of mass.
+    pub fn part_inertia_tensor(&self, part_id: &str) -> Result<Matrix3<f64>, PhysicsError> {
+        let rb = self.get_body(part_id)?;
+        Ok(rb.local_inertia)
     }
 
     /// Returns the world-space axis-aligned bounding box `([min_x, min_y, min_z], [max_x, max_y, max_z])`
@@ -882,80 +723,74 @@ impl PhysicsWorld {
         for &col_h in col_handles {
             if let Some(col) = self.colliders.get(col_h) {
                 let aabb = col.compute_aabb();
-                min[0] = min[0].min(aabb.mins.x as f64);
-                min[1] = min[1].min(aabb.mins.y as f64);
-                min[2] = min[2].min(aabb.mins.z as f64);
-                max[0] = max[0].max(aabb.maxs.x as f64);
-                max[1] = max[1].max(aabb.maxs.y as f64);
-                max[2] = max[2].max(aabb.maxs.z as f64);
+                min[0] = min[0].min(aabb.min[0]);
+                min[1] = min[1].min(aabb.min[1]);
+                min[2] = min[2].min(aabb.min[2]);
+                max[0] = max[0].max(aabb.max[0]);
+                max[1] = max[1].max(aabb.max[1]);
+                max[2] = max[2].max(aabb.max[2]);
             }
         }
         Ok((min, max))
     }
 
-    /// Retrieves current 3D position [x, y, z] of a part.
+    /// Retrieves current 3D position `[x, y, z]` of a part.
     pub fn part_position(&self, part_id: &str) -> Result<[f64; 3], PhysicsError> {
         let rb = self.get_body(part_id)?;
-        let pos = rb.translation();
-        Ok([pos.x as f64, pos.y as f64, pos.z as f64])
+        Ok([rb.position.x, rb.position.y, rb.position.z])
     }
 
-    /// Retrieves current orientation quaternion [x, y, z, w] of a part.
+    /// Retrieves current orientation quaternion `[x, y, z, w]` of a part.
     pub fn part_orientation(&self, part_id: &str) -> Result<[f64; 4], PhysicsError> {
         let rb = self.get_body(part_id)?;
-        let q = rb.rotation().quaternion();
+        let q = rb.orientation.quaternion();
+        Ok([q.coords.x, q.coords.y, q.coords.z, q.coords.w])
+    }
+
+    /// Retrieves current linear velocity `[vx, vy, vz]` of a part.
+    pub fn part_velocity(&self, part_id: &str) -> Result<[f64; 3], PhysicsError> {
+        let rb = self.get_body(part_id)?;
         Ok([
-            q.coords.x as f64,
-            q.coords.y as f64,
-            q.coords.z as f64,
-            q.coords.w as f64,
+            rb.linear_velocity.x,
+            rb.linear_velocity.y,
+            rb.linear_velocity.z,
         ])
     }
 
-    /// Retrieves current linear velocity [vx, vy, vz] of a part.
-    pub fn part_velocity(&self, part_id: &str) -> Result<[f64; 3], PhysicsError> {
-        let rb = self.get_body(part_id)?;
-        let lv = rb.linvel();
-        Ok([lv.x as f64, lv.y as f64, lv.z as f64])
-    }
-
-    /// Retrieves current linear velocity [vx, vy, vz] of a part (alias for [`Self::part_velocity`]).
+    /// Retrieves current linear velocity `[vx, vy, vz]` of a part (alias for [`Self::part_velocity`]).
     pub fn part_linear_velocity(&self, part_id: &str) -> Result<[f64; 3], PhysicsError> {
         self.part_velocity(part_id)
     }
 
-    /// Retrieves current angular velocity [wx, wy, wz] of a part.
+    /// Retrieves current angular velocity `[wx, wy, wz]` of a part.
     pub fn part_angular_velocity(&self, part_id: &str) -> Result<[f64; 3], PhysicsError> {
         let rb = self.get_body(part_id)?;
-        let av = rb.angvel();
-        Ok([av.x as f64, av.y as f64, av.z as f64])
+        Ok([
+            rb.angular_velocity.x,
+            rb.angular_velocity.y,
+            rb.angular_velocity.z,
+        ])
     }
 
-    /// Sets linear velocity [vx, vy, vz] on a part.
+    /// Sets linear velocity `[vx, vy, vz]` on a part.
     pub fn set_part_velocity(
         &mut self,
         part_id: &str,
         linvel: [f64; 3],
     ) -> Result<(), PhysicsError> {
         let rb = self.get_body_mut(part_id)?;
-        rb.set_linvel(
-            vector![linvel[0] as Real, linvel[1] as Real, linvel[2] as Real],
-            true,
-        );
+        rb.set_linvel(Vector3::new(linvel[0], linvel[1], linvel[2]));
         Ok(())
     }
 
-    /// Sets angular velocity [wx, wy, wz] on a part.
+    /// Sets angular velocity `[wx, wy, wz]` on a part.
     pub fn set_part_angular_velocity(
         &mut self,
         part_id: &str,
         angvel: [f64; 3],
     ) -> Result<(), PhysicsError> {
         let rb = self.get_body_mut(part_id)?;
-        rb.set_angvel(
-            vector![angvel[0] as Real, angvel[1] as Real, angvel[2] as Real],
-            true,
-        );
+        rb.set_angvel(Vector3::new(angvel[0], angvel[1], angvel[2]));
         Ok(())
     }
 
@@ -967,60 +802,43 @@ impl PhysicsWorld {
         position: [f64; 3],
         orientation_quat: [f64; 4],
     ) -> Result<(), PhysicsError> {
-        let quat = Quaternion::new(
-            orientation_quat[3] as Real,
-            orientation_quat[0] as Real,
-            orientation_quat[1] as Real,
-            orientation_quat[2] as Real,
+        let pos_f64 = Vector3::new(position[0], position[1], position[2]);
+        let quat_f64 = Quaternion::new(
+            orientation_quat[3],
+            orientation_quat[0],
+            orientation_quat[1],
+            orientation_quat[2],
         );
-        let unit_quat = if quat.norm() > 1e-12 {
-            UnitQuaternion::from_quaternion(quat)
+        let unit_quat_f64 = if quat_f64.norm() > 1e-12 {
+            UnitQuaternion::from_quaternion(quat_f64)
         } else {
             UnitQuaternion::identity()
         };
-        let iso = Isometry::from_parts(
-            Translation::new(
-                position[0] as Real,
-                position[1] as Real,
-                position[2] as Real,
-            ),
-            unit_quat,
-        );
 
         let rb = self.get_body_mut(part_id)?;
-        rb.set_position(iso, true);
+        rb.set_pose(pos_f64, unit_quat_f64);
 
         if let Some(col_handles) = self.part_to_colliders.get(part_id).cloned() {
             for col_h in col_handles {
                 if let Some(col) = self.colliders.get_mut(col_h) {
-                    let local_pos = col
-                        .position_wrt_parent()
-                        .copied()
-                        .unwrap_or_else(Isometry::identity);
-                    col.set_position(iso * local_pos);
+                    col.update_world_pose(pos_f64, unit_quat_f64);
                 }
             }
         }
         Ok(())
     }
 
-    /// Applies a continuous external force vector [fx, fy, fz] in Newtons to a part.
+    /// Applies a continuous external force vector `[fx, fy, fz]` in Newtons to a part.
     pub fn apply_force(&mut self, part_id: &str, force: [f64; 3]) -> Result<(), PhysicsError> {
         let rb = self.get_body_mut(part_id)?;
-        rb.add_force(
-            vector![force[0] as Real, force[1] as Real, force[2] as Real],
-            true,
-        );
+        rb.add_force(Vector3::new(force[0], force[1], force[2]));
         Ok(())
     }
 
-    /// Applies an instantaneous impulse vector [ix, iy, iz] in N*s to a part.
+    /// Applies an instantaneous impulse vector `[ix, iy, iz]` in N*s to a part.
     pub fn apply_impulse(&mut self, part_id: &str, impulse: [f64; 3]) -> Result<(), PhysicsError> {
         let rb = self.get_body_mut(part_id)?;
-        rb.apply_impulse(
-            vector![impulse[0] as Real, impulse[1] as Real, impulse[2] as Real],
-            true,
-        );
+        rb.apply_impulse(Vector3::new(impulse[0], impulse[1], impulse[2]));
         Ok(())
     }
 
@@ -1028,20 +846,16 @@ impl PhysicsWorld {
     pub fn joint_reaction_force(
         &self,
         joint_id: &str,
-        dt: f64,
+        _dt: f64,
     ) -> Result<JointReactionForce, PhysicsError> {
-        let record = self
-            .joints
-            .get(joint_id)
+        let s_joint = self
+            .solved_joints
+            .iter()
+            .find(|j| j.id == joint_id)
             .ok_or_else(|| PhysicsError::JointNotFound(joint_id.to_string()))?;
 
-        let joint = self
-            .impulse_joints
-            .get(record.handle)
-            .ok_or_else(|| PhysicsError::JointNotFound(joint_id.to_string()))?;
-
-        let safe_dt = if dt > 0.0 { dt } else { 1.0 / 60.0 };
-        let (force, torque) = self.compute_joint_world_wrench_on_part_a(joint, safe_dt);
+        let force = s_joint.last_force_on_a;
+        let torque = s_joint.last_torque_on_a;
         let force_magnitude = (force[0].powi(2) + force[1].powi(2) + force[2].powi(2)).sqrt();
         let torque_magnitude = (torque[0].powi(2) + torque[1].powi(2) + torque[2].powi(2)).sqrt();
 
@@ -1053,313 +867,6 @@ impl PhysicsWorld {
             force_magnitude,
             torque_magnitude,
         })
-    }
-
-    /// Reconstructs the physical reaction wrench `(force_world, torque_anchor_world)` acting ON
-    /// `part_a` (`joint.body1`) at its joint anchor from Rapier3D 0.22's solved joint impulses.
-    ///
-    /// ### Rapier3D 0.22 Impulse Representation (`P3-T6`)
-    /// 1. **TGS-Soft Substepping**: `IslandSolver::init_and_solve` divides `dt` into
-    ///    `num_substeps = num_solver_iterations + additional_solver_iterations` substeps of
-    ///    duration `substep_dt = dt / num_substeps`. Each substep resets `constraint.impulse = 0`
-    ///    during `joint_constraints.update(...)`, solves for that substep's impulse, and at the
-    ///    end of the step writes the final substep's impulse into `joint.impulses[0..6]`,
-    ///    `joint.data.motors[0..6].impulse`, and `joint.data.limits[0..6].impulse`.
-    ///    Therefore, physical forces and torques equal `impulse / substep_dt`.
-    /// 2. **One-Body vs Two-Body Flipping**: When `joint.body2` (`part_b`) is fixed and
-    ///    `joint.body1` (`part_a`) is dynamic, `JointOneBodyConstraintBuilder::generate` swaps
-    ///    `body1 <-> body2` and calls `joint_data.flip()` so `body2` is always the dynamic body.
-    ///    In `solve_generic`, `+impulse * lin_jac` is applied to `body1` and `-impulse * lin_jac`
-    ///    is applied to `body2`.
-    /// 3. **Modified Gram-Schmidt Decoupling**: In `lock_axes`, locked angular rows (`i = 3..6`)
-    ///    are emitted before locked linear rows (`i = 0..3`), and `finalize_constraints` runs
-    ///    Modified Gram-Schmidt orthogonalization in inverse-inertia space. This subtracts the
-    ///    lever-arm moment `r x lin_jac` along locked angular axes from the linear constraint rows,
-    ///    shifting the effective line of action of `joint.impulses[0..3]` to the center of mass.
-    ///    Tracking the pure anchor couple `tau_anchor` alongside `(lin_jac, ang_jac1, ang_jac2)`
-    ///    through the exact same Gram-Schmidt orthogonalization recovers both the world force
-    ///    `F` and the physical reaction torque `T_anchor` at the joint anchor.
-    fn compute_joint_world_wrench_on_part_a(
-        &self,
-        joint: &ImpulseJoint,
-        dt: f64,
-    ) -> ([f64; 3], [f64; 3]) {
-        let (Some(rb1_orig), Some(rb2_orig)) =
-            (self.bodies.get(joint.body1), self.bodies.get(joint.body2))
-        else {
-            return ([0.0; 3], [0.0; 3]);
-        };
-
-        if !rb1_orig.is_dynamic() && !rb2_orig.is_dynamic() {
-            return ([0.0; 3], [0.0; 3]);
-        }
-
-        // Match JointOneBodyConstraintBuilder::generate flipping when body2 is not dynamic.
-        let flipped = !rb2_orig.is_dynamic();
-        let (rb1, rb2, joint_data) = if flipped {
-            let mut jd = joint.data;
-            jd.flip();
-            (rb2_orig, rb1_orig, jd)
-        } else {
-            (rb1_orig, rb2_orig, joint.data)
-        };
-
-        let safe_dt = if dt > 0.0 {
-            dt
-        } else {
-            self.integration_parameters.dt as f64
-        };
-        let num_substeps = (self.integration_parameters.num_solver_iterations.get()
-            + rb1.additional_solver_iterations()
-            + rb2.additional_solver_iterations())
-        .max(1) as f64;
-        let substep_dt = safe_dt / num_substeps;
-        if substep_dt <= 1e-15 {
-            return ([0.0; 3], [0.0; 3]);
-        }
-        let inv_substep_dt = 1.0 / substep_dt;
-
-        // Reconstruct pre-integration poses of rb1 and rb2 at the final substep where
-        // joint_constraints.update() assembled the constraint Jacobians.
-        let substep_dt_r = substep_dt as Real;
-        let pos1 = if rb1.is_dynamic() {
-            let v1 = RigidBodyVelocity {
-                linvel: *rb1.linvel(),
-                angvel: *rb1.angvel(),
-            };
-            v1.integrate(
-                -substep_dt_r,
-                rb1.position(),
-                &rb1.mass_properties().local_mprops.local_com,
-            )
-        } else {
-            *rb1.position()
-        };
-        let pos2 = if rb2.is_dynamic() {
-            let v2 = RigidBodyVelocity {
-                linvel: *rb2.linvel(),
-                angvel: *rb2.angvel(),
-            };
-            v2.integrate(
-                -substep_dt_r,
-                rb2.position(),
-                &rb2.mass_properties().local_mprops.local_com,
-            )
-        } else {
-            *rb2.position()
-        };
-        let world_com1 = pos1 * rb1.mass_properties().local_mprops.local_com;
-        let world_com2 = pos2 * rb2.mass_properties().local_mprops.local_com;
-
-        let mut frame1 = pos1 * joint_data.local_frame1;
-        let frame2 = pos2 * joint_data.local_frame2;
-        let basis = frame1.rotation.to_rotation_matrix().into_inner();
-        let lin_err = frame2.translation.vector - frame1.translation.vector;
-
-        let locked_axes = joint_data.locked_axes.bits();
-        let motor_axes = joint_data.motor_axes.bits() & !locked_axes;
-        let limit_axes = joint_data.limit_axes.bits() & !locked_axes;
-        let coupled_axes = joint_data.coupled_axes.bits();
-
-        // Snap free linear axes of frame1.translation to frame2.translation
-        let mut new_center1 = frame2.translation.vector;
-        for i in 0..3 {
-            if locked_axes & (1 << i) != 0 {
-                let axis = basis.column(i);
-                new_center1 -= axis * lin_err.dot(&axis);
-            }
-        }
-        frame1.translation.vector = new_center1;
-
-        let r1 = frame1.translation.vector - world_com1.coords;
-        let r2 = frame2.translation.vector - world_com2.coords;
-        let cmat1_basis = r1.cross_matrix() * basis;
-        let cmat2_basis = r2.cross_matrix() * basis;
-
-        // Compute ang_basis = diff_conj1_2(frame1.rotation, frame2.rotation).transpose() * sgn
-        let q1 = frame1.rotation;
-        let q2 = frame2.rotation;
-        let v1 = q1.imag();
-        let v2 = q2.imag();
-        let w1 = q1.w;
-        let w2 = q2.w;
-        let diff_conj = (v1 * v2.transpose()
-            + nalgebra::Matrix3::from_diagonal_element(w1 * w2)
-            - (v1 * w2 + v2 * w1).cross_matrix()
-            + v1.cross_matrix() * v2.cross_matrix())
-            * 0.5_f32;
-        let sgn = 1.0_f32.copysign(q1.coords.dot(&q2.coords));
-        let ang_basis = diff_conj.transpose() * sgn;
-
-        let (im1, sqrt_ii1) = if rb1.is_dynamic() {
-            (
-                rb1.mass_properties().effective_inv_mass,
-                rb1.mass_properties().effective_world_inv_inertia_sqrt,
-            )
-        } else {
-            (nalgebra::Vector3::zeros(), AngularInertia::zero())
-        };
-        let im2 = rb2.mass_properties().effective_inv_mass;
-        let sqrt_ii2 = rb2.mass_properties().effective_world_inv_inertia_sqrt;
-        let imsum = im1 + im2;
-
-        #[derive(Clone, Copy)]
-        struct ConstraintRow {
-            lin_jac: nalgebra::Vector3<Real>,
-            ang_jac1: nalgebra::Vector3<Real>,
-            ang_jac2: nalgebra::Vector3<Real>,
-            tau_anchor: nalgebra::Vector3<Real>,
-            is_unbounded: bool,
-            impulse: Real,
-        }
-
-        let finalize_rows = |rows: &mut [ConstraintRow]| {
-            let len = rows.len();
-            for j in 0..len {
-                let dot_jj = rows[j].lin_jac.dot(&imsum.component_mul(&rows[j].lin_jac))
-                    + rows[j].ang_jac1.dot(&rows[j].ang_jac1)
-                    + rows[j].ang_jac2.dot(&rows[j].ang_jac2);
-                if !rows[j].is_unbounded || dot_jj <= 0.0 {
-                    continue;
-                }
-                let inv_dot_jj = 1.0 / dot_jj;
-                let row_j = rows[j];
-                for row_i in rows.iter_mut().skip(j + 1) {
-                    let dot_ij = row_i.lin_jac.dot(&imsum.component_mul(&row_j.lin_jac))
-                        + row_i.ang_jac1.dot(&row_j.ang_jac1)
-                        + row_i.ang_jac2.dot(&row_j.ang_jac2);
-                    let coeff = dot_ij * inv_dot_jj;
-                    row_i.lin_jac -= row_j.lin_jac * coeff;
-                    row_i.ang_jac1 -= row_j.ang_jac1 * coeff;
-                    row_i.ang_jac2 -= row_j.ang_jac2 * coeff;
-                    row_i.tau_anchor -= row_j.tau_anchor * coeff;
-                }
-            }
-        };
-
-        let mut all_rows: Vec<ConstraintRow> = Vec::with_capacity(12);
-
-        // 1. Motor rows (angular then linear)
-        let mut motor_rows: Vec<ConstraintRow> = Vec::new();
-        for (i, motor) in joint.data.motors.iter().enumerate().skip(3) {
-            if (motor_axes & !coupled_axes) & (1 << i) != 0 {
-                let ang_jac = basis.column(i - 3).into_owned();
-                motor_rows.push(ConstraintRow {
-                    lin_jac: nalgebra::Vector3::zeros(),
-                    ang_jac1: sqrt_ii1 * ang_jac,
-                    ang_jac2: sqrt_ii2 * ang_jac,
-                    tau_anchor: ang_jac,
-                    is_unbounded: false,
-                    impulse: motor.impulse,
-                });
-            }
-        }
-        for (i, motor) in joint.data.motors.iter().enumerate().take(3) {
-            if (motor_axes & !coupled_axes) & (1 << i) != 0 {
-                let lin_jac = basis.column(i).into_owned();
-                let c1 = cmat1_basis.column(i).into_owned();
-                let c2 = cmat2_basis.column(i).into_owned();
-                motor_rows.push(ConstraintRow {
-                    lin_jac,
-                    ang_jac1: sqrt_ii1 * c1,
-                    ang_jac2: sqrt_ii2 * c2,
-                    tau_anchor: nalgebra::Vector3::zeros(),
-                    is_unbounded: false,
-                    impulse: motor.impulse,
-                });
-            }
-        }
-        finalize_rows(&mut motor_rows);
-        all_rows.extend(motor_rows);
-
-        // 2. Locked + Limit rows (locked angular, locked linear, limit angular, limit linear)
-        let mut constraint_rows: Vec<ConstraintRow> = Vec::new();
-        for i in 3..6 {
-            if locked_axes & (1 << i) != 0 {
-                let ang_jac = ang_basis.column(i - 3).into_owned();
-                constraint_rows.push(ConstraintRow {
-                    lin_jac: nalgebra::Vector3::zeros(),
-                    ang_jac1: sqrt_ii1 * ang_jac,
-                    ang_jac2: sqrt_ii2 * ang_jac,
-                    tau_anchor: ang_jac,
-                    is_unbounded: true,
-                    impulse: joint.impulses[i],
-                });
-            }
-        }
-        for i in 0..3 {
-            if locked_axes & (1 << i) != 0 {
-                let lin_jac = basis.column(i).into_owned();
-                let c1 = cmat1_basis.column(i).into_owned();
-                let c2 = cmat2_basis.column(i).into_owned();
-                constraint_rows.push(ConstraintRow {
-                    lin_jac,
-                    ang_jac1: sqrt_ii1 * c1,
-                    ang_jac2: sqrt_ii2 * c2,
-                    tau_anchor: nalgebra::Vector3::zeros(),
-                    is_unbounded: true,
-                    impulse: joint.impulses[i],
-                });
-            }
-        }
-        for (i, limit) in joint.data.limits.iter().enumerate().skip(3) {
-            if (limit_axes & !coupled_axes) & (1 << i) != 0 {
-                let ang_jac = ang_basis.column(i - 3).into_owned();
-                constraint_rows.push(ConstraintRow {
-                    lin_jac: nalgebra::Vector3::zeros(),
-                    ang_jac1: sqrt_ii1 * ang_jac,
-                    ang_jac2: sqrt_ii2 * ang_jac,
-                    tau_anchor: ang_jac,
-                    is_unbounded: false,
-                    impulse: limit.impulse,
-                });
-            }
-        }
-        for (i, limit) in joint.data.limits.iter().enumerate().take(3) {
-            if (limit_axes & !coupled_axes) & (1 << i) != 0 {
-                let lin_jac = basis.column(i).into_owned();
-                let c1 = cmat1_basis.column(i).into_owned();
-                let c2 = cmat2_basis.column(i).into_owned();
-                constraint_rows.push(ConstraintRow {
-                    lin_jac,
-                    ang_jac1: sqrt_ii1 * c1,
-                    ang_jac2: sqrt_ii2 * c2,
-                    tau_anchor: nalgebra::Vector3::zeros(),
-                    is_unbounded: false,
-                    impulse: limit.impulse,
-                });
-            }
-        }
-        finalize_rows(&mut constraint_rows);
-        all_rows.extend(constraint_rows);
-
-        // Sum linear impulse and anchor angular impulse on body1 (in the possibly-flipped order).
-        let mut lin_imp1 = nalgebra::Vector3::<f64>::zeros();
-        let mut ang_imp1 = nalgebra::Vector3::<f64>::zeros();
-        for row in &all_rows {
-            let imp = row.impulse as f64;
-            lin_imp1 += nalgebra::Vector3::new(
-                row.lin_jac.x as f64,
-                row.lin_jac.y as f64,
-                row.lin_jac.z as f64,
-            ) * imp;
-            ang_imp1 += nalgebra::Vector3::new(
-                row.tau_anchor.x as f64,
-                row.tau_anchor.y as f64,
-                row.tau_anchor.z as f64,
-            ) * imp;
-        }
-
-        // If `flipped` was true, `body1` in the solver was `part_b` and `body2` was `part_a`,
-        // so the impulse on `part_a` (`body2`) has the opposite sign (`-lin_imp1`, `-ang_imp1`).
-        let sign_on_part_a = if flipped { -1.0 } else { 1.0 };
-        let force_on_a = lin_imp1 * (sign_on_part_a * inv_substep_dt);
-        let torque_on_a = ang_imp1 * (sign_on_part_a * inv_substep_dt);
-
-        (
-            [force_on_a.x, force_on_a.y, force_on_a.z],
-            [torque_on_a.x, torque_on_a.y, torque_on_a.z],
-        )
     }
 
     /// Returns all joint records connected to `part_id` (`part_a == part_id` or `part_b == part_id`),
@@ -1384,16 +891,6 @@ impl PhysicsWorld {
 
     /// Extracts the complete dynamic/quasi-static load case for `part_id` from a completed
     /// [`SimulationSummary`] in the **local coordinate system of `part_id`** (`P3-T6`).
-    ///
-    /// - Collects all joints connected to `part_id` (`part_a` or `part_b`), applies the
-    ///   Newton's 3rd law sign convention so forces and torques represent loads acting **ON**
-    ///   `part_id`, and rotates them into `part_id`'s local frame at the selected instant.
-    /// - Computes `part_id`'s inertial state (mass, COM, linear & angular acceleration in
-    ///   local and world frames) using the co-rotating transport theorem
-    ///   `a_local = (v_local(t_k) - v_local(t_{k-1})) / dt + omega_local x v_local`.
-    /// - Evaluates the translational and rotational dynamic equilibrium residuals:
-    ///   `R_F = sum(F_joints) + m * g - m * a_com` and
-    ///   `R_T = sum(T_joint + (anchor - com) x F_joint) - (I * alpha + omega x (I * omega))`.
     pub fn extract_part_load_case(
         &self,
         summary: &SimulationSummary,
@@ -1410,47 +907,15 @@ impl PhysicsWorld {
 
         let rb = self.get_body(part_id)?;
         let is_fixed = !rb.is_dynamic();
-        let mass_kg = if is_fixed { 0.0 } else { rb.mass() as f64 };
-        let com_local_pt = rb.mass_properties().local_mprops.local_com;
-        let center_of_mass_local = [
-            com_local_pt.x as f64,
-            com_local_pt.y as f64,
-            com_local_pt.z as f64,
-        ];
-        let com_local_vec = Vector3::new(
-            center_of_mass_local[0],
-            center_of_mass_local[1],
-            center_of_mass_local[2],
-        );
+        let mass_kg = if is_fixed { 0.0 } else { rb.mass() };
+        let center_of_mass_local = [rb.local_com.x, rb.local_com.y, rb.local_com.z];
+        let com_local_vec = rb.local_com;
 
-        // Local inertia tensor I_local (3x3) in body local coordinates
+        // Exact f64 local inertia tensor I_local (3x3) in body local coordinates
         let local_inertia_mat = if is_fixed {
             nalgebra::Matrix3::<f64>::zeros()
         } else {
-            let p_inertia = rb.mass_properties().local_mprops.principal_inertia();
-            let p_frame = rb
-                .mass_properties()
-                .local_mprops
-                .principal_inertia_local_frame
-                .to_rotation_matrix()
-                .into_inner();
-            let p_mat = nalgebra::Matrix3::from_diagonal(&nalgebra::Vector3::new(
-                p_inertia.x as f64,
-                p_inertia.y as f64,
-                p_inertia.z as f64,
-            ));
-            let r_f64 = nalgebra::Matrix3::new(
-                p_frame[(0, 0)] as f64,
-                p_frame[(0, 1)] as f64,
-                p_frame[(0, 2)] as f64,
-                p_frame[(1, 0)] as f64,
-                p_frame[(1, 1)] as f64,
-                p_frame[(1, 2)] as f64,
-                p_frame[(2, 0)] as f64,
-                p_frame[(2, 1)] as f64,
-                p_frame[(2, 2)] as f64,
-            );
-            r_f64 * p_mat * r_f64.transpose()
+            rb.local_inertia
         };
 
         let connected_joints = self.joints_for_part(part_id);
@@ -1494,7 +959,6 @@ impl PhysicsWorld {
         };
 
         let num_samples = samples.len();
-        // Sample 0 is recorded prior to the first solver step; stepped samples start at 1 when available.
         let start_idx = usize::from(num_samples > 1);
 
         let quat_from_arr = |q: [f64; 4]| -> nalgebra::UnitQuaternion<f64> {
@@ -1503,7 +967,6 @@ impl PhysicsWorld {
             ))
         };
 
-        // Helper to compute total force & torque metrics on `part_id` at a given sample index
         let score_at_step = |idx: usize| -> (f64, f64, f64, f64) {
             let q_k = quat_from_arr(samples[idx].orientation_quat);
             let rot_inv = q_k.inverse();
@@ -1598,25 +1061,14 @@ impl PhysicsWorld {
 
         let state_k = &samples[selected_idx];
         let q_k = quat_from_arr(state_k.orientation_quat);
-
-        // Because Rapier3D assembles & solves the final velocity substep BEFORE `integrate_positions`
-        // advances the body pose by `substep_dt = dt / num_substeps`, the orientation at the exact
-        // instant of the final substep constraint solve is `q_solve = exp(-0.5 * omega * substep_dt) * q_k`.
-        let num_substeps = (self.integration_parameters.num_solver_iterations.get()
-            + rb.additional_solver_iterations())
-        .max(1) as f64;
-        let substep_dt = summary.step_size_s.max(1e-9) / num_substeps;
         let omega_k_world = Vector3::new(
             state_k.angular_velocity[0],
             state_k.angular_velocity[1],
             state_k.angular_velocity[2],
         );
-        let q_solve = if omega_k_world.norm() > 1e-12 {
-            let delta_rot = nalgebra::UnitQuaternion::from_scaled_axis(-omega_k_world * substep_dt);
-            delta_rot * q_k
-        } else {
-            q_k
-        };
+        // Reactions in `MultiBodySolver` (`DirectKktIndex2`) are evaluated at the exact
+        // end-of-step manifold pose `q_k` (`state_k.orientation_quat`).
+        let q_solve = q_k;
         let rot_world_to_local = q_solve.inverse();
 
         let mut joint_cases: Vec<JointLoadCase> = Vec::with_capacity(connected_joints.len());
@@ -1808,16 +1260,9 @@ impl PhysicsWorld {
         if part_id.eq_ignore_ascii_case("ground") || part_id.eq_ignore_ascii_case("world") {
             (Vector3::zeros(), Matrix3::identity())
         } else if let Ok(rb) = self.get_body(part_id) {
-            let pos = rb.translation();
-            let q = rb.rotation().quaternion();
-            let pos_vec = Vector3::new(pos.x as f64, pos.y as f64, pos.z as f64);
-            let rot_mat = quat_to_matrix([
-                q.coords.x as f64,
-                q.coords.y as f64,
-                q.coords.z as f64,
-                q.coords.w as f64,
-            ]);
-            (pos_vec, rot_mat)
+            let q = rb.orientation.quaternion();
+            let rot_mat = quat_to_matrix([q.coords.x, q.coords.y, q.coords.z, q.coords.w]);
+            (rb.position, rot_mat)
         } else {
             (Vector3::zeros(), Matrix3::identity())
         }

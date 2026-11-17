@@ -53,7 +53,7 @@ mcp-cad/
 │   ├── BENCH_BASELINE_RUST.md    # Базовая линия 15 задач бенчмарка против нативного Rust-сервера
 │   ├── adr/0001-geometry-kernel.md # ADR выбора геометрического ядра (manifold-rust + monstertruck)
 │   ├── adr/0002-fe-mesher.md        # ADR выбора генератора сетки МКЭ (fe_snap + TET10, P3-T5)
-│   └── agent_tasks/              # Детальные отчёты о выполнении задач P0-T1..T12, P1-T1..T4, P2-T1..T40, P3-T1..T24
+│   └── agent_tasks/              # Детальные отчёты о выполнении задач P0-T1..T12, P1-T1..T4, P2-T1..T40, P3-T1..T24, P4-T0..T3
 ├── spikes/
 │   ├── manifold_rust/            # Прототип ядра manifold-rust v0.19.2 (Pure Rust CSG + face_id)
 │   ├── monstertruck_brep/        # Прототип B-Rep ядра monstertruck v0.4.1 (fillet + ISO 10303-21 STEP)
@@ -224,9 +224,9 @@ graph TD
      - В `batch_cad_operations` при сбое любого шага состояние сцены откатывается целиком, включая клонированный физический мир `state.physics_world.clone()` (`PhysicsWorld: Clone`).
      - В `modify_feature`, `optimize_feature_tree`, `tessellate_part` и `export_stl` перед пересборкой сохраняется снимок `(dag, mesh, cached_mesh, cached_settings, revision)`: если `rebuild()` или валидация параметров завершается ошибкой, деталь остаётся в 100% консистентном предыдущем состоянии.
      - В `PhysicsWorld::set_joint_motor` запись `record.motor` обновляется строго после успешного применения мотора к шарниру Rapier3D (`apply_motor`), а установка мотора на `CadJointType::Gear`, `Fixed` и `Spherical` отклоняется с `INVALID_JOINT_CONFIGURATION`.
-  2. **Обновление коллайдеров на месте без потери шарниров (`PhysicsWorld::update_part_collider`, `P2-T18`)**:
+  2. **Обновление коллайдеров на месте без потери шарниров (`PhysicsWorld::update_part_collider`, `P2-T18`, `P4-T2`)**:
      - Ранее при выполнении `boolean_*`, `transform_part` или `optimize_feature_tree` деталь перерегистрировалась в физическом мире через `remove_part` + `add_part`, что побочным эффектом уничтожало все привязанные к ней шарниры (`joints`) и зубчатые передачи (`gear_constraints`), а при вызове `add_feature_primitive` / `cut_hole` / `modify_feature` коллайдер в `physics_world` вообще не обновлялся.
-     - Реализован метод `PhysicsWorld::update_part_collider(&mut self, part: &Part)`, который пересоздаёт `Collider` и пересчитывает массу и тензор инерции непосредственно на существующем `RigidBodyHandle`, сохраняя все шарниры, приводы и флаг неподвижности `!part.is_fixed`.
+     - Реализован метод `PhysicsWorld::update_part_collider(&mut self, part: &Part)`, который пересоздаёт `Collider` (`ColliderShape` в `f64`) и пересчитывает массу, локальный центр масс и точный 3×3 тензор инерции (`MassProperties::from_part` с учётом полостей и отверстий) непосредственно на существующем `BodyHandle`, сохраняя все шарниры, приводы и флаг неподвижности `!part.is_fixed`.
   3. **Персистентность без раздувания файлов (`save_project` / `load_project`, `P2-T4`)**:
      - Файл проекта (`schema_version = "1.0.0"`) сохраняет единицы измерения, кастомные материалы, параметрические деревья `FeatureTree` деталей, требования и шарниры с моторами, но **не сериализует полигональные сетки процедурных деталей** (`mesh` восстанавливается детерминированно через `part.rebuild()` при `load_project`). Исключение сделано только для импортированных STL-деталей через узел `FeatureOp::ImportedMesh` (`P2-T33`).
 
@@ -297,7 +297,16 @@ graph TD
    - Любая ошибка параметров возвращается как `Result<T, CadError / ServerError>` и преобразуется в структурированный JSON `ErrorEnvelope`.
 2. **Чистота потока `stdout` в режиме `stdio`**:
    - В режиме `--mode stdio` поток `stdout` используется **исключительно** для сообщений JSON-RPC 2.0. Любой вывод логов (`tracing`, `eprintln!`) направляется строго в `std::io::stderr`.
-3. **Статус автоматического тестирования (`mcp-cad-server`, `clippy`, `lint`, `build` и TS-суит актуализированы в `P4-T0` от 15.11.2026; документация/TS-счётчики/lockfile — `P3-T24`; CI/тулчейн — `P3-T22`; `mcp-cad-viewer` — `P3-T23`; `spikes/monstertruck_brep` — `P3-T21`; `mcp-cad-physics` — `P3-T19`; `spikes/manifold_rust` — `P3-T18`; `mcp-cad-core` — `P3-T17`; `mcp-cad-fea` — аудит `P3-T13`)**:
+3. **Статус автоматического тестирования (`mcp-cad-physics`, `gear_kinematic_test`, `clippy`, `lint`, `build` и TS-суит актуализированы в `P4-T3` от 16.11.2026; `mcp-cad-server` — `P4-T0`; документация/TS-счётчики/lockfile — `P3-T24`; CI/тулчейн — `P3-T22`; `mcp-cad-viewer` — `P3-T23`; `spikes/monstertruck_brep` — `P3-T21`; `spikes/manifold_rust` — `P3-T18`; `mcp-cad-core` — `P3-T17`; `mcp-cad-fea` — аудит `P3-T13`)**:
+   - **Проверено в `P4-T3` после внедрения собственного многотельного решателя динамики и ограничений в `f64` (`MultiBodySolver` в `crates/mcp-cad-physics/src/solver.rs`, `joint.rs`, `simulator.rs`) и удаления `PhysicsPipeline`/`ImpulseJointSet`/`GenericJoint`:**
+     - `mcp-cad-physics` (`cargo test -p mcp-cad-physics --no-fail-fast`): **33/33 PASS** (`--lib`: **7/7**, `physics_tests`: **26/26**, включая `test_p4_t3_f64_multibody_solver_coupled_gear_torque_limits_and_closed_loop`, `0 failed`);
+     - `gear_kinematic_test` (`cargo test -p mcp-cad-server --test gear_kinematic_test --no-fail-fast`): **1/1 PASS**;
+     - `cargo clippy --workspace --all-targets -- -D warnings`: **0 ошибок, 0 предупреждений** (`exit 0`);
+     - `npm run lint`: **0 ошибок** (`exit 0`); `npm run build`: **PASS**; `npm test`: **52/52 PASS** (`0 failed`).
+   - **Проверено в `P4-T2` после внедрения собственной `f64`-модели `RigidBody`, `MassProperties` (точный тензор инерции по замкнутой сетке с учётом полостей) и `ColliderShape` / `BodyRegistry` / `ColliderRegistry` в `crates/mcp-cad-physics/src/rigid_body.rs`:**
+     - `mcp-cad-physics` (`cargo test -p mcp-cad-physics --no-fail-fast`): **32/32 PASS** (`--lib`: **7/7**, `physics_tests`: **25/25**, включая `test_p4_t2_f64_rigid_body_hollow_inertia_and_update_part_collider`, `0 failed`);
+     - `cargo clippy --workspace --all-targets -- -D warnings`: **0 ошибок, 0 предупреждений** (`exit 0`);
+     - `npm run lint`: **0 ошибок** (`exit 0`); `npm run build`: **PASS**; `npm test`: **52/52 PASS** (`0 failed`).
    - **Проверено в `P4-T0` после внедрения 41-го MCP-инструмента `apply_recipe` и полной синхронизации счётчиков (`41` Rust / `31` TS):**
      - `mcp-cad-server` (`cargo test -p mcp-cad-server --no-fail-fast`): **140/140 PASS** (`--lib`: **65/65** в `61.31s`, `mcp_contract_tests`: **60/60** в `41.51s`, `qa_wide_scan`: **13/13** в `8.52s`, `bench_suite`: **1/1** в `5.64s`, `gear_kinematic_test`: **1/1** в `0.57s`, `0 failed`);
      - `cargo clippy --workspace --all-targets -- -D warnings`: **0 ошибок, 0 предупреждений** (`7.40s`, `exit 0`);

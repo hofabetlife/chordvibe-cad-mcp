@@ -2348,4 +2348,548 @@ fn test_p3_t16_sweep_joint_open_chain_backward_compat() {
     assert_eq!(rep.status, "PASS");
 }
 
+#[test]
+fn test_p4_t1_dae_f64_candidates_vs_analytical_and_rapier_baseline() {
+    use mcp_cad_physics::dae_prototype::{
+        DaeSolverCandidate, run_free_fall_dae, run_gear_pair_10_revs_dae, run_rotating_rod_dae,
+        run_slider_crank_dae,
+    };
+    use mcp_cad_physics::LoadCaseSelector;
 
+    // -------------------------------------------------------------------------
+    // Benchmark 1: Free Fall under Gravity (y0 = 10.0 m, g = -9.81 m/s^2, T = 1.0 s, dt = 5 ms)
+    // -------------------------------------------------------------------------
+    let ff_kkt = run_free_fall_dae(DaeSolverCandidate::DirectKktIndex2Projection);
+    let ff_pgs = run_free_fall_dae(DaeSolverCandidate::SemiImplicitEulerPgsBaumgarte);
+
+    let mut rapier_ff = PhysicsWorld::new();
+    let box_part = create_test_box("box_falling", "Falling Weight", 0.2, 0.2, 0.2);
+    rapier_ff
+        .add_part_with_options(
+            &box_part,
+            true,
+            ColliderType::ConvexHull,
+            Some([0.0, 10.0, 0.0]),
+            None,
+        )
+        .unwrap();
+    let t0 = std::time::Instant::now();
+    let summary_ff = rapier_ff.simulate(1.0, 0.005);
+    let rapier_ff_us = t0.elapsed().as_secs_f64() * 1e6;
+    let rapier_y = summary_ff.final_position("box_falling").unwrap()[1];
+    let rapier_vy = summary_ff.final_linear_velocity("box_falling").unwrap()[1];
+    let rapier_ff_pos_err = (rapier_y - 5.095).abs();
+    let rapier_ff_vel_err = (rapier_vy - (-9.81)).abs();
+
+    println!(
+        "\n[P4-T1 Benchmark 1: Free Fall (T=1.0s, dt=5ms, y_exact=5.095m, vy_exact=-9.81m/s)]\n\
+         - DirectKktIndex2 (f64): pos_err = {:.3e} m, vel_err = {:.3e} m/s, time = {:.1} us\n\
+         - PgsBaumgarte (f64):    pos_err = {:.3e} m, vel_err = {:.3e} m/s, time = {:.1} us\n\
+         - Rapier3D 0.22 (f32):   pos_err = {:.3e} m, vel_err = {:.3e} m/s, time = {:.1} us",
+        ff_kkt.pos_error_m,
+        ff_kkt.vel_error_m_s,
+        ff_kkt.elapsed_us,
+        ff_pgs.pos_error_m,
+        ff_pgs.vel_error_m_s,
+        ff_pgs.elapsed_us,
+        rapier_ff_pos_err,
+        rapier_ff_vel_err,
+        rapier_ff_us
+    );
+
+    assert!(ff_kkt.pos_error_m < 1e-12);
+    assert!(ff_kkt.vel_error_m_s < 1e-12);
+    assert!(rapier_ff_pos_err < 1e-12);
+    assert!(rapier_ff_vel_err < 1e-12);
+
+    // -------------------------------------------------------------------------
+    // Benchmark 2: Rotating Rod Centripetal Reaction (L = 0.20 m, omega = 10 rad/s, t = 0.20 s)
+    // -------------------------------------------------------------------------
+    let rod_kkt = run_rotating_rod_dae(DaeSolverCandidate::DirectKktIndex2Projection);
+    let rod_pgs = run_rotating_rod_dae(DaeSolverCandidate::SemiImplicitEulerPgsBaumgarte);
+
+    let mut rapier_rod_world = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
+    let mut rod_part = create_test_box("rotating_rod", "Rotating Rod", 0.20, 0.02, 0.02);
+    for v in &mut rod_part.mesh.vertices {
+        v.position[0] += 0.10;
+    }
+    rapier_rod_world.add_part(&rod_part, true).unwrap();
+    rapier_rod_world
+        .add_joint(
+            "pivot_z",
+            "ground",
+            "rotating_rod",
+            CadJointType::Revolute {
+                anchor_a: [0.0, 0.0, 0.0],
+                anchor_b: [0.0, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                limits: None,
+            },
+            None,
+        )
+        .unwrap();
+    rapier_rod_world
+        .set_part_angular_velocity("rotating_rod", [0.0, 0.0, 10.0])
+        .unwrap();
+    rapier_rod_world
+        .set_part_velocity("rotating_rod", [0.0, 1.0, 0.0])
+        .unwrap();
+    let t0 = std::time::Instant::now();
+    let summary_rod = rapier_rod_world.simulate(0.20, 1.0 / 240.0);
+    let rapier_rod_us = t0.elapsed().as_secs_f64() * 1e6;
+    let lc_rod = rapier_rod_world
+        .extract_part_load_case(&summary_rod, "rotating_rod", LoadCaseSelector::AtTime(0.20))
+        .unwrap();
+    let rapier_fx = lc_rod.joints[0].force[0];
+    let rapier_rod_err_pct =
+        ((rapier_fx - rod_kkt.analytical_fx_local_n).abs() / rod_kkt.analytical_fx_local_n.abs())
+            * 100.0;
+    let rapier_w_drift =
+        (rapier_rod_world.part_angular_velocity("rotating_rod").unwrap()[2] - 10.0).abs();
+
+    println!(
+        "\n[P4-T1 Benchmark 2: Rotating Rod (omega=10 rad/s, F_exact={:.4} N)]\n\
+         - DirectKktIndex2 (f64): F_x = {:.6} N, rel_err = {:.3e}%, w_drift = {:.3e} rad/s, time = {:.1} us\n\
+         - PgsBaumgarte (f64):    F_x = {:.6} N, rel_err = {:.3e}%, w_drift = {:.3e} rad/s, time = {:.1} us\n\
+         - PhysicsWorld (f64):    F_x = {:.6} N, rel_err = {:.3e}%, w_drift = {:.3e} rad/s, time = {:.1} us",
+        rod_kkt.analytical_fx_local_n,
+        rod_kkt.simulated_fx_local_n,
+        rod_kkt.force_rel_error_pct,
+        rod_kkt.omega_drift_rad_s,
+        rod_kkt.elapsed_us,
+        rod_pgs.simulated_fx_local_n,
+        rod_pgs.force_rel_error_pct,
+        rod_pgs.omega_drift_rad_s,
+        rod_pgs.elapsed_us,
+        rapier_fx,
+        rapier_rod_err_pct,
+        rapier_w_drift,
+        rapier_rod_us
+    );
+
+    assert!(rod_kkt.force_rel_error_pct < 1e-7);
+    assert!(rod_kkt.omega_drift_rad_s < 1e-11);
+    assert!(rapier_rod_err_pct < 1e-7);
+    assert!(rapier_w_drift < 1e-11);
+
+    // -------------------------------------------------------------------------
+    // Benchmark 3: Slider-Crank 4-Bar Closed Kinematic Loop (R=0.03m, L=0.05m, 1 rev)
+    // -------------------------------------------------------------------------
+    let sc_kkt = run_slider_crank_dae(DaeSolverCandidate::DirectKktIndex2Projection);
+    let sc_pgs = run_slider_crank_dae(DaeSolverCandidate::SemiImplicitEulerPgsBaumgarte);
+
+    println!(
+        "\n[P4-T1 Benchmark 3: Slider-Crank Closed Loop (R=0.03m, L=0.05m, 500 steps)]\n\
+         - DirectKktIndex2 (f64): max_pos_err = {:.3e} m, rms_pos_err = {:.3e} m, max_closure = {:.3e}, time = {:.1} us\n\
+         - PgsBaumgarte (f64):    max_pos_err = {:.3e} m, rms_pos_err = {:.3e} m, max_closure = {:.3e}, time = {:.1} us",
+        sc_kkt.max_slider_pos_error_m,
+        sc_kkt.rms_slider_pos_error_m,
+        sc_kkt.max_closure_residual,
+        sc_kkt.elapsed_us,
+        sc_pgs.max_slider_pos_error_m,
+        sc_pgs.rms_slider_pos_error_m,
+        sc_pgs.max_closure_residual,
+        sc_pgs.elapsed_us
+    );
+
+    assert!(sc_kkt.max_slider_pos_error_m < 1e-9);
+    assert!(sc_kkt.max_closure_residual < 1e-11);
+    assert!(sc_kkt.max_closure_residual < sc_pgs.max_closure_residual * 1e-5);
+
+    // -------------------------------------------------------------------------
+    // Benchmark 4: Gear Pair over 10 Revolutions (ratio = 0.5, load_torque = -4.0 N*m)
+    // -------------------------------------------------------------------------
+    let gear_kkt = run_gear_pair_10_revs_dae(DaeSolverCandidate::DirectKktIndex2Projection);
+    let gear_pgs = run_gear_pair_10_revs_dae(DaeSolverCandidate::SemiImplicitEulerPgsBaumgarte);
+
+    println!(
+        "\n[P4-T1 Benchmark 4: Gear Pair 10 Revolutions (ratio=0.5, load=-4.0 N*m, tau_motor_exact=2.0 N*m)]\n\
+         - DirectKktIndex2 (f64): phase_err = {:.3e} rad, ratio_err = {:.3e}%, tau_motor = {:.6} N*m (err {:.3e}%), time = {:.1} us\n\
+         - PgsBaumgarte (f64):    phase_err = {:.3e} rad, ratio_err = {:.3e}%, tau_motor = {:.6} N*m (err {:.3e}%), time = {:.1} us",
+        gear_kkt.phase_error_rad,
+        gear_kkt.velocity_ratio_error_pct,
+        gear_kkt.transmitted_motor_torque_nm,
+        gear_kkt.torque_error_pct,
+        gear_kkt.elapsed_us,
+        gear_pgs.phase_error_rad,
+        gear_pgs.velocity_ratio_error_pct,
+        gear_pgs.transmitted_motor_torque_nm,
+        gear_pgs.torque_error_pct,
+        gear_pgs.elapsed_us
+    );
+
+    assert!(gear_kkt.phase_error_rad < 1e-11);
+    assert!(gear_kkt.velocity_ratio_error_pct < 1e-9);
+    assert!(gear_kkt.torque_error_pct < 1e-7);
+}
+
+#[test]
+fn test_p4_t2_f64_rigid_body_hollow_inertia_and_update_part_collider() {
+    use mcp_cad_physics::{ColliderShape, compute_mesh_mass_properties};
+
+    let registry = MaterialRegistry::new();
+    let steel = registry.get("steel_structural_aisi1020").unwrap().clone();
+    let density = steel.density_kg_m3;
+    let r_out = 0.05_f64;
+    let r_in = 0.03_f64;
+    let height = 0.12_f64;
+    let segments = 128;
+
+    // 1. Create a solid cylinder part and add it to PhysicsWorld with a Revolute joint
+    let mut flywheel = Part::new("flywheel", "Flywheel", steel);
+    flywheel.dag.add_feature(
+        FeatureOp::AddCylinder {
+            radius: r_out,
+            height,
+            segments,
+            position: None,
+            rotation_deg: None,
+        },
+        None,
+    );
+    flywheel.rebuild().expect("rebuild solid flywheel");
+
+    let mut world = PhysicsWorld::with_gravity([0.0, -9.81, 0.0]);
+    let initial_handle = world.add_part(&flywheel, true).expect("add solid flywheel");
+    let joint_handle = world
+        .add_joint(
+            "flywheel_shaft",
+            "ground",
+            "flywheel",
+            CadJointType::Revolute {
+                anchor_a: [0.0, 0.0, 0.0],
+                anchor_b: [0.0, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                limits: None,
+            },
+            None,
+        )
+        .expect("add revolute joint");
+
+    let solid_mass = world.part_mass("flywheel").unwrap();
+    let solid_inertia = world.part_inertia_tensor("flywheel").unwrap();
+    let exact_solid_vol = std::f64::consts::PI * r_out * r_out * height;
+    let exact_solid_mass = density * exact_solid_vol;
+    let exact_solid_izz = 0.5 * exact_solid_mass * r_out * r_out;
+
+    assert!(
+        ((solid_mass - exact_solid_mass) / exact_solid_mass).abs() < 1e-3,
+        "Solid cylinder mass mismatch: got {solid_mass}, expected {exact_solid_mass}"
+    );
+    assert!(
+        ((solid_inertia[(2, 2)] - exact_solid_izz) / exact_solid_izz).abs() < 2e-3,
+        "Solid cylinder I_zz mismatch: got {}, expected {exact_solid_izz}",
+        solid_inertia[(2, 2)]
+    );
+
+    // 2. Bore an internal cylindrical hole through the flywheel via CutHole
+    // Note: The outer convex hull of the hollow flywheel is IDENTICAL to the solid cylinder,
+    // so a convex-hull collider approximation would falsely report the solid cylinder's mass & inertia.
+    // Our P4-T2 signed-tetrahedron mesh integration must account for the internal bore!
+    flywheel.dag.add_feature(
+        FeatureOp::CutHole {
+            center: [0.0, 0.0, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            radius: r_in,
+            depth: height * 1.2,
+            keyway_width: None,
+            keyway_depth: None,
+        },
+        None,
+    );
+    flywheel.rebuild().expect("rebuild hollow flywheel");
+
+    let updated_handle = world
+        .update_part_collider(&flywheel)
+        .expect("update_part_collider on hollow flywheel");
+
+    // BodyHandle and attached joint must be preserved
+    assert_eq!(
+        updated_handle, initial_handle,
+        "update_part_collider must preserve BodyHandle"
+    );
+    assert_eq!(world.joints().len(), 1);
+    assert_eq!(world.joints()["flywheel_shaft"].handle, joint_handle);
+
+    let hollow_mass = world.part_mass("flywheel").unwrap();
+    let hollow_com = world.part_local_com("flywheel").unwrap();
+    let hollow_inertia = world.part_inertia_tensor("flywheel").unwrap();
+
+    let exact_hollow_vol = std::f64::consts::PI * (r_out * r_out - r_in * r_in) * height;
+    let exact_hollow_mass = density * exact_hollow_vol;
+    let exact_hollow_izz = 0.5 * exact_hollow_mass * (r_out * r_out + r_in * r_in);
+    let exact_hollow_ixx =
+        exact_hollow_mass * (3.0 * (r_out * r_out + r_in * r_in) + height * height) / 12.0;
+
+    assert!(
+        hollow_mass < solid_mass * 0.70,
+        "Hollow flywheel mass ({hollow_mass}) must be significantly smaller than solid ({solid_mass})"
+    );
+    assert!(
+        ((hollow_mass - exact_hollow_mass) / exact_hollow_mass).abs() < 5e-3,
+        "Hollow mass mismatch: got {hollow_mass}, expected {exact_hollow_mass}"
+    );
+    assert!(
+        hollow_com[0].abs() < 1e-5 && hollow_com[1].abs() < 1e-5 && hollow_com[2].abs() < 1e-5,
+        "Hollow COM must be at origin: got {hollow_com:?}"
+    );
+    assert!(
+        ((hollow_inertia[(2, 2)] - exact_hollow_izz) / exact_hollow_izz).abs() < 1e-2,
+        "Hollow I_zz mismatch: got {}, expected {exact_hollow_izz}",
+        hollow_inertia[(2, 2)]
+    );
+    assert!(
+        ((hollow_inertia[(0, 0)] - exact_hollow_ixx) / exact_hollow_ixx).abs() < 1e-2,
+        "Hollow I_xx mismatch: got {}, expected {exact_hollow_ixx}",
+        hollow_inertia[(0, 0)]
+    );
+
+    // Direct check against compute_mesh_mass_properties
+    let direct_mprops = compute_mesh_mass_properties(&flywheel.mesh, density);
+    assert!((direct_mprops.mass - hollow_mass).abs() < 1e-15);
+    assert!((direct_mprops.inertia_tensor - hollow_inertia).norm() < 1e-15);
+
+    // 3. Verify all 6 ColliderType variants populate ColliderRegistry with exact f64 shapes
+    for (idx, col_type) in [
+        ColliderType::ConvexHull,
+        ColliderType::TriMesh,
+        ColliderType::Compound,
+        ColliderType::Cube,
+        ColliderType::Sphere,
+        ColliderType::Cylinder,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let part_id = format!("shape_part_{idx}");
+        let p = create_test_box(&part_id, &part_id, 0.08, 0.06, 0.04);
+        let bh = world
+            .add_part_with_options(&p, true, col_type, Some([1.0 + idx as f64, 0.0, 0.0]), None)
+            .expect("add_part_with_options");
+        let rb = world.body_registry().get(bh).expect("body in registry");
+        assert_eq!(rb.part_id, part_id);
+        assert!((rb.position.x - (1.0 + idx as f64)).abs() < 1e-15);
+
+        let (aabb_min, aabb_max) = world.part_collider_aabb(&part_id).expect("collider aabb");
+        assert!(aabb_max[0] > aabb_min[0] && aabb_max[1] > aabb_min[1] && aabb_max[2] > aabb_min[2]);
+    }
+
+    assert!(world.collider_registry().iter().any(|(_, c)| matches!(c.shape, ColliderShape::ConvexHull { .. })));
+    assert!(world.collider_registry().iter().any(|(_, c)| matches!(c.shape, ColliderShape::TriMesh { .. })));
+    assert!(world.collider_registry().iter().any(|(_, c)| matches!(c.shape, ColliderShape::Compound { .. })));
+    assert!(world.collider_registry().iter().any(|(_, c)| matches!(c.shape, ColliderShape::Cube { .. })));
+    assert!(world.collider_registry().iter().any(|(_, c)| matches!(c.shape, ColliderShape::Sphere { .. })));
+    assert!(world.collider_registry().iter().any(|(_, c)| matches!(c.shape, ColliderShape::Cylinder { .. })));
+}
+
+#[test]
+fn test_p4_t3_f64_multibody_solver_coupled_gear_torque_limits_and_closed_loop() {
+    // 1. Coupled Gear constraint with external load torque on driven gear:
+    //    Verify exact velocity ratio w_b = -ratio * w_a AND real torque transmission
+    //    through Lagrange multipliers without any post-step set_angvel hacks.
+    let mut gear_world = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
+    let gear_a = create_test_box("gear_a", "Drive Gear", 0.06, 0.06, 0.02);
+    let gear_b = create_test_box("gear_b", "Driven Gear", 0.12, 0.12, 0.02);
+    gear_world
+        .add_part_with_options(
+            &gear_a,
+            true,
+            ColliderType::ConvexHull,
+            Some([0.0, 0.0, 0.0]),
+            None,
+        )
+        .unwrap();
+    gear_world
+        .add_part_with_options(
+            &gear_b,
+            true,
+            ColliderType::ConvexHull,
+            Some([0.20, 0.0, 0.0]),
+            None,
+        )
+        .unwrap();
+
+    // Revolute mount for gear_a with motor driving at 6.0 rad/s (max torque 50 N*m)
+    gear_world
+        .add_joint(
+            "mount_a",
+            "ground",
+            "gear_a",
+            CadJointType::Revolute {
+                anchor_a: [0.0, 0.0, 0.0],
+                anchor_b: [0.0, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                limits: None,
+            },
+            Some(MotorConfig {
+                target_velocity: 6.0,
+                max_force: 50.0,
+            }),
+        )
+        .unwrap();
+
+    // Revolute mount for gear_b with opposing load motor (target_velocity = 0.0, max_force = 4.0 N*m)
+    gear_world
+        .add_joint(
+            "mount_b",
+            "ground",
+            "gear_b",
+            CadJointType::Revolute {
+                anchor_a: [0.20, 0.0, 0.0],
+                anchor_b: [0.0, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                limits: None,
+            },
+            Some(MotorConfig {
+                target_velocity: 0.0,
+                max_force: 4.0,
+            }),
+        )
+        .unwrap();
+
+    // Coupled Gear joint: w_b + 0.5 * w_a = 0 => w_b = -3.0 rad/s
+    let ratio = 0.5_f64;
+    gear_world
+        .add_joint(
+            "gear_pair",
+            "gear_a",
+            "gear_b",
+            CadJointType::Gear {
+                axis_a: [0.0, 0.0, 1.0],
+                axis_b: [0.0, 0.0, 1.0],
+                ratio,
+            },
+            None,
+        )
+        .unwrap();
+
+    let gear_summary = gear_world.simulate(0.5, 0.005);
+    assert!(gear_summary.success);
+    let wa = gear_world.part_angular_velocity("gear_a").unwrap()[2];
+    let wb = gear_world.part_angular_velocity("gear_b").unwrap()[2];
+    assert!(
+        (wa - 6.0).abs() < 1e-9,
+        "Drive gear must reach target velocity 6.0 rad/s, got {wa}"
+    );
+    assert!(
+        (wb - (-3.0)).abs() < 1e-9,
+        "Driven gear must follow coupled ratio -0.5 * 6.0 = -3.0 rad/s, got {wb}"
+    );
+
+    // At steady state, gear_b experiences -4.0 N*m resistive torque from mount_b's saturated damper motor
+    // (since wb = -3.0 < target 0.0, mount_b applies +4.0 N*m trying to bring wb up to 0.0).
+    // Through the coupled Gear constraint J = [ratio, 1], the reaction torque on gear_b is -4.0 N*m
+    // and on gear_a is -ratio * 4.0 = -2.0 N*m, which mount_a's motor balances with +2.0 N*m!
+    let gear_rf = gear_world.joint_reaction_force("gear_pair", 0.005).unwrap();
+    assert!(
+        (gear_rf.torque[2].abs() - 2.0).abs() < 1e-6,
+        "Gear constraint reaction torque on drive gear_a should be 2.0 N*m, got {}",
+        gear_rf.torque[2]
+    );
+    let mount_a_rf = gear_world.joint_reaction_force("mount_a", 0.005).unwrap();
+    assert!(
+        (mount_a_rf.torque[2].abs() - 2.0).abs() < 1e-6,
+        "Drive motor mount_a reaction torque should balance transmitted load (2.0 N*m), got {}",
+        mount_a_rf.torque[2]
+    );
+
+    // 2. Closed-loop 4-bar / slider-crank mechanism holonomic manifold projection:
+    //    Verify that over 200 steps, joint closure residual stays at machine precision (< 1e-11).
+    let mut loop_world = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
+    let crank = create_test_box("crank", "Crank", 0.03, 0.01, 0.01);
+    let rod = create_test_box("rod", "Connecting Rod", 0.05, 0.01, 0.01);
+    let slider = create_test_box("slider", "Slider", 0.02, 0.02, 0.02);
+    loop_world
+        .add_part_with_options(&crank, true, ColliderType::ConvexHull, Some([0.015, 0.0, 0.0]), None)
+        .unwrap();
+    loop_world
+        .add_part_with_options(&rod, true, ColliderType::ConvexHull, Some([0.055, 0.0, 0.0]), None)
+        .unwrap();
+    loop_world
+        .add_part_with_options(&slider, true, ColliderType::ConvexHull, Some([0.08, 0.0, 0.0]), None)
+        .unwrap();
+
+    loop_world
+        .add_joint(
+            "j_crank",
+            "ground",
+            "crank",
+            CadJointType::Revolute {
+                anchor_a: [0.0, 0.0, 0.0],
+                anchor_b: [-0.015, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                limits: None,
+            },
+            Some(MotorConfig {
+                target_velocity: 4.0,
+                max_force: 100.0,
+            }),
+        )
+        .unwrap();
+    loop_world
+        .add_joint(
+            "j_crank_rod",
+            "crank",
+            "rod",
+            CadJointType::Revolute {
+                anchor_a: [0.015, 0.0, 0.0],
+                anchor_b: [-0.025, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                limits: None,
+            },
+            None,
+        )
+        .unwrap();
+    loop_world
+        .add_joint(
+            "j_rod_slider",
+            "rod",
+            "slider",
+            CadJointType::Revolute {
+                anchor_a: [0.025, 0.0, 0.0],
+                anchor_b: [0.0, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                limits: None,
+            },
+            None,
+        )
+        .unwrap();
+    loop_world
+        .add_joint(
+            "j_slider_ground",
+            "ground",
+            "slider",
+            CadJointType::Prismatic {
+                anchor_a: [0.08, 0.0, 0.0],
+                anchor_b: [0.0, 0.0, 0.0],
+                axis: [1.0, 0.0, 0.0],
+                limits: Some([-0.10, 0.10]),
+            },
+            None,
+        )
+        .unwrap();
+
+    let loop_summary = loop_world.simulate(1.0, 0.005);
+    assert!(loop_summary.success);
+    let slider_pos = loop_world.part_position("slider").unwrap();
+    // Slider Y and Z must remain locked to 0.0 to within holonomic projection tolerance
+    assert!(
+        slider_pos[1].abs() < 1e-11 && slider_pos[2].abs() < 1e-11,
+        "Slider off-axis drift must be < 1e-11 m, got y={}, z={}",
+        slider_pos[1],
+        slider_pos[2]
+    );
+    // Analytical slider X position for crank angle theta = 4.0 * 1.0 = 4.0 rad:
+    // x_slider = R * cos(theta) + sqrt(L^2 - R^2 * sin^2(theta)), with R = 0.03, L = 0.05
+    let theta = 4.0_f64;
+    let r_len = 0.03_f64;
+    let l_len = 0.05_f64;
+    let exact_slider_x =
+        r_len * theta.cos() + (l_len * l_len - (r_len * theta.sin()).powi(2)).sqrt();
+    assert!(
+        (slider_pos[0] - exact_slider_x).abs() < 1e-4,
+        "Slider X position {} must match analytical {} within 1e-4 m",
+        slider_pos[0],
+        exact_slider_x
+    );
+}

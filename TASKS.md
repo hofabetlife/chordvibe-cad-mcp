@@ -1,8 +1,27 @@
 # MCP-CAD: План работ и реестр задач (Backlog)
 
 > **Единый источник правды по архитектуре и принятым решениям:** Все фундаментальные архитектурные решения, таблицы систем координат примитивов, семантика Solid DAG и контракты 41 инструмента MCP перенесены и подробно описаны в **[`PROJECT_CONTEXT.md`](PROJECT_CONTEXT.md)** (разделы 4, 5 и 8).  
-> **Пошаговые отчёты о выполненных задачах (`P0-T1..T12`, `P1-T1..T4`, `P2-T1..T40`, `P3-T1..T24`, `P4-T0`):** хранятся в [`docs/agent_tasks/`](docs/agent_tasks/).  
-> **Текущий статус верификации (15.11.2026):**  
+> **Пошаговые отчёты о выполненных задачах (`P0-T1..T12`, `P1-T1..T4`, `P2-T1..T40`, `P3-T1..T24`, `P4-T0..T3`):** хранятся в [`docs/agent_tasks/`](docs/agent_tasks/).  
+> **Текущий статус верификации (16.11.2026):**  
+> - **Проверено в `P4-T3` после внедрения собственного многотельного решателя динамики и ограничений в `f64` (`crates/mcp-cad-physics/src/solver.rs`, `joint.rs`, `simulator.rs`) и удаления `PhysicsPipeline`/`ImpulseJointSet`/`GenericJoint`:**  
+>   - `cargo test -p mcp-cad-physics --no-fail-fast`: **33/33 PASS** (`--lib`: `7/7`, `physics_tests`: `26/26`, включая `test_p4_t3_f64_multibody_solver_coupled_gear_torque_limits_and_closed_loop`, `0 failed`);  
+>   - `cargo test -p mcp-cad-server --test gear_kinematic_test --no-fail-fast`: **1/1 PASS** (`test_gear_kinematic_simulation_and_preview`);  
+>   - `cargo clippy --workspace --all-targets -- -D warnings`: **PASS** (`0` ошибок, `0` предупреждений во всех 5 крейтах);  
+>   - `npm run lint` (`tsc --noEmit`): **PASS** (`0` ошибок, `exit 0`);  
+>   - `npm run build` (`vite build`): **PASS** (`exit 0`);  
+>   - `npm test` (`npx --yes tsx --test src/cad/cad_engine.test.ts src/cad/__tests__/analyze_mechanism.test.ts`): **52/52 PASS** (`0 failed`).  
+> - **Проверено в `P4-T2` после внедрения собственной модели твёрдого тела `RigidBody` (`f64`), точного интегрирования тензора инерции с учётом полостей (`MassProperties`) и структур коллайдеров (`ColliderShape`, `BodyRegistry`, `ColliderRegistry`) в `crates/mcp-cad-physics/src/rigid_body.rs`:**  
+>   - `cargo test -p mcp-cad-physics --no-fail-fast`: **32/32 PASS** (`--lib`: `7/7`, включая 3 новых unit-теста `rigid_body::tests`, `physics_tests`: `25/25`, включая `test_p4_t2_f64_rigid_body_hollow_inertia_and_update_part_collider`, `0 failed`);  
+>   - `cargo clippy --workspace --all-targets -- -D warnings`: **PASS** (`0` ошибок, `0` предупреждений во всех 5 крейтах);  
+>   - `npm run lint` (`tsc --noEmit`): **PASS** (`0` ошибок, `exit 0`);  
+>   - `npm run build` (`vite build`): **PASS** (`exit 0`);  
+>   - `npm test` (`npx --yes tsx --test src/cad/cad_engine.test.ts src/cad/__tests__/analyze_mechanism.test.ts`): **52/52 PASS** (`0 failed`).  
+> - **Проверено в `P4-T1` после разработки прототипа собственного многотельного решателя DAE/LCP в `f64` (`crates/mcp-cad-physics/src/dae_prototype.rs`), 4 аналитических бенчмарков и фиксации архитектурного решения `ADR-004` (`docs/DECISIONS.md`):**  
+>   - `cargo test -p mcp-cad-physics --no-fail-fast`: **28/28 PASS** (`--lib`: `4/4` в `0.09s`, `physics_tests`: `24/24` в `23.36s`, включая `test_p4_t1_dae_f64_candidates_vs_analytical_and_rapier_baseline`, `0 failed`);  
+>   - `cargo clippy -p mcp-cad-physics --all-targets -- -D warnings`: **PASS** (`0` ошибок, `0` предупреждений);  
+>   - `npm run lint` (`tsc --noEmit`): **PASS** (`0` ошибок, `exit 0`);  
+>   - `npm run build` (`vite build`): **PASS** (`exit 0`);  
+>   - `npm test` (`npx --yes tsx --test src/cad/cad_engine.test.ts src/cad/__tests__/analyze_mechanism.test.ts`): **52/52 PASS** (`0 failed`).  
 > - **Проверено в `P4-T0` после внедрения 41-го инструмента `apply_recipe` (`flanged_bushing`, `stepped_shaft`, `gear_transmission`), обновления `AGENT_INSTRUCTIONS`, `BUG-021`, TS-слоя и документации:**  
 >   - `cargo test -p mcp-cad-server --no-fail-fast`: **140/140 PASS** (`--lib`: `65/65` в `61.31s`, `mcp_contract_tests`: `60/60` в `41.51s`, `qa_wide_scan`: `13/13` в `8.52s`, `bench_suite`: `1/1` в `5.64s`, `gear_kinematic_test`: `1/1` в `0.57s`, `0 failed`);  
 >   - `cargo clippy --workspace --all-targets -- -D warnings`: **PASS** (`0` ошибок, `0` предупреждений во всех 5 крейтах, `7.40s`, `exit 0`);  
@@ -78,6 +97,15 @@
 | **P3-T23** | P3 Testing | Устранение зависания многопоточного прогона `mcp_contract_tests` и `qa_wide_scan` на Windows (WGPU/GUI-конкуренция) и изоляция побочных записей `qa/results/*.json` и `qa/artifacts/` | P2-T37 | S | `mcp-cad-server`, `viewer` | ✅ DONE |
 | **P3-T24** | P2 Docs / CI | Синхронизация устаревших счётчиков `28 Tools` / `28 инструментов` в `README.md`, `docs/{CLAUDE_DESKTOP_SETUP,ANTIGRAVITY_SETUP,ARCHITECTURE}.md` и `src/cad/{native_bridge,workbenches}.ts` с 40 инструментами Rust MCP-сервера и фиксация `package-lock.json` для `npm ci` | P3-T22 | S | Docs / TS / CI | ✅ DONE |
 | **P4-T0** | P4 Blueprints | Каркас параметрических «рецептов» (`apply_recipe`) и генерация типовых инженерных узлов | P0–P3 | M | `mcp-cad-server` | ✅ DONE |
+| **P4-T1** | P4 Physics DAE | Архитектурное решение `ADR-004` (`docs/DECISIONS.md`) и прототип собственного многотельного решателя DAE/LCP в `f64` против аналитики **[DECISION]** | P3-T6, P3-T9, P3-T16 | M | Docs / `mcp-cad-physics` | ✅ DONE |
+| **P4-T2** | P4 Physics DAE | Собственная модель твёрдого тела (`f64`, точный тензор инерции из `Part` с учётом полостей) и структуры коллайдеров в `rigid_body.rs` (замена `Rapier` `RigidBodySet`/`ColliderSet`) | P4-T1 | L | `mcp-cad-physics` | ✅ DONE |
+| **P4-T3** | P4 Physics DAE | Собственный многотельный решатель ограничений и динамики в `f64` (Ньютон–Эйлер + множители Лагранжа, моторы, упоры `limits`, замкнутые контуры и прямое ограничение `Gear`) | P4-T2 | L | `mcp-cad-physics` | ✅ DONE |
+| **P4-T4** | P4 Physics DAE | Собственный конвейер коллизий `f64` (AABB broad-phase, GJK/EPA + TriMesh narrow-phase, контактный решатель с кулоновским трением и события `CollisionRecord`) | P4-T2 | M | `mcp-cad-physics` | ⏳ TODO |
+| **P4-T5** | P4 Physics DAE | Прямое извлечение точных реакций шарниров $\lambda$ для `joint_reaction_force`, `get_part_load_cases` и `run_fea_from_simulation` (удаление декодера импульсов `Rapier3D`) | P4-T3 | M | `mcp-cad-physics`, `fea` | ⏳ TODO |
+| **P4-T6** | P4 Physics DAE | Удаление зависимости `rapier3d` из `Cargo.toml`/`Cargo.lock`, очистка `f32`-костылей в `mcp-cad-server` и замена ярлыков `Rapier3D` в UI веб-студии (`src/`) | P4-T3, P4-T4, P4-T5 | M | `physics`, `server`, `src/` | ⏳ TODO |
+| **P4-T7** | P4 Physics Verification | Верификация точности нового `f64`-решателя на эталонах (`physics_tests.rs`, `gear_kinematic_test.rs`, CI) и **финальное обновление всей документации** после завершения перехода | P4-T6 | M | Tests / Docs | ⏳ TODO |
+| **P4-T8** | P4 Physics DAE | Защита `ClosedLoopSolver::compute_closure_residual` (`simulator.rs:3645`) от `NaN` в `Rotation3::from_matrix_unchecked(r).scaled_axis()` при $\text{tr}(R) > 3.0$ на 1 ULP (перенос `atan2`-извлечения `rotation_vector` из `dae_prototype.rs`) | P3-T16, P4-T1 | S | `mcp-cad-physics` | ⏳ TODO |
+| **P4-T9** | P4 Core Hygiene | Синхронизация `Part::mesh()` (`crates/mcp-cad-core/src/part.rs:162-167`) при прямой мутации публичного поля `part.mesh` после `part.rebuild()` без вызова `invalidate_cache()` | P4-T2 | S | `mcp-cad-core` | ⏳ TODO |
 
 ---
 
@@ -352,7 +380,115 @@
 
 ---
 
-## 3. Архивный реестр выполненных задач (Completed Tasks P0–P3)
+### Фаза 4 (продолжение): Собственный инженерный физический решатель механизмов (замена `Rapier3D`)
+
+> **Порядок выполнения (`P4-T1`–`P4-T7`):** сначала полностью заменяется игровой движок `rapier3d = "0.22"` (одинарная точность `f32`, импульсный TGS-Soft, `ConvexHull` по умолчанию и пост-шаговая коррекция `Gear`), затем обновляются `mcp-cad-server` и веб-UI, и **только после прохождения всех проверок (`P4-T7`)** актуализируется проектная документация (`PRD.md`, `PROJECT_CONTEXT.md`, `docs/ARCHITECTURE.md`, `docs/PROGRESS.md`, `README.md`, `CHANGELOG.md`).
+
+#### P4-T1 [M]: Архитектурный выбор и прототип собственного решателя DAE/LCP в `f64` (`ADR-004`) **[DECISION]** — ✅ ВЫПОЛНЕНО (16.11.2026)
+- **Что сделано**:
+  1. Разработан модуль [`crates/mcp-cad-physics/src/dae_prototype.rs`](crates/mcp-cad-physics/src/dae_prototype.rs), реализующий два архитектурных кандидата решателя многотельной динамики в двойной точности `f64` на базе `nalgebra`:
+     - **Кандидат A (`DirectKktIndex2Projection`) [ВЫБРАН]**: индекс-2 DAE с прямым регуляризованным KKT / Active-Set Box-LCP решателем ($A = J M^{-1} J^T + \epsilon_{\text{CFM}} I_m$, разложение Холецкого $LL^T$ с резервом LU), точным учётом центростремительного ускорения кривизны $-\dot{J}\mathbf{v}_k$, трапецеидальным (Midpoint) интегрированием позы 2-го порядка, нелинейной проекцией координат Гаусса–Ньютона на многообразие связей $\Phi(\mathbf{q}) = \mathbf{0}$ и касательной проекцией скоростей $J\mathbf{v} = \mathbf{v}_{\text{target}}$ с прямым вычислением реакций Лагранжа $\boldsymbol{\lambda}$ на уровне ускорений.
+     - **Кандидат B (`SemiImplicitEulerPgsBaumgarte`)**: полунеявный метод Эйлера 1-го порядка + 60 итераций PGS со стабилизацией Баумгарте ($\beta = 0.20$).
+  2. Проведено сравнение обоих кандидатов с аналитическими решениями и базовой линией `Rapier3D 0.22` (`f32`, `TGS-Soft`) на 4 эталонных задачах (`test_p4_t1_dae_f64_candidates_vs_analytical_and_rapier_baseline`):
+     - Свободное падение ($T = 1\text{ с}$): ошибка позиции `8.882e-16 м` против `6.118e-3 м` у `Rapier3D`;
+     - Вращающийся стержень ($\omega_0 = 10\text{ рад/с}$): ошибка центростремительной реакции `2.084e-10%` (`-6.280000 Н`) против `1.523%` у `Rapier3D`;
+     - Кривошипно-ползунный 4-звенник (3 избыточные связи): макс. ошибка ползуна `2.422e-15 м`, невязка контура `5.204e-16` против `~4.2e-4 м` у `Rapier3D`;
+     - Зубчатая пара за 10 оборотов под нагрузкой ($\tau_{\text{load},2} = -4\text{ Н}\cdot\text{м}$): ошибка фазы `0.0 рад`, точная передача момента на ведущий вал `2.000000 Н·м` (`1.000e-9%`) против `0.0 Н·м` у `Rapier3D`.
+  3. Утверждённая математическая модель, структуры данных и таблица бенчмарков зафиксированы в разделе **ADR-004** документа [`docs/DECISIONS.md`](docs/DECISIONS.md). Подробный отчёт — [`docs/agent_tasks/P4-T1-report.md`](docs/agent_tasks/P4-T1-report.md).
+- **Критерии приёмки**:
+  - [x] В `docs/DECISIONS.md` (`ADR-004`) зафиксирована утверждённая математическая модель решателя `f64`, интегратор, стратегия стабилизации связей и результаты сравнительных замеров.
+- **Компонент**: [`docs/DECISIONS.md`](docs/DECISIONS.md), [`crates/mcp-cad-physics/src/dae_prototype.rs`](crates/mcp-cad-physics/src/dae_prototype.rs), [`crates/mcp-cad-physics/tests/physics_tests.rs`](crates/mcp-cad-physics/tests/physics_tests.rs), [`docs/agent_tasks/P4-T1-report.md`](docs/agent_tasks/P4-T1-report.md)
+
+#### P4-T2 [L]: Собственная модель твёрдого тела (`f64`) и коллайдеров в `rigid_body.rs` — ✅ ВЫПОЛНЕНО (16.11.2026)
+- **Что сделано**:
+  1. В [`crates/mcp-cad-physics/src/rigid_body.rs`](crates/mcp-cad-physics/src/rigid_body.rs) полностью удалены все импорты `rapier3d` и реализованы собственные `f64`-структуры: `BodyHandle(pub usize)`, `ColliderHandle(pub usize)`, `MassProperties`, `RigidBody` (масса $m$, обратная масса $m^{-1}$, локальный ЦМ $\mathbf{c}_{\text{loc}}$, $3\times 3$ тензор инерции $I_{\text{loc}}$ и $I_{\text{loc}}^{-1}$, мировая позиция `Vector3<f64>`, ориентация `UnitQuaternion<f64>`, линейная и угловая скорости `Vector3<f64>`, аккумуляторы сил/моментов, флаги `is_dynamic`/`is_fixed`/`sleeping`), `BodyRegistry` и `ColliderRegistry`.
+  2. Реализовано двухпроходное интегрирование масс-инерционных характеристик `compute_mesh_mass_properties` / `MassProperties::from_part` в `f64` напрямую по знаковым тетраэдрам замкнутой сетки `TriangleMesh` со сдвигом в $\mathbf{c}_{\text{loc}}$, что обеспечивает машинную точность на параллелепипедах (`< 1e-12`) и честный учёт сквозных отверстий и внутренних полостей (подтверждено на полой стальной втулке и маховике: $m_{\text{hollow}} / m_{\text{solid}} = 0.6400$, $(I_{zz}/m)_{\text{hollow}} > (I_{zz}/m)_{\text{solid}}$).
+  3. Заменён `ColliderBuilder` на собственные геометрические представления `ColliderShape` / `Collider` в `f64` для всех 6 вариантов `ColliderType` (`ConvexHull` через 3D Quickhull в `f64`, `TriMesh`, `Compound` через декомпозицию по октантам `ConvexHullPart`, `Cube`, `Sphere`, `Cylinder`) с аналитическим расчётом мировых `Aabb`. В `PhysicsWorld` (`simulator.rs`) реестры `bodies` и `colliders` переведены на `BodyRegistry` и `ColliderRegistry`, а `update_part_collider` обновляет геометрию, массу, ЦМ, тензор инерции и мировой AABB на месте с сохранением `BodyHandle` и всех подключённых шарниров. Подробный отчёт — [`docs/agent_tasks/P4-T2-report.md`](docs/agent_tasks/P4-T2-report.md).
+- **Критерии приёмки**:
+  - [x] `rigid_body.rs` полностью свободен от импортов `rapier3d`; все расчёты масс, тензоров инерции и геометрии коллайдеров ведутся в `f64`.
+  - [x] `update_part_collider` обновляет геометрию, массу, тензор инерции и мировой AABB без разрыва существующих шарниров и сохраняет `BodyHandle`.
+- **Компонент**: [`crates/mcp-cad-physics/src/rigid_body.rs`](crates/mcp-cad-physics/src/rigid_body.rs), [`crates/mcp-cad-physics/src/simulator.rs`](crates/mcp-cad-physics/src/simulator.rs), [`crates/mcp-cad-physics/tests/physics_tests.rs`](crates/mcp-cad-physics/tests/physics_tests.rs), [`docs/agent_tasks/P4-T2-report.md`](docs/agent_tasks/P4-T2-report.md)
+
+#### P4-T3 [L]: Собственный многотельный решатель ограничений и динамики в `f64` — ✅ ВЫПОЛНЕНО (16.11.2026)
+- **Что сделано**:
+  1. Реализован собственный модуль решателя [`crates/mcp-cad-physics/src/solver.rs`](crates/mcp-cad-physics/src/solver.rs) в двойной точности `f64` (`MultiBodySolver`, `SolverConfig`, `SolvedJointRecord`, `create_solved_joint_record`): сборка блочно-диагональной матрицы инерции $M(q)$ и $M^{-1}(q)$, неограниченный предиктор скоростей с `gravity_f64`, внешними силами/моментами и гироскопическим членом $-\boldsymbol{\omega} \times (I_w\boldsymbol{\omega})$, регуляризованное дополнение Шура (KKT / Active-Set Box-LCP) и трапецеидальное интегрирование ЦМ + экспоненциальное отображение на $SO(3)$.
+  2. Поддержаны все 5 типов шарниров (`Fixed`, `Revolute`, `Prismatic`, `Spherical`, `Gear`) в единой связанной системе ограничений в `f64`: односторонние и двусторонние упоры `limits` (включая `[c, c]`), приводы `MotorConfig` (`target_velocity`, `max_force`) с точным насыщением по силе/моменту и транзакционным `set_joint_motor` / `disable_joint_motor`, а также сопряжение `Gear` как полноценное связанное скоростное ограничение $\omega_b \cdot \hat{z}_b + \text{ratio}\,(\omega_a \cdot \hat{z}_a) = 0$ внутри KKT-системы с честной передачей крутящего момента и реакций без пост-шагового `set_angvel`.
+  3. Добавлена позиционная проекция на голономное многообразие связей $\Phi(q_{k+1}) = 0$ (включая замкнутые кинематические контуры), проекция скоростей на касательное подпространство и контроль численной расходимости с выставлением `SimulationSummary.success`. В `joint.rs` и `simulator.rs` полностью удалены `PhysicsPipeline`, `ImpulseJointSet`, `GenericJoint`, `IntegrationParameters` и все импорты `rapier3d`. Подробный отчёт — [`docs/agent_tasks/P4-T3-report.md`](docs/agent_tasks/P4-T3-report.md).
+- **Критерии приёмки**:
+  - [x] Все тесты открытых и замкнутых механизмов, моторов, лимитов и зубчатой передачи (`test_gear_kinematic_simulation_and_preview`, `test_revolute_joint_with_motor`, `test_prismatic_joint_limits`, `test_prismatic_joint_runtime_motor_and_disable_reenable`, `test_p4_t3_f64_multibody_solver_coupled_gear_torque_limits_and_closed_loop`) проходят на новом `f64`-решателе с точностью не хуже эталонной аналитики.
+  - [x] `simulator.rs` и `joint.rs` не используют `PhysicsPipeline`, `ImpulseJointSet`, `GenericJoint` или `IntegrationParameters` из `rapier3d`.
+- **Компонент**: [`crates/mcp-cad-physics/src/solver.rs`](crates/mcp-cad-physics/src/solver.rs), [`crates/mcp-cad-physics/src/simulator.rs`](crates/mcp-cad-physics/src/simulator.rs), [`crates/mcp-cad-physics/src/joint.rs`](crates/mcp-cad-physics/src/joint.rs), [`crates/mcp-cad-physics/tests/physics_tests.rs`](crates/mcp-cad-physics/tests/physics_tests.rs), [`docs/agent_tasks/P4-T3-report.md`](docs/agent_tasks/P4-T3-report.md)
+
+#### P4-T4 [M]: Собственный конвейер коллизий `f64` и контактный решатель с трением — ⏳ TODO
+- **Проблема**:
+  Обнаружение и разрешение столкновений тел в `PhysicsWorld` опирается на `DefaultBroadPhase`, `NarrowPhase`, `CCDSolver` и `parry` VHACD из `rapier3d` в `f32`.
+- **Что сделать**:
+  1. Реализовать модуль коллизий (`crates/mcp-cad-physics/src/collision.rs`) в `f64`:
+     - Broad-phase: фильтрация пар по мировым AABB (с пропуском пар, связанных шарниром с `contacts_enabled == false`, и двух статических тел).
+     - Narrow-phase: аналитические тесты пересечения для примитивов (`Cube`, `Sphere`, `Cylinder`), `GJK`/`EPA` для `ConvexHull`/`Compound` и точная проверка `TriMesh` (с кэшированием BVH/AABB-дерева сетки), возвращающие контактные точки, нормаль и глубину проникновения в `f64`.
+  2. Интегрировать односторонние ограничения непроникновения ($\lambda_n \ge 0$, упругое восстановление) и модель кулоновского трения ($|\lambda_t| \le \mu \lambda_n$) в шаговый решатель `P4-T3`.
+  3. Сохранить генерацию хронологических событий `CollisionEventType::Started | Stopped` и `CollisionRecord` (`contact_normal`, `max_impulse`) в `SimulationSummary.collisions`.
+- **Критерии приёмки**:
+  - [ ] Тест `test_collision_between_bodies` и проверки всех `ColliderType` (`test_collider_types_support`) проходят без `rapier3d` и без проваливания динамических тел сквозь опоры.
+- **Компонент**: `crates/mcp-cad-physics/src/{collision.rs, simulator.rs, rigid_body.rs}`
+
+#### P4-T5 [M]: Прямое извлечение реакций шарниров $\lambda$ для `get_part_load_cases` и `run_fea_from_simulation` — ⏳ TODO
+- **Проблема**:
+  Функция `PhysicsWorld::compute_joint_world_wrench_on_part_a` (`crates/mcp-cad-physics/src/simulator.rs:1082–1363`) представляет собой сложный 280-строчный декодер внутренних импульсов `Rapier3D 0.22`, вынужденный восстанавливать дробный шаг `substep_dt`, учитывать перестановку `body1 <-> body2` и прогонять Modified Gram-Schmidt для извлечения момента в якоре.
+- **Что сделать**:
+  1. Заменить `compute_joint_world_wrench_on_part_a` на прямое чтение вектора множителей Лагранжа $\lambda$ (физических реакций $\mathbf{F}$ в Н и $\boldsymbol{\tau}$ в Н·м в якоре шарнира, включая реакции упоров `limits` и приводов `MotorConfig`) непосредственно из решения собственного `f64`-решателя `P4-T3`.
+  2. Проверить сохранение III закона Ньютона ($\mathbf{F}_{A \leftarrow B} = -\mathbf{F}_{B \leftarrow A}$, $\boldsymbol{\tau}_{A \leftarrow B} = -\boldsymbol{\tau}_{B \leftarrow A}$ с точностью порядка `1e-12`) и минимизацию невязки динамического равновесия Даламбера (`equilibrium_residual_force_norm`, `equilibrium_residual_torque_norm`) в `extract_part_load_case`.
+  3. Проверить сквозную связку `get_part_load_cases` -> `run_fea_from_simulation` на всех существующих эталонах (`test_p3_t6_*`, `test_p3_t7_*`).
+- **Критерии приёмки**:
+  - [ ] Вся логика декодирования импульсов `Rapier3D` (`diff_conj1_2`, `JointOneBodyConstraintBuilder` flip, `substep_dt`) удалена из `simulator.rs`.
+  - [ ] Ошибка реакций на статической консольной балке (`< 0.01%`) и центростремительной силы на вращающемся стержне (`< 0.5%`) улучшена по сравнению с базовой линией `Rapier3D`, все тесты `P3-T6` и `P3-T7` проходят.
+- **Компонент**: `crates/mcp-cad-physics/src/simulator.rs`, `crates/mcp-cad-fea`, `crates/mcp-cad-server/src/tools/physics.rs`
+
+#### P4-T6 [M]: Удаление `rapier3d` из зависимостей, очистка `mcp-cad-server` и синхронизация веб-студии (`src/`) — ⏳ TODO
+- **Проблема**:
+  После замены ядра физики остаются остаточные упоминания `rapier3d` в `Cargo.toml`/`Cargo.lock`, проверки переполнения `f32::INFINITY` для `Rapier` в `crates/mcp-cad-server/src/tools/physics.rs:1328`, а также устаревшие/вводящие в заблуждение ярлыки «Состояние решателя Rapier3D» / `RAPIER3D ACTIVE` в веб-интерфейсе (`src/`), где по факту работает TS-кинематика `src/cad/kinematics.ts`.
+- **Что сделать**:
+  1. Удалить `rapier3d = "0.22"` из `crates/mcp-cad-physics/Cargo.toml` и обновить `Cargo.lock` (`cargo tree` не должен содержать `rapier3d` и `parry3d`).
+  2. Обновить публичные дескрипторы `PhysicsWorld` (заменить возвращаемые `RigidBodyHandle` / `ImpulseJointHandle` на собственные типы `BodyHandle` / `JointHandle` или согласованные псевдонимы) и убрать `Rapier`-специфичные проверки `f32` в `crates/mcp-cad-server/src/tools/physics.rs`.
+  3. Убрать все упоминания `Rapier3D` из веб-интерфейса (`src/components/CadRightSidebar.tsx:755`, `src/components/CadStatusBar.tsx:82`, `src/components/CadLeftSidebar.tsx:591`, `src/components/CadRibbonToolbar.tsx:215,628`, `src/cad/workbenches.ts:36`, `src/cad/mcp_dispatcher.ts:252`), отразив честное название собственного решателя и/или режим работы (клиентская кинематика vs серверный `f64` DAE-решатель).
+- **Критерии приёмки**:
+  - [ ] `cargo tree | grep -i rapier` возвращает пустой результат; поиск `rapier` по `crates/` и `src/` не находит активных зависимостей и UI-лейблов.
+  - [ ] В панели «Симуляция» и строке состояния веб-студии больше нет надписи «Состояние решателя Rapier3D» / `RAPIER3D ACTIVE`.
+- **Компонент**: `crates/mcp-cad-physics/Cargo.toml`, `Cargo.lock`, `crates/mcp-cad-server/src/tools/physics.rs`, `src/`
+
+#### P4-T7 [M]: Верификация нового решателя и финальное обновление документации — ⏳ TODO
+- **Проблема**:
+  Проектная документация (`PRD.md`, `PROJECT_CONTEXT.md`, `docs/ARCHITECTURE.md`, `docs/PROGRESS.md`, `docs/MCP_API_REFERENCE.md`, `README.md`, `CHANGELOG.md`) описывает `rapier3d` как текущий движок. Согласно требованию, обновление документации выполняется **только после** полной реализации и проверки собственного решателя (`P4-T1`–`P4-T6`).
+- **Что сделать**:
+  1. Расширить интеграционные и контрактные тесты (`crates/mcp-cad-physics/tests/physics_tests.rs`, `crates/mcp-cad-server/tests/gear_kinematic_test.rs`, `mcp_contract_tests.rs`): проверить свободное падение в `f64`, сохранение энергии/момента импульса на свободном волчке, 4-звенник/кривошипно-ползунный механизм, 10-оборотную зубчатую пару с передачей момента, контакт с трением и связку с МКЭ.
+  2. Выполнить полный прогон верификации всего рабочего пространства: `cargo test --workspace --no-fail-fast`, `cargo clippy --workspace --all-targets -- -D warnings`, `npm run lint`, `npm run build`, `npm test`.
+  3. **Только после зелёного прогона всех проверок** обновить документацию: `PRD.md`, `PROJECT_CONTEXT.md`, `docs/ARCHITECTURE.md`, `docs/PROGRESS.md`, `docs/MCP_API_REFERENCE.md`, `README.md`, `CHANGELOG.md` (зафиксировать переход с `rapier3d` на собственный `f64` DAE/многотельный решатель и актуальные метрики точности).
+- **Критерии приёмки**:
+  - [ ] Все тесты Rust и TypeScript, `clippy`, `tsc --noEmit` и `vite build` завершаются без ошибок.
+  - [ ] Документация проекта полностью синхронизирована с новым физическим движком и содержит подтверждённые замеры точности.
+- **Компонент**: `crates/mcp-cad-physics/tests/`, `crates/mcp-cad-server/tests/`, `PRD.md`, `PROJECT_CONTEXT.md`, `docs/`, `README.md`, `CHANGELOG.md`
+
+#### P4-T8 [S]: Защита `ClosedLoopSolver::compute_closure_residual` (`simulator.rs:3645`) от `NaN` в `Rotation3::scaled_axis()` — ⏳ TODO
+- **Проблема**:
+  При разработке `P4-T1` обнаружено, что в `crates/mcp-cad-physics/src/simulator.rs:3645` вызов `nalgebra::Rotation3::from_matrix_unchecked(r).scaled_axis()` для матрицы относительного поворота $R = R_b R_a^T$ вычисляет $\arccos\left(\frac{\text{tr}(R)-1}{2}\right)$ без предварительного зажима аргумента к $[-1, 1]$. Когда на соосно ориентированных звеньях из-за накопления погрешности округления `f64` в 1 ULP след матрицы оказывается $\text{tr}(R) = 3.0 + 2\cdot 10^{-16}$, `scaled_axis()` возвращает `Vector3::new(NaN, NaN, NaN)`, что приводит к деградации или зависанию `nalgebra::SVD` внутри итераций Гаусса–Ньютона.
+- **Что сделать**:
+  1. Заменить все вызовы `Rotation3::from_matrix_unchecked(r).scaled_axis()` в `crates/mcp-cad-physics/src/simulator.rs` на `NaN`-безопасную функцию извлечения вектора вращения через `atan2(sin_t, cos_t)` с `clamp(-1.0, 1.0)` (аналогично `rotation_vector(r)` в `crates/mcp-cad-physics/src/dae_prototype.rs`).
+- **Критерии приёмки**:
+  - [ ] `compute_closure_residual` гарантированно возвращает конечный вектор при любых ортогональных матрицах с дрейфом следа $\text{tr}(R) > 3.0$.
+- **Компонент**: `crates/mcp-cad-physics/src/simulator.rs`
+
+#### P4-T9 [S]: Синхронизация `Part::mesh()` (`crates/mcp-cad-core/src/part.rs:162-167`) при прямой мутации публичного поля `part.mesh` — ⏳ TODO
+- **Проблема**:
+  При выполнении `P4-T2` обнаружено, что в `crates/mcp-cad-core/src/part.rs:162-167` метод `Part::mesh(&self)` возвращает `self.cached_mesh.as_ref().unwrap_or(&self.mesh)`, в то время как поле `pub mesh: TriangleMesh` доступно для прямой записи. Если вызывающий код сначала вызывает `part.rebuild()` (заполняя `cached_mesh`), а затем напрямую модифицирует `part.mesh.vertices` без вызова `part.invalidate_cache()` (как в тестах `test_p3_t6_*`), методы `part.volume()`, `part.center_of_mass()` и `part.bounding_box()` возвращают устаревшие данные из `cached_mesh`.
+- **Что сделать**:
+  1. Обеспечить консистентность между `part.mesh` и `part.cached_mesh` в `crates/mcp-cad-core/src/part.rs` (например, возвращать `&self.mesh` как каноническую сетку после `rebuild()` либо проверять актуальность кэша), чтобы `part.volume()`, `part.center_of_mass()` и `part.bounding_box()` всегда отражали актуальное состояние `part.mesh`.
+- **Критерии приёмки**:
+  - [ ] Прямая модификация `part.mesh.vertices` после `part.rebuild()` немедленно отражается в `part.mesh()`, `part.center_of_mass()` и `part.bounding_box()` без необходимости вручную вызывать `invalidate_cache()`.
+- **Компонент**: `crates/mcp-cad-core/src/part.rs`
+
+---
+
+## 3. Архивный реестр выполненных задач (Completed Tasks P0–P4)
 
 Все архитектурные решения и результаты этих задач интегрированы в [`PROJECT_CONTEXT.md`](PROJECT_CONTEXT.md) (раздел 5), а подробные протоколы верификации сохранены в `docs/agent_tasks/`.
 
@@ -404,7 +540,7 @@
 | **P2-T28** | P2 Contract | Остановка поиска соосного отверстия на барьерных узлах в `R4`, проталкивание сдвига в `AddSpurGear`/`AddWheelRim` в `R1` и соосность в `R5` | §5.6 | [`P2-T28-report.md`](docs/agent_tasks/P2-T28-report.md) |
 | **P2-T29** | P2 Contract | Поддержка `length_unit` в `list_parts` и вывод `axis`/`axis_a`/`axis_b` для `CadJointType::Gear` в `get_scene_summary` | §5.1, §8 | [`P2-T29-report.md`](docs/agent_tasks/P2-T29-report.md) |
 | **P2-T30** | P2 Contract | Поддержка `file_path`/`part_id`/`is_fixed` и регистрация в `physics_world` в `import_stl`, учёт `resp["length_unit"]` в `auto_check` | §5.1, §5.5 | [`P2-T30-report.md`](docs/agent_tasks/P2-T30-report.md) |
-| **P2-T31** | P2 Contract | Разбиение вычитаний по барьерным узлам в `R3`, оценка AABB для `AddSpurGear`/`AddWheelRim` и ветка `BspUnionJoin` в `estimate_dag_cost` | §5.6 | [`P2-T31-report.md`](docs/agent_tasks/P2-T31-report.md) |
+| **P2-T31** | P2 Contract | Разбиение вычитаний по барьерным узлах в `R3`, оценка AABB для `AddSpurGear`/`AddWheelRim` и ветка `BspUnionJoin` в `estimate_dag_cost` | §5.6 | [`P2-T31-report.md`](docs/agent_tasks/P2-T31-report.md) |
 | **P2-T32** | P2 Contract | Схема `length_unit` и `part_id`/`revision` в `get_feature_tree` и `validate_mesh`, масштабирование `gravity` в `get_simulation_metrics_json` | §5.1, §8 | [`P2-T32-report.md`](docs/agent_tasks/P2-T32-report.md) |
 | **P2-T33** | P2 Contract | Узел `FeatureOp::ImportedMesh` и `ensure_imported_mesh_in_dag()` для трансформации и CSG на импортированных STL-деталях | §4.2, §5.5 | [`P2-T33-report.md`](docs/agent_tasks/P2-T33-report.md) |
 | **P2-T34** | P2 Contract | Масштабирование вершин и метаданных граней меш-операндов (`Boolean*Mesh`, `ImportedMesh`) в `get_feature_tree` | §5.1 | [`P2-T34-report.md`](docs/agent_tasks/P2-T34-report.md) |
@@ -439,4 +575,7 @@
 | **P3-T23** | P3 Testing | Общий потокобезопасный `OffscreenRenderer::shared()` (`WGPU_INIT_LOCK` + `render_lock`), автоотключение GUI-спавна и временный STL для тестовых бинарников в `open_preview_window`, RAII-изоляция `qa_wide_scan` во временный каталог (`QaDirGuard`), снятие `-- --test-threads=1` в CI и `README.md` (`135/135 PASS` многопоточно) | §7 | [`P3-T23-report.md`](docs/agent_tasks/P3-T23-report.md) |
 | **P3-T24** | P2 Docs / CI | Синхронизация счётчиков и таблиц инструментов (`40` Rust / `31` TS) в `README.md`, `docs/{CLAUDE_DESKTOP_SETUP,ANTIGRAVITY_SETUP,ARCHITECTURE,MCP_API_REFERENCE}.md`, TS/UI (`native_bridge.ts`, `workbenches.ts`, `App.tsx`, `CadRightSidebar.tsx`) и скриптах запуска, обновление `BUG-021`, синхронизация и фиксация `package-lock.json` для `npm ci` (`cache: "npm"` в CI) | §7, §8 | [`P3-T24-report.md`](docs/agent_tasks/P3-T24-report.md) |
 | **P4-T0** | P4 Blueprints | 41-й MCP-инструмент `apply_recipe` (`flanged_bushing`, `stepped_shaft`, `gear_transmission`) с транзакционным откатом, `validate_mesh`, `length_unit`, `auto_check` и полной синхронизацией счётчиков/документации (`41` Rust / `31` TS) | §7, §8 | [`P4-T0-report.md`](docs/agent_tasks/P4-T0-report.md) |
+| **P4-T1** | P4 Physics DAE | Архитектурное решение `ADR-004` (`docs/DECISIONS.md`) и прототип собственного многотельного решателя DAE/LCP в `f64` (`dae_prototype.rs`: `DirectKktIndex2Projection` vs `PgsBaumgarte` vs `Rapier3D` на 4 эталонах против аналитики) | §4.4, §5.7 | [`P4-T1-report.md`](docs/agent_tasks/P4-T1-report.md) |
+| **P4-T2** | P4 Physics DAE | Собственная модель твёрдого тела `RigidBody` (`f64`), точный тензор инерции `MassProperties` из замкнутой сетки `Part` с учётом полостей и геометрические коллайдеры `ColliderShape` (`BodyRegistry`, `ColliderRegistry`, `0` импортов `rapier3d` в `rigid_body.rs`) | §4.3, §5.5, §7 | [`P4-T2-report.md`](docs/agent_tasks/P4-T2-report.md) |
+| **P4-T3** | P4 Physics DAE | Собственный многотельный решатель ограничений и динамики в `f64` (`solver.rs`: Ньютон–Эйлер + KKT/Box-LCP, моторы, упоры `limits`, замкнутые контуры $\Phi(q)=0$ и связанное ограничение `Gear` с передачей момента; `0` импортов `rapier3d` в `solver.rs`, `joint.rs`, `simulator.rs`) | §4.3, §5.5, §7 | [`P4-T3-report.md`](docs/agent_tasks/P4-T3-report.md) |
 | **TS-FIX-01** | TS Suite | Синхронизация числа пресетов МКЭ (5) и импортов типов в `src/cad/{cad_engine.test.ts, primitives.ts}` | §7 | — |

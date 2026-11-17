@@ -10,5 +10,8 @@ export default defineConfig({
     host: '0.0.0.0',
     allowedHosts: true,
     hmr: false,
+    watch: {
+      ignored: ['**/target/**', '**/crates/**', '**/spikes/**'],
+    },
   },
 });
