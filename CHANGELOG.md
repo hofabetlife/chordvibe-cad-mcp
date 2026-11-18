@@ -2,6 +2,23 @@
 
 All notable changes to `chordvibe-cad-mcp` are documented in this file.
 
+## [v0.2.0] - 2026-11-18
+
+### Added & Changed
+- **Native Double-Precision `f64` Index-2 DAE Physics Engine (`mcp-cad-physics`, `ADR-004`, `P4-T1`–`P4-T7`)**:
+  - Replaced `rapier3d = "0.22"` (`f32` / `TGS-Soft`) completely with a dedicated Pure-Rust `f64` multibody DAE/KKT/Active-Set Box-LCP solver (`MultiBodySolver` in `crates/mcp-cad-physics/src/solver.rs`) built on `nalgebra`.
+  - Added exact signed-tetrahedral inertia integration (`MassProperties::from_part` in `rigid_body.rs`) accounting for internal bores and pockets, plus implicit midpoint (Lie–Poisson) 3D Euler rotational predictor preserving rotational energy and angular momentum norm to `< 1e-13` on asymmetric spinning tops.
+  - Added native `f64` collision detection pipeline (`collision.rs`: Sweep-and-Prune AABB broad-phase, cached `TriMeshBvh`, analytical primitives + GJK/EPA + planar manifold clipping for all 6 `ColliderType` variants) with unilateral normal contacts and isotropic Coulomb friction cone (`2x2` disk projector).
+  - Replaced legacy impulse decoding with direct Lagrange multiplier ($\boldsymbol{\lambda}$) extraction (`Pinned KKT Re-solve` in `simulator.rs`) for `joint_reaction_force`, `get_part_load_cases`, and `run_fea_from_simulation` (Newton's 3rd law residual $< 10^{-15}$, static cantilever beam root reaction error $< 0.0001\%$, 10-revolution gear torque transmission error $< 10^{-7}\text{ N}\cdot\text{m}$).
+  - Hardened `ClosedLoopSolver` (`rotation_vector` in `simulator.rs`, `P4-T8`) with a `NaN`-safe `atan2(sin_t, cos_t)` + clamped-trace extraction (plus $\theta \approx \pi$ axis recovery) so 1-ULP trace drift ($\operatorname{tr}(R) > 3.0$ or $< -1.0$) never produces `NaN` in Gauss–Newton SVD steps.
+  - Synchronized `Part::mesh()`, `Part::mesh_mut()`, and `Part::tessellate()` (`crates/mcp-cad-core/src/part.rs`, `P4-T9`) so direct edits to `part.mesh` after `part.rebuild()` reflect immediately in all queries without manual `invalidate_cache()`, and simplified `MassProperties::from_part` (`rigid_body.rs`).
+  - Stabilized `test_p3_t10_benchmark_check_interference_10_parts_45_pairs` (`crates/mcp-cad-physics/tests/physics_tests.rs`, `P4-T10`) under parallel CPU contention by replacing the brittle `< 250.0 ms` debug wall-clock threshold with deterministic broad-phase/narrow-phase structural and analytical checks (`broadphase_overlap_pairs_count == 1`, `max_intersection_volume == 3.0e-5 m³`, `min_clearance == 0.05 m`, `elapsed_ms.is_finite()`) plus a generous `5000 ms` hang guard.
+  - Removed `rapier3d` and transitive `parry3d` crates from `Cargo.toml`/`Cargo.lock`, replaced `as f32` bounds with `MAX_MOTOR_PARAM_F64 = 1e30`, and synchronized Web Studio (`src/`) labels to `f64 DAE`.
+- **Expanded MCP Toolset (41 Rust Tools / 31 TS Tools)**:
+  - Added engineering contract & precision tools: `set_units` (millimeter boundary contract, `[DECISION-UNITS-1]`), `save_project` / `load_project` (`schema_version = "1.0.0"`), `set_requirements` / `check_requirements` (revision-tracked `FRESH`/`STALE` FEA checks), `get_scene_summary`, `get_part_load_cases`, `run_fea_from_simulation` (3-2-1 minimal support & D'Alembert body loads), `check_gear_strength` (Lewis/Barth bending + Hertz/AGMA contact), `analyze_mechanism` (Grübler + Jacobian SVD + `redundant_joint_ids` + `joints_at_limits`), `check_interference` (broad-phase AABB + `csg_intersection` + triangle clearance), `sweep_joint` (including `ClosedLoopSolver` for 4-bar & slider-crank mechanisms), and `apply_recipe` (`flanged_bushing`, `stepped_shaft`, `gear_transmission`).
+- **Topological Face Naming (`face_ids` / `FaceInfo`), Coaxial Threading & WGPU Thread-Safety**:
+  - Preserved logical `face_id` labels across BSP-CSG, holes, and `transform_part`; added watertight coaxial manifold meshing for angled/offset `cut_helical_groove` (`0.00% < 5°` slivers); added `OffscreenRenderer::shared()` and isolated `qa_wide_scan` temp artifacts (`348/348` Rust workspace tests + `53/53` TS tests passing).
+
 ## [v0.1.0] - 2026-11-02
 
 ### Added

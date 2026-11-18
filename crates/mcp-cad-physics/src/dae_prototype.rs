@@ -1,7 +1,7 @@
 //! Prototype and benchmark suite for the `f64` multi-body DAE/LCP physics solver (`P4-T1` / `ADR-004`).
 //!
 //! Compares two `f64` solver formulations built on `nalgebra` against closed-form analytical
-//! mechanics solutions and the legacy `Rapier3D 0.22` (`f32`, `TGS-Soft`) baseline across four
+//! mechanics solutions and the legacy `f32` `TGS-Soft` impulse baseline across four
 //! canonical engineering benchmarks:
 //! 1. **Free fall under uniform gravity** ($y(t) = y_0 + v_0 t + \frac{1}{2} g t^2$, $v_y(t) = v_0 + g t$).
 //! 2. **Rotating cantilevered rod** (centripetal reaction force $F_r = -m \omega^2 r_c$ in the body frame,
@@ -1815,7 +1815,7 @@ fn solve_box_constrained_kkt(
 /// Accuracy metrics for Benchmark 1: Free Fall under Gravity ($T = 1.0\text{ s}, \Delta t = 5\text{ ms}$).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FreeFallBenchmarkResult {
-    /// Solver name (`"DirectKktIndex2 (f64)"`, `"PgsBaumgarte (f64)"`, `"Rapier3D 0.22 (f32)"`).
+    /// Solver name (`"DirectKktIndex2 (f64)"`, `"PgsBaumgarte (f64)"`).
     pub solver_name: String,
     /// Simulated final vertical position $y(T)$ in meters (analytical: $5.095000\text{ m}$).
     pub final_y_m: f64,
@@ -1892,7 +1892,7 @@ pub struct GearPairBenchmarkResult {
 /// Complete comparison report across all 4 `P4-T1` benchmarks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaeBenchmarkComparisonReport {
-    /// Benchmark 1 results (Direct KKT f64, PGS Baumgarte f64, Rapier3D f32).
+    /// Benchmark 1 results (Direct KKT f64, PGS Baumgarte f64).
     pub free_fall: Vec<FreeFallBenchmarkResult>,
     /// Benchmark 2 results.
     pub rotating_rod: Vec<RotatingRodBenchmarkResult>,

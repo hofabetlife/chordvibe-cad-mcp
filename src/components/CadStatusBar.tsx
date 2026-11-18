@@ -79,7 +79,7 @@ export const CadStatusBar: React.FC<CadStatusBarProps> = ({
               isSimulatingPhysics ? 'text-[#10b981] font-semibold' : 'text-[#64748b]'
             }
           >
-            {isSimulatingPhysics ? 'RAPIER3D ACTIVE' : 'KINEMATICS IDLE'}
+            {isSimulatingPhysics ? 'DAE f64 ACTIVE' : 'KINEMATICS IDLE'}
           </span>
         </div>
 

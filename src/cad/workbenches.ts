@@ -33,7 +33,7 @@ export const ENGINEERING_WORKBENCHES: WorkbenchMetadata[] = [
     id: 'simulation',
     label: 'Симуляция',
     shortLabel: '3. Симуляция',
-    subtitle: 'Кинематика механизмов Rapier3D, шарниры, приводы, зубчатые зацепления',
+    subtitle: 'Кинематика механизмов (f64 DAE), шарниры, приводы, зубчатые зацепления',
     accentColor: '#10b981',
     leftPanelTitle: 'Шарниры и Приводы (Joints)',
     rightPanelTitle: 'Телеметрия движения и Сборка',

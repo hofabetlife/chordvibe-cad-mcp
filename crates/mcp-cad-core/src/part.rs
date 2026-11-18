@@ -79,9 +79,9 @@ impl Part {
     /// does not modify the part's parametric DAG or structural geometry.
     pub fn tessellate(&mut self, settings: &TessellationSettings) -> Result<&TriangleMesh, CadError> {
         self.ensure_imported_mesh_in_dag();
-        if let (Some(ref _cached), Some(ref s)) = (&self.cached_mesh, &self.cached_settings) {
-            if s == settings {
-                return Ok(self.cached_mesh.as_ref().unwrap());
+        if let (Some(ref cached), Some(ref s)) = (&self.cached_mesh, &self.cached_settings) {
+            if s == settings && *cached == self.mesh {
+                return Ok(&self.mesh);
             }
         }
 
@@ -89,7 +89,7 @@ impl Part {
         self.mesh = evaluated.clone();
         self.cached_mesh = Some(evaluated);
         self.cached_settings = Some(settings.clone());
-        Ok(self.cached_mesh.as_ref().unwrap())
+        Ok(&self.mesh)
     }
 
     /// Evaluates the part geometry with a quality preset.
@@ -158,18 +158,21 @@ impl Part {
     }
 
     /// Reference to the current evaluated triangle mesh.
+    ///
+    /// Always returns `&self.mesh`, which is updated by [`Part::rebuild`] and
+    /// [`Part::tessellate`] and also receives direct mutations (such as `part.mesh.vertices`).
     #[inline]
     pub fn mesh(&self) -> &TriangleMesh {
-        if let Some(ref m) = self.cached_mesh {
-            m
-        } else {
-            &self.mesh
-        }
+        &self.mesh
     }
 
     /// Mutable reference to the boundary mesh for legacy direct manipulations.
+    ///
+    /// Invalidates any cached tessellation snapshot so `cached_mesh`/`cached_settings`
+    /// do not become stale after direct modification.
     #[inline]
     pub fn mesh_mut(&mut self) -> &mut TriangleMesh {
+        self.invalidate_cache();
         &mut self.mesh
     }
 
@@ -379,5 +382,94 @@ mod tests {
         assert!((center[0] - 0.20).abs() < 1e-6);
         assert!((center[1] - 0.10).abs() < 1e-6);
         assert!((center[2] - (-0.05)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_p4_t9_direct_mesh_mutation_after_rebuild_updates_part_queries() {
+        let registry = MaterialRegistry::new();
+        let steel = registry.get("steel_structural_aisi1020").unwrap().clone();
+
+        let mut part = Part::new("p4t9-box", "Direct Mutation Box", steel);
+        part.dag.add_feature(
+            FeatureOp::AddBox {
+                width: 0.20,
+                height: 0.04,
+                depth: 0.04,
+                position: None,
+                rotation_deg: None,
+            },
+            None,
+        );
+        part.rebuild().unwrap();
+        assert!(part.cached_mesh.is_some());
+
+        let base_vol = part.volume();
+        assert!((base_vol - 0.20 * 0.04 * 0.04).abs() < 1e-12);
+
+        // Mutate part.mesh.vertices directly after rebuild() WITHOUT calling invalidate_cache()
+        for v in &mut part.mesh.vertices {
+            v.position[0] = v.position[0] * 2.0 + 0.25;
+            v.position[1] -= 0.05;
+            v.position[2] += 0.10;
+        }
+
+        assert!(std::ptr::eq(part.mesh(), &part.mesh));
+        let com = part.center_of_mass();
+        assert!((com[0] - 0.25).abs() < 1e-12, "com[0]={}", com[0]);
+        assert!((com[1] - (-0.05)).abs() < 1e-12, "com[1]={}", com[1]);
+        assert!((com[2] - 0.10).abs() < 1e-12, "com[2]={}", com[2]);
+
+        let aabb = part.bounding_box();
+        assert!((aabb.min[0] - 0.05).abs() < 1e-12);
+        assert!((aabb.max[0] - 0.45).abs() < 1e-12);
+        assert!((aabb.min[1] - (-0.07)).abs() < 1e-12);
+        assert!((aabb.max[1] - (-0.03)).abs() < 1e-12);
+
+        assert!((part.volume() - base_vol * 2.0).abs() < 1e-12);
+        let summary = part.summary();
+        assert!((summary.volume - base_vol * 2.0).abs() < 1e-12);
+        assert!((summary.bounding_box_dimensions[0] - 0.40).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_p4_t9_mesh_mut_invalidates_cache_and_tessellate_detects_direct_mutation() {
+        let registry = MaterialRegistry::new();
+        let alu = registry.get("aluminum_6061_t6").unwrap().clone();
+
+        let mut part = Part::new("p4t9-cyl", "Direct Mutation Cylinder", alu);
+        part.dag.add_feature(
+            FeatureOp::AddCylinder {
+                radius: 0.02,
+                height: 0.06,
+                segments: 24,
+                position: None,
+                rotation_deg: None,
+            },
+            None,
+        );
+
+        let coarse = TessellationSettings::coarse();
+        part.tessellate(&coarse).unwrap();
+        assert!(part.cached_mesh.is_some());
+
+        // Direct mutation of part.mesh without invalidate_cache()
+        for v in &mut part.mesh.vertices {
+            v.position[0] += 0.50;
+        }
+        assert!((part.center_of_mass()[0] - 0.50).abs() < 1e-12);
+
+        // Calling tessellate(&coarse) must not serve stale cached_mesh
+        let refreshed = part.tessellate(&coarse).unwrap();
+        assert!(refreshed.center_of_mass()[0].abs() < 1e-12);
+        assert!(part.center_of_mass()[0].abs() < 1e-12);
+
+        // Calling mesh_mut() explicitly invalidates cached_mesh and cached_settings
+        let mutable_mesh = part.mesh_mut();
+        for v in &mut mutable_mesh.vertices {
+            v.position[2] += 0.30;
+        }
+        assert!(part.cached_mesh.is_none());
+        assert!(part.cached_settings.is_none());
+        assert!((part.center_of_mass()[2] - 0.30).abs() < 1e-12);
     }
 }

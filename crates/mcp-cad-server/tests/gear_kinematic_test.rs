@@ -332,3 +332,106 @@ async fn test_gear_kinematic_simulation_and_preview() {
     println!("Max vertex displacement across assembly: {:.4} m", max_disp);
     assert!(max_disp > 0.005, "Moving parts must displace/rotate across animation frames");
 }
+
+#[tokio::test]
+async fn test_gear_kinematic_10_revolutions_and_load_cases() {
+    let state = EngineState::new()
+        .expect("EngineState initialization failed")
+        .into_shared();
+
+    // Apply gear_transmission recipe with motor velocity 20.0 rad/s (10 revolutions in pi seconds)
+    let resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 100,
+            "method": "tools/call",
+            "params": {
+                "name": "apply_recipe",
+                "arguments": {
+                    "recipe": "gear_transmission",
+                    "params": {
+                        "id_prefix": "g10",
+                        "module": 2.0,
+                        "teeth_pinion": 20,
+                        "teeth_gear": 40,
+                        "motor_velocity_rad_s": 20.0
+                    }
+                }
+            }
+        }),
+    )
+    .await;
+    let rec_text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let rec: Value = serde_json::from_str(rec_text).unwrap();
+    assert_eq!(rec["status"], "recipe_applied");
+
+    // Simulate for pi seconds (3.141592653589793 s) at 10 ms step size => 10 revolutions of pinion
+    let resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 101,
+            "method": "tools/call",
+            "params": {
+                "name": "run_physics_simulation",
+                "arguments": {
+                    "duration_seconds": std::f64::consts::PI,
+                    "step_size_ms": 10.0
+                }
+            }
+        }),
+    )
+    .await;
+    let sim_text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let sim: Value = serde_json::from_str(sim_text).unwrap();
+    assert_eq!(sim["success"], true);
+
+    let traj = &sim["trajectory_summary"];
+    let s_pinion = traj["g10_pinion"]["samples"].as_array().unwrap();
+    let s_gear = traj["g10_gear"]["samples"].as_array().unwrap();
+    assert!(s_pinion.len() >= 314);
+
+    for i in 1..s_pinion.len() {
+        let w1 = s_pinion[i]["angular_velocity"][2].as_f64().unwrap();
+        let w2 = s_gear[i]["angular_velocity"][2].as_f64().unwrap();
+        assert!(
+            (w1 - 20.0).abs() < 1e-9,
+            "Pinion w_z at sample {i} must be 20.0 rad/s, got {w1}"
+        );
+        assert!(
+            (w2 - (-10.0)).abs() < 1e-9,
+            "Gear w_z at sample {i} must be -10.0 rad/s, got {w2}"
+        );
+    }
+
+    // Verify load case extraction from the 10-revolution simulation
+    let resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 102,
+            "method": "tools/call",
+            "params": {
+                "name": "get_part_load_cases",
+                "arguments": {
+                    "part_id": "g10_pinion",
+                    "select": "peak_force"
+                }
+            }
+        }),
+    )
+    .await;
+    let lc_text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let lc: Value = serde_json::from_str(lc_text).unwrap();
+    assert_eq!(lc["part_id"], "g10_pinion");
+    assert!(
+        lc["equilibrium_residual_force_norm"].as_f64().unwrap() < 1e-7,
+        "10-rev pinion force equilibrium residual must be < 1e-7 N"
+    );
+    assert!(
+        lc["equilibrium_residual_torque_norm"].as_f64().unwrap() < 1e-7,
+        "10-rev pinion torque equilibrium residual must be < 1e-7 N*m"
+    );
+}
+

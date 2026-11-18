@@ -1,7 +1,7 @@
 //! Rigid body and collider models in double precision (`f64`) with exact mesh mass-inertia
 //! integration (`P4-T2` / `ADR-004`).
 //!
-//! This module is completely free of `rapier3d` dependencies:
+//! Pure-Rust double-precision (`f64`) rigid-body and collision geometry primitives:
 //! - Computes exact volume, center of mass $\mathbf{c}_{\text{loc}}$, and full $3\times 3$ inertia
 //!   tensor $I_{\text{loc}}$ directly from the closed triangulated boundary mesh (`TriangleMesh`)
 //!   of a CAD [`Part`] via signed tetrahedron decomposition (accounting for through-holes, bores,
@@ -17,6 +17,7 @@ use mcp_cad_core::Part;
 use nalgebra::{Matrix3, Quaternion, Rotation3, UnitQuaternion, Vector3};
 use serde::{Deserialize, Serialize};
 
+use crate::collision::TriMeshBvh;
 use crate::error::PhysicsError;
 
 /// Stable, copyable handle identifying a [`RigidBody`] in a [`BodyRegistry`].
@@ -256,12 +257,7 @@ impl MassProperties {
     /// Computes exact mass properties for a CAD [`Part`] from its evaluated mesh and material density.
     #[must_use]
     pub fn from_part(part: &Part) -> Self {
-        let mesh = if !part.mesh.vertices.is_empty() {
-            &part.mesh
-        } else {
-            part.mesh()
-        };
-        Self::from_mesh_and_density(mesh, part.material.density_kg_m3)
+        Self::from_mesh_and_density(part.mesh(), part.material.density_kg_m3)
     }
 
     /// Decomposes `self.inertia_tensor` into principal moments of inertia `(I_x, I_y, I_z)`
@@ -972,10 +968,12 @@ pub struct Collider {
     pub friction: f64,
     /// Coefficient of restitution $e \in [0, 1]$.
     pub restitution: f64,
-    /// Cached part-local axis-aligned bounding box ($\text{m}$).
+    /// Cached local-space axis-aligned bounding box ($\text{m}$).
     pub local_aabb: BoundingBox,
     /// Cached world-space axis-aligned bounding box ($\text{m}$).
     pub world_aabb: BoundingBox,
+    /// Cached local-space BVH acceleration structure for [`ColliderShape::TriMesh`] colliders.
+    pub tri_bvh: Option<TriMeshBvh>,
 }
 
 impl Collider {
@@ -1116,6 +1114,12 @@ impl Collider {
             UnitQuaternion::identity(),
         );
         let world_aabb = local_aabb;
+        let tri_bvh = match &shape {
+            ColliderShape::TriMesh { vertices, indices } => {
+                Some(TriMeshBvh::build(vertices, indices))
+            }
+            _ => None,
+        };
 
         Ok(Self {
             handle: ColliderHandle(0),
@@ -1134,6 +1138,7 @@ impl Collider {
             restitution: 0.0,
             local_aabb,
             world_aabb,
+            tri_bvh,
         })
     }
 

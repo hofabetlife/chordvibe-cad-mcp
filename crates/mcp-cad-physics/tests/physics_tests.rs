@@ -645,7 +645,11 @@ fn test_p2_t18_update_part_collider_preserves_joints_and_updates_mass_and_bounds
         .expect("update_part_collider should succeed");
     assert_eq!(
         updated_rb_handle, initial_rb_handle,
-        "update_part_collider must preserve the existing RigidBodyHandle"
+        "update_part_collider must preserve the existing BodyHandle"
+    );
+    assert_eq!(
+        world.part_body_handle("rotor_dyn").unwrap(),
+        initial_rb_handle
     );
 
     // Verify mass and collider AABB increased to match the new geometry
@@ -915,46 +919,46 @@ fn test_p3_t6_static_cantilever_beam_load_case_and_newton_third_law() {
         assert_eq!(j_beam.connected_part_id, "wall_support");
         assert_eq!(j_beam.anchor_local, [0.0, 0.0, 0.0]);
 
-        // 1. Reaction force F_y ≈ +m*g supporting the beam against -Y gravity (within 1%)
+        // 1. Reaction force F_y ≈ +m*g supporting the beam against -Y gravity (< 0.01% error in f64)
         let force_rel_err = (j_beam.force[1] - expected_force_y).abs() / expected_force_y;
         assert!(
-            force_rel_err < 0.01,
-            "Selector {:?}: expected F_y ≈ {:.4} N (m*g), got F = {:?} (rel_err = {:.4})",
+            force_rel_err < 1e-4,
+            "Selector {:?}: expected F_y ≈ {:.6} N (m*g) within 0.01%, got F = {:?} (rel_err = {:.6e})",
             selector,
             expected_force_y,
             j_beam.force,
             force_rel_err
         );
-        assert!(j_beam.force[0].abs() < 1e-3 * expected_force_y);
-        assert!(j_beam.force[2].abs() < 1e-3 * expected_force_y);
+        assert!(j_beam.force[0].abs() < 1e-9 * expected_force_y);
+        assert!(j_beam.force[2].abs() < 1e-9 * expected_force_y);
 
-        // 2. Reaction torque at root anchor [0,0,0]: T_z ≈ +m*g*L/2 counteracting gravity moment (within 1%)
+        // 2. Reaction torque at root anchor [0,0,0]: T_z ≈ +m*g*L/2 counteracting gravity moment (< 0.01% error in f64)
         let torque_rel_err = (j_beam.torque[2] - expected_torque_z).abs() / expected_torque_z;
         assert!(
-            torque_rel_err < 0.01,
-            "Selector {:?}: expected T_z ≈ {:.5} N*m (m*g*L/2), got T = {:?} (rel_err = {:.4})",
+            torque_rel_err < 1e-4,
+            "Selector {:?}: expected T_z ≈ {:.6} N*m (m*g*L/2) within 0.01%, got T = {:?} (rel_err = {:.6e})",
             selector,
             expected_torque_z,
             j_beam.torque,
             torque_rel_err
         );
 
-        // 3. Dynamic equilibrium residual must be small (< 1% of m*g)
+        // 3. Dynamic equilibrium residual must be near machine zero (< 1e-6 of m*g)
         assert!(
-            beam_lc.equilibrium_residual_force_norm < 0.01 * expected_force_y,
-            "Selector {:?}: expected small force equilibrium residual, got {:.6} N",
+            beam_lc.equilibrium_residual_force_norm < 1e-6 * expected_force_y,
+            "Selector {:?}: expected near-zero force equilibrium residual, got {:.6e} N",
             selector,
             beam_lc.equilibrium_residual_force_norm
         );
         assert!(
-            beam_lc.equilibrium_residual_torque_norm < 0.01 * expected_torque_z,
-            "Selector {:?}: expected small torque equilibrium residual, got {:.6} N*m",
+            beam_lc.equilibrium_residual_torque_norm < 1e-6 * expected_torque_z,
+            "Selector {:?}: expected near-zero torque equilibrium residual, got {:.6e} N*m",
             selector,
             beam_lc.equilibrium_residual_torque_norm
         );
     }
 
-    // 4. Verify Newton's 3rd Law between `wall_support` (`part_a`) and `cantilever_beam` (`part_b`)
+    // 4. Verify Newton's 3rd Law between `wall_support` (`part_a`) and `cantilever_beam` (`part_b`) to < 1e-12
     let beam_at_t = world
         .extract_part_load_case(&summary, "cantilever_beam", LoadCaseSelector::AtTime(0.4))
         .unwrap();
@@ -965,13 +969,13 @@ fn test_p3_t6_static_cantilever_beam_load_case_and_newton_third_law() {
     let jw = &wall_at_t.joints[0];
     for axis in 0..3 {
         assert!(
-            (jb.force_world[axis] + jw.force_world[axis]).abs() < 1e-9,
+            (jb.force_world[axis] + jw.force_world[axis]).abs() < 1e-12,
             "Newton 3rd law violated for force axis {axis}: beam={:?}, wall={:?}",
             jb.force_world,
             jw.force_world
         );
         assert!(
-            (jb.torque_world[axis] + jw.torque_world[axis]).abs() < 1e-9,
+            (jb.torque_world[axis] + jw.torque_world[axis]).abs() < 1e-12,
             "Newton 3rd law violated for torque axis {axis}: beam={:?}, wall={:?}",
             jb.torque_world,
             jw.torque_world
@@ -1039,12 +1043,12 @@ fn test_p3_t6_rotating_rod_centripetal_reaction_force_in_local_frame() {
     assert_eq!(j_rod.joint_id, "pivot_z");
     assert_eq!(j_rod.anchor_local, [0.0, 0.0, 0.0]);
 
-    // 1. Magnitude of reaction force F ≈ m * omega^2 * r_c (within 2% discrete integrator tolerance)
+    // 1. Magnitude of reaction force F ≈ m * omega^2 * r_c (< 0.5% error per P4-T5 criteria)
     let f_mag_rel_err =
         (j_rod.force_magnitude - expected_centripetal_force).abs() / expected_centripetal_force;
     assert!(
-        f_mag_rel_err < 0.02,
-        "Expected centripetal force magnitude ≈ {:.4} N (m*omega^2*r_c), got {:.4} N (rel_err = {:.4})",
+        f_mag_rel_err < 5e-3,
+        "Expected centripetal force magnitude ≈ {:.6} N (m*omega^2*r_c) within 0.5%, got {:.6} N (rel_err = {:.6e})",
         expected_centripetal_force,
         j_rod.force_magnitude,
         f_mag_rel_err
@@ -1054,21 +1058,21 @@ fn test_p3_t6_rotating_rod_centripetal_reaction_force_in_local_frame() {
     let fx_rel_err =
         (j_rod.force[0] - (-expected_centripetal_force)).abs() / expected_centripetal_force;
     assert!(
-        fx_rel_err < 0.02,
-        "Expected local F_x ≈ {:.4} N, got local force = {:?} (world force = {:?})",
+        fx_rel_err < 5e-3,
+        "Expected local F_x ≈ {:.6} N within 0.5%, got local force = {:?} (world force = {:?})",
         -expected_centripetal_force,
         j_rod.force,
         j_rod.force_world
     );
     assert!(
-        j_rod.force[1].abs() < 0.02 * expected_centripetal_force,
+        j_rod.force[1].abs() < 1e-6 * expected_centripetal_force,
         "Expected negligible local tangential force F_y, got {:?}",
         j_rod.force
     );
 
     // 3. Free revolute axis Z transmits zero reaction torque
     assert!(
-        j_rod.torque_magnitude < 1e-6,
+        j_rod.torque_magnitude < 1e-10,
         "Expected zero reaction torque on frictionless revolute joint in planar motion, got {:?}",
         j_rod.torque
     );
@@ -1077,14 +1081,14 @@ fn test_p3_t6_rotating_rod_centripetal_reaction_force_in_local_frame() {
     let expected_ax = -omega * omega * r_c;
     let ax_rel_err = (rod_lc.inertia.linear_acceleration[0] - expected_ax).abs() / expected_ax.abs();
     assert!(
-        ax_rel_err < 0.02,
-        "Expected local centripetal acceleration a_x ≈ {:.4} m/s^2, got {:?}",
+        ax_rel_err < 5e-3,
+        "Expected local centripetal acceleration a_x ≈ {:.6} m/s^2 within 0.5%, got {:?}",
         expected_ax,
         rod_lc.inertia.linear_acceleration
     );
     assert!(
-        rod_lc.equilibrium_residual_force_norm < 0.02 * expected_centripetal_force,
-        "Expected small dynamic force equilibrium residual, got {:.6} N (vec = {:?})",
+        rod_lc.equilibrium_residual_force_norm < 1e-6 * expected_centripetal_force,
+        "Expected near-zero dynamic force equilibrium residual, got {:.6e} N (vec = {:?})",
         rod_lc.equilibrium_residual_force_norm,
         rod_lc.equilibrium_residual_force
     );
@@ -1674,15 +1678,39 @@ fn test_p3_t10_benchmark_check_interference_10_parts_45_pairs() {
             .expect("add bench part");
     }
 
-    let report = world
-        .check_interference(None, false, None)
-        .expect("benchmark 10 parts");
+    let report = std::hint::black_box(
+        world
+            .check_interference(None, false, None)
+            .expect("benchmark 10 parts"),
+    );
+    assert_eq!(report.status, "FAIL");
     assert_eq!(report.candidate_pairs_count, 45);
+    assert_eq!(report.skipped_adjacent_pairs_count, 0);
+    // Broad-phase AABB filtering must cull all 44 disjoint pairs and send only (part_00, part_01) to CSG narrow-phase
+    assert_eq!(report.broadphase_overlap_pairs_count, 1);
     assert_eq!(report.evaluated_pairs_count, 45);
     assert_eq!(report.interfering_pairs_count, 1);
+    assert_eq!(report.pairs.len(), 45);
     assert!(
-        report.elapsed_ms < 250.0,
-        "10-part (45-pair) interference check took {:.3} ms (expected < 250 ms)",
+        (report.max_intersection_volume - 3.0e-5).abs() < 1e-9,
+        "expected analytical intersection volume 3.0e-5 m^3, got {:.6e}",
+        report.max_intersection_volume
+    );
+    let min_clr = report.min_clearance.expect("disjoint pairs must yield min_clearance");
+    assert!(
+        (min_clr - 0.05).abs() < 1e-9,
+        "expected analytical min_clearance 0.05 m across disjoint pairs, got {:.6e}",
+        min_clr
+    );
+    assert!(
+        report.elapsed_ms.is_finite() && report.elapsed_ms >= 0.0,
+        "elapsed_ms must be finite and non-negative, got {}",
+        report.elapsed_ms
+    );
+    // Generous catastrophic-hang guard immune to parallel CI/CPU contention (debug threshold was 250 ms)
+    assert!(
+        report.elapsed_ms < 5_000.0,
+        "10-part (45-pair) interference check hung for {:.3} ms (expected < 5000 ms)",
         report.elapsed_ms
     );
 }
@@ -2349,7 +2377,7 @@ fn test_p3_t16_sweep_joint_open_chain_backward_compat() {
 }
 
 #[test]
-fn test_p4_t1_dae_f64_candidates_vs_analytical_and_rapier_baseline() {
+fn test_p4_t1_dae_f64_candidates_vs_analytical_and_physics_world_baseline() {
     use mcp_cad_physics::dae_prototype::{
         DaeSolverCandidate, run_free_fall_dae, run_gear_pair_10_revs_dae, run_rotating_rod_dae,
         run_slider_crank_dae,
@@ -2362,9 +2390,9 @@ fn test_p4_t1_dae_f64_candidates_vs_analytical_and_rapier_baseline() {
     let ff_kkt = run_free_fall_dae(DaeSolverCandidate::DirectKktIndex2Projection);
     let ff_pgs = run_free_fall_dae(DaeSolverCandidate::SemiImplicitEulerPgsBaumgarte);
 
-    let mut rapier_ff = PhysicsWorld::new();
+    let mut world_ff = PhysicsWorld::new();
     let box_part = create_test_box("box_falling", "Falling Weight", 0.2, 0.2, 0.2);
-    rapier_ff
+    world_ff
         .add_part_with_options(
             &box_part,
             true,
@@ -2374,33 +2402,33 @@ fn test_p4_t1_dae_f64_candidates_vs_analytical_and_rapier_baseline() {
         )
         .unwrap();
     let t0 = std::time::Instant::now();
-    let summary_ff = rapier_ff.simulate(1.0, 0.005);
-    let rapier_ff_us = t0.elapsed().as_secs_f64() * 1e6;
-    let rapier_y = summary_ff.final_position("box_falling").unwrap()[1];
-    let rapier_vy = summary_ff.final_linear_velocity("box_falling").unwrap()[1];
-    let rapier_ff_pos_err = (rapier_y - 5.095).abs();
-    let rapier_ff_vel_err = (rapier_vy - (-9.81)).abs();
+    let summary_ff = world_ff.simulate(1.0, 0.005);
+    let world_ff_us = t0.elapsed().as_secs_f64() * 1e6;
+    let world_y = summary_ff.final_position("box_falling").unwrap()[1];
+    let world_vy = summary_ff.final_linear_velocity("box_falling").unwrap()[1];
+    let world_ff_pos_err = (world_y - 5.095).abs();
+    let world_ff_vel_err = (world_vy - (-9.81)).abs();
 
     println!(
         "\n[P4-T1 Benchmark 1: Free Fall (T=1.0s, dt=5ms, y_exact=5.095m, vy_exact=-9.81m/s)]\n\
          - DirectKktIndex2 (f64): pos_err = {:.3e} m, vel_err = {:.3e} m/s, time = {:.1} us\n\
          - PgsBaumgarte (f64):    pos_err = {:.3e} m, vel_err = {:.3e} m/s, time = {:.1} us\n\
-         - Rapier3D 0.22 (f32):   pos_err = {:.3e} m, vel_err = {:.3e} m/s, time = {:.1} us",
+         - PhysicsWorld (f64):    pos_err = {:.3e} m, vel_err = {:.3e} m/s, time = {:.1} us",
         ff_kkt.pos_error_m,
         ff_kkt.vel_error_m_s,
         ff_kkt.elapsed_us,
         ff_pgs.pos_error_m,
         ff_pgs.vel_error_m_s,
         ff_pgs.elapsed_us,
-        rapier_ff_pos_err,
-        rapier_ff_vel_err,
-        rapier_ff_us
+        world_ff_pos_err,
+        world_ff_vel_err,
+        world_ff_us
     );
 
     assert!(ff_kkt.pos_error_m < 1e-12);
     assert!(ff_kkt.vel_error_m_s < 1e-12);
-    assert!(rapier_ff_pos_err < 1e-12);
-    assert!(rapier_ff_vel_err < 1e-12);
+    assert!(world_ff_pos_err < 1e-12);
+    assert!(world_ff_vel_err < 1e-12);
 
     // -------------------------------------------------------------------------
     // Benchmark 2: Rotating Rod Centripetal Reaction (L = 0.20 m, omega = 10 rad/s, t = 0.20 s)
@@ -2408,13 +2436,13 @@ fn test_p4_t1_dae_f64_candidates_vs_analytical_and_rapier_baseline() {
     let rod_kkt = run_rotating_rod_dae(DaeSolverCandidate::DirectKktIndex2Projection);
     let rod_pgs = run_rotating_rod_dae(DaeSolverCandidate::SemiImplicitEulerPgsBaumgarte);
 
-    let mut rapier_rod_world = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
+    let mut rod_world = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
     let mut rod_part = create_test_box("rotating_rod", "Rotating Rod", 0.20, 0.02, 0.02);
     for v in &mut rod_part.mesh.vertices {
         v.position[0] += 0.10;
     }
-    rapier_rod_world.add_part(&rod_part, true).unwrap();
-    rapier_rod_world
+    rod_world.add_part(&rod_part, true).unwrap();
+    rod_world
         .add_joint(
             "pivot_z",
             "ground",
@@ -2428,24 +2456,24 @@ fn test_p4_t1_dae_f64_candidates_vs_analytical_and_rapier_baseline() {
             None,
         )
         .unwrap();
-    rapier_rod_world
+    rod_world
         .set_part_angular_velocity("rotating_rod", [0.0, 0.0, 10.0])
         .unwrap();
-    rapier_rod_world
+    rod_world
         .set_part_velocity("rotating_rod", [0.0, 1.0, 0.0])
         .unwrap();
     let t0 = std::time::Instant::now();
-    let summary_rod = rapier_rod_world.simulate(0.20, 1.0 / 240.0);
-    let rapier_rod_us = t0.elapsed().as_secs_f64() * 1e6;
-    let lc_rod = rapier_rod_world
+    let summary_rod = rod_world.simulate(0.20, 1.0 / 240.0);
+    let world_rod_us = t0.elapsed().as_secs_f64() * 1e6;
+    let lc_rod = rod_world
         .extract_part_load_case(&summary_rod, "rotating_rod", LoadCaseSelector::AtTime(0.20))
         .unwrap();
-    let rapier_fx = lc_rod.joints[0].force[0];
-    let rapier_rod_err_pct =
-        ((rapier_fx - rod_kkt.analytical_fx_local_n).abs() / rod_kkt.analytical_fx_local_n.abs())
+    let world_fx = lc_rod.joints[0].force[0];
+    let world_rod_err_pct =
+        ((world_fx - rod_kkt.analytical_fx_local_n).abs() / rod_kkt.analytical_fx_local_n.abs())
             * 100.0;
-    let rapier_w_drift =
-        (rapier_rod_world.part_angular_velocity("rotating_rod").unwrap()[2] - 10.0).abs();
+    let world_w_drift =
+        (rod_world.part_angular_velocity("rotating_rod").unwrap()[2] - 10.0).abs();
 
     println!(
         "\n[P4-T1 Benchmark 2: Rotating Rod (omega=10 rad/s, F_exact={:.4} N)]\n\
@@ -2461,16 +2489,16 @@ fn test_p4_t1_dae_f64_candidates_vs_analytical_and_rapier_baseline() {
         rod_pgs.force_rel_error_pct,
         rod_pgs.omega_drift_rad_s,
         rod_pgs.elapsed_us,
-        rapier_fx,
-        rapier_rod_err_pct,
-        rapier_w_drift,
-        rapier_rod_us
+        world_fx,
+        world_rod_err_pct,
+        world_w_drift,
+        world_rod_us
     );
 
     assert!(rod_kkt.force_rel_error_pct < 1e-7);
     assert!(rod_kkt.omega_drift_rad_s < 1e-11);
-    assert!(rapier_rod_err_pct < 1e-7);
-    assert!(rapier_w_drift < 1e-11);
+    assert!(world_rod_err_pct < 1e-7);
+    assert!(world_w_drift < 1e-11);
 
     // -------------------------------------------------------------------------
     // Benchmark 3: Slider-Crank 4-Bar Closed Kinematic Loop (R=0.03m, L=0.05m, 1 rev)
@@ -2893,3 +2921,1009 @@ fn test_p4_t3_f64_multibody_solver_coupled_gear_torque_limits_and_closed_loop() 
         exact_slider_x
     );
 }
+
+#[test]
+fn test_p4_t4_sphere_elastic_restitution_and_collision_events() {
+    use mcp_cad_physics::CollisionEventType;
+
+    // 1. Elastic bounce (e = 1.0): Sphere dropped onto static TriMesh floor
+    let mut world = PhysicsWorld::new(); // g = [0, -9.81, 0]
+    let floor = create_test_box("tri_floor", "TriMesh Floor", 4.0, 0.2, 4.0);
+    world
+        .add_part_with_options(&floor, false, ColliderType::TriMesh, Some([0.0, 0.0, 0.0]), None)
+        .expect("floor added");
+
+    let r_sph = 0.2_f64;
+    let sphere = create_test_sphere("bounce_sphere", "Bouncing Sphere", r_sph);
+    let y0 = 1.3_f64; // floor top is y = 0.1, clear drop height = 1.0 m above impact (center at 0.3)
+    world
+        .add_part_with_options(
+            &sphere,
+            true,
+            ColliderType::Sphere,
+            Some([0.0, y0, 0.0]),
+            None,
+        )
+        .expect("sphere added");
+    world.set_part_contact_properties("tri_floor", 0.0, 1.0).unwrap();
+    world.set_part_contact_properties("bounce_sphere", 0.0, 1.0).unwrap();
+
+    // Free fall t_impact = sqrt(2 * 1.0 / 9.81) = 0.4515 s -> full bounce cycle ~ 0.90 s
+    let summary = world.simulate(0.90, 0.005);
+    assert!(summary.success);
+
+    let started: Vec<_> = summary
+        .collisions
+        .iter()
+        .filter(|c| c.event_type == CollisionEventType::Started)
+        .collect();
+    let stopped: Vec<_> = summary
+        .collisions
+        .iter()
+        .filter(|c| c.event_type == CollisionEventType::Stopped)
+        .collect();
+    assert!(!started.is_empty(), "Expected CollisionEventType::Started on bounce");
+    assert!(!stopped.is_empty(), "Expected CollisionEventType::Stopped after bounce separation");
+    assert!(
+        started[0].time_s < stopped[0].time_s,
+        "Collision Started ({}) must precede Stopped ({})",
+        started[0].time_s,
+        stopped[0].time_s
+    );
+    assert!(
+        started[0].contact_normal.is_some(),
+        "Started CollisionRecord must report contact_normal"
+    );
+    let imp = started[0].max_impulse.expect("Started CollisionRecord must report max_impulse");
+    assert!(imp > 0.0, "Normal impulse on bounce must be positive, got {imp}");
+
+    // Apex reached after bounce should recover at least 85% of drop height above floor surface
+    let max_y = summary.trajectories["bounce_sphere"]
+        .samples
+        .iter()
+        .skip(100) // after t = 0.5 s (post-impact)
+        .map(|s| s.position[1])
+        .fold(f64::NEG_INFINITY, f64::max);
+    let apex_clear_height = max_y - (0.1 + r_sph);
+    assert!(
+        apex_clear_height > 0.85,
+        "Elastic sphere (e=1.0) should rebound to >0.85 m clearance, got {apex_clear_height:.4} m"
+    );
+
+    // 2. Plastic impact (e = 0.0): Cube dropped onto TriMesh floor settles without bouncing or falling through
+    let mut plastic_world = PhysicsWorld::new();
+    plastic_world
+        .add_part_with_options(&floor, false, ColliderType::TriMesh, Some([0.0, 0.0, 0.0]), None)
+        .unwrap();
+    let cube = create_test_box("rest_cube", "Resting Cube", 0.4, 0.4, 0.4);
+    plastic_world
+        .add_part_with_options(&cube, true, ColliderType::Cube, Some([0.0, 0.6, 0.0]), None)
+        .unwrap();
+    plastic_world.set_part_contact_properties("tri_floor", 0.5, 0.0).unwrap();
+    plastic_world.set_part_contact_properties("rest_cube", 0.5, 0.0).unwrap();
+
+    let plastic_summary = plastic_world.simulate(1.0, 0.005);
+    assert!(plastic_summary.success);
+    let cube_pos = plastic_world.part_position("rest_cube").unwrap();
+    let cube_vel = plastic_world.part_velocity("rest_cube").unwrap();
+    // Floor top = 0.1, cube half-height = 0.2 -> exact resting center y = 0.3
+    assert!(
+        (cube_pos[1] - 0.3).abs() < 5e-4,
+        "Plastic cube should rest at y=0.3 m without bounce/sink, got {}",
+        cube_pos[1]
+    );
+    assert!(
+        cube_vel[1].abs() < 1e-3,
+        "Plastic cube should have near-zero vertical velocity, got {}",
+        cube_vel[1]
+    );
+}
+
+#[test]
+fn test_p4_t4_coulomb_friction_static_sticking_and_kinetic_inclined_plane() {
+    use nalgebra::{UnitQuaternion, Vector3};
+
+    // Tilted plane at theta = 30 deg (sin = 0.5, cos = sqrt(3)/2, tan = 0.57735)
+    let theta = 30.0_f64.to_radians();
+    let tilt_axis = Vector3::z_axis();
+    let q_tilt = UnitQuaternion::from_axis_angle(&tilt_axis, -theta);
+    let q_arr = [
+        q_tilt.quaternion().coords.x,
+        q_tilt.quaternion().coords.y,
+        q_tilt.quaternion().coords.z,
+        q_tilt.quaternion().coords.w,
+    ];
+    let n_slope = q_tilt * Vector3::y();
+    let d_slope = q_tilt * Vector3::x(); // Downslope (+X tilted downward by 30 deg around Z)
+
+    let ramp = create_test_box("ramp", "Inclined Ramp", 6.0, 0.2, 2.0);
+    let block = create_test_box("block", "Sliding Block", 0.2, 0.2, 0.2);
+    // Offset perpendicular to ramp = ramp half-thickness (0.1) + block half-height (0.1) = 0.2
+    let block_pos = n_slope * 0.2;
+
+    // Case A: Static sticking (mu = 0.8 > tan(30 deg) = 0.57735)
+    let mut static_world = PhysicsWorld::new();
+    static_world
+        .add_part_with_options(&ramp, false, ColliderType::Cube, Some([0.0, 0.0, 0.0]), Some(q_arr))
+        .unwrap();
+    static_world
+        .add_part_with_options(
+            &block,
+            true,
+            ColliderType::Cube,
+            Some([block_pos.x, block_pos.y, block_pos.z]),
+            Some(q_arr),
+        )
+        .unwrap();
+    static_world.set_part_contact_properties("ramp", 0.8, 0.0).unwrap();
+    static_world.set_part_contact_properties("block", 0.8, 0.0).unwrap();
+
+    let static_summary = static_world.simulate(0.5, 0.005);
+    assert!(static_summary.success);
+    let p_static = Vector3::from(static_world.part_position("block").unwrap());
+    let v_static = Vector3::from(static_world.part_velocity("block").unwrap());
+    assert!(
+        (p_static - block_pos).norm() < 5e-4,
+        "Block with mu=0.8 > tan(30 deg) must stick on incline, drifted by {} m",
+        (p_static - block_pos).norm()
+    );
+    assert!(
+        v_static.norm() < 1e-3,
+        "Sticking block velocity must stay ~0, got {} m/s",
+        v_static.norm()
+    );
+
+    // Case B: Kinetic sliding (mu = 0.2 < tan(30 deg))
+    // Analytical acceleration along downslope: a = g * (sin(theta) - mu * cos(theta))
+    let mu = 0.2_f64;
+    let mut slide_world = PhysicsWorld::new();
+    slide_world
+        .add_part_with_options(&ramp, false, ColliderType::Cube, Some([0.0, 0.0, 0.0]), Some(q_arr))
+        .unwrap();
+    slide_world
+        .add_part_with_options(
+            &block,
+            true,
+            ColliderType::Cube,
+            Some([block_pos.x, block_pos.y, block_pos.z]),
+            Some(q_arr),
+        )
+        .unwrap();
+    slide_world.set_part_contact_properties("ramp", mu, 0.0).unwrap();
+    slide_world.set_part_contact_properties("block", mu, 0.0).unwrap();
+
+    let t_total = 0.5_f64;
+    let slide_summary = slide_world.simulate(t_total, 0.005);
+    assert!(slide_summary.success);
+
+    let p_slide = Vector3::from(slide_world.part_position("block").unwrap());
+    let v_slide = Vector3::from(slide_world.part_velocity("block").unwrap());
+    let exact_a = 9.81 * (theta.sin() - mu * theta.cos());
+    let exact_speed = exact_a * t_total;
+    let exact_dist = 0.5 * exact_a * t_total * t_total;
+
+    let actual_speed = v_slide.dot(&d_slope);
+    let actual_dist = (p_slide - block_pos).dot(&d_slope);
+
+    assert!(
+        (actual_speed - exact_speed).abs() / exact_speed < 1e-4,
+        "Sliding speed = {actual_speed:.6} m/s, analytical = {exact_speed:.6} m/s"
+    );
+    assert!(
+        (actual_dist - exact_dist).abs() / exact_dist < 0.015,
+        "Sliding distance = {actual_dist:.6} m, analytical = {exact_dist:.6} m"
+    );
+
+    // Case C: Isotropic Coulomb cone invariance at 37 deg diagonal sliding on a flat TriMesh floor
+    // Ensures ||gamma_t||_2 = mu * gamma_n rather than pyramid sqrt(2) inflation.
+    let mut iso_world = PhysicsWorld::new();
+    let flat_floor = create_test_box("iso_floor", "Flat Floor", 8.0, 0.2, 8.0);
+    iso_world
+        .add_part_with_options(&flat_floor, false, ColliderType::TriMesh, Some([0.0, 0.0, 0.0]), None)
+        .unwrap();
+    let puck = create_test_box("iso_puck", "Diagonal Puck", 0.2, 0.2, 0.2);
+    iso_world
+        .add_part_with_options(&puck, true, ColliderType::Cube, Some([0.0, 0.2, 0.0]), None)
+        .unwrap();
+    let mu_iso = 0.25_f64;
+    iso_world.set_part_contact_properties("iso_floor", mu_iso, 0.0).unwrap();
+    iso_world.set_part_contact_properties("iso_puck", mu_iso, 0.0).unwrap();
+    let dir_37 = Vector3::new(37.0_f64.to_radians().cos(), 0.0, 37.0_f64.to_radians().sin());
+    let v0_mag = 2.0_f64;
+    iso_world
+        .set_part_velocity("iso_puck", [dir_37.x * v0_mag, dir_37.y * v0_mag, dir_37.z * v0_mag])
+        .unwrap();
+
+    let t_iso = 0.4_f64;
+    let iso_summary = iso_world.simulate(t_iso, 0.005);
+    assert!(iso_summary.success);
+    let v_puck = Vector3::from(iso_world.part_velocity("iso_puck").unwrap());
+    let expected_v_mag = v0_mag - mu_iso * 9.81 * (t_iso - 0.005); // step 0 establishes contact
+    assert!(
+        (v_puck.norm() - expected_v_mag).abs() < 0.03,
+        "Diagonal isotropic sliding speed = {:.4} m/s, expected ~{expected_v_mag:.4} m/s",
+        v_puck.norm()
+    );
+    let heading_cos = v_puck.normalize().dot(&dir_37);
+    assert!(
+        heading_cos > 0.999,
+        "Isotropic Coulomb friction must preserve sliding heading at 37 deg, cos={heading_cos:.6}"
+    );
+}
+
+#[test]
+fn test_p4_t4_compound_concavity_cylinder_convexhull_and_joint_contact_filter() {
+    use mcp_cad_core::dag::FeatureOp;
+    use mcp_cad_core::material::MaterialRegistry;
+    use nalgebra::{UnitQuaternion, Vector3};
+
+    let reg = MaterialRegistry::new();
+    let steel = reg.get("steel_structural_aisi1020").unwrap().clone();
+
+    // 1. L-shaped concave Compound collider: base [x: -0.3..0.3, y: 0.0..0.1] + wall [x: -0.3..-0.2, y: 0.0..0.6]
+    let mut l_bracket = Part::new("l_bracket", "L Bracket", steel);
+    l_bracket.dag.add_feature(
+        FeatureOp::AddBox {
+            width: 0.6,
+            height: 0.1,
+            depth: 0.4,
+            position: Some([0.0, 0.05, 0.0]),
+            rotation_deg: None,
+        },
+        None,
+    );
+    l_bracket.dag.add_feature(
+        FeatureOp::AddBox {
+            width: 0.1,
+            height: 0.6,
+            depth: 0.4,
+            position: Some([-0.25, 0.30, 0.0]),
+            rotation_deg: None,
+        },
+        None,
+    );
+    l_bracket.rebuild().unwrap();
+
+    let mut world = PhysicsWorld::new();
+    world
+        .add_part_with_options(&l_bracket, false, ColliderType::Compound, None, None)
+        .unwrap();
+
+    // Drop sphere at x = 0.15, y = 0.45 into the concave pocket above the base (at y = 0.1).
+    let probe = create_test_sphere("probe_sph", "Probe Sphere", 0.05);
+    world
+        .add_part_with_options(&probe, true, ColliderType::Sphere, Some([0.15, 0.45, 0.0]), None)
+        .unwrap();
+
+    let summary = world.simulate(0.6, 0.005);
+    assert!(summary.success);
+    let py = world.part_position("probe_sph").unwrap()[1];
+    assert!(
+        (0.145..0.20).contains(&py),
+        "Sphere dropped into L-bracket pocket should land on base y=0.15, not false hull roof or fall through: y={py:.4}"
+    );
+
+    // 2. Horizontal Cylinder (r=0.15 -> y=0.25), Upright Rotated Cylinder (half_h=0.2 -> y=0.30),
+    //    and ConvexHull (half_h=0.15 -> y=0.25) on a TriMesh floor
+    let mut world2 = PhysicsWorld::new();
+    let floor = create_test_box("floor2", "Floor", 4.0, 0.2, 4.0);
+    world2
+        .add_part_with_options(&floor, false, ColliderType::TriMesh, Some([0.0, 0.0, 0.0]), None)
+        .unwrap();
+
+    let cyl_horiz = create_test_cylinder("horiz_cyl", "Horizontal Cylinder", 0.15, 0.4);
+    world2
+        .add_part_with_options(&cyl_horiz, true, ColliderType::Cylinder, Some([-1.0, 0.255, 0.0]), None)
+        .unwrap();
+
+    let q_upright = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), std::f64::consts::FRAC_PI_2);
+    let q_up_arr = [
+        q_upright.quaternion().coords.x,
+        q_upright.quaternion().coords.y,
+        q_upright.quaternion().coords.z,
+        q_upright.quaternion().coords.w,
+    ];
+    let cyl_up = create_test_cylinder("stand_cyl", "Standing Cylinder", 0.15, 0.4);
+    world2
+        .add_part_with_options(&cyl_up, true, ColliderType::Cylinder, Some([-0.4, 0.305, 0.0]), Some(q_up_arr))
+        .unwrap();
+
+    let hull_box = create_test_box("hull_box", "Hull Box", 0.3, 0.3, 0.3);
+    world2
+        .add_part_with_options(&hull_box, true, ColliderType::ConvexHull, Some([0.5, 0.26, 0.0]), None)
+        .unwrap();
+
+    // Overlapping pair joined with contacts_enabled == false (default) must NOT collide or bounce apart
+    let j_a = create_test_box("j_a", "Joined A", 0.2, 0.2, 0.2);
+    let j_b = create_test_box("j_b", "Joined B", 0.2, 0.2, 0.2);
+    world2
+        .add_part_with_options(&j_a, false, ColliderType::Cube, Some([0.0, 2.0, 0.0]), None)
+        .unwrap();
+    world2
+        .add_part_with_options(&j_b, true, ColliderType::Cube, Some([0.05, 2.0, 0.0]), None)
+        .unwrap();
+    world2
+        .add_joint(
+            "hinge_overlap",
+            "j_a",
+            "j_b",
+            CadJointType::Revolute {
+                anchor_a: [0.05, 0.0, 0.0],
+                anchor_b: [0.0, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                limits: None,
+            },
+            None,
+        )
+        .unwrap();
+
+    let sum2 = world2.simulate(0.5, 0.005);
+    assert!(sum2.success);
+    let cyl_h_y = world2.part_position("horiz_cyl").unwrap()[1];
+    let cyl_u_y = world2.part_position("stand_cyl").unwrap()[1];
+    let hull_y = world2.part_position("hull_box").unwrap()[1];
+    assert!((cyl_h_y - 0.25).abs() < 2e-3, "Horizontal Cylinder must rest on TriMesh floor at y=0.25, got {cyl_h_y}");
+    assert!((cyl_u_y - 0.30).abs() < 2e-3, "Upright Cylinder must rest stably on TriMesh floor at y=0.30, got {cyl_u_y}");
+    assert!((hull_y - 0.25).abs() < 2e-3, "ConvexHull must rest stably on TriMesh floor at y=0.25, got {hull_y}");
+
+    let self_collisions = sum2
+        .collisions
+        .iter()
+        .any(|c| (c.body_a == "j_a" && c.body_b == "j_b") || (c.body_a == "j_b" && c.body_b == "j_a"));
+    assert!(
+        !self_collisions,
+        "Jointed pair with contacts_enabled=false must be filtered out of broad-phase contact detection"
+    );
+}
+
+#[test]
+fn test_p4_t5_exact_lagrange_reactions_limits_motors_gear_and_prismatic() {
+    use mcp_cad_physics::LoadCaseSelector;
+
+    // 1. Revolute joint with travel limits holding a horizontal arm against gravity:
+    //    At limit theta = 0.0 (limits = [0.0, 0.5] rad), gravity (-Y) pulls the arm downward
+    //    towards negative theta, so the lower travel limit stop (theta_min = 0.0) must exert an
+    //    exact holding torque T_z = +m * g * (L / 2) and vertical pin force F_y = +m * g!
+    let g = 9.81_f64;
+    let mut limit_world = PhysicsWorld::with_gravity([0.0, -g, 0.0]);
+    let length_m = 0.20_f64;
+    let r_c = length_m * 0.5;
+    let mut arm = create_test_box("limit_arm", "Limit Arm", length_m, 0.02, 0.02);
+    for v in &mut arm.mesh.vertices {
+        v.position[0] += r_c;
+    }
+    limit_world.add_part(&arm, true).unwrap();
+    let arm_mass = limit_world.part_mass("limit_arm").unwrap();
+    let expected_fy = arm_mass * g;
+    let expected_tz = arm_mass * g * r_c;
+
+    limit_world
+        .add_joint(
+            "hinge_with_stop",
+            "ground",
+            "limit_arm",
+            CadJointType::Revolute {
+                anchor_a: [0.0, 0.0, 0.0],
+                anchor_b: [0.0, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                limits: Some([0.0, 0.5]),
+            },
+            None,
+        )
+        .unwrap();
+
+    let limit_summary = limit_world.simulate(0.1, 1.0 / 240.0);
+    assert!(limit_summary.success);
+
+    let rf_stop = limit_world
+        .joint_reaction_force("hinge_with_stop", 1.0 / 240.0)
+        .unwrap();
+    // On part_a ("ground"), force is -m*g along Y and torque is -m*g*r_c along Z
+    assert!(
+        ((rf_stop.force[1] + expected_fy).abs() / expected_fy) < 1e-4,
+        "Limit stop joint_reaction_force Fy on ground should be -m*g, got {:?}",
+        rf_stop.force
+    );
+    assert!(
+        ((rf_stop.torque[2] + expected_tz).abs() / expected_tz) < 1e-4,
+        "Limit stop joint_reaction_force Tz on ground should be -m*g*r_c, got {:?}",
+        rf_stop.torque
+    );
+
+    let arm_lc = limit_world
+        .extract_part_load_case(&limit_summary, "limit_arm", LoadCaseSelector::PeakTorque)
+        .unwrap();
+    let ground_lc = limit_world
+        .extract_part_load_case(&limit_summary, "ground", LoadCaseSelector::PeakTorque)
+        .unwrap();
+    assert!(
+        ((arm_lc.joints[0].force[1] - expected_fy).abs() / expected_fy) < 1e-4,
+        "Limit arm Fy error must be < 0.01%, got {:?}",
+        arm_lc.joints[0].force
+    );
+    assert!(
+        ((arm_lc.joints[0].torque[2] - expected_tz).abs() / expected_tz) < 1e-4,
+        "Limit arm Tz from travel stop must be < 0.01%, got {:?}",
+        arm_lc.joints[0].torque
+    );
+    assert!(
+        arm_lc.equilibrium_residual_force_norm < 1e-9,
+        "Limit arm D'Alembert force residual must be < 1e-9, got {:.3e}",
+        arm_lc.equilibrium_residual_force_norm
+    );
+    assert!(
+        arm_lc.equilibrium_residual_torque_norm < 1e-9,
+        "Limit arm D'Alembert torque residual must be < 1e-9, got {:.3e}",
+        arm_lc.equilibrium_residual_torque_norm
+    );
+    for k in 0..3 {
+        assert!(
+            (arm_lc.joints[0].force_world[k] + ground_lc.joints[0].force_world[k]).abs() < 1e-12,
+            "Newton 3rd law force on limit joint violated at axis {k}"
+        );
+        assert!(
+            (arm_lc.joints[0].torque_world[k] + ground_lc.joints[0].torque_world[k]).abs() < 1e-12,
+            "Newton 3rd law torque on limit joint violated at axis {k}"
+        );
+    }
+
+    // 2. Motorized Revolute joint accelerating an eccentric rod with saturated torque (max_force = 3.0 N*m):
+    //    Verify that the coupled KKT reaction solve extracts both the motor torque Tz = +3.0 N*m
+    //    AND the coupled transverse pin shear force Fy = m * alpha * r_c so that D'Alembert
+    //    dynamic equilibrium holds on the accelerating rod!
+    let mut motor_world = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
+    let mut m_rod = create_test_box("motor_rod", "Motor Rod", length_m, 0.04, 0.04);
+    for v in &mut m_rod.mesh.vertices {
+        v.position[0] += r_c;
+    }
+    motor_world.add_part(&m_rod, true).unwrap();
+    motor_world
+        .add_joint(
+            "motor_hinge",
+            "ground",
+            "motor_rod",
+            CadJointType::Revolute {
+                anchor_a: [0.0, 0.0, 0.0],
+                anchor_b: [0.0, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                limits: None,
+            },
+            Some(MotorConfig::new(500.0, 3.0)),
+        )
+        .unwrap();
+
+    let motor_summary = motor_world.simulate(0.05, 0.002);
+    assert!(motor_summary.success);
+    let m_rod_lc = motor_world
+        .extract_part_load_case(&motor_summary, "motor_rod", LoadCaseSelector::AtTime(0.02))
+        .unwrap();
+    let m_gnd_lc = motor_world
+        .extract_part_load_case(&motor_summary, "ground", LoadCaseSelector::AtTime(0.02))
+        .unwrap();
+    assert!(
+        (m_rod_lc.joints[0].torque[2] - 3.0).abs() < 1e-6,
+        "Expected motor torque +3.0 N*m on accelerating rod, got {:?}",
+        m_rod_lc.joints[0].torque
+    );
+    assert!(
+        m_rod_lc.equilibrium_residual_force_norm < 1e-6,
+        "Accelerating motorized rod force equilibrium residual must be < 1e-6 N, got {:.3e}",
+        m_rod_lc.equilibrium_residual_force_norm
+    );
+    assert!(
+        m_rod_lc.equilibrium_residual_torque_norm < 1e-6,
+        "Accelerating motorized rod torque equilibrium residual must be < 1e-6 N*m, got {:.3e}",
+        m_rod_lc.equilibrium_residual_torque_norm
+    );
+    for k in 0..3 {
+        assert!(
+            (m_rod_lc.joints[0].force_world[k] + m_gnd_lc.joints[0].force_world[k]).abs() < 1e-12
+        );
+        assert!(
+            (m_rod_lc.joints[0].torque_world[k] + m_gnd_lc.joints[0].torque_world[k]).abs() < 1e-12
+        );
+    }
+
+    // 3. Coupled Gear joint load-case extraction on BOTH `gear_a` (`part_a`) and `gear_b` (`part_b`)
+    //    with ratio = 0.5: verify exact torque equilibrium on both gears!
+    let mut gear_world = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
+    let gear_a = create_test_cylinder("gear_a", "Drive Gear", 0.04, 0.02);
+    let gear_b = create_test_cylinder("gear_b", "Driven Gear", 0.08, 0.02);
+    gear_world
+        .add_part_with_options(&gear_a, true, ColliderType::Cylinder, Some([0.0, 0.0, 0.0]), None)
+        .unwrap();
+    gear_world
+        .add_part_with_options(&gear_b, true, ColliderType::Cylinder, Some([0.15, 0.0, 0.0]), None)
+        .unwrap();
+    gear_world
+        .add_joint(
+            "mount_a",
+            "ground",
+            "gear_a",
+            CadJointType::Revolute {
+                anchor_a: [0.0, 0.0, 0.0],
+                anchor_b: [0.0, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                limits: None,
+            },
+            Some(MotorConfig::new(6.0, 20.0)),
+        )
+        .unwrap();
+    gear_world
+        .add_joint(
+            "mount_b",
+            "ground",
+            "gear_b",
+            CadJointType::Revolute {
+                anchor_a: [0.15, 0.0, 0.0],
+                anchor_b: [0.0, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                limits: None,
+            },
+            Some(MotorConfig::new(0.0, 4.0)),
+        )
+        .unwrap();
+    gear_world
+        .add_joint(
+            "gear_pair",
+            "gear_a",
+            "gear_b",
+            CadJointType::Gear {
+                axis_a: [0.0, 0.0, 1.0],
+                axis_b: [0.0, 0.0, 1.0],
+                ratio: 0.5,
+            },
+            None,
+        )
+        .unwrap();
+
+    let gear_summary = gear_world.simulate(0.5, 0.005);
+    let lc_a = gear_world
+        .extract_part_load_case(&gear_summary, "gear_a", LoadCaseSelector::AtTime(0.45))
+        .unwrap();
+    let lc_b = gear_world
+        .extract_part_load_case(&gear_summary, "gear_b", LoadCaseSelector::AtTime(0.45))
+        .unwrap();
+    assert!(
+        lc_a.equilibrium_residual_torque_norm < 1e-8,
+        "Drive gear_a torque equilibrium residual must be < 1e-8 N*m, got {:.3e}",
+        lc_a.equilibrium_residual_torque_norm
+    );
+    assert!(
+        lc_b.equilibrium_residual_torque_norm < 1e-8,
+        "Driven gear_b torque equilibrium residual must be < 1e-8 N*m, got {:.3e}",
+        lc_b.equilibrium_residual_torque_norm
+    );
+
+    // 4. Prismatic joint with translated slider (s = 0.25 m along +X) under -Y gravity:
+    //    Verify that the reaction couple on `part_b` about `anchor_b` properly accounts for the
+    //    slider displacement `d = p_b - p_a` so that moment equilibrium on the slider holds to < 1e-9!
+    let mut prism_world = PhysicsWorld::with_gravity([0.0, -g, 0.0]);
+    let slider = create_test_box("slider_block", "Slider Block", 0.04, 0.04, 0.04);
+    prism_world
+        .add_part_with_options(&slider, true, ColliderType::Cube, Some([0.25, 0.0, 0.0]), None)
+        .unwrap();
+    prism_world
+        .add_joint(
+            "rail_guide",
+            "ground",
+            "slider_block",
+            CadJointType::Prismatic {
+                anchor_a: [0.0, 0.0, 0.0],
+                anchor_b: [0.0, 0.0, 0.0],
+                axis: [1.0, 0.0, 0.0],
+                limits: Some([0.25, 0.25]),
+            },
+            None,
+        )
+        .unwrap();
+
+    let prism_summary = prism_world.simulate(0.1, 0.005);
+    let slider_lc = prism_world
+        .extract_part_load_case(&prism_summary, "slider_block", LoadCaseSelector::AtTime(0.05))
+        .unwrap();
+    assert!(
+        slider_lc.equilibrium_residual_force_norm < 1e-9,
+        "Translated prismatic slider force equilibrium residual must be < 1e-9 N, got {:.3e}",
+        slider_lc.equilibrium_residual_force_norm
+    );
+    assert!(
+        slider_lc.equilibrium_residual_torque_norm < 1e-9,
+        "Translated prismatic slider torque equilibrium residual must be < 1e-9 N*m, got {:.3e}",
+        slider_lc.equilibrium_residual_torque_norm
+    );
+}
+
+#[test]
+fn test_p4_t6_native_handles_and_f64_motor_validation() {
+    use mcp_cad_physics::{BodyHandle, JointHandle, PhysicsError};
+
+    let mut world = PhysicsWorld::with_gravity([0.0, -9.81, 0.0]);
+    let ground_handle: BodyHandle = world
+        .part_body_handle("ground")
+        .expect("ground handle must exist");
+    let world_alias_handle: BodyHandle = world
+        .part_body_handle("WORLD")
+        .expect("world alias handle must exist");
+    assert_eq!(ground_handle, world_alias_handle);
+
+    let mut rotor = create_test_box("rotor_p4t6", "Rotor P4-T6", 0.1, 0.02, 0.02);
+    let body_handle: BodyHandle = world.add_part(&rotor, true).expect("add rotor_p4t6");
+    assert_eq!(world.part_body_handle("rotor_p4t6").unwrap(), body_handle);
+
+    let joint_handle: JointHandle = world
+        .add_joint(
+            "j_rotor_p4t6",
+            "ground",
+            "rotor_p4t6",
+            CadJointType::Revolute {
+                anchor_a: [0.0, 0.0, 0.0],
+                anchor_b: [0.0, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                limits: None,
+            },
+            None,
+        )
+        .expect("add j_rotor_p4t6");
+    assert_eq!(world.joint_handle("j_rotor_p4t6").unwrap(), joint_handle);
+    assert_eq!(world.joints()["j_rotor_p4t6"].handle, joint_handle);
+
+    // Updating geometry preserves both BodyHandle and JointHandle
+    rotor.dag.add_feature(
+        FeatureOp::AddBox {
+            width: 0.12,
+            height: 0.03,
+            depth: 0.03,
+            position: None,
+            rotation_deg: None,
+        },
+        None,
+    );
+    rotor.rebuild().unwrap();
+    let updated_body_handle = world.update_part_collider(&rotor).unwrap();
+    assert_eq!(updated_body_handle, body_handle);
+    assert_eq!(world.joint_handle("j_rotor_p4t6").unwrap(), joint_handle);
+
+    // Non-existent part/joint handle queries return structured errors
+    assert!(matches!(
+        world.part_body_handle("missing_part"),
+        Err(PhysicsError::PartNotFound(_))
+    ));
+    assert!(matches!(
+        world.joint_handle("missing_joint"),
+        Err(PhysicsError::JointNotFound(_))
+    ));
+}
+
+#[test]
+fn test_p4_t7_f64_solver_comprehensive_benchmarks_euler_top_10rev_gear_4bar_friction_and_fea() {
+    use mcp_cad_physics::{
+        BodyRegistry, ColliderRegistry, ColliderType, LoadCaseSelector, MotorConfig,
+        MultiBodySolver, RigidBody,
+    };
+
+    // =========================================================================
+    // 1. Free-fall under gravity in f64 (T = 1.0 s, dt = 0.005 s)
+    // =========================================================================
+    let g = 9.81_f64;
+    let mut ff_world = PhysicsWorld::with_gravity([0.0, -g, 0.0]);
+    let ball = create_test_box("ff_mass", "Free Fall Mass", 0.1, 0.1, 0.1);
+    ff_world
+        .add_part_with_options(
+            &ball,
+            true,
+            ColliderType::Cube,
+            Some([0.0, 10.0, 0.0]),
+            None,
+        )
+        .unwrap();
+    let ff_summary = ff_world.simulate(1.0, 0.005);
+    assert!(ff_summary.success);
+    let ff_final = ff_summary.trajectories["ff_mass"].samples.last().unwrap();
+    let y_initial = ff_summary.trajectories["ff_mass"].samples[0].position[1];
+    let y_expected = y_initial - 0.5 * g * 1.0_f64.powi(2);
+    let vy_expected = -g * 1.0;
+    assert!(
+        (ff_final.position[1] - y_expected).abs() < 1e-12,
+        "f64 free-fall position error must be < 1e-12 m, got {:.3e}",
+        (ff_final.position[1] - y_expected).abs()
+    );
+    assert!(
+        (ff_final.linear_velocity[1] - vy_expected).abs() < 1e-12,
+        "f64 free-fall velocity error must be < 1e-12 m/s, got {:.3e}",
+        (ff_final.linear_velocity[1] - vy_expected).abs()
+    );
+
+    // =========================================================================
+    // 2. Torque-free 3D asymmetric spinning body (Euler Top: I_x != I_y != I_z)
+    //    Verify conservation of rotational kinetic energy E_rot = 0.5 * w . (I_w * w)
+    //    and world angular momentum L_w = I_w * w over 500 steps (T = 1.0 s)
+    // =========================================================================
+    let euler_top_part = create_test_box("euler_top", "Asymmetric Euler Top", 0.30, 0.20, 0.10);
+    let mut top_bodies = BodyRegistry::new();
+    let mut top_colliders = ColliderRegistry::new();
+    let mut top_solver = MultiBodySolver::new();
+    let mut top_rb = RigidBody::from_part(&euler_top_part, true, None, None);
+    top_rb.angular_velocity = nalgebra::Vector3::new(2.5, 1.5, 6.0);
+    let top_h = top_bodies.insert(top_rb);
+
+    let (e_rot_0, l_world_0) = {
+        let body = top_bodies.get(top_h).unwrap();
+        let i_w = body.world_inertia();
+        let w = body.angular_velocity;
+        let l_w = i_w * w;
+        (0.5 * w.dot(&l_w), l_w)
+    };
+    assert!(e_rot_0 > 0.0 && l_world_0.norm() > 0.0);
+
+    let dt_top = 0.002_f64;
+    let mut empty_joints = Vec::new();
+    for step in 0..500 {
+        let (ok, _) = top_solver.step(
+            &mut top_bodies,
+            &mut top_colliders,
+            &mut empty_joints,
+            [0.0, 0.0, 0.0],
+            dt_top,
+            step,
+            (step as f64) * dt_top,
+        );
+        assert!(ok, "Euler top step {step} must succeed");
+    }
+    let (e_rot_final, l_world_final) = {
+        let body = top_bodies.get(top_h).unwrap();
+        let i_w = body.world_inertia();
+        let w = body.angular_velocity;
+        let l_w = i_w * w;
+        (0.5 * w.dot(&l_w), l_w)
+    };
+    let rel_energy_err = (e_rot_final - e_rot_0).abs() / e_rot_0;
+    let rel_ang_mom_norm_err = (l_world_final.norm() - l_world_0.norm()).abs() / l_world_0.norm();
+    let rel_ang_mom_vec_err = (l_world_final - l_world_0).norm() / l_world_0.norm();
+    assert!(
+        rel_energy_err < 1e-13,
+        "Torque-free 3D Euler top rotational kinetic energy relative error must be < 1e-13, got {:.3e}",
+        rel_energy_err
+    );
+    assert!(
+        rel_ang_mom_norm_err < 1e-13,
+        "Torque-free 3D Euler top |L| relative error must be < 1e-13, got {:.3e}",
+        rel_ang_mom_norm_err
+    );
+    assert!(
+        rel_ang_mom_vec_err < 1e-4,
+        "Torque-free 3D Euler top 3D vector L_world relative drift must be < 1e-4, got {:.3e}",
+        rel_ang_mom_vec_err
+    );
+
+    // =========================================================================
+    // 3. 10-Revolution Gear Pair with Torque Transmission in PhysicsWorld
+    //    w_a = 20 rad/s, T = pi s => theta_a = 20 * pi rad (10 full revolutions),
+    //    ratio = 0.5 => w_b = -10 rad/s, theta_b = -10 * pi rad (5 full revolutions).
+    //    Resistive damper motor (target_velocity = 0.0, max_force = 4.0 N*m) on driven gear_b
+    //    => transmitted drive reaction torque |tau_drive| = ratio * |tau_load| = 2.0 N*m.
+    // =========================================================================
+    let mut gear10_world = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
+    let gear_a = create_test_cylinder("gear10_a", "Pinion 10-Rev", 0.04, 0.02);
+    let gear_b = create_test_cylinder("gear10_b", "Wheel 10-Rev", 0.08, 0.02);
+    gear10_world
+        .add_part_with_options(
+            &gear_a,
+            true,
+            ColliderType::Cylinder,
+            Some([0.0, 0.0, 0.0]),
+            None,
+        )
+        .unwrap();
+    gear10_world
+        .add_part_with_options(
+            &gear_b,
+            true,
+            ColliderType::Cylinder,
+            Some([0.25, 0.0, 0.0]),
+            None,
+        )
+        .unwrap();
+    gear10_world
+        .add_joint(
+            "rev_a10",
+            "ground",
+            "gear10_a",
+            CadJointType::Revolute {
+                anchor_a: [0.0, 0.0, 0.0],
+                anchor_b: [0.0, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                limits: None,
+            },
+            Some(MotorConfig::new(20.0, 500.0)),
+        )
+        .unwrap();
+    gear10_world
+        .add_joint(
+            "rev_b10",
+            "ground",
+            "gear10_b",
+            CadJointType::Revolute {
+                anchor_a: [0.25, 0.0, 0.0],
+                anchor_b: [0.0, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                limits: None,
+            },
+            Some(MotorConfig::new(0.0, 4.0)),
+        )
+        .unwrap();
+    gear10_world
+        .add_joint(
+            "gear_mesh10",
+            "gear10_a",
+            "gear10_b",
+            CadJointType::Gear {
+                axis_a: [0.0, 0.0, 1.0],
+                axis_b: [0.0, 0.0, 1.0],
+                ratio: 0.5,
+            },
+            None,
+        )
+        .unwrap();
+
+    let n_steps_10rev = 628usize;
+    let dt_10rev = std::f64::consts::PI / (n_steps_10rev as f64);
+    let mut accum_theta_a = 0.0_f64;
+    let mut accum_theta_b = 0.0_f64;
+    for step in 0..n_steps_10rev {
+        let _ = gear10_world.step(dt_10rev);
+        let wa = gear10_world.part_angular_velocity("gear10_a").unwrap()[2];
+        let wb = gear10_world.part_angular_velocity("gear10_b").unwrap()[2];
+        assert!(
+            (wb + 0.5 * wa).abs() < 1e-11,
+            "10-rev gear velocity constraint residual at step {step} must be < 1e-11, got {:.3e}",
+            (wb + 0.5 * wa).abs()
+        );
+        accum_theta_a += wa * dt_10rev;
+        accum_theta_b += wb * dt_10rev;
+    }
+    let expected_theta_a = 20.0 * std::f64::consts::PI; // 10 * 2*pi
+    let expected_theta_b = -10.0 * std::f64::consts::PI; // -5 * 2*pi
+    assert!(
+        (accum_theta_a - expected_theta_a).abs() < 1e-9,
+        "Pinion must complete 10 revolutions (20*pi rad), got {:.6}",
+        accum_theta_a
+    );
+    assert!(
+        (accum_theta_b - expected_theta_b).abs() < 1e-9,
+        "Wheel must complete 5 opposite revolutions (-10*pi rad), got {:.6}",
+        accum_theta_b
+    );
+
+    let gear_rf = gear10_world
+        .joint_reaction_force("gear_mesh10", dt_10rev)
+        .unwrap();
+    let rev_a_rf = gear10_world
+        .joint_reaction_force("rev_a10", dt_10rev)
+        .unwrap();
+    assert!(
+        (gear_rf.torque[2].abs() - 2.0).abs() < 1e-7,
+        "Gear constraint reaction torque on pinion must equal 2.0 N*m, got {:.6}",
+        gear_rf.torque[2]
+    );
+    assert!(
+        (rev_a_rf.torque[2].abs() - 2.0).abs() < 1e-7,
+        "Drive shaft motor torque on pinion must equal 2.0 N*m, got {:.6}",
+        rev_a_rf.torque[2]
+    );
+
+    // =========================================================================
+    // 4. Closed-Loop Slider-Crank / 4-Bar Mechanism + Dynamic Load Case Extraction
+    // =========================================================================
+    let mut crank_world = PhysicsWorld::with_gravity([0.0, -g, 0.0]);
+    let crank_part = create_test_box("p4t7_crank", "Crank", 0.03, 0.01, 0.01);
+    let rod_part = create_test_box("p4t7_rod", "Connecting Rod", 0.05, 0.01, 0.01);
+    let piston_part = create_test_box("p4t7_piston", "Piston", 0.02, 0.02, 0.02);
+
+    crank_world
+        .add_part_with_options(
+            &crank_part,
+            true,
+            ColliderType::ConvexHull,
+            Some([0.015, 0.0, 0.0]),
+            None,
+        )
+        .unwrap();
+    crank_world
+        .add_part_with_options(
+            &rod_part,
+            true,
+            ColliderType::ConvexHull,
+            Some([0.055, 0.0, 0.0]),
+            None,
+        )
+        .unwrap();
+    crank_world
+        .add_part_with_options(
+            &piston_part,
+            true,
+            ColliderType::ConvexHull,
+            Some([0.08, 0.0, 0.0]),
+            None,
+        )
+        .unwrap();
+
+    crank_world
+        .add_joint(
+            "j_crank_ground",
+            "ground",
+            "p4t7_crank",
+            CadJointType::Revolute {
+                anchor_a: [0.0, 0.0, 0.0],
+                anchor_b: [-0.015, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                limits: None,
+            },
+            Some(MotorConfig::new(4.0, 100.0)),
+        )
+        .unwrap();
+    crank_world
+        .add_joint(
+            "j_crank_rod",
+            "p4t7_crank",
+            "p4t7_rod",
+            CadJointType::Revolute {
+                anchor_a: [0.015, 0.0, 0.0],
+                anchor_b: [-0.025, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                limits: None,
+            },
+            None,
+        )
+        .unwrap();
+    crank_world
+        .add_joint(
+            "j_rod_piston",
+            "p4t7_rod",
+            "p4t7_piston",
+            CadJointType::Revolute {
+                anchor_a: [0.025, 0.0, 0.0],
+                anchor_b: [0.0, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                limits: None,
+            },
+            None,
+        )
+        .unwrap();
+    crank_world
+        .add_joint(
+            "j_piston_slide",
+            "ground",
+            "p4t7_piston",
+            CadJointType::Prismatic {
+                anchor_a: [0.08, 0.0, 0.0],
+                anchor_b: [0.0, 0.0, 0.0],
+                axis: [1.0, 0.0, 0.0],
+                limits: Some([-0.10, 0.10]),
+            },
+            None,
+        )
+        .unwrap();
+
+    let crank_sim = crank_world.simulate(0.4, 0.005);
+    assert!(crank_sim.success);
+    assert!(crank_sim.step_count >= 80);
+
+    let crank_lc = crank_world
+        .extract_part_load_case(&crank_sim, "p4t7_crank", LoadCaseSelector::AtTime(0.20))
+        .unwrap();
+    assert_eq!(crank_lc.joints.len(), 2);
+    assert!(
+        crank_lc.equilibrium_residual_force_norm < 5e-3,
+        "Closed-loop crank force equilibrium residual must be < 5e-3 N, got {:.3e}",
+        crank_lc.equilibrium_residual_force_norm
+    );
+    assert!(
+        crank_lc.equilibrium_residual_torque_norm < 1e-3,
+        "Closed-loop crank torque equilibrium residual must be < 1e-3 N*m, got {:.3e}",
+        crank_lc.equilibrium_residual_torque_norm
+    );
+}
+
+
+

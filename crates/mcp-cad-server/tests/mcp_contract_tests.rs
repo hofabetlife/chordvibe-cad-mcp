@@ -5186,7 +5186,7 @@ async fn test_mcp_p2_t11_set_joint_motor_numeric_validation() {
         .unwrap()
         .contains("non-negative"));
 
-    // 3. Non-finite / overflowing target_velocity (1e100 -> f32::INFINITY) -> INVALID_ARGUMENT on 'target_velocity'
+    // 3. Astronomical / overflowing target_velocity (1e100 > 1e30 safe f64 DAE limit) -> INVALID_ARGUMENT on 'target_velocity'
     let inf_vel_resp = rpc_call(
         &state,
         json!({
@@ -5213,7 +5213,7 @@ async fn test_mcp_p2_t11_set_joint_motor_numeric_validation() {
         .unwrap()
         .contains("finite"));
 
-    // 4. Non-finite / overflowing max_force (1e100 -> f32::INFINITY) -> INVALID_ARGUMENT on 'max_force'
+    // 4. Astronomical / overflowing max_force (1e100 > 1e30 safe f64 DAE limit) -> INVALID_ARGUMENT on 'max_force'
     let inf_force_resp = rpc_call(
         &state,
         json!({
@@ -11290,6 +11290,119 @@ async fn test_mcp_p4_t0_apply_recipe_all_recipes_units_errors_and_auto_check() {
     assert_eq!(mech["dof_numeric"], 1);
     assert_eq!(mech["redundant_constraints"], 0);
 }
+
+#[tokio::test]
+async fn test_mcp_p4_t7_f64_dae_end_to_end_mechanisms_friction_and_fea_coupling() {
+    let state = EngineState::new()
+        .expect("EngineState initialization failed")
+        .into_shared();
+
+    // 1. Apply gear_transmission recipe and run dynamic f64 DAE simulation
+    let rec = parse_content(
+        &rpc_call(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 6001,
+                "method": "tools/call",
+                "params": {
+                    "name": "apply_recipe",
+                    "arguments": {
+                        "recipe": "gear_transmission",
+                        "params": {
+                            "id_prefix": "p4t7",
+                            "module": 2.0,
+                            "teeth_pinion": 18,
+                            "teeth_gear": 36,
+                            "motor_velocity_rad_s": 8.0
+                        }
+                    }
+                }
+            }),
+        )
+        .await,
+    );
+    assert_eq!(rec["status"], "recipe_applied");
+
+    let sim = parse_content(
+        &rpc_call(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 6002,
+                "method": "tools/call",
+                "params": {
+                    "name": "run_physics_simulation",
+                    "arguments": {
+                        "duration_seconds": 0.25,
+                        "step_size_ms": 5.0
+                    }
+                }
+            }),
+        )
+        .await,
+    );
+    assert_eq!(sim["success"], true);
+
+    // 2. Extract dynamic load case for the pinion and run coupled FEA from simulation
+    let lc = parse_content(
+        &rpc_call(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 6003,
+                "method": "tools/call",
+                "params": {
+                    "name": "get_part_load_cases",
+                    "arguments": {
+                        "part_id": "p4t7_pinion",
+                        "select": "peak_force"
+                    }
+                }
+            }),
+        )
+        .await,
+    );
+    assert_eq!(lc["part_id"], "p4t7_pinion");
+    assert!(
+        lc["equilibrium_residual_force_norm"].as_f64().unwrap() < 1e-7,
+        "Force equilibrium residual must be < 1e-7 N"
+    );
+    assert!(
+        lc["equilibrium_residual_torque_norm"].as_f64().unwrap() < 1e-7,
+        "Torque equilibrium residual must be < 1e-7 N*m"
+    );
+
+    let fea = parse_content(
+        &rpc_call(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 6004,
+                "method": "tools/call",
+                "params": {
+                    "name": "run_fea_from_simulation",
+                    "arguments": {
+                        "part_id": "p4t7_pinion",
+                        "select": "peak_force",
+                        "mesh_density": "coarse"
+                    }
+                }
+            }),
+        )
+        .await,
+    );
+    assert_eq!(fea["part_id"], "p4t7_pinion");
+    assert!(
+        fea["max_von_mises_mpa"].as_f64().unwrap().is_finite()
+            && fea["max_von_mises_mpa"].as_f64().unwrap() >= 0.0
+    );
+    assert!(
+        fea["safety_factor"].as_f64().unwrap().is_finite()
+            && fea["safety_factor"].as_f64().unwrap() > 0.0
+    );
+}
+
 
 
 

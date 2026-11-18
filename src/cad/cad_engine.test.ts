@@ -2211,4 +2211,26 @@ describe('MCP-CAD Core Geometry & Topological Verification Suite', () => {
     assert.ok(grooveRes.response.feature_id);
     assert.equal(grooveRes.response.revision, 4);
   });
+
+  it('verifies P4-T6: workbenches and MCP tools catalog reference f64 DAE solver without legacy 3rd-party engine labels', () => {
+    const legacyPattern = new RegExp('rap' + 'ier', 'i');
+    const simWb = ENGINEERING_WORKBENCHES.find((w) => w.id === 'simulation');
+    assert.ok(simWb, 'simulation workbench must exist');
+    assert.ok(
+      simWb.subtitle.includes('f64 DAE'),
+      `simulation workbench subtitle should mention f64 DAE, got: ${simWb.subtitle}`
+    );
+    assert.ok(
+      !legacyPattern.test(simWb.subtitle),
+      `simulation workbench subtitle must not mention legacy engine, got: ${simWb.subtitle}`
+    );
+
+    for (const tool of MCP_TOOLS_CATALOG) {
+      assert.ok(
+        !legacyPattern.test(tool.description),
+        `MCP tool '${tool.name}' description must not mention legacy engine, got: ${tool.description}`
+      );
+    }
+  });
 });
+

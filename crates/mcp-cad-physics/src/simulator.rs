@@ -135,6 +135,38 @@ impl PhysicsWorld {
         &self.colliders
     }
 
+    /// Returns a mutable reference to the native `f64` [`ColliderRegistry`].
+    #[must_use]
+    pub fn collider_registry_mut(&mut self) -> &mut ColliderRegistry {
+        &mut self.colliders
+    }
+
+    /// Sets Coulomb friction coefficient $\mu \ge 0$ and restitution $e \in [0, 1]$ on all
+    /// colliders attached to `part_id`.
+    pub fn set_part_contact_properties(
+        &mut self,
+        part_id: &str,
+        friction: f64,
+        restitution: f64,
+    ) -> Result<(), PhysicsError> {
+        if !friction.is_finite() || friction < 0.0 || !restitution.is_finite() || !(0.0..=1.0).contains(&restitution) {
+            return Err(PhysicsError::SimulationError(format!(
+                "Invalid contact properties: friction={friction} (expected >= 0), restitution={restitution} (expected [0, 1])"
+            )));
+        }
+        let col_handles = self
+            .part_to_colliders
+            .get(part_id)
+            .ok_or_else(|| PhysicsError::PartNotFound(part_id.to_string()))?;
+        for &col_h in col_handles {
+            if let Some(col) = self.colliders.get_mut(col_h) {
+                col.friction = friction;
+                col.restitution = restitution;
+            }
+        }
+        Ok(())
+    }
+
     /// Sets the gravity acceleration vector `[gx, gy, gz]`.
     pub fn set_gravity(&mut self, gravity: [f64; 3]) {
         self.gravity_f64 = gravity;
@@ -679,6 +711,29 @@ impl PhysicsWorld {
         self.part_to_body.contains_key(norm_id)
     }
 
+    /// Returns the native `f64` [`BodyHandle`] assigned to a registered `part_id` (or `"ground"` / `"world"`).
+    pub fn part_body_handle(&self, part_id: &str) -> Result<BodyHandle, PhysicsError> {
+        let norm_id = if part_id.eq_ignore_ascii_case("ground") {
+            "ground"
+        } else if part_id.eq_ignore_ascii_case("world") {
+            "world"
+        } else {
+            part_id
+        };
+        self.part_to_body
+            .get(norm_id)
+            .copied()
+            .ok_or_else(|| PhysicsError::PartNotFound(part_id.to_string()))
+    }
+
+    /// Returns the native `f64` [`JointHandle`] assigned to a registered `joint_id`.
+    pub fn joint_handle(&self, joint_id: &str) -> Result<JointHandle, PhysicsError> {
+        self.joints
+            .get(joint_id)
+            .map(|rec| rec.handle)
+            .ok_or_else(|| PhysicsError::JointNotFound(joint_id.to_string()))
+    }
+
     /// Returns `true` if a registered part's rigid body is dynamic (movable), or `false` if fixed.
     pub fn is_part_dynamic(&self, part_id: &str) -> Result<bool, PhysicsError> {
         let rb = self.get_body(part_id)?;
@@ -967,6 +1022,87 @@ impl PhysicsWorld {
             ))
         };
 
+        let pose_at_step = |pid: &str, idx: usize| -> (Vector3<f64>, nalgebra::UnitQuaternion<f64>) {
+            let np = if pid.eq_ignore_ascii_case("ground") {
+                "ground"
+            } else if pid.eq_ignore_ascii_case("world") {
+                "world"
+            } else {
+                pid
+            };
+            if np == "ground" || np == "world" {
+                return (Vector3::zeros(), nalgebra::UnitQuaternion::identity());
+            }
+            if let Some(s) = summary.trajectories.get(np).and_then(|t| t.samples.get(idx)) {
+                (
+                    Vector3::new(s.position[0], s.position[1], s.position[2]),
+                    quat_from_arr(s.orientation_quat),
+                )
+            } else {
+                let p = self.part_position(pid).unwrap_or([0.0; 3]);
+                let q = self.part_orientation(pid).unwrap_or([0.0, 0.0, 0.0, 1.0]);
+                (Vector3::new(p[0], p[1], p[2]), quat_from_arr(q))
+            }
+        };
+
+        // Maps the solver's Lagrange multiplier reaction wrench (rf.force = F_A, rf.torque = T_{A,anchor_a})
+        // to the exact world-space force and anchor couple acting on `norm_part_id` (`part_a` or `part_b`).
+        let joint_wrench_on_part =
+            |jrec: &CadJointRecord, rf_force: [f64; 3], rf_torque: [f64; 3], idx: usize| -> (Vector3<f64>, Vector3<f64>, [f64; 3]) {
+                let fa = Vector3::new(rf_force[0], rf_force[1], rf_force[2]);
+                let ta = Vector3::new(rf_torque[0], rf_torque[1], rf_torque[2]);
+                if jrec.part_a == norm_part_id {
+                    (fa, ta, jrec.joint_type.anchor_a())
+                } else {
+                    let anchor_b = jrec.joint_type.anchor_b();
+                    match &jrec.joint_type {
+                        CadJointType::Gear {
+                            axis_a,
+                            axis_b,
+                            ratio,
+                        } => {
+                            let (_, qa) = pose_at_step(&jrec.part_a, idx);
+                            let (_, qb) = pose_at_step(&jrec.part_b, idx);
+                            let za_raw = Vector3::new(axis_a[0], axis_a[1], axis_a[2]);
+                            let zb_raw = Vector3::new(axis_b[0], axis_b[1], axis_b[2]);
+                            let za_w = qa * if za_raw.norm() > 1e-12 {
+                                za_raw.normalize()
+                            } else {
+                                Vector3::z()
+                            };
+                            let zb_w = qb * if zb_raw.norm() > 1e-12 {
+                                zb_raw.normalize()
+                            } else {
+                                Vector3::z()
+                            };
+                            let tb = if ratio.abs() > 1e-15 {
+                                zb_w * (ta.dot(&za_w) / (*ratio))
+                            } else {
+                                -ta
+                            };
+                            (Vector3::zeros(), tb, anchor_b)
+                        }
+                        CadJointType::Prismatic {
+                            anchor_a: aa_arr,
+                            anchor_b: ab_arr,
+                            ..
+                        } => {
+                            let (pa_pos, qa) = pose_at_step(&jrec.part_a, idx);
+                            let (pb_pos, qb) = pose_at_step(&jrec.part_b, idx);
+                            let pa_anchor =
+                                pa_pos + qa * Vector3::new(aa_arr[0], aa_arr[1], aa_arr[2]);
+                            let pb_anchor =
+                                pb_pos + qb * Vector3::new(ab_arr[0], ab_arr[1], ab_arr[2]);
+                            let d = pb_anchor - pa_anchor;
+                            let fb = -fa;
+                            let tb = -ta + d.cross(&fa);
+                            (fb, tb, anchor_b)
+                        }
+                        _ => (-fa, -ta, anchor_b),
+                    }
+                }
+            };
+
         let score_at_step = |idx: usize| -> (f64, f64, f64, f64) {
             let q_k = quat_from_arr(samples[idx].orientation_quat);
             let rot_inv = q_k.inverse();
@@ -978,21 +1114,8 @@ impl PhysicsWorld {
             for jrec in &connected_joints {
                 if let Some(reactions) = summary.joint_reactions.get(&jrec.id) {
                     if let Some(rf) = reactions.get(idx) {
-                        let (sign, anchor_arr) = if jrec.part_a == norm_part_id {
-                            (1.0_f64, jrec.joint_type.anchor_a())
-                        } else {
-                            (-1.0_f64, jrec.joint_type.anchor_b())
-                        };
-                        let fw = Vector3::new(
-                            sign * rf.force[0],
-                            sign * rf.force[1],
-                            sign * rf.force[2],
-                        );
-                        let tw = Vector3::new(
-                            sign * rf.torque[0],
-                            sign * rf.torque[1],
-                            sign * rf.torque[2],
-                        );
+                        let (fw, tw, anchor_arr) =
+                            joint_wrench_on_part(jrec, rf.force, rf.torque, idx);
                         let fl = rot_inv * fw;
                         let tl = rot_inv * tw;
                         let anchor_vec = Vector3::new(anchor_arr[0], anchor_arr[1], anchor_arr[2]);
@@ -1077,20 +1200,10 @@ impl PhysicsWorld {
         let mut net_torque_com_local = Vector3::<f64>::zeros();
 
         for jrec in &connected_joints {
-            let (sign, role, connected_part_id, anchor_local) = if jrec.part_a == norm_part_id {
-                (
-                    1.0_f64,
-                    "part_a".to_string(),
-                    jrec.part_b.clone(),
-                    jrec.joint_type.anchor_a(),
-                )
+            let (role, connected_part_id) = if jrec.part_a == norm_part_id {
+                ("part_a".to_string(), jrec.part_b.clone())
             } else {
-                (
-                    -1.0_f64,
-                    "part_b".to_string(),
-                    jrec.part_a.clone(),
-                    jrec.joint_type.anchor_b(),
-                )
+                ("part_b".to_string(), jrec.part_a.clone())
             };
 
             let (rf_force, rf_torque) = summary
@@ -1099,16 +1212,8 @@ impl PhysicsWorld {
                 .and_then(|list| list.get(selected_idx))
                 .map_or(([0.0; 3], [0.0; 3]), |rf| (rf.force, rf.torque));
 
-            let force_world_vec = Vector3::new(
-                sign * rf_force[0],
-                sign * rf_force[1],
-                sign * rf_force[2],
-            );
-            let torque_world_vec = Vector3::new(
-                sign * rf_torque[0],
-                sign * rf_torque[1],
-                sign * rf_torque[2],
-            );
+            let (force_world_vec, torque_world_vec, anchor_local) =
+                joint_wrench_on_part(jrec, rf_force, rf_torque, selected_idx);
 
             let force_local_vec = rot_world_to_local * force_world_vec;
             let torque_local_vec = rot_world_to_local * torque_world_vec;
@@ -1286,7 +1391,7 @@ impl PhysicsWorld {
     }
 
     /// Variant of [`Self::analyze_mechanism`] that also accounts for CAD scene parts
-    /// (`(part_id, is_fixed)`) not yet registered as Rapier bodies in `PhysicsWorld`.
+    /// (`(part_id, is_fixed)`) not yet registered as rigid bodies in `PhysicsWorld`.
     pub fn analyze_mechanism_with_scene_parts(
         &self,
         part_ids: Option<&[String]>,
@@ -3087,8 +3192,55 @@ fn scale_jacobian_block_rows(
     }
 }
 
+/// Extracts the signed 3D rotation vector ($\theta\,\hat{\mathbf{u}}$ in radians, $\theta \in [0, \pi]$)
+/// from a $3\times 3$ rotation matrix $R$ using clamped `atan2(sin_t, cos_t)` (`P4-T8`).
+///
+/// Unlike `nalgebra::Rotation3::scaled_axis()`, this never computes `acos` on an unclamped
+/// trace, preventing `NaN` when 1-ULP floating-point drift causes $\operatorname{tr}(R) > 3.0$
+/// or $\operatorname{tr}(R) < -1.0$.
 fn rotation_vector(r: Matrix3<f64>) -> Vector3<f64> {
-    nalgebra::Rotation3::from_matrix_unchecked(r).scaled_axis()
+    let s_vec = 0.5
+        * Vector3::new(
+            r[(2, 1)] - r[(1, 2)],
+            r[(0, 2)] - r[(2, 0)],
+            r[(1, 0)] - r[(0, 1)],
+        );
+    let sin_t = s_vec.norm();
+    let cos_t = (0.5 * (r.trace() - 1.0)).clamp(-1.0, 1.0);
+    if sin_t < 1e-12 {
+        if cos_t >= 0.0 {
+            s_vec
+        } else {
+            // Near theta = pi: extract unit axis from the largest diagonal column of R + I.
+            let diag = [r[(0, 0)], r[(1, 1)], r[(2, 2)]];
+            let k = if diag[0] >= diag[1] && diag[0] >= diag[2] {
+                0
+            } else if diag[1] >= diag[2] {
+                1
+            } else {
+                2
+            };
+            let mut axis = Vector3::new(
+                r[(0, k)] + if k == 0 { 1.0 } else { 0.0 },
+                r[(1, k)] + if k == 1 { 1.0 } else { 0.0 },
+                r[(2, k)] + if k == 2 { 1.0 } else { 0.0 },
+            );
+            let axis_norm = axis.norm();
+            if axis_norm > 1e-15 {
+                axis /= axis_norm;
+                if s_vec.dot(&axis) < 0.0 {
+                    axis = -axis;
+                }
+                let theta = sin_t.atan2(cos_t);
+                axis * theta
+            } else {
+                Vector3::zeros()
+            }
+        }
+    } else {
+        let theta = sin_t.atan2(cos_t);
+        s_vec * (theta / sin_t)
+    }
 }
 
 fn wrap_angle_pi(angle: f64) -> f64 {
@@ -3598,4 +3750,197 @@ fn evaluate_joint_limit_status(
     ))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mcp_cad_core::{Part, dag::FeatureOp, material::MaterialRegistry};
+
+    fn make_box_part(id: &str, name: &str, w: f64, h: f64, d: f64) -> Part {
+        let registry = MaterialRegistry::new();
+        let steel = registry.get("steel_structural_aisi1020").unwrap().clone();
+        let mut part = Part::new(id, name, steel);
+        part.dag.add_feature(
+            FeatureOp::AddBox {
+                width: w,
+                height: h,
+                depth: d,
+                position: None,
+                rotation_deg: None,
+            },
+            None,
+        );
+        part.rebuild().expect("rebuild box should succeed");
+        part
+    }
+
+    #[test]
+    fn test_p4_t8_rotation_vector_handles_trace_above_three_and_pi_without_nan() {
+        // 1. Identity with +2 ULP drift on every diagonal entry -> trace > 3.0.
+        let mut r_above_3 = Matrix3::identity();
+        r_above_3[(0, 0)] = 1.0 + 2.0 * f64::EPSILON;
+        r_above_3[(1, 1)] = 1.0 + 2.0 * f64::EPSILON;
+        r_above_3[(2, 2)] = 1.0 + 2.0 * f64::EPSILON;
+        assert!(r_above_3.trace() > 3.0);
+        let rv = rotation_vector(r_above_3);
+        assert!(rv.iter().all(|v| v.is_finite()), "must be finite: {rv:?}");
+        assert!(rv.norm() < 1e-14, "expected near-zero vector, got {rv:?}");
+
+        // 2. Small rotation with positive trace drift (sin_t > 1e-12 AND trace > 3.0).
+        let tiny_skew = Matrix3::new(
+            1.0 + 4.0 * f64::EPSILON,
+            -1e-9,
+            0.0,
+            1e-9,
+            1.0 + 4.0 * f64::EPSILON,
+            0.0,
+            0.0,
+            0.0,
+            1.0 + 4.0 * f64::EPSILON,
+        );
+        assert!(tiny_skew.trace() > 3.0);
+        let rv_tiny = rotation_vector(tiny_skew);
+        assert!(
+            rv_tiny.iter().all(|v| v.is_finite()),
+            "must be finite: {rv_tiny:?}"
+        );
+        assert!((rv_tiny.z - 1e-9).abs() < 1e-15);
+
+        // 3. Exact 180-degree rotation with negative trace drift -> trace < -1.0.
+        let mut r_pi = Matrix3::from_diagonal(&Vector3::new(1.0, -1.0, -1.0));
+        r_pi[(1, 1)] = -1.0 - 2.0 * f64::EPSILON;
+        r_pi[(2, 2)] = -1.0 - 2.0 * f64::EPSILON;
+        assert!(r_pi.trace() < -1.0);
+        let rv_pi = rotation_vector(r_pi);
+        assert!(
+            rv_pi.iter().all(|v| v.is_finite()),
+            "must be finite at pi: {rv_pi:?}"
+        );
+        assert!(
+            (rv_pi.norm() - std::f64::consts::PI).abs() < 1e-12,
+            "expected norm ~ pi, got {}",
+            rv_pi.norm()
+        );
+
+        // 4. General 3D rotation matches axis * angle.
+        let axis = nalgebra::Unit::new_normalize(Vector3::new(1.0, -2.0, 3.0));
+        let angle = 1.23456789_f64;
+        let r_gen = nalgebra::Rotation3::from_axis_angle(&axis, angle).into_inner();
+        let rv_gen = rotation_vector(r_gen);
+        let expected = axis.into_inner() * angle;
+        assert!((rv_gen - expected).norm() < 1e-12);
+    }
+
+    #[test]
+    fn test_p4_t8_closed_loop_solver_evaluate_system_finite_with_trace_drift() {
+        let mut world = PhysicsWorld::new();
+        let p_base = make_box_part("base", "Base", 0.1, 0.1, 0.1);
+        let p_crank = make_box_part("crank", "Crank", 0.2, 0.05, 0.05);
+        let p_slider = make_box_part("slider", "Slider", 0.1, 0.1, 0.1);
+
+        world.add_part(&p_base, false).unwrap();
+        world.add_part(&p_crank, true).unwrap();
+        world.add_part(&p_slider, true).unwrap();
+
+        world
+            .add_joint(
+                "j_drive",
+                "base",
+                "crank",
+                CadJointType::Revolute {
+                    anchor_a: [0.0, 0.0, 0.0],
+                    anchor_b: [0.0, 0.0, 0.0],
+                    axis: [0.0, 0.0, 1.0],
+                    limits: None,
+                },
+                None,
+            )
+            .unwrap();
+        world
+            .add_joint(
+                "j_fixed_loop",
+                "crank",
+                "slider",
+                CadJointType::Fixed {
+                    anchor_a: [0.1, 0.0, 0.0],
+                    anchor_b: [0.0, 0.0, 0.0],
+                },
+                None,
+            )
+            .unwrap();
+        world
+            .add_joint(
+                "j_prismatic",
+                "base",
+                "slider",
+                CadJointType::Prismatic {
+                    anchor_a: [0.1, 0.0, 0.0],
+                    anchor_b: [0.0, 0.0, 0.0],
+                    axis: [1.0, 0.0, 0.0],
+                    limits: None,
+                },
+                None,
+            )
+            .unwrap();
+        world
+            .add_joint(
+                "j_gear",
+                "crank",
+                "slider",
+                CadJointType::Gear {
+                    ratio: 1.0,
+                    axis_a: [0.0, 0.0, 1.0],
+                    axis_b: [0.0, 0.0, 1.0],
+                },
+                None,
+            )
+            .unwrap();
+
+        let mut solver = ClosedLoopSolver::new(
+            &world,
+            "j_drive",
+            "base",
+            "crank",
+            true,
+            Vector3::zeros(),
+            Vector3::zeros(),
+            Vector3::z(),
+            Vector3::zeros(),
+            Matrix3::identity(),
+            Vector3::zeros(),
+            Matrix3::identity(),
+            vec!["slider".to_string()],
+            true,
+        );
+
+        let mut drifted_poses = solver.poses.clone();
+        let mut r_drifted = Matrix3::identity();
+        r_drifted[(0, 0)] = 1.0 + 2.0 * f64::EPSILON;
+        r_drifted[(1, 1)] = 1.0 + 2.0 * f64::EPSILON;
+        r_drifted[(2, 2)] = 1.0 + 2.0 * f64::EPSILON;
+        drifted_poses.insert("crank".to_string(), (Vector3::zeros(), r_drifted));
+        drifted_poses.insert(
+            "slider".to_string(),
+            (Vector3::new(0.1, 0.0, 0.0), r_drifted),
+        );
+
+        let base_gears = vec![(0.0, 0.0); solver.joints.len()];
+        let eval = solver.evaluate_system(0.0, &drifted_poses, &solver.poses, &base_gears, true);
+        assert!(eval.phys_norm.is_finite(), "phys_norm must be finite");
+        assert!(eval.scaled_norm.is_finite(), "scaled_norm must be finite");
+        assert!(eval.max_rot_err.is_finite(), "max_rot_err must be finite");
+        assert!(
+            eval.phi_scaled.iter().all(|v| v.is_finite()),
+            "phi_scaled must have no NaNs"
+        );
+        assert!(eval.max_rot_err < 1e-12);
+
+        let base_poses = solver.poses.clone();
+        solver.poses = drifted_poses;
+        solver.commit_gear_angles(&base_poses, &base_gears);
+        for j in &solver.joints {
+            assert!(j.gear_theta_a.is_finite());
+            assert!(j.gear_theta_b.is_finite());
+        }
+    }
+}
 

@@ -21,11 +21,12 @@
 //!    followed by tangent-space velocity projection ($J\mathbf{v}_{k+1} = \mathbf{b}$) and exact
 //!    end-of-step Lagrange multiplier reaction force/torque extraction.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use nalgebra::{DMatrix, DVector, UnitQuaternion, Vector3};
 use serde::{Deserialize, Serialize};
 
+use crate::collision::{detect_contacts, orthonormal_pair, ContactPoint};
 use crate::joint::{
     is_zero_range_limits, local_orthonormal_basis, CadJointType, JointData, JointHandle,
     MotorConfig,
@@ -98,6 +99,10 @@ pub struct SolvedJointRecord {
     pub last_force_on_a: [f64; 3],
     /// World-space constraint reaction torque $\boldsymbol{\tau}_A$ ($\text{N}\cdot\text{m}$) about `anchor_a` exerted on `part_a`.
     pub last_torque_on_a: [f64; 3],
+    /// World-space constraint reaction force $\mathbf{F}_B$ ($\text{N}$) exerted on `part_b`.
+    pub last_force_on_b: [f64; 3],
+    /// World-space constraint reaction torque $\boldsymbol{\tau}_B$ ($\text{N}\cdot\text{m}$) about `anchor_b` exerted on `part_b`.
+    pub last_torque_on_b: [f64; 3],
 }
 
 /// Computes the signed rotation vector $\boldsymbol{\theta} \in \mathbb{R}^3$ ($\text{rad}$)
@@ -117,6 +122,21 @@ pub fn rotation_vector(q: &UnitQuaternion<f64>) -> Vector3<f64> {
         let angle = 2.0 * sin_half.atan2(w);
         v * (angle / sin_half)
     }
+}
+
+/// Role of a constraint row with respect to contact / Coulomb friction handling.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ContactRowRole {
+    /// Bilateral/unilateral joint or motor row.
+    None,
+    /// Unilateral non-penetration contact normal row ($\gamma_n \ge 0$).
+    Normal { contact_idx: usize, friction: f64 },
+    /// Coupled Coulomb tangential friction row constrained within $\|\boldsymbol{\gamma}_t\|_2 \le \mu \gamma_n$.
+    Tangent {
+        normal_row: usize,
+        pair_row: usize,
+        friction: f64,
+    },
 }
 
 /// Single scalar constraint row in the global velocity Jacobian $J(\mathbf{q})\mathbf{v} = \mathbf{b}$.
@@ -146,29 +166,8 @@ struct AssembledConstraintRow {
     cfm: f64,
     /// Whether this row represents a motor actuator row.
     is_motor_row: bool,
-}
-
-/// Detected overlap between two colliders for contact constraint resolution.
-#[derive(Debug, Clone)]
-struct DetectedContact {
-    /// Index of Body A in the solver's body list.
-    body_a: usize,
-    /// Index of Body B in the solver's body list.
-    body_b: usize,
-    /// Part ID of Body A.
-    part_a: String,
-    /// Part ID of Body B.
-    part_b: String,
-    /// Contact point in world coordinates ($\text{m}$).
-    point: Vector3<f64>,
-    /// Unit contact normal pointing from Body A to Body B.
-    normal: Vector3<f64>,
-    /// Penetration depth $\delta > 0$ ($\text{m}$).
-    depth: f64,
-    /// Combined coefficient of restitution $e \in [0, 1]$.
-    restitution: f64,
-    /// Combined Coulomb friction coefficient $\mu \ge 0$.
-    friction: f64,
+    /// Contact / Coulomb friction role metadata.
+    contact_role: ContactRowRole,
 }
 
 /// Double-precision (`f64`) multi-body constraint and dynamics solver (`ADR-004`).
@@ -237,10 +236,9 @@ impl MultiBodySolver {
         // Synchronize collider world poses before contact detection
         sync_all_colliders(bodies, colliders);
 
-        // Detect active contacts between non-jointed colliders
-        let contacts = detect_contacts(bodies, colliders, joints, &handle_to_idx);
-        let collision_events =
-            self.update_collision_events(&contacts, step_index, timestamp_s);
+        // Detect active contacts via broad-phase + f64 narrow-phase collision pipeline
+        let col_slice: Vec<_> = colliders.iter().collect();
+        let contacts = detect_contacts(bodies, &col_slice, joints, &handle_to_idx);
 
         // 1. Assemble block-diagonal inverse mass/inertia and unconstrained velocity predictor v*
         let mut v_old = DVector::<f64>::zeros(6 * nb);
@@ -263,16 +261,12 @@ impl MultiBodySolver {
 
             if b.is_dynamic && b.inv_mass > 0.0 {
                 inv_mass_vec[i] = b.inv_mass;
-                let i_w = b.world_inertia();
                 let inv_i_w = b.world_inv_inertia();
                 inv_inertia_world[i] = inv_i_w;
 
                 let dv = (g_vec + b.external_force * b.inv_mass) * dt;
-                let gyro = w.cross(&(i_w * w));
-                let dw = inv_i_w * (b.external_torque - gyro) * dt;
-
                 let vp = v + dv;
-                let wp = w + dw;
+                let wp = predict_angular_velocity_implicit_midpoint(b, dt);
                 v_star[6 * i] = vp.x;
                 v_star[6 * i + 1] = vp.y;
                 v_star[6 * i + 2] = vp.z;
@@ -282,7 +276,7 @@ impl MultiBodySolver {
             }
         }
 
-        // 2. Assemble velocity constraint rows (joints + limits + motors + contacts)
+        // 2. Assemble velocity constraint rows (joints + limits + motors + contacts/friction)
         let rows = assemble_velocity_constraints(
             bodies,
             &handles,
@@ -292,20 +286,24 @@ impl MultiBodySolver {
             &v_star,
             dt,
             true,
+            true,
             self.config.cfm_regularization,
         );
 
-        // 3. Solve coupled KKT / Box-LCP system for velocity impulses
+        // 3. Solve coupled KKT / Box-LCP + Coulomb friction cone system for velocity impulses
         let mut v_new = v_star.clone();
         let m = rows.len();
-        let mut step_motor_force_on_a = vec![Vector3::<f64>::zeros(); joints.len()];
-        let mut step_motor_torque_on_a = vec![Vector3::<f64>::zeros(); joints.len()];
+        let mut step_motor_impulses = vec![0.0_f64; joints.len()];
+        let mut step_limit_impulses = vec![0.0_f64; joints.len()];
         for j in joints.iter_mut() {
             j.last_force_on_a = [0.0; 3];
             j.last_torque_on_a = [0.0; 3];
+            j.last_force_on_b = [0.0; 3];
+            j.last_torque_on_b = [0.0; 3];
             j.motor_saturated = false;
         }
 
+        let mut step_impulses = DVector::<f64>::zeros(m);
         if m > 0 {
             let impulses = solve_kkt_system(
                 &rows,
@@ -315,6 +313,7 @@ impl MultiBodySolver {
                 nb,
                 self.config.max_lcp_iters,
             );
+            step_impulses = impulses.clone();
 
             // Apply impulses: v_new = v_star + M^{-1} J^T * gamma
             for (r, row) in rows.iter().enumerate() {
@@ -343,18 +342,21 @@ impl MultiBodySolver {
                     v_new[6 * ib + 5] += dw_b.z;
                 }
 
-                // Track motor saturation and accumulate reaction forces/torques
+                // Track motor saturation, step motor/limit impulses, and accumulate reaction forces/torques
                 if let Some(j_idx) = row.joint_idx {
                     let lambda = imp / dt;
                     let f_a = row.j_lin_a * lambda;
                     let t_a_com = row.j_ang_a * lambda;
+                    let f_b = row.j_lin_b * lambda;
+                    let t_b_com = row.j_ang_b * lambda;
                     if row.is_motor_row {
                         let bound = row.upper_impulse.abs();
                         if bound <= 1e-15 || imp.abs() >= bound * (1.0 - 1e-5) {
                             joints[j_idx].motor_saturated = true;
                         }
-                        step_motor_force_on_a[j_idx] += f_a;
-                        step_motor_torque_on_a[j_idx] += t_a_com;
+                        step_motor_impulses[j_idx] += imp;
+                    } else if row.lower_impulse.is_finite() || row.upper_impulse.is_finite() {
+                        step_limit_impulses[j_idx] += imp;
                     }
                     joints[j_idx].last_force_on_a[0] += f_a.x;
                     joints[j_idx].last_force_on_a[1] += f_a.y;
@@ -362,9 +364,23 @@ impl MultiBodySolver {
                     joints[j_idx].last_torque_on_a[0] += t_a_com.x;
                     joints[j_idx].last_torque_on_a[1] += t_a_com.y;
                     joints[j_idx].last_torque_on_a[2] += t_a_com.z;
+                    joints[j_idx].last_force_on_b[0] += f_b.x;
+                    joints[j_idx].last_force_on_b[1] += f_b.y;
+                    joints[j_idx].last_force_on_b[2] += f_b.z;
+                    joints[j_idx].last_torque_on_b[0] += t_b_com.x;
+                    joints[j_idx].last_torque_on_b[1] += t_b_com.y;
+                    joints[j_idx].last_torque_on_b[2] += t_b_com.z;
                 }
             }
         }
+
+        let collision_events = self.update_collision_events(
+            &contacts,
+            &rows,
+            &step_impulses,
+            step_index,
+            timestamp_s,
+        );
 
         // Convert accumulated COM torque to pure anchor couple for step-level fallback
         convert_com_torque_to_anchor_couple(bodies, joints);
@@ -425,15 +441,18 @@ impl MultiBodySolver {
             let v_avg = 0.5 * (b.linear_velocity + v_next);
             let w_avg = 0.5 * (b.angular_velocity + w_next);
 
+            let q_old = b.orientation;
+            let w_body_next = q_old.inverse() * w_next;
+
             let x_com_old = b.world_com();
             let x_com_new = x_com_old + v_avg * dt;
             let dq = UnitQuaternion::from_scaled_axis(w_avg * dt);
-            let q_new = UnitQuaternion::from_quaternion((dq * b.orientation).quaternion().normalize());
+            let q_new = UnitQuaternion::from_quaternion((dq * q_old).quaternion().normalize());
 
             b.orientation = q_new;
             b.position = x_com_new - q_new * b.local_com;
             b.linear_velocity = v_next;
-            b.angular_velocity = w_next;
+            b.angular_velocity = q_new * w_body_next;
         }
 
         // Depenetrate any resting/colliding contact pairs
@@ -480,8 +499,8 @@ impl MultiBodySolver {
             &handle_to_idx,
             joints,
             &contacts,
-            &step_motor_force_on_a,
-            &step_motor_torque_on_a,
+            &step_motor_impulses,
+            &step_limit_impulses,
             g_vec,
             dt,
             self.config.cfm_regularization,
@@ -528,13 +547,29 @@ impl MultiBodySolver {
 
     fn update_collision_events(
         &mut self,
-        contacts: &[DetectedContact],
+        contacts: &[ContactPoint],
+        rows: &[AssembledConstraintRow],
+        impulses: &DVector<f64>,
         _step_index: usize,
         timestamp_s: f64,
     ) -> Vec<CollisionRecord> {
+        // Gather solved normal impulse per contact index
+        let mut contact_normal_impulses = vec![0.0_f64; contacts.len()];
+        for (r, row) in rows.iter().enumerate() {
+            if let ContactRowRole::Normal { contact_idx, .. } = row.contact_role {
+                if let Some(slot) = contact_normal_impulses.get_mut(contact_idx) {
+                    if r < impulses.len() {
+                        *slot = impulses[r].max(0.0);
+                    }
+                }
+            }
+        }
+
         let mut current_pairs = HashSet::new();
-        let mut pair_normals = std::collections::HashMap::new();
-        for c in contacts {
+        let mut pair_normals: HashMap<(String, String), ([f64; 3], f64)> = HashMap::new();
+        let mut pair_impulses: HashMap<(String, String), f64> = HashMap::new();
+
+        for (c_idx, c) in contacts.iter().enumerate() {
             let (pair, n) = if c.part_a <= c.part_b {
                 (
                     (c.part_a.clone(), c.part_b.clone()),
@@ -547,19 +582,29 @@ impl MultiBodySolver {
                 )
             };
             current_pairs.insert(pair.clone());
-            pair_normals.insert(pair, n);
+            pair_normals
+                .entry(pair.clone())
+                .and_modify(|e| {
+                    if c.depth > e.1 {
+                        *e = (n, c.depth);
+                    }
+                })
+                .or_insert((n, c.depth));
+            *pair_impulses.entry(pair).or_insert(0.0) += contact_normal_impulses[c_idx];
         }
 
         let mut events = Vec::new();
         for pair in &current_pairs {
             if !self.active_contact_pairs.contains(pair) {
+                let normal = pair_normals.get(pair).map(|x| x.0);
+                let imp = pair_impulses.get(pair).copied();
                 events.push(CollisionRecord {
                     time_s: timestamp_s,
                     body_a: pair.0.clone(),
                     body_b: pair.1.clone(),
                     event_type: CollisionEventType::Started,
-                    contact_normal: pair_normals.get(pair).copied(),
-                    max_impulse: None,
+                    contact_normal: normal,
+                    max_impulse: imp,
                 });
             }
         }
@@ -580,6 +625,48 @@ impl MultiBodySolver {
     }
 }
 
+/// Integrates the unconstrained 3D Euler rotational dynamics over time step `dt` using the
+/// implicit midpoint (Lie–Poisson) discretization in the body's local frame:
+/// $$I_b (\boldsymbol{\Omega}^* - \boldsymbol{\Omega}_k) + \Delta t \left(\boldsymbol{\Omega}_{\text{mid}} \times (I_b \boldsymbol{\Omega}_{\text{mid}}) - \boldsymbol{\tau}_{\text{ext},b}\right) = \mathbf{0}, \qquad \boldsymbol{\Omega}_{\text{mid}} = \frac{\boldsymbol{\Omega}_k + \boldsymbol{\Omega}^*}{2}.$$
+///
+/// For torque-free 3D asymmetric rigid bodies ($\boldsymbol{\tau}_{\text{ext}} = \mathbf{0}$), this
+/// preserves both rotational kinetic energy $T_{\text{rot}} = \frac{1}{2}\boldsymbol{\Omega}\cdot(I_b\boldsymbol{\Omega})$
+/// and angular momentum magnitude $\|\mathbf{L}\| = \|I_b\boldsymbol{\Omega}\|$ to machine precision (`~1e-15`).
+fn predict_angular_velocity_implicit_midpoint(
+    body: &crate::rigid_body::RigidBody,
+    dt: f64,
+) -> Vector3<f64> {
+    let q_old = body.orientation;
+    let q_inv = q_old.inverse();
+    let w_b0 = q_inv * body.angular_velocity;
+    let tau_b = q_inv * body.external_torque;
+    let i_b = body.local_inertia;
+    let inv_i_b = body.local_inv_inertia;
+
+    let gyro0 = w_b0.cross(&(i_b * w_b0));
+    let mut w_b = w_b0 + inv_i_b * (tau_b - gyro0) * dt;
+
+    for _ in 0..5 {
+        let w_mid = 0.5 * (w_b0 + w_b);
+        let m_mid = i_b * w_mid;
+        let res = i_b * (w_b - w_b0) + (w_mid.cross(&m_mid) - tau_b) * dt;
+        if res.norm_squared() <= 1e-30 {
+            break;
+        }
+        let jac = i_b + 0.5 * dt * (w_mid.cross_matrix() * i_b - m_mid.cross_matrix());
+        if let Some(delta) = jac.lu().solve(&res) {
+            w_b -= delta;
+            if delta.norm_squared() <= 1e-30 {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    q_old * w_b
+}
+
 fn sync_all_colliders(bodies: &BodyRegistry, colliders: &mut ColliderRegistry) {
     let col_handles: Vec<_> = colliders.iter().map(|(h, _)| h).collect();
     for ch in col_handles {
@@ -594,130 +681,34 @@ fn sync_all_colliders(bodies: &BodyRegistry, colliders: &mut ColliderRegistry) {
     }
 }
 
-fn detect_contacts(
-    bodies: &BodyRegistry,
-    colliders: &ColliderRegistry,
-    joints: &[SolvedJointRecord],
-    handle_to_idx: &std::collections::HashMap<BodyHandle, usize>,
-) -> Vec<DetectedContact> {
-    let mut disabled_pairs = HashSet::new();
-    for j in joints {
-        if !j.data.contacts_enabled {
-            let pair = if j.body_a <= j.body_b {
-                (j.body_a, j.body_b)
-            } else {
-                (j.body_b, j.body_a)
-            };
-            disabled_pairs.insert(pair);
-        }
-    }
-
-    let col_list: Vec<_> = colliders.iter().map(|(_, c)| c).collect();
-    let mut contacts = Vec::new();
-
-    for i in 0..col_list.len() {
-        for k in (i + 1)..col_list.len() {
-            let ca = col_list[i];
-            let cb = col_list[k];
-            let (Some(ha), Some(hb)) = (ca.parent, cb.parent) else {
-                continue;
-            };
-            if ha == hb {
-                continue;
-            }
-            let pair_key = if ha <= hb { (ha, hb) } else { (hb, ha) };
-            if disabled_pairs.contains(&pair_key) {
-                continue;
-            }
-            let (Some(ba), Some(bb)) = (bodies.get(ha), bodies.get(hb)) else {
-                continue;
-            };
-            if !ba.is_dynamic && !bb.is_dynamic {
-                continue;
-            }
-            let (Some(&ia), Some(&ib)) = (handle_to_idx.get(&ha), handle_to_idx.get(&hb)) else {
-                continue;
-            };
-
-            let aabb_a = ca.world_aabb;
-            let aabb_b = cb.world_aabb;
-            if aabb_a.max[0] < aabb_b.min[0]
-                || aabb_a.min[0] > aabb_b.max[0]
-                || aabb_a.max[1] < aabb_b.min[1]
-                || aabb_a.min[1] > aabb_b.max[1]
-                || aabb_a.max[2] < aabb_b.min[2]
-                || aabb_a.min[2] > aabb_b.max[2]
-            {
-                continue;
-            }
-
-            // Compute minimum penetration axis between world AABBs
-            let mut min_depth = f64::INFINITY;
-            let mut normal = Vector3::y();
-            let mut overlap_min = [0.0_f64; 3];
-            let mut overlap_max = [0.0_f64; 3];
-
-            let axes = [Vector3::x(), Vector3::y(), Vector3::z()];
-            let mut valid = true;
-            for axis_idx in 0..3 {
-                let lo = aabb_a.min[axis_idx].max(aabb_b.min[axis_idx]);
-                let hi = aabb_a.max[axis_idx].min(aabb_b.max[axis_idx]);
-                if hi < lo {
-                    valid = false;
-                    break;
-                }
-                overlap_min[axis_idx] = lo;
-                overlap_max[axis_idx] = hi;
-
-                // Depth if B is pushed along +axis vs -axis
-                let d_pos = aabb_a.max[axis_idx] - aabb_b.min[axis_idx];
-                let d_neg = aabb_b.max[axis_idx] - aabb_a.min[axis_idx];
-                if d_pos <= d_neg {
-                    if d_pos < min_depth {
-                        min_depth = d_pos;
-                        normal = axes[axis_idx];
-                    }
-                } else if d_neg < min_depth {
-                    min_depth = d_neg;
-                    normal = -axes[axis_idx];
-                }
-            }
-
-            if !valid || !min_depth.is_finite() {
-                continue;
-            }
-
-            let contact_pt = Vector3::new(
-                0.5 * (overlap_min[0] + overlap_max[0]),
-                0.5 * (overlap_min[1] + overlap_max[1]),
-                0.5 * (overlap_min[2] + overlap_max[2]),
-            );
-            let restitution = 0.5 * (ca.restitution + cb.restitution);
-            let friction = (ca.friction * cb.friction).sqrt();
-
-            contacts.push(DetectedContact {
-                body_a: ia,
-                body_b: ib,
-                part_a: ba.part_id.clone(),
-                part_b: bb.part_id.clone(),
-                point: contact_pt,
-                normal,
-                depth: min_depth,
-                restitution,
-                friction,
-            });
-        }
-    }
-
-    contacts
-}
-
 fn resolve_contact_penetrations(
     bodies: &mut BodyRegistry,
     handles: &[BodyHandle],
-    contacts: &[DetectedContact],
+    contacts: &[ContactPoint],
 ) {
+    // Group multi-point manifolds by unordered body pair so position correction is applied
+    // once per pair using the deepest contact rather than multiplying by manifold point count.
+    let mut deepest_by_pair: HashMap<(usize, usize), &ContactPoint> = HashMap::new();
     for c in contacts {
+        let pair = if c.body_a <= c.body_b {
+            (c.body_a, c.body_b)
+        } else {
+            (c.body_b, c.body_a)
+        };
+        deepest_by_pair
+            .entry(pair)
+            .and_modify(|prev| {
+                if c.depth > prev.depth {
+                    *prev = c;
+                }
+            })
+            .or_insert(c);
+    }
+
+    let mut pairs: Vec<((usize, usize), &ContactPoint)> = deepest_by_pair.into_iter().collect();
+    pairs.sort_unstable_by_key(|&(pair, _)| pair);
+
+    for (_, c) in pairs {
         let slop = 1e-5;
         if c.depth <= slop {
             continue;
@@ -750,10 +741,11 @@ fn assemble_velocity_constraints(
     handles: &[BodyHandle],
     handle_to_idx: &std::collections::HashMap<BodyHandle, usize>,
     joints: &[SolvedJointRecord],
-    contacts: &[DetectedContact],
+    contacts: &[ContactPoint],
     v_ref: &DVector<f64>,
     dt: f64,
     include_centripetal_bias: bool,
+    include_friction: bool,
     base_cfm: f64,
 ) -> Vec<AssembledConstraintRow> {
     let mut rows = Vec::with_capacity(joints.len() * 6 + contacts.len() * 3);
@@ -802,6 +794,7 @@ fn assemble_velocity_constraints(
                         upper_impulse: f64::INFINITY,
                         cfm: base_cfm,
                         is_motor_row: false,
+                        contact_role: ContactRowRole::None,
                     });
                 }
             }
@@ -821,6 +814,7 @@ fn assemble_velocity_constraints(
                         upper_impulse: f64::INFINITY,
                         cfm: base_cfm,
                         is_motor_row: false,
+                        contact_role: ContactRowRole::None,
                     });
                 }
                 for axis in &axes {
@@ -837,6 +831,7 @@ fn assemble_velocity_constraints(
                         upper_impulse: f64::INFINITY,
                         cfm: base_cfm,
                         is_motor_row: false,
+                        contact_role: ContactRowRole::None,
                     });
                 }
             }
@@ -857,6 +852,7 @@ fn assemble_velocity_constraints(
                         upper_impulse: f64::INFINITY,
                         cfm: base_cfm,
                         is_motor_row: false,
+                        contact_role: ContactRowRole::None,
                     });
                 }
 
@@ -892,6 +888,7 @@ fn assemble_velocity_constraints(
                     upper_impulse: f64::INFINITY,
                     cfm: base_cfm,
                     is_motor_row: false,
+                    contact_role: ContactRowRole::None,
                 });
                 rows.push(AssembledConstraintRow {
                     joint_idx: Some(j_idx),
@@ -906,6 +903,7 @@ fn assemble_velocity_constraints(
                     upper_impulse: f64::INFINITY,
                     cfm: base_cfm,
                     is_motor_row: false,
+                    contact_role: ContactRowRole::None,
                 });
 
                 // Current hinge angle theta (rad)
@@ -936,6 +934,7 @@ fn assemble_velocity_constraints(
                             upper_impulse: f64::INFINITY,
                             cfm: base_cfm,
                             is_motor_row: false,
+                            contact_role: ContactRowRole::None,
                         });
                     } else {
                         let rel_w = (wb - wa).dot(&z_a);
@@ -960,6 +959,7 @@ fn assemble_velocity_constraints(
                                 upper_impulse: f64::INFINITY,
                                 cfm: base_cfm,
                                 is_motor_row: false,
+                                contact_role: ContactRowRole::None,
                             });
                         }
                         if cur_theta >= max_a - 1e-2
@@ -979,6 +979,7 @@ fn assemble_velocity_constraints(
                                 upper_impulse: 0.0,
                                 cfm: base_cfm,
                                 is_motor_row: false,
+                                contact_role: ContactRowRole::None,
                             });
                         }
                     }
@@ -1001,6 +1002,7 @@ fn assemble_velocity_constraints(
                             upper_impulse: max_imp,
                             cfm: base_cfm.max(1e-11),
                             is_motor_row: true,
+                            contact_role: ContactRowRole::None,
                         });
                     }
                 }
@@ -1037,6 +1039,7 @@ fn assemble_velocity_constraints(
                         upper_impulse: f64::INFINITY,
                         cfm: base_cfm,
                         is_motor_row: false,
+                        contact_role: ContactRowRole::None,
                     });
                 }
 
@@ -1055,6 +1058,7 @@ fn assemble_velocity_constraints(
                         upper_impulse: f64::INFINITY,
                         cfm: base_cfm,
                         is_motor_row: false,
+                        contact_role: ContactRowRole::None,
                     });
                 }
 
@@ -1076,6 +1080,7 @@ fn assemble_velocity_constraints(
                             upper_impulse: f64::INFINITY,
                             cfm: base_cfm,
                             is_motor_row: false,
+                            contact_role: ContactRowRole::None,
                         });
                     } else {
                         let rel_v = v_rel_ab.dot(&z_a);
@@ -1100,6 +1105,7 @@ fn assemble_velocity_constraints(
                                 upper_impulse: f64::INFINITY,
                                 cfm: base_cfm,
                                 is_motor_row: false,
+                                contact_role: ContactRowRole::None,
                             });
                         }
                         if cur_s >= max_s - 1e-2
@@ -1119,6 +1125,7 @@ fn assemble_velocity_constraints(
                                 upper_impulse: 0.0,
                                 cfm: base_cfm,
                                 is_motor_row: false,
+                                contact_role: ContactRowRole::None,
                             });
                         }
                     }
@@ -1141,6 +1148,7 @@ fn assemble_velocity_constraints(
                             upper_impulse: max_imp,
                             cfm: base_cfm.max(1e-11),
                             is_motor_row: true,
+                            contact_role: ContactRowRole::None,
                         });
                     }
                 }
@@ -1168,13 +1176,14 @@ fn assemble_velocity_constraints(
                     upper_impulse: f64::INFINITY,
                     cfm: base_cfm,
                     is_motor_row: false,
+                    contact_role: ContactRowRole::None,
                 });
             }
         }
     }
 
-    // Unilateral contact normal + friction constraint rows
-    for c in contacts {
+    // Unilateral contact normal + coupled Coulomb friction constraint rows
+    for (c_idx, c) in contacts.iter().enumerate() {
         let ha = handles[c.body_a];
         let hb = handles[c.body_b];
         let (Some(ba), Some(bb)) = (bodies.get(ha), bodies.get(hb)) else {
@@ -1183,21 +1192,17 @@ fn assemble_velocity_constraints(
         let r_a = c.point - ba.world_com();
         let r_b = c.point - bb.world_com();
 
-        let va = ba.linear_velocity + ba.angular_velocity.cross(&r_a);
-        let vb = bb.linear_velocity + bb.angular_velocity.cross(&r_b);
-        let vn_pre = (vb - va).dot(&c.normal);
+        let va_pre = ba.linear_velocity + ba.angular_velocity.cross(&r_a);
+        let vb_pre = bb.linear_velocity + bb.angular_velocity.cross(&r_b);
+        let vn_pre = (vb_pre - va_pre).dot(&c.normal);
 
-        let bounce = if include_centripetal_bias && vn_pre < -0.5 {
+        let bounce = if include_centripetal_bias && c.restitution > 0.0 && vn_pre < -0.05 {
             -c.restitution * vn_pre
         } else {
             0.0
         };
-        let bias = if include_centripetal_bias {
-            (0.2 / dt) * (c.depth - 1e-4).max(0.0)
-        } else {
-            0.0
-        };
 
+        let normal_row_idx = rows.len();
         rows.push(AssembledConstraintRow {
             joint_idx: None,
             body_a: c.body_a,
@@ -1206,37 +1211,76 @@ fn assemble_velocity_constraints(
             j_ang_a: -r_a.cross(&c.normal),
             j_lin_b: c.normal,
             j_ang_b: r_b.cross(&c.normal),
-            rhs_velocity_bias: bounce.max(bias),
+            rhs_velocity_bias: bounce,
             lower_impulse: 0.0,
             upper_impulse: f64::INFINITY,
             cfm: base_cfm.max(1e-10),
             is_motor_row: false,
+            contact_role: ContactRowRole::Normal {
+                contact_idx: c_idx,
+                friction: c.friction,
+            },
         });
 
-        // Tangential Coulomb friction row opposing relative slip
-        if c.friction > 0.0 {
-            let v_rel = vb - va;
-            let v_tan = v_rel - c.normal * vn_pre;
+        // Two orthogonal tangential Coulomb friction rows bounded dynamically by |gamma_t|_2 <= mu * gamma_n
+        if include_friction && c.friction > 0.0 {
+            let ia = c.body_a;
+            let ib = c.body_b;
+            let va_ref = Vector3::new(v_ref[6 * ia], v_ref[6 * ia + 1], v_ref[6 * ia + 2])
+                + Vector3::new(v_ref[6 * ia + 3], v_ref[6 * ia + 4], v_ref[6 * ia + 5]).cross(&r_a);
+            let vb_ref = Vector3::new(v_ref[6 * ib], v_ref[6 * ib + 1], v_ref[6 * ib + 2])
+                + Vector3::new(v_ref[6 * ib + 3], v_ref[6 * ib + 4], v_ref[6 * ib + 5]).cross(&r_b);
+            let v_rel_ref = vb_ref - va_ref;
+            let v_tan = v_rel_ref - c.normal * v_rel_ref.dot(&c.normal);
             let slip = v_tan.norm();
-            if slip > 1e-6 {
-                let t_dir = v_tan / slip;
-                let m_eff = (ba.inv_mass() + bb.inv_mass()).max(1e-6).recip();
-                let max_f_imp = c.friction * m_eff * 9.81 * dt;
-                rows.push(AssembledConstraintRow {
-                    joint_idx: None,
-                    body_a: c.body_a,
-                    body_b: c.body_b,
-                    j_lin_a: -t_dir,
-                    j_ang_a: -r_a.cross(&t_dir),
-                    j_lin_b: t_dir,
-                    j_ang_b: r_b.cross(&t_dir),
-                    rhs_velocity_bias: 0.0,
-                    lower_impulse: -max_f_imp,
-                    upper_impulse: max_f_imp,
-                    cfm: base_cfm.max(1e-9),
-                    is_motor_row: false,
-                });
-            }
+            let (t1, t2) = if slip > 1e-8 {
+                let d1 = v_tan / slip;
+                let d2 = c.normal.cross(&d1).normalize();
+                (d1, d2)
+            } else {
+                orthonormal_pair(&c.normal)
+            };
+
+            let t1_row = rows.len();
+            let t2_row = t1_row + 1;
+            rows.push(AssembledConstraintRow {
+                joint_idx: None,
+                body_a: c.body_a,
+                body_b: c.body_b,
+                j_lin_a: -t1,
+                j_ang_a: -r_a.cross(&t1),
+                j_lin_b: t1,
+                j_ang_b: r_b.cross(&t1),
+                rhs_velocity_bias: 0.0,
+                lower_impulse: 0.0,
+                upper_impulse: 0.0,
+                cfm: base_cfm.max(1e-10),
+                is_motor_row: false,
+                contact_role: ContactRowRole::Tangent {
+                    normal_row: normal_row_idx,
+                    pair_row: t2_row,
+                    friction: c.friction,
+                },
+            });
+            rows.push(AssembledConstraintRow {
+                joint_idx: None,
+                body_a: c.body_a,
+                body_b: c.body_b,
+                j_lin_a: -t2,
+                j_ang_a: -r_a.cross(&t2),
+                j_lin_b: t2,
+                j_ang_b: r_b.cross(&t2),
+                rhs_velocity_bias: 0.0,
+                lower_impulse: 0.0,
+                upper_impulse: 0.0,
+                cfm: base_cfm.max(1e-10),
+                is_motor_row: false,
+                contact_role: ContactRowRole::Tangent {
+                    normal_row: normal_row_idx,
+                    pair_row: t1_row,
+                    friction: c.friction,
+                },
+            });
         }
     }
 
@@ -1300,7 +1344,200 @@ fn solve_kkt_system(
         a_mat[(r, r)] += row.cfm;
     }
 
-    solve_box_constrained_kkt(&a_mat, &rhs, &lower, &upper, max_lcp_iters)
+    solve_kkt_with_coulomb_contacts(rows, &a_mat, &rhs, &mut lower, &mut upper, max_lcp_iters)
+}
+
+/// Solves Box-LCP KKT with coupled isotropic Coulomb friction cones
+/// $\|\boldsymbol{\gamma}_t\|_2 \le \mu \gamma_n$ ($\gamma_n \ge 0$).
+fn solve_kkt_with_coulomb_contacts(
+    rows: &[AssembledConstraintRow],
+    a_mat: &DMatrix<f64>,
+    rhs: &DVector<f64>,
+    lower: &mut [f64],
+    upper: &mut [f64],
+    max_lcp_iters: usize,
+) -> DVector<f64> {
+    let mut friction_triplets: Vec<(usize, usize, usize, f64)> = Vec::new();
+    for (r, row) in rows.iter().enumerate() {
+        if let ContactRowRole::Tangent {
+            normal_row,
+            pair_row,
+            friction,
+        } = row.contact_role
+        {
+            if r < pair_row {
+                friction_triplets.push((normal_row, r, pair_row, friction));
+            }
+        }
+    }
+
+    // Fast path: preserve exact Cholesky / Box-LCP behavior when no Coulomb tangent rows exist
+    if friction_triplets.is_empty() {
+        return solve_box_constrained_kkt(a_mat, rhs, lower, upper, max_lcp_iters);
+    }
+
+    let m = rhs.len();
+    // Pass 0: solve frictionless normal + joint KKT to obtain initial normal impulses gamma_n >= 0
+    let mut x = solve_box_constrained_kkt(a_mat, rhs, lower, upper, max_lcp_iters);
+    let mut prev_r_cone = vec![0.0_f64; friction_triplets.len()];
+
+    for pass in 0..20 {
+        let mut max_cone_change = 0.0_f64;
+        for (idx, &(n_row, t1_row, t2_row, mu)) in friction_triplets.iter().enumerate() {
+            let raw_cone = mu * x[n_row].max(0.0);
+            let r_cone = if pass >= 8 {
+                0.5 * prev_r_cone[idx] + 0.5 * raw_cone
+            } else {
+                raw_cone
+            };
+            max_cone_change = max_cone_change.max((r_cone - prev_r_cone[idx]).abs());
+            prev_r_cone[idx] = r_cone;
+
+            if r_cone <= 1e-15 {
+                lower[t1_row] = 0.0;
+                upper[t1_row] = 0.0;
+                lower[t2_row] = 0.0;
+                upper[t2_row] = 0.0;
+                continue;
+            }
+
+            let mut b_t1 = rhs[t1_row];
+            let mut b_t2 = rhs[t2_row];
+            for j in 0..m {
+                if j != t1_row && j != t2_row {
+                    b_t1 -= a_mat[(t1_row, j)] * x[j];
+                    b_t2 -= a_mat[(t2_row, j)] * x[j];
+                }
+            }
+
+            let a11 = a_mat[(t1_row, t1_row)];
+            let a12 = a_mat[(t1_row, t2_row)];
+            let a22 = a_mat[(t2_row, t2_row)];
+            let (gt1, gt2, inside_cone) =
+                solve_2x2_coulomb_disk(a11, a12, a22, b_t1, b_t2, r_cone);
+
+            if inside_cone {
+                // Sticking inside Coulomb cone: allow full isotropic disk radius along either axis
+                lower[t1_row] = -r_cone;
+                upper[t1_row] = r_cone;
+                lower[t2_row] = -r_cone;
+                upper[t2_row] = r_cone;
+            } else {
+                // Sliding on boundary of Coulomb disk: exact KKT direction opposes post-impulse slip
+                let lim1 = gt1.abs().min(r_cone);
+                let lim2 = gt2.abs().min(r_cone);
+                lower[t1_row] = -lim1;
+                upper[t1_row] = lim1;
+                lower[t2_row] = -lim2;
+                upper[t2_row] = lim2;
+            }
+        }
+
+        let x_new = solve_box_constrained_kkt(a_mat, rhs, lower, upper, max_lcp_iters);
+        let mut max_diff = 0.0_f64;
+        for i in 0..m {
+            max_diff = max_diff.max((x_new[i] - x[i]).abs());
+        }
+        x = x_new;
+
+        let mut max_cone_viol = 0.0_f64;
+        for &(n_row, t1_row, t2_row, mu) in &friction_triplets {
+            let r_cone = mu * x[n_row].max(0.0);
+            let t_mag = (x[t1_row] * x[t1_row] + x[t2_row] * x[t2_row]).sqrt();
+            max_cone_viol = max_cone_viol.max(t_mag - r_cone);
+        }
+
+        if max_diff < 1e-11 && max_cone_change < 1e-11 && max_cone_viol < 1e-10 {
+            break;
+        }
+    }
+
+    // Strict Coulomb cone invariant clamp on tangent impulses
+    for &(n_row, t1_row, t2_row, mu) in &friction_triplets {
+        let r_cone = mu * x[n_row].max(0.0);
+        let t_mag = (x[t1_row] * x[t1_row] + x[t2_row] * x[t2_row]).sqrt();
+        if t_mag > r_cone && t_mag > 1e-15 {
+            let scale = r_cone / t_mag;
+            x[t1_row] *= scale;
+            x[t2_row] *= scale;
+        }
+    }
+
+    x
+}
+
+/// Solves $\min_{\|\boldsymbol{\gamma}_t\|_2 \le r} \frac{1}{2}\boldsymbol{\gamma}_t^T A_{tt}\boldsymbol{\gamma}_t - \mathbf{b}_t^T\boldsymbol{\gamma}_t$
+/// via safeguarded Moré–Sorensen secular Newton iteration on $(A_{tt} + \lambda I)\boldsymbol{\gamma}_t = \mathbf{b}_t$.
+/// Returns `(gt1, gt2, inside_cone)`.
+fn solve_2x2_coulomb_disk(
+    a11: f64,
+    a12: f64,
+    a22: f64,
+    b1: f64,
+    b2: f64,
+    r: f64,
+) -> (f64, f64, bool) {
+    let det = a11 * a22 - a12 * a12;
+    let (g1_0, g2_0) = if det.abs() > 1e-24 {
+        ((a22 * b1 - a12 * b2) / det, (-a12 * b1 + a11 * b2) / det)
+    } else {
+        (b1 / a11.abs().max(1e-15), b2 / a22.abs().max(1e-15))
+    };
+    let mag0 = g1_0.hypot(g2_0);
+    if mag0 <= r * (1.0 + 1e-9) {
+        return (g1_0, g2_0, true);
+    }
+
+    let b_norm = b1.hypot(b2);
+    if b_norm <= 1e-20 || r <= 1e-20 {
+        return (0.0, 0.0, false);
+    }
+
+    let mut lo = 0.0_f64;
+    let mut hi = (b_norm / r) * 1.01 + 1e-12;
+    let mut lambda = ((b_norm / r) - 0.5 * (a11 + a22)).clamp(lo + 1e-15, hi);
+    let mut g1 = g1_0 * (r / mag0);
+    let mut g2 = g2_0 * (r / mag0);
+
+    for _ in 0..24 {
+        let d1 = a11 + lambda;
+        let d2 = a22 + lambda;
+        let det_l = d1 * d2 - a12 * a12;
+        if det_l.abs() <= 1e-28 {
+            lambda = 0.5 * (lo + hi);
+            continue;
+        }
+        g1 = (d2 * b1 - a12 * b2) / det_l;
+        g2 = (-a12 * b1 + d1 * b2) / det_l;
+        let nrm = g1.hypot(g2);
+        if (nrm - r).abs() <= 1e-13 * r {
+            let scale = r / nrm.max(1e-20);
+            return (g1 * scale, g2 * scale, false);
+        }
+
+        if nrm > r {
+            lo = lo.max(lambda);
+        } else {
+            hi = hi.min(lambda);
+        }
+
+        let q1 = (d2 * g1 - a12 * g2) / det_l;
+        let q2 = (-a12 * g1 + d1 * g2) / det_l;
+        let gq = g1 * q1 + g2 * q2;
+        let next = if gq > 1e-30 {
+            lambda + (nrm * nrm / gq) * ((nrm - r) / r)
+        } else {
+            0.5 * (lo + hi)
+        };
+        lambda = if next > lo && next < hi {
+            next
+        } else {
+            0.5 * (lo + hi)
+        };
+    }
+
+    let nrm = g1.hypot(g2).max(1e-20);
+    (g1 * (r / nrm), g2 * (r / nrm), false)
 }
 
 /// Active-set + Projected Gauss–Seidel fallback solver for the symmetric positive-definite
@@ -1332,11 +1569,18 @@ fn solve_box_constrained_kkt(
             .unwrap_or_else(|| DVector::zeros(m));
     }
 
-    // Active-set Box-LCP iteration: 0 = free, -1 = clamped at lower, +1 = clamped at upper
+    // Active-set Box-LCP iteration:
+    //  0 = free, -1 = clamped at lower, +1 = clamped at upper, 2 = permanently fixed (lower == upper)
     let mut state = vec![0i8; m];
     let mut x = DVector::<f64>::zeros(m);
+    for i in 0..m {
+        if lower[i].is_finite() && upper[i].is_finite() && (upper[i] - lower[i]).abs() <= 1e-15 {
+            state[i] = 2;
+            x[i] = 0.5 * (lower[i] + upper[i]);
+        }
+    }
 
-    for _iter in 0..max_iters.min(24) {
+    for iter in 0..max_iters.min(32) {
         let free_indices: Vec<usize> = (0..m).filter(|&i| state[i] == 0).collect();
 
         for i in 0..m {
@@ -1344,6 +1588,8 @@ fn solve_box_constrained_kkt(
                 x[i] = lower[i];
             } else if state[i] == 1 {
                 x[i] = upper[i];
+            } else if state[i] == 2 {
+                x[i] = 0.5 * (lower[i] + upper[i]);
             }
         }
 
@@ -1378,23 +1624,74 @@ fn solve_box_constrained_kkt(
         }
 
         let mut changed = false;
+        let single_pivot = iter >= 8;
+        let mut best_flip_idx: Option<usize> = None;
+        let mut best_flip_state: i8 = 0;
+        let mut best_flip_score = 0.0_f64;
+
         for i in 0..m {
+            if state[i] == 2 {
+                continue;
+            }
             if state[i] == 0 {
-                if x[i] < lower[i] - 1e-14 {
-                    x[i] = lower[i];
-                    state[i] = -1;
-                    changed = true;
-                } else if x[i] > upper[i] + 1e-14 {
-                    x[i] = upper[i];
-                    state[i] = 1;
-                    changed = true;
+                if x[i] < lower[i] - 1e-13 {
+                    let viol = lower[i] - x[i];
+                    if !single_pivot {
+                        x[i] = lower[i];
+                        state[i] = -1;
+                        changed = true;
+                    } else if viol > best_flip_score {
+                        best_flip_score = viol;
+                        best_flip_idx = Some(i);
+                        best_flip_state = -1;
+                    }
+                } else if x[i] > upper[i] + 1e-13 {
+                    let viol = x[i] - upper[i];
+                    if !single_pivot {
+                        x[i] = upper[i];
+                        state[i] = 1;
+                        changed = true;
+                    } else if viol > best_flip_score {
+                        best_flip_score = viol;
+                        best_flip_idx = Some(i);
+                        best_flip_state = 1;
+                    }
                 }
             } else {
                 let residual = a_mat.row(i).dot(&x.transpose()) - rhs[i];
-                if (state[i] == -1 && residual < -1e-12) || (state[i] == 1 && residual > 1e-12) {
-                    state[i] = 0;
-                    changed = true;
+                if state[i] == -1 && residual < -1e-11 {
+                    let viol = -residual;
+                    if !single_pivot {
+                        state[i] = 0;
+                        changed = true;
+                    } else if viol > best_flip_score {
+                        best_flip_score = viol;
+                        best_flip_idx = Some(i);
+                        best_flip_state = 0;
+                    }
+                } else if state[i] == 1 && residual > 1e-11 {
+                    let viol = residual;
+                    if !single_pivot {
+                        state[i] = 0;
+                        changed = true;
+                    } else if viol > best_flip_score {
+                        best_flip_score = viol;
+                        best_flip_idx = Some(i);
+                        best_flip_state = 0;
+                    }
                 }
+            }
+        }
+
+        if single_pivot {
+            if let Some(idx) = best_flip_idx {
+                state[idx] = best_flip_state;
+                if best_flip_state == -1 {
+                    x[idx] = lower[idx];
+                } else if best_flip_state == 1 {
+                    x[idx] = upper[idx];
+                }
+                changed = true;
             }
         }
 
@@ -1404,8 +1701,12 @@ fn solve_box_constrained_kkt(
     }
 
     // Fallback: Projected Gauss–Seidel polish if active-set cycled
-    for _ in 0..max_iters {
+    for _ in 0..(max_iters * 4) {
         for i in 0..m {
+            if state[i] == 2 {
+                x[i] = 0.5 * (lower[i] + upper[i]);
+                continue;
+            }
             let diag = a_mat[(i, i)];
             if diag.abs() <= 1e-20 {
                 continue;
@@ -1797,9 +2098,9 @@ fn project_velocity_and_compute_reactions(
     handles: &[BodyHandle],
     handle_to_idx: &std::collections::HashMap<BodyHandle, usize>,
     joints: &mut [SolvedJointRecord],
-    contacts: &[DetectedContact],
-    step_motor_force_on_a: &[Vector3<f64>],
-    step_motor_torque_on_a: &[Vector3<f64>],
+    contacts: &[ContactPoint],
+    step_motor_impulses: &[f64],
+    step_limit_impulses: &[f64],
     g_vec: Vector3<f64>,
     dt: f64,
     cfm: f64,
@@ -1835,7 +2136,8 @@ fn project_velocity_and_compute_reactions(
         }
     }
 
-    // 1. Project velocities onto tangent manifold (skipping motor rows that saturated during the step)
+    // 1. Project velocities onto tangent manifold (skipping motor rows that saturated during the step,
+    //    and omitting tangential friction rows so sliding contacts do not incur duplicate braking impulses)
     let mut proj_rows = assemble_velocity_constraints(
         bodies,
         handles,
@@ -1844,6 +2146,7 @@ fn project_velocity_and_compute_reactions(
         contacts,
         &v_cur,
         dt,
+        false,
         false,
         cfm,
     );
@@ -1878,13 +2181,13 @@ fn project_velocity_and_compute_reactions(
             let w_ib = &inv_inertia_world[ib];
 
             let jma_lin = row.j_lin_a * w_ma;
-            let jma_ang = if !is_pure_trans || multi_a {
+            let jma_ang = if row.joint_idx.is_none() || !is_pure_trans || multi_a {
                 w_ia * row.j_ang_a
             } else {
                 Vector3::zeros()
             };
             let jmb_lin = row.j_lin_b * w_mb;
-            let jmb_ang = if !is_pure_trans || multi_b {
+            let jmb_ang = if row.joint_idx.is_none() || !is_pure_trans || multi_b {
                 w_ib * row.j_ang_b
             } else {
                 Vector3::zeros()
@@ -1949,7 +2252,7 @@ fn project_velocity_and_compute_reactions(
         }
     }
 
-    let react_rows = assemble_velocity_constraints(
+    let mut react_rows = assemble_velocity_constraints(
         bodies,
         handles,
         handle_to_idx,
@@ -1958,10 +2261,11 @@ fn project_velocity_and_compute_reactions(
         &v_cur,
         dt,
         true,
+        true,
         cfm,
     );
     if !react_rows.is_empty() {
-        let gamma_react = solve_kkt_system(
+        let mut gamma_react = solve_kkt_system(
             &react_rows,
             &v_react_star,
             &inv_mass_vec,
@@ -1969,42 +2273,68 @@ fn project_velocity_and_compute_reactions(
             nb,
             max_lcp_iters,
         );
+
+        // If any motor actuator or unilateral travel limit applied a larger step impulse during Step 3
+        // (e.g. an unsaturated velocity motor spinning up a body in a single step, or an inelastic impact
+        // arresting motion at a travel limit so that v_{k+1} already satisfies the target velocity),
+        // pin those active actuator/limit impulses and re-solve the coupled KKT system at q_{k+1}
+        // so that all bilateral support and gear rows balance the impulse consistently.
+        let mut pinned_any = false;
+        for (r, row) in react_rows.iter_mut().enumerate() {
+            if let Some(j_idx) = row.joint_idx {
+                if row.is_motor_row {
+                    let step_imp = step_motor_impulses.get(j_idx).copied().unwrap_or(0.0);
+                    if step_imp.abs() > gamma_react[r].abs() + 1e-12 {
+                        row.lower_impulse = step_imp;
+                        row.upper_impulse = step_imp;
+                        pinned_any = true;
+                    }
+                } else if row.lower_impulse.is_finite() || row.upper_impulse.is_finite() {
+                    let step_imp = step_limit_impulses.get(j_idx).copied().unwrap_or(0.0);
+                    if step_imp.abs() > gamma_react[r].abs() + 1e-12 {
+                        row.lower_impulse = step_imp;
+                        row.upper_impulse = step_imp;
+                        pinned_any = true;
+                    }
+                }
+            }
+        }
+        if pinned_any {
+            gamma_react = solve_kkt_system(
+                &react_rows,
+                &v_react_star,
+                &inv_mass_vec,
+                &inv_inertia_world,
+                nb,
+                max_lcp_iters,
+            );
+        }
+
         for j in joints.iter_mut() {
             j.last_force_on_a = [0.0; 3];
             j.last_torque_on_a = [0.0; 3];
+            j.last_force_on_b = [0.0; 3];
+            j.last_torque_on_b = [0.0; 3];
         }
         for (r, row) in react_rows.iter().enumerate() {
             if let Some(j_idx) = row.joint_idx {
-                if row.is_motor_row {
-                    let rf_f = row.j_lin_a * (gamma_react[r] / dt);
-                    let rf_t = row.j_ang_a * (gamma_react[r] / dt);
-                    let sf_f = step_motor_force_on_a
-                        .get(j_idx)
-                        .copied()
-                        .unwrap_or_else(Vector3::zeros);
-                    let sf_t = step_motor_torque_on_a
-                        .get(j_idx)
-                        .copied()
-                        .unwrap_or_else(Vector3::zeros);
-                    let f_a = if sf_f.norm() >= rf_f.norm() { sf_f } else { rf_f };
-                    let t_a_com = if sf_t.norm() >= rf_t.norm() { sf_t } else { rf_t };
-                    joints[j_idx].last_force_on_a[0] += f_a.x;
-                    joints[j_idx].last_force_on_a[1] += f_a.y;
-                    joints[j_idx].last_force_on_a[2] += f_a.z;
-                    joints[j_idx].last_torque_on_a[0] += t_a_com.x;
-                    joints[j_idx].last_torque_on_a[1] += t_a_com.y;
-                    joints[j_idx].last_torque_on_a[2] += t_a_com.z;
-                } else {
-                    let lambda = gamma_react[r] / dt;
-                    let f_a = row.j_lin_a * lambda;
-                    let t_a_com = row.j_ang_a * lambda;
-                    joints[j_idx].last_force_on_a[0] += f_a.x;
-                    joints[j_idx].last_force_on_a[1] += f_a.y;
-                    joints[j_idx].last_force_on_a[2] += f_a.z;
-                    joints[j_idx].last_torque_on_a[0] += t_a_com.x;
-                    joints[j_idx].last_torque_on_a[1] += t_a_com.y;
-                    joints[j_idx].last_torque_on_a[2] += t_a_com.z;
-                }
+                let lambda = gamma_react[r] / dt;
+                let f_a = row.j_lin_a * lambda;
+                let t_a_com = row.j_ang_a * lambda;
+                let f_b = row.j_lin_b * lambda;
+                let t_b_com = row.j_ang_b * lambda;
+                joints[j_idx].last_force_on_a[0] += f_a.x;
+                joints[j_idx].last_force_on_a[1] += f_a.y;
+                joints[j_idx].last_force_on_a[2] += f_a.z;
+                joints[j_idx].last_torque_on_a[0] += t_a_com.x;
+                joints[j_idx].last_torque_on_a[1] += t_a_com.y;
+                joints[j_idx].last_torque_on_a[2] += t_a_com.z;
+                joints[j_idx].last_force_on_b[0] += f_b.x;
+                joints[j_idx].last_force_on_b[1] += f_b.y;
+                joints[j_idx].last_force_on_b[2] += f_b.z;
+                joints[j_idx].last_torque_on_b[0] += t_b_com.x;
+                joints[j_idx].last_torque_on_b[1] += t_b_com.y;
+                joints[j_idx].last_torque_on_b[2] += t_b_com.z;
             }
         }
         convert_com_torque_to_anchor_couple(bodies, joints);
@@ -2018,22 +2348,30 @@ fn project_velocity_and_compute_reactions(
     }
 }
 
-/// Converts `last_torque_on_a` from total moment about Body A's COM ($\boldsymbol{\tau}_{A,\text{com}}$)
-/// into the pure joint reaction couple about `anchor_a`:
-/// $\boldsymbol{\tau}_{A,\text{anchor}} = \boldsymbol{\tau}_{A,\text{com}} - (\mathbf{p}_{\text{anchor},a} - \mathbf{x}_{\text{com},a}) \times \mathbf{F}_A$.
+/// Converts `last_torque_on_a` and `last_torque_on_b` from total moments about Body A's and Body B's
+/// centers of mass ($\boldsymbol{\tau}_{A,\text{com}}$, $\boldsymbol{\tau}_{B,\text{com}}$) into pure
+/// joint reaction couples about `anchor_a` and `anchor_b`:
+/// $\boldsymbol{\tau}_{A,\text{anchor}} = \boldsymbol{\tau}_{A,\text{com}} - (\mathbf{p}_{\text{anchor},a} - \mathbf{x}_{\text{com},a}) \times \mathbf{F}_A$,
+/// $\boldsymbol{\tau}_{B,\text{anchor}} = \boldsymbol{\tau}_{B,\text{com}} - (\mathbf{p}_{\text{anchor},b} - \mathbf{x}_{\text{com},b}) \times \mathbf{F}_B$.
 fn convert_com_torque_to_anchor_couple(
     bodies: &BodyRegistry,
     joints: &mut [SolvedJointRecord],
 ) {
     for j in joints.iter_mut() {
-        let Some(ba) = bodies.get(j.body_a) else {
-            continue;
-        };
-        let r_a = ba.orientation * (Vector3::from(j.data.anchor_a) - ba.local_com);
-        let f_a = Vector3::from(j.last_force_on_a);
-        let t_a_com = Vector3::from(j.last_torque_on_a);
-        let t_anchor = t_a_com - r_a.cross(&f_a);
-        j.last_torque_on_a = [t_anchor.x, t_anchor.y, t_anchor.z];
+        if let Some(ba) = bodies.get(j.body_a) {
+            let r_a = ba.orientation * (Vector3::from(j.data.anchor_a) - ba.local_com);
+            let f_a = Vector3::from(j.last_force_on_a);
+            let t_a_com = Vector3::from(j.last_torque_on_a);
+            let t_anchor = t_a_com - r_a.cross(&f_a);
+            j.last_torque_on_a = [t_anchor.x, t_anchor.y, t_anchor.z];
+        }
+        if let Some(bb) = bodies.get(j.body_b) {
+            let r_b = bb.orientation * (Vector3::from(j.data.anchor_b) - bb.local_com);
+            let f_b = Vector3::from(j.last_force_on_b);
+            let t_b_com = Vector3::from(j.last_torque_on_b);
+            let t_anchor = t_b_com - r_b.cross(&f_b);
+            j.last_torque_on_b = [t_anchor.x, t_anchor.y, t_anchor.z];
+        }
     }
 }
 
@@ -2087,5 +2425,7 @@ pub fn create_solved_joint_record(
         motor_saturated: false,
         last_force_on_a: [0.0; 3],
         last_torque_on_a: [0.0; 3],
+        last_force_on_b: [0.0; 3],
+        last_torque_on_b: [0.0; 3],
     }
 }

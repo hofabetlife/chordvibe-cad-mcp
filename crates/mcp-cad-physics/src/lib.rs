@@ -1,6 +1,7 @@
 //! Physics simulation crate for MCP-CAD in double precision (`f64`).
 #![deny(unsafe_code)]
 
+pub mod collision;
 pub mod dae_prototype;
 pub mod error;
 pub mod joint;
@@ -9,6 +10,7 @@ pub mod simulator;
 pub mod solver;
 pub mod telemetry;
 
+pub use collision::{ContactPoint, TriMeshBvh};
 pub use error::PhysicsError;
 pub use joint::{
     CadJointType, JointData, JointHandle, JointLimitStatus, MechanismAnalysisReport, MotorConfig,

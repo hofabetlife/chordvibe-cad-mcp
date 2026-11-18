@@ -1,4 +1,4 @@
-//! Kinematics, joints, and physics simulation tools powered by Rapier3D.
+//! Kinematics, joints, and physics simulation tools powered by the native `f64` DAE multi-body solver.
 
 use std::collections::HashMap;
 use serde_json::{json, Value};
@@ -159,7 +159,7 @@ pub fn create_joint(args: &Value, state: &mut EngineState) -> Result<Value, Serv
         return Err(ServerError::PartNotFound(raw_part_b.to_string()));
     }
 
-    // Ensure non-ground parts are registered into the Rapier physics world if they have geometry
+    // Ensure non-ground parts are registered into the f64 physics world if they have geometry
     for p_id in [&part_a, &part_b] {
         if !is_world_or_ground(p_id) {
             let part = &state.parts[p_id.as_str()];
@@ -406,7 +406,11 @@ pub fn set_joint_motor(args: &Value, state: &mut EngineState) -> Result<Value, S
         })?,
     };
 
-    if !target_velocity.is_finite() || !(target_velocity as f32).is_finite() {
+    /// Maximum safe motor velocity (rad/s or m/s) and force/torque (N or N*m) in the `f64` DAE
+    /// solver before quadratic/quartic KKT and SVD matrix norms risk `f64` overflow.
+    const MAX_MOTOR_PARAM_F64: f64 = 1.0e30;
+
+    if !target_velocity.is_finite() || target_velocity.abs() > MAX_MOTOR_PARAM_F64 {
         return Err(ServerError::InvalidArgument(format!(
             "Argument 'target_velocity' must be a finite number, got {target_velocity}"
         )));
@@ -425,7 +429,7 @@ pub fn set_joint_motor(args: &Value, state: &mut EngineState) -> Result<Value, S
         })?,
     };
 
-    if !max_force.is_finite() || !(max_force as f32).is_finite() {
+    if !max_force.is_finite() || max_force.abs() > MAX_MOTOR_PARAM_F64 {
         return Err(ServerError::InvalidArgument(format!(
             "Argument 'max_force' must be a finite number, got {max_force}"
         )));
@@ -1325,7 +1329,7 @@ mod tests {
         assert_eq!(body_neg.param.as_deref(), Some("max_force"));
         assert!(body_neg.message.contains("non-negative"));
 
-        // 2. Overflowing f64 that becomes f32::INFINITY in Rapier -> rejected
+        // 2. Astronomical f64 values exceeding safe DAE solver range (> 1e30) -> rejected
         let err_inf_vel = set_joint_motor(
             &json!({
                 "joint_id": joint_id,

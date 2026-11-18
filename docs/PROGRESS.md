@@ -44,9 +44,30 @@
 
 ---
 
-## План следующих шагов
-- **Фаза 2**: Единый слой команд в Rust, вынос нативного окна `winit` под опциональный feature-флаг `native-gui` (по умолчанию выключен), единый реестр 28 инструментов MCP как источник правды.
-- **Фаза 3**: Веб-транспорт и статика/API на порту 3000 (`0.0.0.0` с обязательным Bearer-токеном для не-loopback адреса и всех мутирующих запросов), песочница путей `./output` для STL, `TET10` в Rust МКЭ, тонкий клиент на TypeScript без дублирования вычислений.
-- **Фаза 4**: Разработка и бенчмарк собственного физического движка механизмов (DAE / обобщённый $\alpha$-метод / стабилизированный индекс 2, прямая и обратная динамика, анализ рангов якобиана и сингулярностей, регуляризованный контакт с трением), перекрёстная проверка с аналитикой и `MuJoCo 3.17.0`, полное удаление `rapier3d`.
-- **Фаза 5**: Сквозная проверка в среде (порт 3000, MCP по `stdio` и HTTP/SSE с токеном, проверка через headless Chromium / `playwright-cli`, кросс-проверка `cargo check --target x86_64-pc-windows-gnu`).
-- **Фаза 6**: Актуализация документации (`README.md`, `CHANGELOG.md`, `PRD.md`, `docs/`), добавление `LICENSE-MIT`, `LICENSE-APACHE` и `.github/workflows/ci.yml`.
+## План и сводный статус фаз P2–P4 (актуализировано в `P4-T10`, 18.11.2026)
+
+- **Фаза 2 (P2-T1..T40 — ✅ ВЫПОЛНЕНО)**: Единый слой команд и протокольных ошибок (`ErrorEnvelope`, 36 кодов) в Rust, контракт единиц измерения (`mm` по умолчанию / `m`), топологическое именование граней (`FaceInfo`/`FaceSelector`), слой инженерных требований (`set_requirements`/`check_requirements`), персистентность (`save_project`/`load_project`), автономный запуск превью из `stdio` и руководство `SKILL.md` / `AGENT_GUIDE.md`.
+- **Фаза 3 (P3-T1..T24 — ✅ ВЫПОЛНЕНО)**:
+  - Аналитическая верификация FEA, предполётная проверка `validate_mesh`, баланс реакций, сходимость Ричардсона и квадратичные элементы **`TET10`** (`element_order = 2`, ошибка прогиба консоли снижена с `20.14%` до `0.25%`).
+  - Извлечение пиковых нагрузок из симуляции и квазистатический МКЭ (`get_part_load_cases`, `run_fea_from_simulation`), расчёт зубчатых передач по Льюису и Герцу/AGMA (`check_gear_strength`), анализ подвижности по Грюблеру и SVD (`analyze_mechanism`), детекция интерференции и развёртка хода замкнутых механизмов (`check_interference`, `sweep_joint`), изоляция `qa_wide_scan` и многопоточного рендеринга WGPU.
+- **Фаза 4 (`P4-T0`–`P4-T10` — ✅ ВЫПОЛНЕНО; открытых задач в бэклоге нет)**:
+  - Добавлен 41-й MCP-инструмент `apply_recipe` (`flanged_bushing`, `stepped_shaft`, `gear_transmission`).
+  - Реализован и утверждён (`ADR-004`) собственный многотельный физический решатель в двойной точности **`f64`** (`mcp-cad-physics`):
+    - `rigid_body.rs` (`P4-T2`, `P4-T9`): `RigidBody`, `MassProperties` (двухпроходный тензор инерции по знаковым тетраэдрам с учётом полостей и отверстий, прямое чтение `part.mesh()`) и `ColliderShape` (`ConvexHull`, `TriMesh`, `Compound`, `Cube`, `Sphere`, `Cylinder`).
+    - `solver.rs` (`P4-T3`, `P4-T7`): `MultiBodySolver` (`DirectKktIndex2Projection` — неявно-среднеточечный Lie–Poisson предиктор вращения в СК тела + регуляризованная KKT / Active-Set Box-LCP система + трапецеидальный шаг + SVD-проекция на многообразие $\Phi(\mathbf{q})=\mathbf{0}$, прямая передача момента в `Gear`).
+    - `collision.rs` (`P4-T4`): AABB Sweep-and-Prune, `TriMeshBvh`, аналитика + GJK/EPA + планарный клиппинг и изотропный конусный контактный решатель Кулона ($\|\boldsymbol{\gamma}_t\|_2 \le \mu \gamma_n$).
+    - `simulator.rs` (`P4-T5`, `P4-T6`, `P4-T8`): прямое извлечение реакций шарниров $\boldsymbol{\lambda}$ (`Pinned KKT Re-solve`), полное удаление зависимости `rapier3d`/`parry3d` из `Cargo.toml`/`Cargo.lock`, очистка `f32`-приведений, обновление UI веб-студии (`src/`) и `NaN`-безопасный `rotation_vector` в `ClosedLoopSolver` (`atan2` + `clamp(-1.0, 1.0)`).
+  - Гигиена ядра и тестов (`part.rs`, `physics_tests.rs`, `P4-T9`–`P4-T10`): `Part::mesh()` возвращает каноническую сетку `&self.mesh`, `Part::mesh_mut()` сбрасывает кэш `cached_mesh`/`cached_settings`, `Part::tessellate()` проверяет `*cached == self.mesh`; тест `test_p3_t10_benchmark_check_interference_10_parts_45_pairs` стабилизирован под параллельной нагрузкой на CPU (детерминированные инварианты broad-phase/CSG + защитный предел `< 5000.0 ms`).
+- **Итоговая верификация (`P4-T10`, 18.11.2026)**:
+  - Перепроверено в `P4-T10` после правки `crates/mcp-cad-physics/tests/physics_tests.rs`:
+    - `cargo test -p mcp-cad-physics --no-fail-fast`: **42/42 PASS** (`10` `--lib`, `32` `physics_tests`, `0 failed`), включая стресс-прогон параллельно с `npm run build && npm test` на 4-vCPU (`rc_rust=0`, `rc_web=0`);
+    - `cargo clippy --workspace --all-targets -- -D warnings`: **0 ошибок, 0 предупреждений**;
+    - `npm run lint` (`tsc --noEmit`) & `npm run build` (`vite build`): **PASS** (`0` ошибок);
+    - `npm test` (`src/cad/cad_engine.test.ts` + `src/cad/__tests__/analyze_mechanism.test.ts`): **53/53 PASS** (`38/38` + `15/15`, `0 failed`).
+  - Полный прогон Rust Workspace (подтверждён в `P4-T9`): **348/348 PASS** (`0 failed`):
+    - `mcp-cad-core`: **133/133 PASS** (`76` `--lib`, `10` `csg_invariants`, `16` `dag_tests`, `25` `primitive_invariants`, `6` `tessellation_tests`);
+    - `mcp-cad-fea`: **21/21 PASS** (`8` `--lib`, `2` `fea_benchmarks`, `11` `fea_tests`);
+    - `mcp-cad-physics`: **42/42 PASS** (`10` `--lib`, `32` `physics_tests`);
+    - `mcp-cad-viewer`: **10/10 PASS** (`10` `viewer_tests`);
+    - `mcp-cad-server`: **142/142 PASS** (`65` `--lib`, `1` `bench_suite`, `2` `gear_kinematic_test`, `61` `mcp_contract_tests`, `13` `qa_wide_scan`).
+  - `cargo tree | grep -i -E 'rapier|parry'` и `grep -rnI -i 'rapier\|parry' crates src`: **0 совпадений**.

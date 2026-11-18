@@ -212,7 +212,7 @@ const ASSEMBLY_PRESETS: AssemblyPresetItem[] = [
   {
     id: 'crank_mechanism',
     label: 'Кривошипно-шатунный',
-    description: 'Кривошипно-ползунный механизм (Rapier3D)',
+    description: 'Кривошипно-ползунный механизм (f64 DAE)',
     icon: (
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-4 h-4 text-[#38bdf8]">
         <circle cx="6" cy="14" r="2" />
@@ -625,7 +625,7 @@ export const CadRibbonToolbar: React.FC<CadRibbonToolbarProps> = ({
           <div className="flex items-center gap-1 bg-[#10131a] p-0.5 rounded border border-[#252b38] shrink-0">
             <button
               onClick={onTogglePhysics}
-              title="Запуск / Пауза кинематической симуляции Rapier3D (Клавиша P)"
+              title="Запуск / Пауза кинематической симуляции f64 DAE (Клавиша P)"
               className={`flex items-center gap-1.5 px-3 py-1 rounded text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap ${
                 isSimulatingPhysics
                   ? 'bg-[#10b981] text-[#0c0e12]'

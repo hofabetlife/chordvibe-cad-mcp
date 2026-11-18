@@ -10,14 +10,14 @@
 **MCP-CAD Engine** — автономная инженерная 3D CAD/CAE система на языке **Rust**, спроектированная для управления искусственным интеллектом (LLM / AI Agents) через протокол **Model Context Protocol (MCP)** (`2024-11-05`, JSON-RPC 2.0).
 
 Система реализует замкнутый верифицируемый цикл инженерного проектирования ИИ-агента:
-$$\text{Требования (Requirements)} \longrightarrow \text{Проектирование (Solid DAG)} \longrightarrow \text{Топологический аудит (Mesh Validation)} \longrightarrow \text{Анализ прочности (FEA) и Кинематики (Rapier3D)} \longrightarrow \text{Визуальный контроль (WGPU) и Экспорт (STL / Project JSON)}$$
+$$\text{Требования (Requirements)} \longrightarrow \text{Проектирование (Solid DAG)} \longrightarrow \text{Топологический аудит (Mesh Validation)} \longrightarrow \text{Анализ прочности (FEA) и Кинематики (f64 DAE)} \longrightarrow \text{Визуальный контроль (WGPU) и Экспорт (STL / Project JSON)}$$
 
 ### Ключевые возможности
 1. **Параметрическое твердотельное моделирование (Solid Modeling DAG & CBO)**: Дерево построения деталей (`FeatureTree`) с поддержкой 8 аналитических и машиностроительных примитивов (`box`, `cylinder`, `sphere`, `cone`, `polygon_prism`, `spur_gear`, `revolve`, `wheel_rim`), вырезов (`cut_hole` со шпоночным пазом и режимом `through: true`, `cut_helical_groove` со спиральным и резьбовым профилем ISO 68-1), булевых операций CSG (`union`, `difference`, `intersection`), пространственных трансформаций (`transform_part` с выравниванием по именованным граням), редактирования истории (`modify_feature`) и стоимостного оптимизатора запросов (**Cost-Based CAD Query Optimizer**, правила `R1`–`R5`).
 2. **Топологическое именование граней (`FaceInfo`) и семантические селекторы (`FaceSelector`)**: Каждый треугольник сетки несёт идентификатор логической грани `face_id`, сохраняющийся при трансформациях и булевых операциях CSG. ИИ-агент обращается к поверхностям детали по смыслу (`"cap_top"`, `"cap_bottom"`, `"hole_wall:feat_1"`, `{"where": {"kind": "cylinder", "radius": 5.0}}`), а не по «сырым» координатам.
 3. **Слой инженерных требований и самопроверки (`Requirements Layer`)**: Декларативное задание ограничений (`bbox_max`, `bbox_min`, `mass_max`, `mesh_valid`, `min_safety_factor`, `no_interference`, `mechanism_dof`) через `set_requirements` (`auto_check: true`) и проверка запасов через `check_requirements` с отслеживанием актуальности расчётов МКЭ по ревизии детали (`part.revision`).
 4. **Линейный МКЭ-анализ прочности (FEA Linear Elasticity)**: Воксельная тетраэдризация (`TET4`, `element_order = 1`) и квадратичные 10-узловые изопараметрические тетраэдры (`TET10`, `element_order = 2`, 4-точечная квадратура Гаусса 2-го порядка, устраняющая `shear locking` при изгибе) с адаптивным измельчением поверхностных рёбер, сборка разреженной матрицы жёсткости ($K \cdot u = F$), решение методом сопряжённых градиентов (PCG), граничные условия Дирихле и Неймана (силы в `N`, давление в `MPa`, моменты в `N·m`) по именованным граням, расчёт напряжений по Мизесу ($\sigma_{vM}$) и коэффициента запаса прочности ($FoS = \sigma_y / \max \sigma_{vM}$).
-5. **Кинематика и динамика механизмов (`Rapier3D`)**: Твёрдые тела с автоматическим пересчётом массы, центра масс и тензора инерции из полигональной сетки и плотности материала $\rho$; 5 типов сочленений (`Revolute`, `Prismatic`, `Spherical`, `Fixed`, `Gear`), приводы (`set_joint_motor`), статические якоря `"ground"` / `"world"`, телеметрия траекторий, пиковых реакций и коллизий.
+5. **Кинематика и динамика механизмов (`f64` Index-2 DAE)**: Твёрдые тела (`RigidBody`) и коллайдеры (`ColliderShape`) в двойной точности `f64` с двухпроходным пересчётом массы, ЦМ и $3\times 3$ тензора инерции напрямую по замкнутой сетке `Part` с учётом полостей и отверстий (`MassProperties::from_part`); собственный многотельный KKT/Active-Set Box-LCP решатель (`MultiBodySolver`, `ADR-004`) для 5 типов сочленений (`Revolute`, `Prismatic`, `Spherical`, `Fixed`, `Gear` со связанной передачей момента), приводов (`set_joint_motor`), статических якорей `"ground"` / `"world"`, конвейера коллизий с трением Кулона и прямого извлечения реакций $\boldsymbol{\lambda}$ в МКЭ.
 6. **WGPU 3D Viewport & Headless Offscreen Render**: Оффскрин-рендеринг сцены и тепловых карт МКЭ в PNG/Base64 (`capture_viewport`, `get_fea_heatmap_image`), работающий на любой платформе (включая headless-контейнеры через программный Vulkan Lavapipe и CPU-fallback), а также нативное интерактивное 3D-окно (`winit` + `wgpu`, `open_preview_window`, `--gui`, `--stl`).
 7. **Двойной транспорт MCP и персистентность**: Поддержка `stdio` (для локального запуска в Google Antigravity, Claude Desktop, Cursor) и `HTTP/SSE` (Axum), плюс транзакционное сохранение/загрузка проектов (`save_project` / `load_project`, `schema_version = "1.0.0"`).
 
@@ -53,17 +53,17 @@ mcp-cad/
 │   ├── BENCH_BASELINE_RUST.md    # Базовая линия 15 задач бенчмарка против нативного Rust-сервера
 │   ├── adr/0001-geometry-kernel.md # ADR выбора геометрического ядра (manifold-rust + monstertruck)
 │   ├── adr/0002-fe-mesher.md        # ADR выбора генератора сетки МКЭ (fe_snap + TET10, P3-T5)
-│   └── agent_tasks/              # Детальные отчёты о выполнении задач P0-T1..T12, P1-T1..T4, P2-T1..T40, P3-T1..T24, P4-T0..T3
+│   └── agent_tasks/              # Детальные отчёты о выполнении задач P0-T1..T12, P1-T1..T4, P2-T1..T40, P3-T1..T24, P4-T0..T10
 ├── spikes/
 │   ├── manifold_rust/            # Прототип ядра manifold-rust v0.19.2 (Pure Rust CSG + face_id)
 │   ├── monstertruck_brep/        # Прототип B-Rep ядра monstertruck v0.4.1 (fillet + ISO 10303-21 STEP)
 │   └── fe_snap/                  # Прототип boundary-conforming мешера (P3-T5: line-search + TET10)
 └── crates/
     ├── mcp-cad-core/             # Геометрическое ядро, примитивы, CSG, DAG, CBO, топология, STL
-    ├── mcp-cad-physics/          # Динамика и кинематика механизмов (Rapier3D), шарниры, моторы
+    ├── mcp-cad-physics/          # Собственный f64 DAE/KKT-решатель динамики, коллизий, шарниров и реакций
     ├── mcp-cad-fea/              # Тетраэдризация (TET4/TET10), МКЭ-решатель PCG, Мизес, FoS, ГУ по граням
     ├── mcp-cad-viewer/           # Рендеринг WGPU/Winit, шейдеры, offscreen PNG/Base64 + CPU fallback
-    └── mcp-cad-server/           # MCP-сервер (stdio/SSE), состояние сцены, диспетчер 40 инструментов
+    └── mcp-cad-server/           # MCP-сервер (stdio/SSE), состояние сцены, диспетчер 41 инструмента
 ```
 
 ### Граф зависимостей между крейтами
@@ -132,8 +132,8 @@ graph TD
 
 ### 4.3. Спецификация остальных подсистем
 
-#### `crates/mcp-cad-physics` (Динамика и кинематика механизмов)
-- Интеграция с `rapier3d`: автоматическое построение твёрдых тел (`RigidBodyType::Dynamic` при `!part.is_fixed` и `RigidBodyType::Fixed` при `part.is_fixed == true`) и коллайдеров (`Collider`), расчёт массы и тензора инерции по объёму сетки и плотности материала $\rho$.
+#### `crates/mcp-cad-physics` (Динамика и кинематика механизмов в `f64`)
+- Собственный **Pure-Rust многотельный решатель в двойной точности `f64`** (`MultiBodySolver`, `BodyRegistry`, `ColliderRegistry`, `TriMeshBvh`, `ADR-004` на `nalgebra`): построение твёрдых тел (`is_dynamic = !part.is_fixed`), коллайдеров (`ColliderShape`: `ConvexHull`, `TriMesh`, `Compound`, `Cube`, `Sphere`, `Cylinder`), двухпроходный расчёт массы, ЦМ и $3\times 3$ тензора инерции по замкнутой сетке `Part` с учётом полостей (`MassProperties::from_part`), трапецеидальный шаг + неявный среднеточечный предиктор вращения Эйлера (Lie–Poisson), односторонние контакты с изотропным конусом сухого трения Кулона ($\|\boldsymbol{\gamma}_t\|_2 \le \mu \gamma_n$) и прямое извлечение 6-компонентных реакций Лагранжа $\boldsymbol{\lambda}$ (`Pinned KKT Re-solve`).
 - Статические мировые якоря `"ground"` и `"world"` (регистронезависимые, защищены от удаления и переопределения в `create_part` / `delete_part`).
 - 5 типов шарниров (`CadJointType`): `Revolute` (ось, пределы углов `limits` в `deg`, мотор угловой скорости `rad/s` и момента `N·m`), `Prismatic` (ось, пределы хода `limits` в `mm`/`m`, мотор линейной скорости `m/s` и силы `N`), `Spherical`, `Fixed`, `Gear` (кинематическая зубчатая передача с отношением `ratio` или `teeth_a / teeth_b` и осями `axis_a`, `axis_b`).
 - Кинематический анализ подвижности механизма (`analyze_mechanism`, `P3-T9`, `P3-T15`): расчёт числа степеней свободы по пространственной формуле Чебышёва–Грюблера–Кутцбаха ($M = 6(N-1) - \sum c_i$) и численного ранга линеаризованного якобиана связей $J$ через SVD (`nalgebra`: $\text{DOF} = 6 N_{\text{moving}} - \text{rank}(J)$) с выявлением избыточных связей (`redundant_constraints`), атрибуцией линейно зависимых шарниров (`redundant_joint_ids` через leave-one-joint-out SVD), диагностикой достижения/выхода за пределы хода `limits` (`joints_at_limits`, включая `motor_blocked` и двустороннюю блокировку при нулевом диапазоне `[c, c]`), а также несвязанных и «висящих» деталей (`floating_parts`, `unconnected_parts`).
@@ -223,7 +223,7 @@ graph TD
   1. **Полный транзакционный откат при ошибках (`P2-T12`, `P2-T17`, `P2-T19`, `P2-T24`)**:
      - В `batch_cad_operations` при сбое любого шага состояние сцены откатывается целиком, включая клонированный физический мир `state.physics_world.clone()` (`PhysicsWorld: Clone`).
      - В `modify_feature`, `optimize_feature_tree`, `tessellate_part` и `export_stl` перед пересборкой сохраняется снимок `(dag, mesh, cached_mesh, cached_settings, revision)`: если `rebuild()` или валидация параметров завершается ошибкой, деталь остаётся в 100% консистентном предыдущем состоянии.
-     - В `PhysicsWorld::set_joint_motor` запись `record.motor` обновляется строго после успешного применения мотора к шарниру Rapier3D (`apply_motor`), а установка мотора на `CadJointType::Gear`, `Fixed` и `Spherical` отклоняется с `INVALID_JOINT_CONFIGURATION`.
+     - В `PhysicsWorld::set_joint_motor` запись `record.motor` обновляется атомарно после проверки типа шарнира в `f64`-решателе, а установка мотора на `CadJointType::Gear`, `Fixed` и `Spherical` отклоняется с `INVALID_JOINT_CONFIGURATION` (без переполнений `f32`, с `f64`-порогом `MAX_MOTOR_PARAM_F64 = 1.0e30`).
   2. **Обновление коллайдеров на месте без потери шарниров (`PhysicsWorld::update_part_collider`, `P2-T18`, `P4-T2`)**:
      - Ранее при выполнении `boolean_*`, `transform_part` или `optimize_feature_tree` деталь перерегистрировалась в физическом мире через `remove_part` + `add_part`, что побочным эффектом уничтожало все привязанные к ней шарниры (`joints`) и зубчатые передачи (`gear_constraints`), а при вызове `add_feature_primitive` / `cut_hole` / `modify_feature` коллайдер в `physics_world` вообще не обновлялся.
      - Реализован метод `PhysicsWorld::update_part_collider(&mut self, part: &Part)`, который пересоздаёт `Collider` (`ColliderShape` в `f64`) и пересчитывает массу, локальный центр масс и точный 3×3 тензор инерции (`MassProperties::from_part` с учётом полостей и отверстий) непосредственно на существующем `BodyHandle`, сохраняя все шарниры, приводы и флаг неподвижности `!part.is_fixed`.
@@ -276,8 +276,8 @@ graph TD
 
 | Crate | Версия | Область применения |
 |---|---|---|
-| `nalgebra` | `^0.33` | Линейная алгебра, векторы, матрицы вращения Эйлера, МКЭ-расчёты |
-| `rapier3d` | `^0.22` | Pure-Rust физический движок твёрдых тел, коллайдеров и шарниров |
+| `nalgebra` | `^0.33` | Линейная алгебра, векторы, матрицы вращения Эйлера, `f64` Index-2 DAE/KKT физика и МКЭ-расчёты |
+| `mcp-cad-physics` *(внутр.)* | `0.1.0` | Собственный Pure-Rust `f64` многотельный решатель (`MultiBodySolver`, `TriMeshBvh`, GJK/EPA, конус Кулона; `rapier3d` полностью удалён в `P4-T6`) |
 | `wgpu` | `^22.0` | Кроссплатформенный графический API (DX12 / Vulkan / Lavapipe) |
 | `winit` | `^0.30` | Нативное окно предпросмотра 3D-сцены и цикл событий |
 | `tokio` | `^1.40` | Асинхронный рантайм (`features = ["full"]`) |
@@ -297,7 +297,32 @@ graph TD
    - Любая ошибка параметров возвращается как `Result<T, CadError / ServerError>` и преобразуется в структурированный JSON `ErrorEnvelope`.
 2. **Чистота потока `stdout` в режиме `stdio`**:
    - В режиме `--mode stdio` поток `stdout` используется **исключительно** для сообщений JSON-RPC 2.0. Любой вывод логов (`tracing`, `eprintln!`) направляется строго в `std::io::stderr`.
-3. **Статус автоматического тестирования (`mcp-cad-physics`, `gear_kinematic_test`, `clippy`, `lint`, `build` и TS-суит актуализированы в `P4-T3` от 16.11.2026; `mcp-cad-server` — `P4-T0`; документация/TS-счётчики/lockfile — `P3-T24`; CI/тулчейн — `P3-T22`; `mcp-cad-viewer` — `P3-T23`; `spikes/monstertruck_brep` — `P3-T21`; `spikes/manifold_rust` — `P3-T18`; `mcp-cad-core` — `P3-T17`; `mcp-cad-fea` — аудит `P3-T13`)**:
+3. **Статус автоматического тестирования (актуализировано в `P4-T10` от 18.11.2026)**:
+   - **Проверено в `P4-T10` после стабилизации `test_p3_t10_benchmark_check_interference_10_parts_45_pairs` (`crates/mcp-cad-physics/tests/physics_tests.rs`):**
+     - `cargo test -p mcp-cad-physics --no-fail-fast`: **42/42 PASS** (`--lib`: **10/10**, `physics_tests`: **32/32**, `0 failed`), включая стресс-прогон под параллельной нагрузкой одновременно с `npm run build && npm test` (`rc_rust=0`, `rc_web=0`);
+     - `cargo clippy --workspace --all-targets -- -D warnings`: **0 ошибок, 0 предупреждений**; `npm run lint`, `npm run build`, `npm test`: **53/53 PASS**.
+   - **Проверено в `P4-T9` после синхронизации `Part::mesh()`/`Part::mesh_mut()`/`Part::tessellate()` (`part.rs`) и упрощения `MassProperties::from_part` (`rigid_body.rs`):**
+     - `cargo test --workspace --no-fail-fast`: **348/348 PASS** (`0 failed`): `mcp-cad-core` **133/133** (`--lib`: **76/76** включая 2 теста `P4-T9`, `csg_invariants`: **10/10**, `dag_tests`: **16/16**, `primitive_invariants`: **25/25**, `tessellation_tests`: **6/6**), `mcp-cad-fea` **21/21**, `mcp-cad-physics` **42/42** (`--lib`: **10/10** включая 2 теста `P4-T8`, `physics_tests`: **32/32**), `mcp-cad-viewer` **10/10**, `mcp-cad-server` **142/142**;
+     - `cargo clippy --workspace --all-targets -- -D warnings`: **0 ошибок, 0 предупреждений**; `npm run lint`, `npm run build`, `npm test`: **53/53 PASS**.
+   - **Проверено в `P4-T7` (полная финальная верификация `f64` DAE/KKT решателя, неявно-среднеточечного Lie–Poisson предиктора вращения и всего рабочего пространства после удаления `rapier3d`):**
+     - `cargo test --workspace --no-fail-fast`: **344/344 PASS** (`0 failed`):
+       - `mcp-cad-core`: **131/131 PASS** (`--lib`: **74/74** в `20.06s`, `csg_invariants`: **10/10** в `27.12s`, `dag_tests`: **16/16** в `5.86s`, `primitive_invariants`: **25/25** в `7.15s`, `tessellation_tests`: **6/6** в `0.03s`);
+       - `mcp-cad-fea`: **21/21 PASS** (`--lib`: **8/8** в `0.00s`, `fea_benchmarks`: **2/2** в `125.71s`, `fea_tests`: **11/11** в `52.49s`);
+       - `mcp-cad-physics`: **40/40 PASS** (`--lib`: **8/8** в `2.17s`, `physics_tests`: **32/32** в `10.04s`, включая новый `test_p4_t7_f64_solver_comprehensive_benchmarks_euler_top_10rev_gear_4bar_friction_and_fea`: свободное падение `< 1e-12`, 3D асимметричный волчок Эйлера — сохранение $T_{\text{rot}}$ и $\|\mathbf{L}\|$ $< 1e-13$, 10-оборотная зубчатая передача с передачей момента `< 1e-7\text{ Н}\cdot\text{м}$, замкнутый кривошипно-ползунный механизм + `extract_part_load_case`);
+       - `mcp-cad-viewer`: **10/10 PASS** (`tests/viewer_tests.rs`, `12.53s`);
+       - `mcp-cad-server`: **142/142 PASS** (`--lib`: **65/65** в `77.79s`, `bench_suite`: **1/1** в `8.48s`, `gear_kinematic_test`: **2/2** в `0.95s` включая `test_gear_kinematic_10_revolutions_and_load_cases`, `mcp_contract_tests`: **61/61** в `47.48s` включая сквозной `test_mcp_p4_t7_f64_dae_end_to_end_mechanisms_friction_and_fea_coupling`, `qa_wide_scan`: **13/13** в `9.00s`);
+     - `cargo clippy --workspace --all-targets -- -D warnings`: **0 ошибок, 0 предупреждений** (`exit 0`);
+     - `cargo tree | grep -i -E 'rapier|parry'` и `grep -rnI -i 'rapier\|parry' crates src`: **0 совпадений**;
+     - `npm run lint`: **0 ошибок** (`exit 0`); `npm run build`: **PASS**; `npm test`: **53/53 PASS** (`38/38` + `15/15`, `0 failed`).
+   - **Проверено в `P4-T6` после удаления зависимости `rapier3d` и синхронизации `mcp-cad-server` / веб-студии (`src/`):**
+     - `mcp-cad-physics`: **39/39 PASS**; `tools::physics::tests`: **7/7 PASS**; `npm test`: **53/53 PASS** (`38/38` + `15/15`).
+   - **Проверено в `P4-T5` после перевода `joint_reaction_force`, `get_part_load_cases` и `run_fea_from_simulation` на прямое извлечение множителей Лагранжа $\boldsymbol{\lambda}$:**
+     - `mcp-cad-physics`: **38/38 PASS** (погрешность консольной балки `< 0.0001%`, III закон Ньютона `< 1e-15`); `mcp-cad-fea --test fea_tests`: **11/11 PASS**; `mcp-cad-server --lib`: **65/65 PASS**.
+   - **Проверено в `P4-T4` после внедрения собственного `f64`-конвейера коллизий (`collision.rs`), `TriMeshBvh` и изотропного конусного контактного решателя Кулона в `solver.rs`:**
+     - `mcp-cad-physics` (`cargo test -p mcp-cad-physics --no-fail-fast`): **37/37 PASS** (`--lib`: **8/8**, `physics_tests`: **29/29**, включая 3 новых теста `P4-T4` — точность скольжения по наклонной плоскости $30^\circ$ $< 10^{-4}$ при соотношении импульсов `0.200000`, `0 failed`);
+     - `gear_kinematic_test` (`cargo test -p mcp-cad-server --test gear_kinematic_test --no-fail-fast`): **1/1 PASS**;
+     - `cargo clippy --workspace --all-targets -- -D warnings`: **0 ошибок, 0 предупреждений** (`exit 0`);
+     - `npm run lint`: **0 ошибок** (`exit 0`); `npm run build`: **PASS**; `npm test`: **52/52 PASS** (`0 failed`).
    - **Проверено в `P4-T3` после внедрения собственного многотельного решателя динамики и ограничений в `f64` (`MultiBodySolver` в `crates/mcp-cad-physics/src/solver.rs`, `joint.rs`, `simulator.rs`) и удаления `PhysicsPipeline`/`ImpulseJointSet`/`GenericJoint`:**
      - `mcp-cad-physics` (`cargo test -p mcp-cad-physics --no-fail-fast`): **33/33 PASS** (`--lib`: **7/7**, `physics_tests`: **26/26**, включая `test_p4_t3_f64_multibody_solver_coupled_gear_torque_limits_and_closed_loop`, `0 failed`);
      - `gear_kinematic_test` (`cargo test -p mcp-cad-server --test gear_kinematic_test --no-fail-fast`): **1/1 PASS**;
@@ -353,7 +378,7 @@ graph TD
 | 10 | `tessellate_part` | Топология | Адаптивная тесселяция детали (`coarse`, `medium`, `fine` или `chord_tolerance`). Не инкрементирует `part.revision` и не делает результаты МКЭ `STALE` |
 | 11 | `create_joint` | Физика | Создаёт шарнир (`revolute`, `prismatic`, `spherical`, `fixed`, `gear`) с опциональным пользовательским `joint_id`, пределами `limits` (`deg` или `mm`/`m`) и поддержкой `"ground"`/`"world"` |
 | 12 | `set_joint_motor` | Физика | Настраивает привод (`target_velocity`, `max_force >= 0`) для `revolute` и `prismatic` с пробуждением тел `wake_up(true)` |
-| 13 | `run_physics_simulation` | Физика | Выполняет шаг динамики Rapier3D (`duration_seconds`, `step_size_ms > 0`), возвращая траектории, пиковые реакции в шарнирах и коллизии |
+| 13 | `run_physics_simulation` | Физика | Выполняет шаг динамики собственного `f64` Index-2 DAE решателя (`duration_seconds`, `step_size_ms > 0`), возвращая траектории, точные реакции Лагранжа $\boldsymbol{\lambda}$ в шарнирах и коллизии с трением Кулона |
 | 14 | `run_fea_analysis` | МКЭ (FEA) | Статический расчёт упругости (`TET4` при `element_order = 1`, `TET10` при `element_order = 2`) с предполётной проверкой `validate_mesh` (`MESH_INVALID`). Принимает граничные условия по именованным граням `fixed` и `loads` (`force`, `pressure`, `moment`), опциональное исследование сеточной сходимости (`convergence_study: true`, `levels`, `max_seconds`), возвращает `max_von_mises_mpa`, `max_stress_excluding_constraint_zone_mpa`, `safety_factor`, `max_displacement_mm`, `element_order`, `verdict`, `confidence`, блок `diagnostics` и блок `accuracy` (сходимость и экстраполяция Ричардсона `P3-T3`) |
 | 15 | `get_fea_heatmap_image` | МКЭ / Рендер | Оффскрин-рендер деформированной сетки с тепловой картой напряжений по Мизесу в PNG/Base64 и легендой `colormap_legend` |
 | 16 | `capture_viewport` | Визуализация | Оффскрин-рендер детали или всей сцены в PNG/Base64 (с выбором `camera_preset` и `debug_mode`: `Shaded`, `Wireframe`, `Normals`, `Backfaces`, `BoundaryEdges`) |

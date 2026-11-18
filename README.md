@@ -6,7 +6,7 @@
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux-blue.svg?logo=windows&logoColor=white)](https://www.microsoft.com/windows)
 [![Dependencies](https://img.shields.io/badge/dependencies-Zero%20C%2B%2B%20%2F%20Pure%20Rust-brightgreen.svg)](Cargo.toml)
 [![Protocol](https://img.shields.io/badge/MCP-2024--11--05-blueviolet.svg)](https://modelcontextprotocol.io)
-[![Tests](https://img.shields.io/badge/tests-Rust%20Workspace%20PASS%20%7C%20TS%2052%2F52-brightgreen.svg)](TASKS.md)
+[![Tests](https://img.shields.io/badge/tests-Rust%20348%2F348%20%7C%20TS%2053%2F53-brightgreen.svg)](TASKS.md)
 [![License](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-blue.svg)](LICENSE)
 
 **Первая в мире автономная инженерная среда 3D CAD/CAE на чистом Rust под Windows, спроектированная под прямое управление ИИ-агентами по протоколу Model Context Protocol (MCP).**
@@ -30,8 +30,8 @@
 
 ```mermaid
 flowchart LR
-    A["📐 Проектирование<br/>(Solid DAG & Адаптивная тесселяция)"] --> B["⚙️ Кинематика<br/>(Rapier3D)"]
-    B --> C["🧪 Анализ прочности<br/>(FEA / МКЭ TET4)"]
+    A["📐 Проектирование<br/>(Solid DAG & Адаптивная тесселяция)"] --> B["⚙️ Кинематика<br/>(f64 Index-2 DAE)"]
+    B --> C["🧪 Анализ прочности<br/>(FEA / МКЭ TET4 & TET10)"]
     C --> D["👁️ Визуальный аудит<br/>(WGPU PNG/Base64)"]
     D --> E["🖨️ Экспорт в производство<br/>(STL с контролем хорды)"]
     D -.->|"Оптимизация<br/>геометрии"| A
@@ -58,10 +58,10 @@ flowchart LR
    - **Инспекция геометрии (`query_part_geometry`)**: устранение "слепоты координат" у LLM благодаря автодетекции компланарных граней (`detected_planar_faces`), вычислению нормалей, средневзвешенных центров, объема, площади и точного AABB.
    - **Пакетное атомарное выполнение (`batch_cad_operations`)**: выполнение цепочек из десятков CAD-операций за один сетевой запрос с валидацией шагов.
 
-3. **Динамика подвижных механизмов (Rapier3D)**:
-   - Полный спектр кинематических сочленений: шарниры (`Revolute`), направляющие ползуны (`Prismatic`), шаровые опоры (`Spherical`) и жесткие фиксации (`Fixed`).
-   - Управляемые сервомоторы с ограничением по пиковому моменту и скорости.
-   - Симуляция динамики во времени с фиксацией траекторий, реакций в сочленениях и соударений.
+3. **Динамика подвижных механизмов (`f64` Index-2 DAE)**:
+   - Полный спектр кинематических сочленений: шарниры (`Revolute`), направляющие ползуны (`Prismatic`), шаровые опоры (`Spherical`), жесткие фиксации (`Fixed`) и связанные зубчатые передачи (`Gear` с прямой передачей крутящего момента).
+   - Управляемые сервоприводы с ограничением по пиковому моменту и скорости (`f64`), точный тензор инерции по замкнутой сетке с учётом полостей и собственный конвейер коллизий (`TriMeshBvh`, GJK/EPA, сухое трение Кулона).
+   - Симуляция динамики во времени с прямым извлечением реакций Лагранжа $\boldsymbol{\lambda}$ для квазистатического МКЭ (`get_part_load_cases` $\to$ `run_fea_from_simulation`), анализом подвижности (`analyze_mechanism`), проверкой зазоров и замкнутых контуров (`check_interference`, `sweep_joint`).
 
 4. **Линейный МКЭ-анализ прочности (Pure-Rust FEA)**:
    - Автоматическая 3D тетраэдризация геометрии (TET4: 4 узла, 12 DoF) с адаптивной увязкой поверхностного меша и разбиением длинных ребер (`refine_mesh_max_edge_length`).
@@ -289,8 +289,8 @@ graph TD
 
     subgraph Engineering Engines Pure Rust
         CORE[mcp-cad-core: DAG FeatureTree, Primitives, Materials, STL]
-        PHYSICS[mcp-cad-physics: Rapier3D, Joints, Motors, Telemetry]
-        FEA[mcp-cad-fea: TET4 Mesher, Linear Elasticity, von Mises, FoS]
+        PHYSICS[mcp-cad-physics: f64 Index-2 DAE, Joints, Motors, Collisions]
+        FEA[mcp-cad-fea: TET4/TET10 Mesher, Linear Elasticity, von Mises, FoS]
         VIEWER[mcp-cad-viewer: WGPU Offscreen Renderer, WGSL Shaders]
     end
 
@@ -313,15 +313,15 @@ graph TD
 
 В репозитории реализован набор юнит-, интеграционных и инвариантных тестов:
 - **Инварианты примитивов и CSG (`mcp-cad-core`)**: Проверка водонепроницаемости (`validate_mesh`), внешней ориентации нормалей, характеристики Эйлера ($\chi = 2 - 2g$), отсутствия вырожденных углов (`Sliver Gate`) и аналитических тождеств объёма.
-- **Аналитическая верификация МКЭ (`mcp-cad-fea`)**: Проверка решения 3D-задач теории упругости на тетраэдрах `TET4` методом сопряжённых градиентов (PCG).
-- **Верификация кинематики (`mcp-cad-physics`)**: Тестирование степеней свободы сочленений Rapier3D, работы моторов и детекции коллизий.
-- **Контрактное и сквозное E2E тестирование MCP (`mcp-cad-server`)**: Проверка обработки всех 40 инструментов и соответствия схеме MCP 2024-11-05 (`mcp_contract_tests`, `qa_wide_scan`, `gear_kinematic_test`).
+- **Аналитическая верификация МКЭ (`mcp-cad-fea`)**: Проверка решения 3D-задач теории упругости на тетраэдрах `TET4` и квадратичных элементах `TET10` (ошибка прогиба консоли `0.25%`) методом сопряжённых градиентов (PCG).
+- **Верификация кинематики и динамики (`mcp-cad-physics`)**: Проверка собственного `f64` DAE/KKT решателя на свободном падении (`< 1e-12`), асимметричном свободном волчке Эйлера (сохранение $T_{\text{rot}}$ и $\|\mathbf{L}\|$ до `< 1e-13`), 10-оборотной зубчатой передаче с передачей момента (`< 1e-7 Н·м`), замкнутых механизмах, коллизиях с трением Кулона (`< 1e-4` на наклоне $30^\circ$) и передаче реакций в МКЭ.
+- **Контрактное и сквозное E2E тестирование MCP (`mcp-cad-server`)**: Проверка обработки всех 41 инструментов и соответствия схеме MCP 2024-11-05 (`mcp_contract_tests`, `qa_wide_scan`, `gear_kinematic_test`, `bench_suite`).
 
 > [!IMPORTANT]
 > **Требуемая версия Rust и фактическое состояние тестов:**
 > - Для сборки и тестирования используется **Rust `1.91`** (зафиксирован в [`rust-toolchain.toml`](rust-toolchain.toml) с компонентами `rustfmt`, `clippy`; зависимости в `Cargo.lock` требуют `rustc >= 1.89`, проверено на `rustc 1.91.1` и `rustc 1.97.1`).
-> - **Rust Workspace**: тесты всех 5 крейтов (`mcp-cad-core`, `mcp-cad-physics`, `mcp-cad-fea`, `mcp-cad-viewer`, `mcp-cad-server`) проходят без ошибок (`0 failed`) в стандартном многопоточном режиме `cargo test --workspace --no-fail-fast` (задача `P3-T23` выполнена; `qa_wide_scan` изолирован во временный каталог).
-> - **TypeScript / Web Studio (`npm test`)**: **52/52 PASS** (`37` тестов в [`src/cad/cad_engine.test.ts`](src/cad/cad_engine.test.ts) + `15` тестов в [`src/cad/__tests__/analyze_mechanism.test.ts`](src/cad/__tests__/analyze_mechanism.test.ts)), `npm run lint` (`tsc --noEmit`) — **0 ошибок**.
+> - **Rust Workspace (`348/348 PASS`, `0 failed`)**: тесты всех 5 крейтов (`mcp-cad-core` `133/133`, `mcp-cad-fea` `21/21`, `mcp-cad-physics` `42/42`, `mcp-cad-viewer` `10/10`, `mcp-cad-server` `142/142`) проходят без ошибок в стандартном многопоточном режиме `cargo test --workspace --no-fail-fast` (`qa_wide_scan` изолирован во временный каталог).
+> - **TypeScript / Web Studio (`npm test`)**: **53/53 PASS** (`38` тестов в [`src/cad/cad_engine.test.ts`](src/cad/cad_engine.test.ts) + `15` тестов в [`src/cad/__tests__/analyze_mechanism.test.ts`](src/cad/__tests__/analyze_mechanism.test.ts)), `npm run lint` (`tsc --noEmit`) — **0 ошибок**, `npm run build` — **PASS**.
 > - **Clippy (`cargo clippy --workspace --all-targets -- -D warnings`)**: **0 ошибок, 0 предупреждений** во всех 5 крейтах workspace (строгий гейт в CI).
 > - Актуальный источник истины по статусу тестов, точным счётчикам и открытым задачам — [`TASKS.md`](TASKS.md) и [`PROJECT_CONTEXT.md`](PROJECT_CONTEXT.md) (раздел 7; исторические отчёты в каталоге `qa/` устарели).
 
@@ -366,7 +366,7 @@ chordvibe-cad-mcp/
 ├── src/cad/                      # TypeScript CAD/kinematics/FEA слой и тесты (cad_engine.test.ts, __tests__/)
 └── crates/
     ├── mcp-cad-core/             # Геометрическое ядро, Solid DAG, материалы, STL
-    ├── mcp-cad-physics/          # Физика кинематики и сочленений Rapier3D
+    ├── mcp-cad-physics/          # Собственный f64 Index-2 DAE/KKT-решатель динамики, коллизий и шарниров
     ├── mcp-cad-fea/              # 3D тетраэдризация и линейный МКЭ-солвер
     ├── mcp-cad-viewer/           # Графический WGPU/WGSL рендерер и снимки
     └── mcp-cad-server/           # MCP JSON-RPC сервер (stdio и HTTP/SSE)

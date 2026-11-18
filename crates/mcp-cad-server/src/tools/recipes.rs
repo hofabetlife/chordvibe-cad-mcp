@@ -1,7 +1,7 @@
 //! Engineering assembly and part recipe tools (`apply_recipe`).
 //!
 //! Provides high-level parametric recipes built cleanly atop existing DAG primitives,
-//! CSG booleans, mesh validation, and Rapier3D kinematic joints while preserving
+//! CSG booleans, mesh validation, and `f64` DAE kinematic joints while preserving
 //! active `length_unit` semantics, transactional state rollback, and `ErrorEnvelope` contracts.
 
 use std::f64::consts::PI;

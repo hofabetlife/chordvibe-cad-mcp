@@ -752,7 +752,7 @@ export const CadRightSidebar: React.FC<CadRightSidebarProps> = ({
             <div className="bg-[#181c24] border border-[#282e3d] rounded p-3 space-y-2.5">
               <div className="flex items-center justify-between border-b border-[#242936] pb-1.5">
                 <span className="text-xs font-semibold text-[#f1f5f9]">
-                  Состояние решателя Rapier3D
+                  Состояние решателя DAE (f64)
                 </span>
                 <span
                   className={`text-[10px] font-mono font-semibold ${

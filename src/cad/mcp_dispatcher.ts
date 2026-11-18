@@ -249,7 +249,7 @@ export const MCP_TOOLS_CATALOG: McpToolDefinition[] = [
     name: 'create_joint',
     category: 'Physics & Kinematics',
     description:
-      'Create a Rapier3D kinematic joint (revolute, prismatic, fixed, spherical, gear)',
+      'Create a kinematic joint (revolute, prismatic, fixed, spherical, gear) in the f64 DAE solver',
     defaultParams: {
       joint_id: 'joint_drive',
       joint_type: 'revolute',

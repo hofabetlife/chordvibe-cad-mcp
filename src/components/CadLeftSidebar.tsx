@@ -588,7 +588,7 @@ export const CadLeftSidebar: React.FC<CadLeftSidebarProps> = ({
             <Link2 className="w-3.5 h-3.5 text-[#10b981]" />
             <span>Кинематические пары ({joints.length})</span>
           </div>
-          <span className="text-[10px] font-mono text-[#10b981]">Rapier3D</span>
+          <span className="text-[10px] font-mono text-[#10b981]">f64 DAE</span>
         </div>
       )}
 

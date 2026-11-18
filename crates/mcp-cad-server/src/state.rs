@@ -113,7 +113,7 @@ pub struct EngineState {
     pub materials: MaterialRegistry,
     /// Active CAD parts keyed by `part_id`.
     pub parts: HashMap<String, Part>,
-    /// Rapier3D physics and kinematics simulation world.
+    /// Double-precision (`f64`) DAE physics and kinematics simulation world.
     pub physics_world: PhysicsWorld,
     /// Latest FEA analysis reports keyed by `part_id`.
     pub last_fea_reports: HashMap<String, FeaReport>,
