@@ -11,3 +11,5 @@ coverage/
 .vite/
 output/
 crates/*/output/
+.mcp_live/
+

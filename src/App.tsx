@@ -13,6 +13,7 @@ import {
   KinematicJoint,
   MaterialSpec,
   McpToolExecution,
+  MeshGeometryData,
   PhysicsTrajectoryFrame,
   ProjectionMode,
   QualityPreset,
@@ -20,12 +21,24 @@ import {
   SimulationSubMode,
   ViewportLayout,
 } from './types/cad';
+import {
+  LiveSceneSnapshot,
+  LiveSyncApiResponse,
+  MCP_LIVE_PRESET_ID,
+  mapLiveToolsToMcpHistory,
+  mapRustDagNodesToWebStudio,
+  mapRustFeaSummaryToWebStudio,
+  mapRustJointsToWebStudio,
+  mapRustMaterialToWebStudio,
+  shouldAutoFitCamera,
+} from './cad/live_sync_adapter';
 import { DEFAULT_MATERIALS, getMaterialById } from './cad/materials';
 import {
   createBoxMesh,
   createConeMesh,
   createCylinderMesh,
   createHelicalDrillMesh,
+  createHelixMesh,
   createLightbulbRevolveMesh,
   createPolygonPrismMesh,
   createRevolveMesh,
@@ -96,6 +109,7 @@ import {
   Compass,
   Activity,
   Flame,
+  Radio,
 } from 'lucide-react';
 
 const NATIVE_STL_PRESET_MAP: Record<
@@ -141,9 +155,15 @@ const NATIVE_STL_PRESET_MAP: Record<
 };
 
 export function App() {
-  const [uiMode, setUiMode] = useState<'windows_preview' | 'studio_ide'>(
-    'windows_preview'
-  );
+  const [uiMode, setUiMode] = useState<'windows_preview' | 'studio_ide'>(() => {
+    if (typeof window !== 'undefined') {
+      const viewParam = new URLSearchParams(window.location.search).get('view');
+      if (viewParam === 'studio' || viewParam === 'ide') {
+        return 'studio_ide';
+      }
+    }
+    return 'windows_preview';
+  });
   const [activeWorkbench, setActiveWorkbench] =
     useState<EngineeringWorkbench>('modeling');
   const [showLeftPanel, setShowLeftPanel] = useState<boolean>(true);
@@ -164,6 +184,24 @@ export function App() {
   const [bridgeStatus, setBridgeStatus] =
     useState<NativeBridgeStatus>(DEFAULT_BRIDGE_STATUS);
   const [useCompiledRustStl, setUseCompiledRustStl] = useState<boolean>(false);
+
+  // Real-time Cross-Process Live MCP Sync state (Antigravity / Claude Desktop / Cursor -> Web Studio)
+  const [liveSyncEnabled, setLiveSyncEnabled] = useState<boolean>(() => {
+    if (typeof window !== 'undefined') {
+      const urlPreset = new URLSearchParams(window.location.search).get('preset');
+      if (urlPreset && urlPreset !== MCP_LIVE_PRESET_ID) {
+        return false;
+      }
+    }
+    return true;
+  });
+  const [liveSyncConnected, setLiveSyncConnected] = useState<boolean>(false);
+  const [liveSnapshot, setLiveSnapshot] = useState<LiveSceneSnapshot | null>(
+    null
+  );
+  const liveStlCacheRef = useRef<Map<string, MeshGeometryData>>(new Map());
+  const liveApplySeqRef = useRef<number>(0);
+  const liveLastAppliedKeyRef = useRef<string>('');
 
   const [materials, setMaterials] = useState<MaterialSpec[]>(DEFAULT_MATERIALS);
   const [parts, setParts] = useState<CadPart[]>([]);
@@ -202,7 +240,7 @@ export function App() {
   const [destructionFieldMode, setDestructionFieldMode] =
     useState<DestructionFieldMode>('shaded');
   const [destructionDeformScale, setDestructionDeformScale] =
-    useState<DeformationScalePreset>(5);
+    useState<DeformationScalePreset>(1);
   const [rustAccuracyLevel, setRustAccuracyLevel] =
     useState<RustAccuracyLevel>('standard');
   const [isProbingRust, setIsProbingRust] = useState<boolean>(false);
@@ -645,6 +683,40 @@ export function App() {
             currentAngleRad: 0,
           },
         ]);
+      } else if (presetId === 'coil_spring') {
+        const dag = [
+          {
+            id: 'node_1',
+            name: 'Helical Coil Spring (R=17.5, r=2.5, P=12, 5 витков)',
+            type: 'helix' as const,
+            params: {
+              helix_radius: 0.0175,
+              wire_radius: 0.0025,
+              pitch: 0.012,
+              height: 0.06,
+              turns: 5,
+              starts: 1,
+              is_right_hand: true,
+            },
+            enabled: true,
+          },
+        ];
+        const springMesh = evaluateFeatureTree(dag, q, 7850);
+        const yOffset = Math.max(0, -springMesh.boundingBox.min[1]);
+        const springPart: CadPart = {
+          id: 'coil_spring_1',
+          name: 'Винтовая пружина (R=17.5, r=2.5, P=12)',
+          materialId: 'steel_1045',
+          dag,
+          mesh: springMesh,
+          visible: true,
+          position: [0, yOffset, 0],
+          rotation: [0, 0, 0],
+          scale: [1, 1, 1],
+        };
+        setParts([springPart]);
+        setSelectedPartId(springPart.id);
+        setJoints([]);
       } else if (presetId === 'lightbulb_e27') {
         const dag = [
           {
@@ -1322,10 +1394,395 @@ export function App() {
     [quality, renderMode, materials, useCompiledRustStl]
   );
 
+  const liveSyncEnabledRef = useRef<boolean>(liveSyncEnabled);
+  const activePresetRef = useRef<string>(activePreset);
+  const partsRef = useRef<CadPart[]>(parts);
+  const selectedPartIdRef = useRef<string>(selectedPartId);
+  const materialsRef = useRef<MaterialSpec[]>(materials);
+  const qualityRef = useRef<QualityPreset>(quality);
+
   useEffect(() => {
-    const urlPreset = typeof window !== 'undefined' ? new URLSearchParams(window.location.search).get('preset') : null;
-    loadScenePreset(urlPreset || 'v8_piston', 'standard');
+    liveSyncEnabledRef.current = liveSyncEnabled;
+  }, [liveSyncEnabled]);
+  useEffect(() => {
+    activePresetRef.current = activePreset;
+  }, [activePreset]);
+  useEffect(() => {
+    partsRef.current = parts;
+  }, [parts]);
+  useEffect(() => {
+    selectedPartIdRef.current = selectedPartId;
+  }, [selectedPartId]);
+  useEffect(() => {
+    materialsRef.current = materials;
+  }, [materials]);
+  useEffect(() => {
+    qualityRef.current = quality;
+  }, [quality]);
+
+  const applyLiveSnapshot = useCallback(
+    async (
+      snapshot: LiveSceneSnapshot,
+      options?: { forceSwitch?: boolean; silent?: boolean }
+    ) => {
+      if (!snapshot || !Array.isArray(snapshot.parts) || snapshot.parts.length === 0) {
+        return false;
+      }
+
+      const snapshotKey = `${snapshot.source}:${snapshot.revision}:${snapshot.timestamp_ms}:${snapshot.parts
+        .map((p) => `${p.safe_id}@${p.revision}:${p.triangle_count}`)
+        .join(',')}`;
+      if (
+        !options?.forceSwitch &&
+        snapshotKey === liveLastAppliedKeyRef.current &&
+        activePresetRef.current === MCP_LIVE_PRESET_ID
+      ) {
+        return true;
+      }
+
+      const seq = ++liveApplySeqRef.current;
+      const workingMaterials: MaterialSpec[] = [...materialsRef.current];
+      const addedCustomMaterials: MaterialSpec[] = [];
+      const hydratedParts: CadPart[] = [];
+
+      for (const livePart of snapshot.parts) {
+        const mappedMat = mapRustMaterialToWebStudio(
+          livePart.material,
+          workingMaterials
+        );
+        if (mappedMat.customMaterial) {
+          workingMaterials.push(mappedMat.customMaterial);
+          addedCustomMaterials.push(mappedMat.customMaterial);
+        }
+        const matSpec = getMaterialById(mappedMat.materialId, workingMaterials);
+        const mappedDag = mapRustDagNodesToWebStudio(livePart.dag, livePart.name);
+        const safeId = livePart.safe_id || livePart.id;
+        const stlCacheKey = `${safeId}:${livePart.revision}:${livePart.triangle_count}:${snapshot.source === 'legacy_preview_stl' ? snapshot.timestamp_ms : ''}`;
+
+        let mesh: MeshGeometryData | null =
+          liveStlCacheRef.current.get(stlCacheKey) ?? null;
+
+        if (!mesh) {
+          try {
+            const stlUrl = `/api/live-sync/stl/${encodeURIComponent(
+              safeId
+            )}?rev=${encodeURIComponent(String(livePart.revision))}&t=${encodeURIComponent(
+              String(snapshot.timestamp_ms)
+            )}`;
+            const res = await fetch(stlUrl, { cache: 'no-store' });
+            if (res.ok) {
+              const buf = await res.arrayBuffer();
+              if (buf.byteLength >= 84) {
+                mesh = parseStlBuffer(buf, matSpec.density, 1.0);
+                if (liveStlCacheRef.current.size > 64) {
+                  liveStlCacheRef.current.clear();
+                }
+                liveStlCacheRef.current.set(stlCacheKey, mesh);
+              }
+            }
+          } catch {
+            // Fall through to parametric / empty mesh fallback
+          }
+        }
+
+        if (!mesh) {
+          const hasParametricOp = mappedDag.some((n) => n.type !== 'stl_import');
+          if (hasParametricOp) {
+            try {
+              mesh = evaluateFeatureTree(
+                mappedDag,
+                qualityRef.current,
+                matSpec.density
+              );
+            } catch {
+              mesh = null;
+            }
+          }
+        }
+
+        if (!mesh) {
+          mesh = {
+            vertices: new Float32Array(0),
+            normals: new Float32Array(0),
+            indices: new Uint32Array(0),
+            triangleCount: 0,
+            vertexCount: 0,
+            weldedVertexCount: 0,
+            uniqueEdgeCount: 0,
+            volume: livePart.volume_m3 || 0,
+            surfaceArea: 0,
+            mass: livePart.mass_kg || 0,
+            boundingBox: {
+              min: livePart.bounding_box_m?.[0] ?? [0, 0, 0],
+              max: livePart.bounding_box_m?.[1] ?? [0, 0, 0],
+            },
+            centerOfMass: [0, 0, 0],
+            inertiaTensor: [0, 0, 0],
+            isWatertight: true,
+            isManifold: true,
+            isOutwardOriented: true,
+            eulerCharacteristic: 2,
+            eulerGenus: 0,
+            boundaryEdgesCount: 0,
+            nonManifoldEdgesCount: 0,
+            inconsistentEdgesCount: 0,
+            degenerateTrianglesCount: 0,
+            zeroNormalsCount: 0,
+            detectedPlanarFaces: [],
+          };
+        }
+
+        hydratedParts.push({
+          id: livePart.id,
+          name: livePart.name || livePart.id,
+          materialId: mappedMat.materialId,
+          dag: mappedDag,
+          mesh,
+          visible: true,
+          isFixed: livePart.is_fixed,
+          position: [0, 0, 0],
+          rotation: [0, 0, 0],
+          scale: [1, 1, 1],
+          nativeStlUrl: `/api/live-sync/stl/${encodeURIComponent(safeId)}`,
+        });
+      }
+
+      // Discard stale async hydration if a newer snapshot arrived while fetching STLs
+      if (seq !== liveApplySeqRef.current) {
+        return false;
+      }
+
+      const prevPartIds = partsRef.current.map((p) => p.id);
+      const nextPartIds = hydratedParts.map((p) => p.id);
+      const wasLiveMode = activePresetRef.current === MCP_LIVE_PRESET_ID;
+
+      if (addedCustomMaterials.length > 0) {
+        setMaterials((prev) => {
+          const existingIds = new Set(prev.map((m) => m.id));
+          const uniqueNew = addedCustomMaterials.filter(
+            (m) => !existingIds.has(m.id)
+          );
+          return uniqueNew.length > 0 ? [...prev, ...uniqueNew] : prev;
+        });
+      }
+
+      const nextSelectedId = hydratedParts.some(
+        (p) => p.id === selectedPartIdRef.current
+      )
+        ? selectedPartIdRef.current
+        : hydratedParts[0]?.id || '';
+
+      const selectedLivePart = snapshot.parts.find(
+        (p) => p.id === nextSelectedId
+      );
+      const mappedFea = selectedLivePart
+        ? mapRustFeaSummaryToWebStudio(selectedLivePart.id, selectedLivePart.fea)
+        : null;
+
+      setActivePreset(MCP_LIVE_PRESET_ID);
+      setIsSimulatingPhysics(false);
+      setDestructionCache(null);
+      setDestructionFrame(0);
+      setIsPlayingDestruction(false);
+      setIsDestructionCacheStale(false);
+      setParts(hydratedParts);
+      setSelectedPartId(nextSelectedId);
+      setJoints(mapRustJointsToWebStudio(snapshot.joints));
+      setFeaResult(mappedFea);
+
+      if (snapshot.recent_tools && snapshot.recent_tools.length > 0) {
+        const mappedHistory = mapLiveToolsToMcpHistory(snapshot.recent_tools);
+        setMcpHistory((prev) => {
+          const seen = new Set(mappedHistory.map((h) => h.id));
+          const rest = prev.filter((h) => !seen.has(h.id)).slice(0, 40);
+          return [...mappedHistory, ...rest];
+        });
+      }
+
+      if (shouldAutoFitCamera(prevPartIds, nextPartIds, wasLiveMode)) {
+        setFitTrigger((c) => c + 1);
+      }
+
+      liveLastAppliedKeyRef.current = snapshotKey;
+
+      if (!options?.silent) {
+        const toolMsg =
+          snapshot.last_tool?.summary ||
+          snapshot.last_tool?.tool_name ||
+          `${hydratedParts.length} дет.`;
+        showToast(`MCP Агент: ${toolMsg}`);
+      }
+
+      return true;
+    },
+    [showToast]
+  );
+
+  const handleUserSelectPreset = useCallback(
+    async (presetId: string) => {
+      if (presetId === MCP_LIVE_PRESET_ID) {
+        setLiveSyncEnabled(true);
+        liveSyncEnabledRef.current = true;
+        if (liveSnapshot && liveSnapshot.parts.length > 0) {
+          await applyLiveSnapshot(liveSnapshot, { forceSwitch: true });
+          return;
+        }
+        try {
+          const res = await fetch('/api/live-sync/scene', { cache: 'no-store' });
+          if (res.ok) {
+            const data = (await res.json()) as LiveSyncApiResponse;
+            if (data.active && data.snapshot && data.snapshot.parts.length > 0) {
+              setLiveSnapshot(data.snapshot);
+              await applyLiveSnapshot(data.snapshot, { forceSwitch: true });
+              return;
+            }
+          }
+        } catch {
+          // Ignore network error
+        }
+        showToast(
+          'Live MCP включён — ожидание модели от агента (Antigravity / Claude Desktop)'
+        );
+        return;
+      }
+
+      setLiveSyncEnabled(false);
+      liveSyncEnabledRef.current = false;
+      loadScenePreset(presetId, quality);
+    },
+    [applyLiveSnapshot, liveSnapshot, loadScenePreset, quality, showToast]
+  );
+
+  const handleToggleLiveSync = useCallback(async () => {
+    if (!liveSyncEnabledRef.current) {
+      setLiveSyncEnabled(true);
+      liveSyncEnabledRef.current = true;
+      if (liveSnapshot && liveSnapshot.parts.length > 0) {
+        await applyLiveSnapshot(liveSnapshot, { forceSwitch: true });
+        return;
+      }
+      try {
+        const res = await fetch('/api/live-sync/scene', { cache: 'no-store' });
+        if (res.ok) {
+          const data = (await res.json()) as LiveSyncApiResponse;
+          if (data.active && data.snapshot && data.snapshot.parts.length > 0) {
+            setLiveSnapshot(data.snapshot);
+            await applyLiveSnapshot(data.snapshot, { forceSwitch: true });
+            return;
+          }
+        }
+      } catch {
+        // Ignore
+      }
+      showToast('Live MCP синхронизация активна — ожидание команд агента');
+      return;
+    }
+
+    if (
+      liveSnapshot &&
+      liveSnapshot.parts.length > 0 &&
+      activePresetRef.current !== MCP_LIVE_PRESET_ID
+    ) {
+      await applyLiveSnapshot(liveSnapshot, { forceSwitch: true });
+      return;
+    }
+
+    setLiveSyncEnabled(false);
+    liveSyncEnabledRef.current = false;
+    showToast('Live MCP синхронизация на паузе (можно свободно смотреть пресеты)');
+  }, [applyLiveSnapshot, liveSnapshot, showToast]);
+
+  // Startup initialization: prefer active Live MCP Agent scene if present (unless ?preset= is explicitly specified)
+  useEffect(() => {
+    let cancelled = false;
+    const urlPreset =
+      typeof window !== 'undefined'
+        ? new URLSearchParams(window.location.search).get('preset')
+        : null;
+
+    if (urlPreset && urlPreset !== MCP_LIVE_PRESET_ID) {
+      loadScenePreset(urlPreset, 'standard');
+      return;
+    }
+
+    (async () => {
+      try {
+        const res = await fetch('/api/live-sync/scene', { cache: 'no-store' });
+        if (!cancelled && res.ok) {
+          const data = (await res.json()) as LiveSyncApiResponse;
+          if (data.active && data.snapshot && data.snapshot.parts.length > 0) {
+            setLiveSnapshot(data.snapshot);
+            const applied = await applyLiveSnapshot(data.snapshot, {
+              forceSwitch: true,
+              silent: true,
+            });
+            if (applied) {
+              return;
+            }
+          }
+        }
+      } catch {
+        // Fallback to default preset when backend is unreachable
+      }
+
+      if (!cancelled) {
+        loadScenePreset('v8_piston', 'standard');
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
+
+  // Subscribe to real-time SSE updates from /api/live-sync/events
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof EventSource === 'undefined') {
+      return;
+    }
+
+    const es = new EventSource('/api/live-sync/events');
+
+    const handleIncomingEvent = (evt: MessageEvent, isInitialReady: boolean) => {
+      try {
+        const payload = JSON.parse(evt.data) as LiveSyncApiResponse;
+        setLiveSyncConnected(true);
+        if (payload.active && payload.snapshot) {
+          setLiveSnapshot(payload.snapshot);
+          if (liveSyncEnabledRef.current && payload.snapshot.parts.length > 0) {
+            void applyLiveSnapshot(payload.snapshot, {
+              silent: isInitialReady,
+            });
+          }
+        }
+      } catch {
+        // Ignore malformed SSE payload
+      }
+    };
+
+    es.onopen = () => {
+      setLiveSyncConnected(true);
+    };
+
+    es.onerror = () => {
+      setLiveSyncConnected(false);
+    };
+
+    es.addEventListener('ready', (evt) =>
+      handleIncomingEvent(evt as MessageEvent, true)
+    );
+    es.addEventListener('scene_updated', (evt) =>
+      handleIncomingEvent(evt as MessageEvent, false)
+    );
+    es.addEventListener('scene_cleared', () => {
+      setLiveSnapshot(null);
+      liveLastAppliedKeyRef.current = '';
+    });
+
+    return () => {
+      es.close();
+    };
+  }, [applyLiveSnapshot]);
 
   const cycleQualityPreset = useCallback(() => {
     setQuality((prev) => {
@@ -1868,6 +2325,17 @@ export function App() {
         spoke_thickness: 0.022,
         offset: 0.025,
       };
+    } else if (type === 'helix') {
+      mesh = createHelixMesh(0.0175, 0.0025, 0.012, 0.06, 1, true, quality);
+      params = {
+        helix_radius: 0.0175,
+        wire_radius: 0.0025,
+        pitch: 0.012,
+        height: 0.06,
+        turns: 5,
+        starts: 1,
+        is_right_hand: true,
+      };
     }
 
     const offset = (parts.length % 3) * 0.065;
@@ -2399,9 +2867,14 @@ export function App() {
               <select
                 aria-label="Выбор 3D модели предпросмотра"
                 value={activePreset}
-                onChange={(e) => loadScenePreset(e.target.value, quality)}
+                onChange={(e) => void handleUserSelectPreset(e.target.value)}
                 className="w-40 2xl:w-48 bg-[#222730] hover:bg-[#282e3a] text-[#f1f5f9] text-xs font-mono px-2 py-1 rounded border border-[#333b4a] focus:outline-none focus:border-[#38bdf8] cursor-pointer truncate"
               >
+                <option value={MCP_LIVE_PRESET_ID}>
+                  {liveSnapshot && liveSnapshot.parts.length > 0
+                    ? `⚡ Live-сцена агента (MCP · ${liveSnapshot.parts.length} дет.)`
+                    : '⚡ Live-сцена агента (MCP)'}
+                </option>
                 <optgroup label="Параметрические модели (WGPU Golden)">
                                     <option value="v8_piston">
                     Поршень ДВС V8 (Камера сгорания, 3 кольца)
@@ -2417,6 +2890,9 @@ export function App() {
                   </option>
                   <option value="wheel_rim">
                     Литой автодиск 18" (5 спиц, 5x90)
+                  </option>
+                  <option value="coil_spring">
+                    Винтовая пружина (R=17.5, r=2.5, P=12)
                   </option>
                   <option value="lightbulb_e27">
                     Лампа накаливания E27 A60
@@ -2485,6 +2961,42 @@ export function App() {
                 </optgroup>
               </select>
             </label>
+
+            <button
+              type="button"
+              onClick={() => void handleToggleLiveSync()}
+              aria-pressed={liveSyncEnabled}
+              aria-label="Переключить Live MCP синхронизацию с агентом"
+              title={
+                liveSyncEnabled
+                  ? 'Live MCP синхронизация активна — модели агента обновляются автоматически'
+                  : 'Live MCP синхронизация на паузе — нажмите, чтобы вернуться к сцене агента'
+              }
+              className={`px-2 py-1 rounded border text-[11px] font-mono flex items-center gap-1 cursor-pointer transition-colors shrink-0 ${
+                !liveSyncEnabled
+                  ? liveSnapshot && liveSnapshot.parts.length > 0
+                    ? 'bg-[#f59e0b]/20 border-[#f59e0b]/60 text-[#fbbf24]'
+                    : 'bg-[#222730] hover:bg-[#2b313d] border-[#323946] text-[#94a3b8]'
+                  : liveSnapshot && liveSnapshot.parts.length > 0
+                    ? 'bg-[#10b981]/20 border-[#10b981]/60 text-[#34d399]'
+                    : 'bg-[#0ea5e9]/15 border-[#38bdf8]/50 text-[#38bdf8]'
+              }`}
+            >
+              <Radio
+                className={`w-3 h-3 shrink-0 ${
+                  liveSyncEnabled && liveSyncConnected ? 'animate-pulse' : ''
+                }`}
+              />
+              <span>
+                {!liveSyncEnabled
+                  ? liveSnapshot && liveSnapshot.parts.length > 0
+                    ? `MCP (${liveSnapshot.parts.length})`
+                    : 'Live: Пауза'
+                  : liveSnapshot && liveSnapshot.parts.length > 0
+                    ? `Live MCP · ${liveSnapshot.parts.length}`
+                    : 'Live MCP'}
+              </span>
+            </button>
 
             {hasCompiledStlMapping && (
               <button
@@ -2843,7 +3355,7 @@ export function App() {
         activeWorkbench={activeWorkbench}
         onSelectWorkbench={handleSelectWorkbench}
         activePreset={activePreset}
-        onSelectPreset={(id) => loadScenePreset(id, quality)}
+        onSelectPreset={(id) => void handleUserSelectPreset(id)}
         quality={quality}
         onChangeQuality={handleChangeQuality}
         onCaptureViewport={() => {
@@ -2878,6 +3390,11 @@ export function App() {
         onToggleRightPanel={() => setShowRightPanel((v) => !v)}
         onSwitchToPreviewWindow={() => setUiMode('windows_preview')}
         onOpenHelp={() => setIsHelpOpen(true)}
+        liveSyncEnabled={liveSyncEnabled}
+        liveSyncConnected={liveSyncConnected}
+        livePartsCount={liveSnapshot?.parts.length ?? 0}
+        liveLastToolName={liveSnapshot?.last_tool?.tool_name}
+        onToggleLiveSync={() => void handleToggleLiveSync()}
       />
 
       {/* 2. Contextual Engineering Ribbon Toolbar (Adapts to Modeling / FEA / Simulation / Optimizer) */}
@@ -3219,6 +3736,10 @@ export function App() {
         isSimulatingPhysics={isSimulatingPhysics}
         fps={fps}
         mcpToolsCount={bridgeStatus.activeToolsCount}
+        liveSyncEnabled={liveSyncEnabled}
+        liveSyncConnected={liveSyncConnected}
+        livePartsCount={liveSnapshot?.parts.length ?? 0}
+        liveLastTool={liveSnapshot?.last_tool?.tool_name}
       />
 
       {/* Modal 1: Cut Cylindrical Hole + DIN 6885 Keyway */}

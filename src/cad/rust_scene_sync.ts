@@ -388,6 +388,19 @@ export function mapDagNodeToRustOperation(
       };
     }
 
+    case 'helix': {
+      const params: Record<string, unknown> = { ...p };
+      return {
+        tool: 'add_feature_primitive',
+        args: {
+          part_id: partId,
+          primitive_type: 'helix',
+          length_unit: 'm',
+          params,
+        },
+      };
+    }
+
     case 'cut_hole': {
       const args: Record<string, unknown> = {
         part_id: partId,
@@ -517,8 +530,9 @@ export function buildRustSceneSyncPlan(
       const uy = dist > 1e-9 ? dy / dist : 0;
       const midX = 0.5 * (pA[0] + pB[0]);
       const midY = 0.5 * (pA[1] + pB[1]);
-      // Slight 0.15 mm clearance above nominal pitchSum prevents initial coarse-mesh overlap at t=0
-      const targetHalf = 0.5 * (pitchSum + 0.00015);
+      // 0.55 mm clearance above nominal pitchSum ensures zero initial TET4 overhang penetration at t=0
+      // while preserving 3.85+ mm radial tooth engagement so teeth clash immediately upon rotation.
+      const targetHalf = 0.5 * (pitchSum + 0.00055);
       syncedPositions.set(gA.part.id, [midX - ux * targetHalf, midY - uy * targetHalf, pA[2]]);
       syncedPositions.set(gB.part.id, [midX + ux * targetHalf, midY + uy * targetHalf, pB[2]]);
     }
@@ -633,14 +647,20 @@ export function buildRustSceneSyncPlan(
     const targetPartId = partB !== 'ground' ? partB : partA;
     const targetPos = syncedPositions.get(targetPartId) ?? joint.anchor;
 
+    const isGrounded = partA === 'ground' || partB === 'ground';
+    const anchorWorld = isGrounded ? targetPos : joint.anchor;
+
+    // In Rust mcp-cad-server, transform_part bakes translation directly into part.mesh.vertices
+    // while RigidBody::from_part keeps rb.position = [0,0,0]. Therefore BOTH anchor_a and anchor_b
+    // must specify the world shaft pivot coordinates (matching gear_kinematic_test.rs).
     const createArgs: Record<string, unknown> = {
       joint_id: jointId,
       joint_type: joint.type,
       part_a: partA,
       part_b: partB,
       length_unit: 'm',
-      anchor_a: partA === 'ground' ? targetPos : [0, 0, 0],
-      anchor_b: partB === 'ground' ? targetPos : [0, 0, 0],
+      anchor_a: anchorWorld,
+      anchor_b: anchorWorld,
       axis: joint.axis,
     };
 
@@ -714,7 +734,7 @@ export function buildRustSceneSyncPlan(
             part_b: gEntry.part.id,
             length_unit: 'm',
             anchor_a: pos,
-            anchor_b: [0, 0, 0],
+            anchor_b: pos,
             axis: [0, 0, 1],
           },
         });

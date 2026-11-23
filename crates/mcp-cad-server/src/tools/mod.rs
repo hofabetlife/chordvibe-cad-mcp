@@ -80,7 +80,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         // 4. add_feature_primitive
         ToolDefinition {
             name: "add_feature_primitive".to_string(),
-            description: "Appends a 3D solid primitive (box, cylinder, sphere, cone, polygon_prism, spur_gear, revolve, or wheel_rim) into the parametric history DAG of a part. Coordinate conventions: all primitives are centered along Z in [-height/2, +height/2] with origin [0,0,0] (box: X in [-width/2, +width/2], Y in [-height/2, +height/2], Z in [-depth/2, +depth/2]; cone: base radius_bottom at Z=-height/2, apex radius_top at Z=+height/2). FeatureTree DAG semantics: subsequent add_feature_primitive calls on the same part_id AUTOMATICALLY perform csg_union with the existing solid body (they do not overwrite the part). Units: all linear dimensions, radii, module, and positions [x, y, z] are in active length_unit ('mm' by default, or 'm'); angles are in degrees (deg). Example: {\"part_id\": \"bracket_1\", \"primitive_type\": \"box\", \"params\": {\"width\": 100.0, \"height\": 20.0, \"depth\": 20.0, \"position\": [0.0, 0.0, 0.0]}}. Common errors: PART_NOT_FOUND, INVALID_ARGUMENT (non-positive dimensions or invalid primitive_type), CAD_EVALUATION_ERROR. Next step: call 'cut_hole' to add bores, 'validate_mesh' to verify topology, or 'query_part_geometry' to inspect named faces.".to_string(),
+            description: "Appends a 3D solid primitive (box, cylinder, sphere, cone, polygon_prism, spur_gear, revolve, wheel_rim, or helix / coil_spring) into the parametric history DAG of a part. Coordinate conventions: all primitives are centered along Z in [-height/2, +height/2] with origin [0,0,0] (box: X in [-width/2, +width/2], Y in [-height/2, +height/2], Z in [-depth/2, +depth/2]; cone: base radius_bottom at Z=-height/2, apex radius_top at Z=+height/2; helix: circular wire swept along Z in [-height/2, +height/2] with named faces cap_bottom, cap_top, side). FeatureTree DAG semantics: subsequent add_feature_primitive calls on the same part_id AUTOMATICALLY perform csg_union with the existing solid body (they do not overwrite the part). Units: all linear dimensions, radii, module, pitch, and positions [x, y, z] are in active length_unit ('mm' by default, or 'm'); angles are in degrees (deg). Example: {\"part_id\": \"spring_1\", \"primitive_type\": \"helix\", \"params\": {\"helix_radius\": 17.5, \"wire_radius\": 2.5, \"pitch\": 12.0, \"turns\": 5}}. Common errors: PART_NOT_FOUND, INVALID_ARGUMENT (non-positive dimensions, wire_radius >= helix_radius, pitch <= 2*wire_radius, or invalid primitive_type), CAD_EVALUATION_ERROR. Next step: call 'cut_hole' to add bores, 'validate_mesh' to verify topology, or 'query_part_geometry' to inspect named faces.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -90,8 +90,8 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     },
                     "primitive_type": {
                         "type": "string",
-                        "enum": ["box", "cylinder", "sphere", "cone", "polygon_prism", "spur_gear", "revolve", "wheel_rim"],
-                        "description": "Type of 3D primitive"
+                        "enum": ["box", "cylinder", "sphere", "cone", "polygon_prism", "spur_gear", "revolve", "wheel_rim", "helix", "coil_spring"],
+                        "description": "Type of 3D primitive ('coil_spring' is an ergonomic alias for 'helix')"
                     },
                     "length_unit": {
                         "type": "string",
@@ -100,10 +100,10 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     },
                     "params": {
                         "type": "object",
-                        "description": "Geometric parameters in active length_unit (mm by default, or m) and degrees (deg) (box: width, height, depth; cylinder: radius, height; sphere: radius; cone: radius_bottom, radius_top, height; polygon_prism: height, sides, width_across_flats, radius/outer_radius, chamfer/chamfer_radius; spur_gear: module, teeth, face_width, pressure_angle_deg, bore_radius, bore_diameter, keyway_width, keyway_depth, hub_diameter, hub_length; revolve: profile [[r,z],...], optional inner_radius for 2-point profile, angle_deg; wheel_rim: rim_diameter, rim_width, flange_diameter, hub_diameter, hub_bore_diameter, pcd_diameter, bolt_holes_count, bolt_hole_diameter, spokes_count, spoke_width, spoke_thickness, offset_et; optional position [x,y,z], rotation_deg [rx,ry,rz])",
+                        "description": "Geometric parameters in active length_unit (mm by default, or m) and degrees (deg) (box: width, height, depth; cylinder: radius, height; sphere: radius; cone: radius_bottom, radius_top, height; polygon_prism: height, sides, width_across_flats, radius/outer_radius, chamfer/chamfer_radius; spur_gear: module, teeth, face_width, pressure_angle_deg, bore_radius, bore_diameter, keyway_width, keyway_depth, hub_diameter, hub_length; revolve: profile [[r,z],...], optional inner_radius for 2-point profile, angle_deg; wheel_rim: rim_diameter, rim_width, flange_diameter, hub_diameter, hub_bore_diameter, pcd_diameter, bolt_holes_count, bolt_hole_diameter, spokes_count, spoke_width, spoke_thickness, offset_et; helix/coil_spring: helix_radius (or coil_radius/mean_diameter/coil_diameter), wire_radius (or wire_diameter/tube_radius), plus any two of pitch, height/free_length, turns/active_coils, optional starts, is_right_hand; optional position [x,y,z], rotation_deg [rx,ry,rz])",
                         "properties": {
                             "width": { "type": "number", "description": "Box width in active length_unit (mm by default, or m)" },
-                            "height": { "type": "number", "description": "Height in active length_unit (mm by default, or m) (box, cylinder, cone, polygon_prism)" },
+                            "height": { "type": "number", "description": "Height in active length_unit (mm by default, or m) (box, cylinder, cone, polygon_prism, helix)" },
                             "depth": { "type": "number", "description": "Box depth in active length_unit (mm by default, or m)" },
                             "radius": { "type": "number", "description": "Radius in active length_unit (mm by default, or m) (cylinder, sphere, polygon_prism circumradius)" },
                             "outer_radius": { "type": "number", "description": "Outer circumradius alias for polygon_prism in active length_unit (mm by default, or m)" },
@@ -146,6 +146,16 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                             "spoke_width": { "type": "number", "description": "Circumferential width of each spoke in active length_unit (mm by default, or m)" },
                             "spoke_thickness": { "type": "number", "description": "Axial thickness of each spoke in active length_unit (mm by default, or m)" },
                             "offset_et": { "type": "number", "description": "Wheel offset ET in active length_unit (mm by default, e.g. 35.0 for +35 mm, or m)" },
+                            "helix_radius": { "type": "number", "description": "Mean coil radius of helix/coil_spring in active length_unit (mm by default, e.g. 17.5, or m)" },
+                            "coil_radius": { "type": "number", "description": "Alias for helix_radius in active length_unit" },
+                            "mean_diameter": { "type": "number", "description": "Mean coil diameter (2 * helix_radius) for helix/coil_spring in active length_unit" },
+                            "coil_diameter": { "type": "number", "description": "Alias for mean_diameter (2 * helix_radius) in active length_unit" },
+                            "wire_radius": { "type": "number", "description": "Circular wire cross-section radius of helix/coil_spring in active length_unit (mm by default, e.g. 2.5, or m)" },
+                            "wire_diameter": { "type": "number", "description": "Circular wire diameter (2 * wire_radius) of helix/coil_spring in active length_unit" },
+                            "pitch": { "type": "number", "description": "Axial helix pitch (center-to-center distance between consecutive turns) in active length_unit (must exceed 2 * wire_radius * starts)" },
+                            "turns": { "type": "number", "description": "Number of active helical turns (dimensionless > 0; computes height = turns * pitch or pitch = height / turns)" },
+                            "starts": { "type": "integer", "description": "Number of interwoven helical wire starts (dimensionless integer >= 1, default 1)" },
+                            "is_right_hand": { "type": "boolean", "description": "Helix handedness: true for right-hand (default), false for left-hand" },
                             "segments": { "type": "integer", "description": "Radial segments (dimensionless integer, default 32)" },
                             "sectors": { "type": "integer", "description": "Sphere sectors (dimensionless integer, default 32)" },
                             "stacks": { "type": "integer", "description": "Sphere stacks (dimensionless integer, default 16)" },
@@ -1590,14 +1600,14 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         // 41. apply_recipe
         ToolDefinition {
             name: "apply_recipe".to_string(),
-            description: "Applies a named parametric engineering recipe ('flanged_bushing', 'stepped_shaft', or 'gear_transmission') to atomically build verified watertight CAD parts and (for assemblies) coupled f64 DAE kinematic joints with transactional rollback on error. Units: linear parameters use active length_unit ('mm' by default, or 'm'), angles in deg, angular velocity in rad/s, torque in N*m, counts/ratios are dimensionless. Example: {\"recipe\": \"flanged_bushing\", \"params\": {\"bore_diameter\": 16.0, \"flange_diameter\": 64.0, \"bolt_holes_count\": 4}}. Common errors: INVALID_ARGUMENT (unknown recipe or invalid parameter invariants), PART_ALREADY_EXISTS (target part_id already exists), GEOMETRY_ERROR (mesh validation failed). Next step: call 'validate_mesh', 'query_part_geometry', 'run_fea_analysis', or (for gear_transmission) 'analyze_mechanism' and 'run_physics_simulation'.".to_string(),
+            description: "Applies a named parametric engineering recipe ('flanged_bushing', 'stepped_shaft', 'gear_transmission', or 'coil_spring') to atomically build verified watertight CAD parts and (for assemblies) coupled f64 DAE kinematic joints with transactional rollback on error. Units: linear parameters use active length_unit ('mm' by default, or 'm'), angles in deg, angular velocity in rad/s, torque in N*m, counts/ratios are dimensionless. Example: {\"recipe\": \"coil_spring\", \"params\": {\"helix_radius\": 17.5, \"wire_radius\": 2.5, \"pitch\": 12.0, \"active_coils\": 5}}. Common errors: INVALID_ARGUMENT (unknown recipe or invalid parameter invariants), PART_ALREADY_EXISTS (target part_id already exists), GEOMETRY_ERROR (mesh validation failed). Next step: call 'validate_mesh', 'query_part_geometry', 'run_fea_analysis', or (for gear_transmission) 'analyze_mechanism' and 'run_physics_simulation'.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "recipe": {
                         "type": "string",
-                        "enum": ["flanged_bushing", "stepped_shaft", "gear_transmission"],
-                        "description": "Named engineering recipe to build ('flanged_bushing', 'stepped_shaft', or 'gear_transmission')"
+                        "enum": ["flanged_bushing", "stepped_shaft", "gear_transmission", "coil_spring"],
+                        "description": "Named engineering recipe to build ('flanged_bushing', 'stepped_shaft', 'gear_transmission', or 'coil_spring')"
                     },
                     "length_unit": {
                         "type": "string",
@@ -1755,6 +1765,38 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                             "motor_max_torque_nm": {
                                 "type": "number",
                                 "description": "Optional maximum torque for the pinion motor in N*m (default: 100.0)"
+                            },
+                            "helix_radius": {
+                                "type": "number",
+                                "description": "Mean coil radius for coil_spring in active length_unit (default: 17.5 mm)"
+                            },
+                            "mean_diameter": {
+                                "type": "number",
+                                "description": "Mean coil diameter (2 * helix_radius) for coil_spring in active length_unit (default: 35.0 mm)"
+                            },
+                            "wire_radius": {
+                                "type": "number",
+                                "description": "Circular wire radius for coil_spring in active length_unit (default: 2.5 mm)"
+                            },
+                            "wire_diameter": {
+                                "type": "number",
+                                "description": "Circular wire diameter (2 * wire_radius) for coil_spring in active length_unit (default: 5.0 mm)"
+                            },
+                            "pitch": {
+                                "type": "number",
+                                "description": "Axial pitch between adjacent coils for coil_spring in active length_unit (default: 12.0 mm)"
+                            },
+                            "active_coils": {
+                                "type": "number",
+                                "description": "Number of active helical turns for coil_spring (dimensionless > 0; default: 5.0)"
+                            },
+                            "free_length": {
+                                "type": "number",
+                                "description": "Total axial free length for coil_spring in active length_unit (default: 60.0 mm)"
+                            },
+                            "is_right_hand": {
+                                "type": "boolean",
+                                "description": "Handedness for coil_spring: true for right-hand (default), false for left-hand"
                             }
                         }
                     }

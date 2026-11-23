@@ -9,9 +9,11 @@ import {
   Monitor,
   PanelLeft,
   PanelRight,
+  Radio,
 } from 'lucide-react';
 import { EngineeringWorkbench, QualityPreset } from '../types/cad';
 import { ENGINEERING_WORKBENCHES } from '../cad/workbenches';
+import { MCP_LIVE_PRESET_ID } from '../cad/live_sync_adapter';
 
 interface CadTitleBarProps {
   activeWorkbench: EngineeringWorkbench;
@@ -32,6 +34,11 @@ interface CadTitleBarProps {
   onToggleRightPanel: () => void;
   onSwitchToPreviewWindow: () => void;
   onOpenHelp?: () => void;
+  liveSyncEnabled?: boolean;
+  liveSyncConnected?: boolean;
+  livePartsCount?: number;
+  liveLastToolName?: string;
+  onToggleLiveSync?: () => void;
 }
 
 const PRESET_SCENES = [
@@ -40,18 +47,19 @@ const PRESET_SCENES = [
   { id: 'hex_nut_m10', label: '2. Гайка М10 (DIN 934 / Резьба ISO 68-1)' },
   { id: 'twist_drill', label: '3. Спиральное сверло Ø10мм (2 канавки)' },
   { id: 'wheel_rim', label: '4. Литой автодиск 18" (5 спиц)' },
-  { id: 'lightbulb_e27', label: '5. Лампа E27 A60 (Вращение + Цоколь)' },
-  { id: 'gear_transmission', label: '6. Сборка: Редуктор Z1=20 / Z2=40' },
-  { id: 'bracket_fea', label: '7. Прочность: Консольная балка (МКЭ)' },
-  { id: 'crank_mechanism', label: '8. Кинематика: Кривошипно-шатунный механизм' },
-  { id: 'ai_unopt_bushing', label: '9. ИИ-цепочка: Втулка (5 оп. → Revolve)' },
-  { id: 'ai_unopt_flange_plate', label: '10. ИИ-цепочка: Плита (8 оп. → De Morgan)' },
-  { id: 'ai_unopt_hex_nut', label: '11. ИИ-цепочка: Гайка М10 (Kernel Pushdown)' },
-  { id: 'qa_hex_chamfer', label: '12. QA Эталон: Шестигранная призма с фаской' },
-  { id: 'qa_revolve_180', label: '13. QA Эталон: Тело вращения 180° (BUG-003)' },
-  { id: 'qa_csg_two_holes', label: '14. QA Эталон: Блок с 2 отверстиями (g=2)' },
-  { id: 'gears_clash_destruction', label: '15. Разрушение: Встречное столкновение шестерён' },
-  { id: 'gear_overload_burst', label: '16. Разрушение: Разрыв редуктора (Перегрузка)' },
+  { id: 'coil_spring', label: '5. Винтовая пружина (R=17.5, r=2.5, P=12)' },
+  { id: 'lightbulb_e27', label: '6. Лампа E27 A60 (Вращение + Цоколь)' },
+  { id: 'gear_transmission', label: '7. Сборка: Редуктор Z1=20 / Z2=40' },
+  { id: 'bracket_fea', label: '8. Прочность: Консольная балка (МКЭ)' },
+  { id: 'crank_mechanism', label: '9. Кинематика: Кривошипно-шатунный механизм' },
+  { id: 'ai_unopt_bushing', label: '10. ИИ-цепочка: Втулка (5 оп. → Revolve)' },
+  { id: 'ai_unopt_flange_plate', label: '11. ИИ-цепочка: Плита (8 оп. → De Morgan)' },
+  { id: 'ai_unopt_hex_nut', label: '12. ИИ-цепочка: Гайка М10 (Kernel Pushdown)' },
+  { id: 'qa_hex_chamfer', label: '13. QA Эталон: Шестигранная призма с фаской' },
+  { id: 'qa_revolve_180', label: '14. QA Эталон: Тело вращения 180° (BUG-003)' },
+  { id: 'qa_csg_two_holes', label: '15. QA Эталон: Блок с 2 отверстиями (g=2)' },
+  { id: 'gears_clash_destruction', label: '16. Разрушение: Встречное столкновение шестерён' },
+  { id: 'gear_overload_burst', label: '17. Разрушение: Разрыв редуктора (Перегрузка)' },
 ];
 
 export const CadTitleBar: React.FC<CadTitleBarProps> = ({
@@ -65,6 +73,11 @@ export const CadTitleBar: React.FC<CadTitleBarProps> = ({
   onToggleRightPanel,
   onSwitchToPreviewWindow,
   onOpenHelp,
+  liveSyncEnabled = true,
+  liveSyncConnected = false,
+  livePartsCount = 0,
+  liveLastToolName,
+  onToggleLiveSync,
 }) => {
   const getWorkbenchIcon = (id: EngineeringWorkbench) => {
     switch (id) {
@@ -79,29 +92,64 @@ export const CadTitleBar: React.FC<CadTitleBarProps> = ({
     }
   };
 
+  const isViewingLive = activePreset === MCP_LIVE_PRESET_ID;
+  const liveLabel = !liveSyncEnabled
+    ? livePartsCount > 0
+      ? `MCP Агент (${livePartsCount})`
+      : 'Live MCP: Пауза'
+    : livePartsCount > 0
+      ? `Live MCP · ${livePartsCount} дет.`
+      : liveSyncConnected
+        ? 'Live MCP'
+        : 'Live MCP...';
+
+  const liveButtonClass = !liveSyncEnabled
+    ? livePartsCount > 0
+      ? 'bg-[#f59e0b]/15 hover:bg-[#f59e0b]/25 text-[#fbbf24] border-[#f59e0b]/50'
+      : 'bg-[#181c26] hover:bg-[#222836] text-[#94a3b8] border-[#2d3545]'
+    : livePartsCount > 0 || isViewingLive
+      ? 'bg-[#10b981]/15 hover:bg-[#10b981]/25 text-[#34d399] border-[#10b981]/50'
+      : 'bg-[#0ea5e9]/15 hover:bg-[#0ea5e9]/25 text-[#38bdf8] border-[#38bdf8]/40';
+
+  const liveTooltip = !liveSyncEnabled
+    ? livePartsCount > 0
+      ? `Live MCP синхронизация на паузе. Нажмите, чтобы переключиться на живую сцену агента (${livePartsCount} дет.)`
+      : 'Live MCP синхронизация на паузе. Нажмите, чтобы включить автообновление от агента'
+    : livePartsCount > 0
+      ? `Подключено к агенту MCP (${livePartsCount} дет.${liveLastToolName ? `, последняя команда: ${liveLastToolName}` : ''}). Нажмите для паузы`
+      : 'Ожидание команд от MCP-агента (Antigravity / Claude Desktop). При создании модели сцена обновится автоматически';
+
   return (
-    <header className="h-11 bg-[#11141c] border-b border-[#252b38] px-3 flex items-center justify-between gap-4 select-none shrink-0">
+    <header className="h-11 bg-[#11141c] border-b border-[#252b38] px-2.5 flex items-center justify-between gap-2 select-none shrink-0 overflow-hidden">
       {/* Zone 1: Brand & Scene Model Selector */}
-      <div className="flex items-center gap-2.5 min-w-0 shrink-0">
-        <div className="flex items-center gap-2 shrink-0">
+      <div className="flex items-center gap-2 min-w-0">
+        <div className="flex items-center gap-1.5 shrink-0">
           <div className="w-6 h-6 rounded bg-[#38bdf8]/15 border border-[#38bdf8]/40 flex items-center justify-center text-[#38bdf8]">
             <Box className="w-3.5 h-3.5" />
           </div>
           <span className="font-semibold text-xs tracking-wide text-[#f1f5f9] whitespace-nowrap">
-            MCP-CAD Инженерная студия
+            MCP-CAD Студия
           </span>
         </div>
 
         <div className="h-4 w-[1px] bg-[#252b38] shrink-0" />
 
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1.5 min-w-0">
           <FolderOpen className="w-3.5 h-3.5 text-[#38bdf8] shrink-0" />
           <select
             aria-label="Выбор инженерной сцены"
             value={activePreset}
             onChange={(e) => onSelectPreset(e.target.value)}
-            className="bg-[#181c26] text-[#f1f5f9] text-xs font-medium px-2 py-1 rounded border border-[#2d3545] hover:border-[#38bdf8]/60 focus:outline-none focus:border-[#38bdf8] transition-colors cursor-pointer max-w-[230px]"
+            className="bg-[#181c26] text-[#f1f5f9] text-xs font-medium px-2 py-1 rounded border border-[#2d3545] hover:border-[#38bdf8]/60 focus:outline-none focus:border-[#38bdf8] transition-colors cursor-pointer max-w-[190px] xl:max-w-[210px] truncate"
           >
+            <option
+              value={MCP_LIVE_PRESET_ID}
+              className="bg-[#181c26] text-[#34d399] font-semibold"
+            >
+              {livePartsCount > 0
+                ? `⚡ Live-сцена агента (MCP · ${livePartsCount} дет.)`
+                : '⚡ Live-сцена агента (MCP)'}
+            </option>
             {PRESET_SCENES.map((s) => (
               <option
                 key={s.id}
@@ -113,12 +161,30 @@ export const CadTitleBar: React.FC<CadTitleBarProps> = ({
             ))}
           </select>
         </div>
+
+        {onToggleLiveSync && (
+          <button
+            type="button"
+            onClick={onToggleLiveSync}
+            aria-pressed={liveSyncEnabled}
+            aria-label="Переключить Live MCP синхронизацию с агентом"
+            title={liveTooltip}
+            className={`flex items-center gap-1.5 px-2 py-1 rounded text-xs font-medium border transition-colors cursor-pointer whitespace-nowrap shrink-0 ${liveButtonClass}`}
+          >
+            <Radio
+              className={`w-3.5 h-3.5 shrink-0 ${
+                liveSyncEnabled && liveSyncConnected ? 'animate-pulse' : ''
+              }`}
+            />
+            <span>{liveLabel}</span>
+          </button>
+        )}
       </div>
 
       {/* Zone 2: Logical Engineering Workbenches (Разделы функционала) */}
       <nav
         aria-label="Инженерные разделы"
-        className="flex items-center gap-1 bg-[#0b0d13] p-1 rounded-lg border border-[#232936] shrink-0"
+        className="flex items-center gap-0.5 bg-[#0b0d13] p-1 rounded-lg border border-[#232936] shrink-0"
       >
         {ENGINEERING_WORKBENCHES.map((wb) => {
           const isActive = activeWorkbench === wb.id;
@@ -136,7 +202,7 @@ export const CadTitleBar: React.FC<CadTitleBarProps> = ({
               key={wb.id}
               onClick={() => onSelectWorkbench(wb.id)}
               title={wb.subtitle}
-              className={`flex items-center gap-1.5 px-3 py-1 rounded-md text-xs transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
                 isActive
                   ? activeStyles
                   : 'text-[#94a3b8] hover:text-[#f1f5f9] hover:bg-[#161b26]'

@@ -272,22 +272,26 @@ test('buildRustSceneSyncPlan converts gear module mm->m, closes air gap, maps gr
   assert.equal(firstParams.module, 0.0022);
   assert.equal(firstParams.teeth, 18);
 
-  // Air-gap shafts (50.8 mm > outerSum 48.4 mm) closed to pitchSum + 0.15 mm = 44.15 mm
+  // Air-gap shafts (50.8 mm > outerSum 48.4 mm) closed to pitchSum + 0.55 mm = 44.55 mm
   const transforms = plan.operations.filter((op) => op.tool === 'transform_part');
   assert.equal(transforms.length, 2);
   const tLeft = transforms[0].args.translation as [number, number, number];
   const tRight = transforms[1].args.translation as [number, number, number];
   const newDist = Math.hypot(tRight[0] - tLeft[0], tRight[1] - tLeft[1]);
   assert.ok(
-    Math.abs(newDist - 0.04415) < 1e-5,
-    `Expected shaft spacing ~0.04415m, got ${newDist}`
+    Math.abs(newDist - 0.04455) < 1e-5,
+    `Expected shaft spacing ~0.04455m, got ${newDist}`
   );
 
-  // Joints mapped bench -> "ground", plus automatic gear metadata coupling
+  // Joints mapped bench -> "ground", BOTH anchor_a and anchor_b match baked world shaft centers, plus automatic gear metadata coupling
   const createJoints = plan.operations.filter((op) => op.tool === 'create_joint');
   assert.equal(createJoints.length, 3);
   assert.equal(createJoints[0].args.part_a, 'ground');
+  assert.deepEqual(createJoints[0].args.anchor_a, tLeft);
+  assert.deepEqual(createJoints[0].args.anchor_b, tLeft);
   assert.equal(createJoints[1].args.part_a, 'ground');
+  assert.deepEqual(createJoints[1].args.anchor_a, tRight);
+  assert.deepEqual(createJoints[1].args.anchor_b, tRight);
   assert.equal(createJoints[2].args.joint_type, 'gear');
 
   // Both revolute joints receive motors driven by config RPM & torque

@@ -2293,6 +2293,193 @@ export function createHelicalDrillMesh(
 }
 
 /**
+ * Generates a watertight additive 3D helical wire / coil spring solid centered along the
+ * vertical Y axis (`y in [-height/2, +height/2]`) matching the Three.js Web Studio orientation.
+ *
+ * Uses analytical smooth normals on the swept circular wire surface and flat outward normals
+ * on both start/end circular caps while sharing exact seam coordinates so topology checks report
+ * 0 boundary edges, 0 non-manifold edges, outward orientation, and Euler genus 0 (for starts=1).
+ */
+export function createHelixMesh(
+  helixRadius: number = 0.0175,
+  wireRadius: number = 0.0025,
+  pitch: number = 0.012,
+  height: number = 0.06,
+  starts: number = 1,
+  isRightHand: boolean = true,
+  quality: QualityPreset = 'standard',
+  density: number = 7850
+): MeshGeometryData {
+  const numStarts = Math.max(1, Math.round(starts));
+  if (
+    !Number.isFinite(helixRadius) ||
+    !Number.isFinite(wireRadius) ||
+    !Number.isFinite(pitch) ||
+    !Number.isFinite(height) ||
+    helixRadius <= 1e-9 ||
+    wireRadius <= 1e-9 ||
+    pitch <= 1e-9 ||
+    height <= 1e-9
+  ) {
+    throw new Error(
+      `Helix parameters must be positive and finite (got R=${helixRadius}, r=${wireRadius}, pitch=${pitch}, height=${height})`
+    );
+  }
+  if (wireRadius >= helixRadius - 1e-9) {
+    throw new Error(
+      `Helix wire_radius (${wireRadius}) must be strictly smaller than helix_radius (${helixRadius}) to avoid inner self-intersection`
+    );
+  }
+  const pitchPerStart = pitch / numStarts;
+  if (2 * wireRadius >= pitchPerStart - 1e-9) {
+    throw new Error(
+      `Helix pitch per start (${pitchPerStart}) must exceed wire diameter (${2 * wireRadius}) to avoid coil self-intersection`
+    );
+  }
+
+  const turns = height / pitch;
+  const crossSegs =
+    quality === 'draft' ? 12 : quality === 'high' ? 24 : 18;
+  const stepsPerTurn =
+    quality === 'draft' ? 24 : quality === 'high' ? 48 : 36;
+  const kSteps = Math.max(12, Math.round(turns * stepsPerTurn));
+
+  const positions: number[] = [];
+  const normals: number[] = [];
+  const indices: number[] = [];
+
+  const s = isRightHand ? 1 : -1;
+  const c = pitch / (2 * Math.PI);
+  const hLen = Math.hypot(helixRadius, c);
+  const totalSweep = 2 * Math.PI * turns;
+  const startY = -0.5 * height;
+
+  for (let startIdx = 0; startIdx < numStarts; startIdx++) {
+    const phi0 = (startIdx * 2 * Math.PI) / numStarts;
+    const tubeOffset = positions.length / 3;
+
+    // Generate ring vertices with analytical smooth outward normals along the helical wire
+    for (let j = 0; j <= kSteps; j++) {
+      const u = j / kSteps;
+      const t = u * totalSweep;
+      const theta = phi0 + s * t;
+      const y = startY + (t / (2 * Math.PI)) * pitch;
+
+      const sinT = Math.sin(theta);
+      const cosT = Math.cos(theta);
+
+      // Right-handed Y-up helix: center = (R*sin(theta), y, R*cos(theta))
+      const cx = helixRadius * sinT;
+      const cy = y;
+      const cz = helixRadius * cosT;
+
+      // Radial outward unit vector e_r
+      const erX = sinT;
+      const erY = 0;
+      const erZ = cosT;
+
+      // Binormal e_b = e_t x e_r (completes right-handed orthonormal triad (e_t, e_r, e_b))
+      const ebX = (c * cosT) / hLen;
+      const ebY = (-s * helixRadius) / hLen;
+      const ebZ = (-c * sinT) / hLen;
+
+      for (let i = 0; i < crossSegs; i++) {
+        const alpha = ((i + 0.5) * 2 * Math.PI) / crossSegs;
+        const cosA = Math.cos(alpha);
+        const sinA = Math.sin(alpha);
+
+        const nx = erX * cosA + ebX * sinA;
+        const ny = erY * cosA + ebY * sinA;
+        const nz = erZ * cosA + ebZ * sinA;
+
+        positions.push(
+          cx + nx * wireRadius,
+          cy + ny * wireRadius,
+          cz + nz * wireRadius
+        );
+        normals.push(nx, ny, nz);
+      }
+    }
+
+    // Side tube quads (outward CCW)
+    for (let j = 0; j < kSteps; j++) {
+      for (let i = 0; i < crossSegs; i++) {
+        const nextI = (i + 1) % crossSegs;
+        const v00 = tubeOffset + j * crossSegs + i;
+        const v01 = tubeOffset + j * crossSegs + nextI;
+        const v10 = tubeOffset + (j + 1) * crossSegs + i;
+        const v11 = tubeOffset + (j + 1) * crossSegs + nextI;
+
+        indices.push(v00, v01, v11);
+        indices.push(v00, v11, v10);
+      }
+    }
+
+    // Start cap at j = 0 with crisp flat normal (-e_t) and exact seam coordinates
+    const sin0 = Math.sin(phi0);
+    const cos0 = Math.cos(phi0);
+    const nStartX = (-s * helixRadius * cos0) / hLen;
+    const nStartY = -c / hLen;
+    const nStartZ = (s * helixRadius * sin0) / hLen;
+
+    const startCenterIdx = positions.length / 3;
+    positions.push(helixRadius * sin0, startY, helixRadius * cos0);
+    normals.push(nStartX, nStartY, nStartZ);
+
+    const startRingCapOffset = positions.length / 3;
+    for (let i = 0; i < crossSegs; i++) {
+      const src = (tubeOffset + i) * 3;
+      positions.push(positions[src], positions[src + 1], positions[src + 2]);
+      normals.push(nStartX, nStartY, nStartZ);
+    }
+    for (let i = 0; i < crossSegs; i++) {
+      const nextI = (i + 1) % crossSegs;
+      indices.push(
+        startCenterIdx,
+        startRingCapOffset + nextI,
+        startRingCapOffset + i
+      );
+    }
+
+    // End cap at j = kSteps with crisp flat normal (+e_t) and exact seam coordinates
+    const thetaK = phi0 + s * totalSweep;
+    const sinK = Math.sin(thetaK);
+    const cosK = Math.cos(thetaK);
+    const yK = startY + height;
+    const nEndX = (s * helixRadius * cosK) / hLen;
+    const nEndY = c / hLen;
+    const nEndZ = (-s * helixRadius * sinK) / hLen;
+
+    const endCenterIdx = positions.length / 3;
+    positions.push(helixRadius * sinK, yK, helixRadius * cosK);
+    normals.push(nEndX, nEndY, nEndZ);
+
+    const endRingCapOffset = positions.length / 3;
+    for (let i = 0; i < crossSegs; i++) {
+      const src = (tubeOffset + kSteps * crossSegs + i) * 3;
+      positions.push(positions[src], positions[src + 1], positions[src + 2]);
+      normals.push(nEndX, nEndY, nEndZ);
+    }
+    for (let i = 0; i < crossSegs; i++) {
+      const nextI = (i + 1) % crossSegs;
+      indices.push(
+        endCenterIdx,
+        endRingCapOffset + i,
+        endRingCapOffset + nextI
+      );
+    }
+  }
+
+  return computeMeshMetrics(
+    new Float32Array(positions),
+    new Float32Array(normals),
+    new Uint32Array(indices),
+    density,
+    numStarts === 1 ? 0 : undefined
+  );
+}
+
+/**
  * Watertight 5/6/10-spoke automotive alloy wheel rim matching
  * `qa/artifacts/wheel_rim_5spoke_shaded.png` and `BUG-004` + `BUG-018`.
  * Includes stepped barrel with outer/inner bead flanges, recessed mounting pad,
@@ -3434,6 +3621,80 @@ export function evaluateFeatureTree(
           spokeThickness,
           offset
         );
+        basePrimitiveNode = node;
+        break;
+      }
+      case 'helix':
+      case ('coil_spring' as any): {
+        const helixR = Number(
+          p.helix_radius ??
+            p.coil_radius ??
+            p.mean_radius ??
+            (p.mean_diameter !== undefined
+              ? Number(p.mean_diameter) * 0.5
+              : p.coil_diameter !== undefined
+                ? Number(p.coil_diameter) * 0.5
+                : 0.0175)
+        );
+        const wireR = Number(
+          p.wire_radius ??
+            p.tube_radius ??
+            p.groove_radius ??
+            p.radius ??
+            (p.wire_diameter !== undefined
+              ? Number(p.wire_diameter) * 0.5
+              : p.tube_diameter !== undefined
+                ? Number(p.tube_diameter) * 0.5
+                : 0.0025)
+        );
+        const pitchRaw = p.pitch !== undefined ? Number(p.pitch) : undefined;
+        const heightRaw =
+          p.height !== undefined
+            ? Number(p.height)
+            : p.free_length !== undefined
+              ? Number(p.free_length)
+              : undefined;
+        const turnsRaw =
+          p.turns !== undefined
+            ? Number(p.turns)
+            : p.active_coils !== undefined
+              ? Number(p.active_coils)
+              : undefined;
+
+        let pitchVal = pitchRaw;
+        let heightVal = heightRaw;
+        if (pitchVal !== undefined && heightVal === undefined && turnsRaw !== undefined) {
+          heightVal = pitchVal * turnsRaw;
+        } else if (pitchVal === undefined && heightVal !== undefined && turnsRaw !== undefined) {
+          if (turnsRaw <= 0 || !Number.isFinite(turnsRaw)) {
+            throw new Error('helix turns must be positive and finite');
+          }
+          pitchVal = heightVal / turnsRaw;
+        }
+        const finalPitch = pitchVal ?? 0.012;
+        const finalHeight = heightVal ?? finalPitch * (turnsRaw ?? 5);
+        const startsVal = Math.max(1, Math.round(Number(p.starts ?? 1)));
+        const isRightHand = p.is_right_hand !== undefined ? Boolean(p.is_right_hand) : true;
+
+        currentMesh = createHelixMesh(
+          helixR,
+          wireR,
+          finalPitch,
+          finalHeight,
+          startsVal,
+          isRightHand,
+          quality,
+          density
+        );
+        if (Array.isArray(p.position) || Array.isArray(p.rotation_deg)) {
+          const pos: [number, number, number] = Array.isArray(p.position)
+            ? [Number(p.position[0]), Number(p.position[1]), Number(p.position[2])]
+            : [0, 0, 0];
+          const rot: [number, number, number] = Array.isArray(p.rotation_deg)
+            ? [Number(p.rotation_deg[0]), Number(p.rotation_deg[1]), Number(p.rotation_deg[2])]
+            : [0, 0, 0];
+          currentMesh = applyTransformToMesh(currentMesh, pos, rot, [1, 1, 1], density);
+        }
         basePrimitiveNode = node;
         break;
       }

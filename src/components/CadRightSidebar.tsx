@@ -166,7 +166,7 @@ export const CadRightSidebar: React.FC<CadRightSidebarProps> = ({
   bakeStageLabel = '',
   isDestructionCacheStale = false,
   destructionFieldMode = 'shaded',
-  destructionDeformScale = 5,
+  destructionDeformScale = 1,
   nativeRustConnected = false,
   rustEndpointUrl = '',
   rustDiagnosticMessage,

@@ -256,10 +256,10 @@ fn map_invalid_argument_error(full_message: String, msg: &str) -> ErrorBody {
     if msg.contains("Unknown primitive_type") {
         return ErrorBody::new("INVALID_PRIMITIVE_TYPE", full_message)
             .with_param("primitive_type")
-            .with_hint("Supported primitive types: box, cylinder, sphere, cone, polygon_prism, spur_gear, revolve, wheel_rim. Check parameter requirements for each in 'tools/list'.")
+            .with_hint("Supported primitive types: box, cylinder, sphere, cone, polygon_prism, spur_gear, revolve, wheel_rim, helix (alias: coil_spring). Check parameter requirements for each in 'tools/list'.")
             .with_details(json!({
                 "supported_primitives": [
-                    "box", "cylinder", "sphere", "cone", "polygon_prism", "spur_gear", "revolve", "wheel_rim"
+                    "box", "cylinder", "sphere", "cone", "polygon_prism", "spur_gear", "revolve", "wheel_rim", "helix", "coil_spring"
                 ]
             }));
     }
@@ -860,7 +860,7 @@ mod tests {
     #[test]
     fn test_to_error_body_invalid_primitive_type() {
         let err = ServerError::InvalidArgument(
-            "Unknown primitive_type 'pyramid'. Supported: box, cylinder, sphere, cone, polygon_prism, spur_gear, revolve, wheel_rim".to_string()
+            "Unknown primitive_type 'pyramid'. Supported: box, cylinder, sphere, cone, polygon_prism, spur_gear, revolve, wheel_rim, helix (alias: coil_spring)".to_string()
         );
         let body = err.to_error_body();
         assert_eq!(body.code, "INVALID_PRIMITIVE_TYPE");

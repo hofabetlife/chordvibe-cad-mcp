@@ -241,6 +241,275 @@ export function applyScaledDeformation(
   return moved;
 }
 
+export interface RigidTransform3D {
+  /** Reference centroid X_bar */
+  refCentroid: [number, number, number];
+  /** Deformed centroid x_bar */
+  defCentroid: [number, number, number];
+  /** Proper 3x3 rotation matrix R in SO(3) (row-major, det(R) = +1) mapping (X - X_bar) -> (x - x_bar) */
+  rotMat: [
+    number, number, number,
+    number, number, number,
+    number, number, number,
+  ];
+  /** Rotation angle in radians [0, pi] */
+  angleRad: number;
+}
+
+/**
+ * Exact Horn (1987) closed-form 3D rigid-motion fit via 4x4 symmetric quaternion eigenproblem.
+ * Guarantees a proper rotation matrix R in SO(3) (det(R) = +1) with no singularity even at 180 deg.
+ */
+export function fitRigidTransformHorn3D(
+  baseVertices: Float32Array,
+  displacements: Float32Array
+): RigidTransform3D {
+  const vCount = Math.floor(Math.min(baseVertices.length, displacements.length) / 3);
+  if (vCount < 3) {
+    return {
+      refCentroid: [0, 0, 0],
+      defCentroid: [0, 0, 0],
+      rotMat: [1, 0, 0, 0, 1, 0, 0, 0, 1],
+      angleRad: 0,
+    };
+  }
+
+  let rx = 0, ry = 0, rz = 0;
+  let dx = 0, dy = 0, dz = 0;
+  let valid = 0;
+  for (let i = 0; i < vCount; i++) {
+    const o = i * 3;
+    const bx = baseVertices[o], by = baseVertices[o + 1], bz = baseVertices[o + 2];
+    const ux = displacements[o], uy = displacements[o + 1], uz = displacements[o + 2];
+    if (
+      Number.isFinite(bx) && Number.isFinite(by) && Number.isFinite(bz) &&
+      Number.isFinite(ux) && Number.isFinite(uy) && Number.isFinite(uz)
+    ) {
+      rx += bx; ry += by; rz += bz;
+      dx += bx + ux; dy += by + uy; dz += bz + uz;
+      valid++;
+    }
+  }
+  if (valid < 3) {
+    return {
+      refCentroid: [0, 0, 0],
+      defCentroid: [0, 0, 0],
+      rotMat: [1, 0, 0, 0, 1, 0, 0, 0, 1],
+      angleRad: 0,
+    };
+  }
+
+  const invN = 1 / valid;
+  rx *= invN; ry *= invN; rz *= invN;
+  dx *= invN; dy *= invN; dz *= invN;
+
+  // Cross-covariance S = sum (X_i - X_bar)(x_i - x_bar)^T
+  let sxx = 0, sxy = 0, sxz = 0;
+  let syx = 0, syy = 0, syz = 0;
+  let szx = 0, szy = 0, szz = 0;
+  for (let i = 0; i < vCount; i++) {
+    const o = i * 3;
+    const bx = baseVertices[o], by = baseVertices[o + 1], bz = baseVertices[o + 2];
+    const ux = displacements[o], uy = displacements[o + 1], uz = displacements[o + 2];
+    if (
+      !Number.isFinite(bx) || !Number.isFinite(by) || !Number.isFinite(bz) ||
+      !Number.isFinite(ux) || !Number.isFinite(uy) || !Number.isFinite(uz)
+    ) {
+      continue;
+    }
+    const px = bx - rx, py = by - ry, pz = bz - rz;
+    const qx = bx + ux - dx, qy = by + uy - dy, qz = bz + uz - dz;
+    sxx += px * qx; sxy += px * qy; sxz += px * qz;
+    syx += py * qx; syy += py * qy; syz += py * qz;
+    szx += pz * qx; szy += pz * qy; szz += pz * qz;
+  }
+
+  // Symmetric 4x4 Davenport/Horn matrix N
+  const a = new Float64Array([
+    sxx + syy + szz, syz - szy, szx - sxz, sxy - syx,
+    syz - szy, sxx - syy - szz, sxy + syx, szx + sxz,
+    szx - sxz, sxy + syx, -sxx + syy - szz, syz + szy,
+    sxy - syx, szx + sxz, syz + szy, -sxx - syy + szz,
+  ]);
+  const v = new Float64Array([
+    1, 0, 0, 0,
+    0, 1, 0, 0,
+    0, 0, 1, 0,
+    0, 0, 0, 1,
+  ]);
+
+  // Cyclic Jacobi eigensolver on 4x4 symmetric matrix (converges to machine precision in <= 12 sweeps)
+  for (let sweep = 0; sweep < 16; sweep++) {
+    let maxOff = 0;
+    for (let p = 0; p < 3; p++) {
+      for (let q = p + 1; q < 4; q++) {
+        const apq = a[p * 4 + q];
+        const absApq = Math.abs(apq);
+        if (absApq > maxOff) maxOff = absApq;
+        if (absApq < 1e-15) continue;
+
+        const app = a[p * 4 + p];
+        const aqq = a[q * 4 + q];
+        const tau = (aqq - app) / (2 * apq);
+        const t =
+          tau >= 0
+            ? 1 / (tau + Math.sqrt(1 + tau * tau))
+            : -1 / (-tau + Math.sqrt(1 + tau * tau));
+        const c = 1 / Math.sqrt(1 + t * t);
+        const s = t * c;
+
+        a[p * 4 + p] = app - t * apq;
+        a[q * 4 + q] = aqq + t * apq;
+        a[p * 4 + q] = 0;
+        a[q * 4 + p] = 0;
+
+        for (let r = 0; r < 4; r++) {
+          if (r === p || r === q) continue;
+          const arp = a[r * 4 + p];
+          const arq = a[r * 4 + q];
+          const newRp = c * arp - s * arq;
+          const newRq = s * arp + c * arq;
+          a[r * 4 + p] = newRp;
+          a[p * 4 + r] = newRp;
+          a[r * 4 + q] = newRq;
+          a[q * 4 + r] = newRq;
+        }
+        for (let r = 0; r < 4; r++) {
+          const vrp = v[r * 4 + p];
+          const vrq = v[r * 4 + q];
+          v[r * 4 + p] = c * vrp - s * vrq;
+          v[r * 4 + q] = s * vrp + c * vrq;
+        }
+      }
+    }
+    if (maxOff < 1e-14) break;
+  }
+
+  let bestCol = 0;
+  let bestVal = a[0];
+  for (let c = 1; c < 4; c++) {
+    if (a[c * 4 + c] > bestVal) {
+      bestVal = a[c * 4 + c];
+      bestCol = c;
+    }
+  }
+
+  let qw = v[bestCol];
+  let qx = v[4 + bestCol];
+  let qy = v[8 + bestCol];
+  let qz = v[12 + bestCol];
+  const qNorm = Math.hypot(qw, qx, qy, qz);
+  if (qNorm > 1e-12) {
+    qw /= qNorm; qx /= qNorm; qy /= qNorm; qz /= qNorm;
+    if (qw < 0) {
+      qw = -qw; qx = -qx; qy = -qy; qz = -qz;
+    }
+  } else {
+    qw = 1; qx = 0; qy = 0; qz = 0;
+  }
+
+  const rotMat: RigidTransform3D['rotMat'] = [
+    1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qw * qz), 2 * (qx * qz + qw * qy),
+    2 * (qx * qy + qw * qz), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qw * qx),
+    2 * (qx * qz - qw * qy), 2 * (qy * qz + qw * qx), 1 - 2 * (qx * qx + qy * qy),
+  ];
+  const angleRad = 2 * Math.acos(Math.min(1, Math.max(-1, qw)));
+
+  return {
+    refCentroid: [rx, ry, rz],
+    defCentroid: [dx, dy, dz],
+    rotMat,
+    angleRad,
+  };
+}
+
+/**
+ * Rigid-motion-aware deformation scaling for finite-rotation FEM visualization.
+ *
+ * - For `scale === 1`: outputs exact deformed coordinates `X + u`.
+ * - For `scale !== 1` on rotating/translating bodies: separates the optimal SO(3) rigid-body
+ *   pose `x_rigid = x_bar + R (X - X_bar)` from true structural strain `u_strain = x - x_rigid`,
+ *   and outputs `x_rigid + scale * u_strain`. Rotating gears/shafts never bloat or inflate at 5x/20x.
+ * - For small-displacement static bending/crushing without significant rigid rotation, preserves
+ *   classic `X + scale * u` so clamped boundaries stay anchored.
+ */
+export function applyRigidAwareScaledDeformation(
+  baseVertices: Float32Array,
+  displacements: Float32Array | undefined,
+  scale: number,
+  outVertices: Float32Array
+): boolean {
+  const len = Math.min(baseVertices.length, outVertices.length);
+  if (!displacements || displacements.length < len || scale === 0) {
+    outVertices.set(baseVertices.subarray(0, len));
+    return false;
+  }
+  if (Math.abs(scale - 1) < 1e-9) {
+    return applyScaledDeformation(baseVertices, displacements, 1, outVertices);
+  }
+
+  const vCount = Math.floor(len / 3);
+  if (vCount < 4) {
+    return applyScaledDeformation(baseVertices, displacements, scale, outVertices);
+  }
+
+  const fit = fitRigidTransformHorn3D(baseVertices, displacements);
+  const [rx, ry, rz] = fit.refCentroid;
+  const [dx, dy, dz] = fit.defCentroid;
+  const [r00, r01, r02, r10, r11, r12, r20, r21, r22] = fit.rotMat;
+
+  let rigidSqSum = 0;
+  let strainSqSum = 0;
+  for (let i = 0; i < vCount; i++) {
+    const o = i * 3;
+    const bx = baseVertices[o], by = baseVertices[o + 1], bz = baseVertices[o + 2];
+    const ux = displacements[o], uy = displacements[o + 1], uz = displacements[o + 2];
+    if (!Number.isFinite(ux) || !Number.isFinite(uy) || !Number.isFinite(uz)) continue;
+    const px = bx - rx, py = by - ry, pz = bz - rz;
+    const xRigX = dx + r00 * px + r01 * py + r02 * pz;
+    const xRigY = dy + r10 * px + r11 * py + r12 * pz;
+    const xRigZ = dz + r20 * px + r21 * py + r22 * pz;
+    const urx = xRigX - bx, ury = xRigY - by, urz = xRigZ - bz;
+    const usx = bx + ux - xRigX, usy = by + uy - xRigY, usz = bz + uz - xRigZ;
+    rigidSqSum += urx * urx + ury * ury + urz * urz;
+    strainSqSum += usx * usx + usy * usy + usz * usz;
+  }
+
+  const useRigidDecomposition =
+    fit.angleRad > 0.015 || rigidSqSum > 4.0 * strainSqSum + 1e-16;
+  if (!useRigidDecomposition) {
+    return applyScaledDeformation(baseVertices, displacements, scale, outVertices);
+  }
+
+  let moved = false;
+  for (let i = 0; i < vCount; i++) {
+    const o = i * 3;
+    const bx = baseVertices[o], by = baseVertices[o + 1], bz = baseVertices[o + 2];
+    const ux = displacements[o], uy = displacements[o + 1], uz = displacements[o + 2];
+    if (
+      !Number.isFinite(ux) || !Number.isFinite(uy) || !Number.isFinite(uz) ||
+      (ux === 0 && uy === 0 && uz === 0 && fit.angleRad === 0)
+    ) {
+      outVertices[o] = bx;
+      outVertices[o + 1] = by;
+      outVertices[o + 2] = bz;
+      continue;
+    }
+    const px = bx - rx, py = by - ry, pz = bz - rz;
+    const xRigX = dx + r00 * px + r01 * py + r02 * pz;
+    const xRigY = dy + r10 * px + r11 * py + r12 * pz;
+    const xRigZ = dz + r20 * px + r21 * py + r22 * pz;
+    const usx = bx + ux - xRigX;
+    const usy = by + uy - xRigY;
+    const usz = bz + uz - xRigZ;
+    outVertices[o] = xRigX + usx * scale;
+    outVertices[o + 1] = xRigY + usy * scale;
+    outVertices[o + 2] = xRigZ + usz * scale;
+    moved = true;
+  }
+  return moved;
+}
+
 /**
  * Populates a packed RGB Float32Array (length = vertexCount * 3) in-place for the selected field mode.
  */

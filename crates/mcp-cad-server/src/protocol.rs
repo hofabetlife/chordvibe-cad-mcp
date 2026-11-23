@@ -181,10 +181,11 @@ DO NOT read Rust source files in crates/ — all coordinates and contracts are s
 - polygon_prism: N-gon, Z[-height/2,+height/2], optional chamfer_radius
 - spur_gear: DIN 867, Z[-face_width/2,+face_width/2], bore/hub/keyway
 - wheel_rim: Z[-rim_width/2,+rim_width/2], PCD bolts, hub bore
+- helix (alias coil_spring): circular wire (wire_radius, helix_radius, pitch, height/turns) centered along Z[-height/2,+height/2] (cap_bottom/cap_top/side)
 2. DAG & SPECIAL TOOLS:
 - 1st add_feature_primitive creates base; subsequent calls on same part_id auto-apply csg_union (never overwrite).
 - cut_hole (through:true, keyway_width/depth) & cut_helical_groove (profile_type: circular|metric_60; start_z auto-aligns to bounding_box.min[2]) auto-apply csg_difference.
-- apply_recipe: flanged_bushing | stepped_shaft | gear_transmission.
+- apply_recipe: flanged_bushing | stepped_shaft | gear_transmission | coil_spring.
 3. GUI VS HEADLESS:
 - capture_viewport: offscreen Base64 PNG for AI (works headless).
 - open_preview_window: WGPU 3D window for user (auto-spawns --stl in stdio mode).
@@ -250,9 +251,11 @@ pub async fn handle_request(req: JsonRpcRequest, state: &SharedState) -> Option<
             };
 
             let tool_result = {
+                let t0 = std::time::Instant::now();
                 let mut engine = state.write();
                 let call_res = dispatch_tool(tool_name, &arguments, &mut engine);
-                match call_res {
+                let is_err = call_res.is_err();
+                let result = match call_res {
                     Ok(res) => res,
                     Err(err) => {
                         let mut existing_parts: Vec<String> = engine.parts.keys().cloned().collect();
@@ -260,7 +263,19 @@ pub async fn handle_request(req: JsonRpcRequest, state: &SharedState) -> Option<
                         let error_body = err.to_error_body_with_parts(Some(&existing_parts));
                         ToolCallResult::error(error_body.to_json_string())
                     }
+                };
+                if crate::live_sync::should_publish_for_tool(tool_name) {
+                    let duration_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    crate::live_sync::publish_live_snapshot(
+                        &mut engine,
+                        tool_name,
+                        &arguments,
+                        is_err,
+                        duration_ms,
+                        "mcp-cad-server",
+                    );
                 }
+                result
             };
 
             let res_value = match serde_json::to_value(&tool_result) {

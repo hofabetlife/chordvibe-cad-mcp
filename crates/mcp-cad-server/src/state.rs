@@ -18,6 +18,7 @@ use mcp_cad_viewer::window::{GuiEvent, GuiProxy};
 use tokio::sync::broadcast;
 
 use crate::error::ServerError;
+use crate::live_sync::LiveSyncTracker;
 use crate::tools::coupled_sim::{
     CoupledSimSseEvent, CoupledSimulationManager, SharedCoupledSimManager,
 };
@@ -139,6 +140,10 @@ pub struct EngineState {
     pub coupled_sim: SharedCoupledSimManager,
     /// Broadcast channel streaming real-time coupled simulation progress and lifecycle SSE events (`P5-T6`).
     pub coupled_sim_events_tx: broadcast::Sender<CoupledSimSseEvent>,
+    /// Cross-process live-sync tracker (exported STL revision cache + recent MCP tool feed).
+    pub live_sync: LiveSyncTracker,
+    /// Broadcast channel notifying connected SSE clients whenever the CAD scene changes.
+    pub live_scene_events_tx: broadcast::Sender<u64>,
 }
 
 /// Thread-safe shared handle to the engine state.
@@ -168,6 +173,8 @@ impl EngineState {
             gui_proxy: None,
             coupled_sim: Arc::new(RwLock::new(CoupledSimulationManager::new())),
             coupled_sim_events_tx: broadcast::channel(256).0,
+            live_sync: LiveSyncTracker::default(),
+            live_scene_events_tx: broadcast::channel(128).0,
         }
     }
 

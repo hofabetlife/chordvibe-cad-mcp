@@ -916,7 +916,201 @@ fn build_gear_transmission(
     })
 }
 
-/// Applies a named parametric engineering recipe (`flanged_bushing`, `stepped_shaft`, `gear_transmission`).
+/// Recipe 4: Helical compression/extension coil spring (`coil_spring`) built natively via `AddHelix`.
+fn build_coil_spring(
+    params: &Value,
+    unit: LengthUnit,
+    state: &mut EngineState,
+) -> Result<RecipeOutcome, ServerError> {
+    let part_id = get_nonempty_str(params, "part_id", "coil_spring")?;
+    let name = get_nonempty_str(params, "name", "Helical Coil Spring")?;
+    let material = get_nonempty_str(params, "material", "steel_high_strength_4140")?;
+    let is_fixed = params
+        .get("is_fixed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let is_right_hand = params
+        .get("is_right_hand")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let helix_radius = if params.get("helix_radius").is_some() {
+        get_positive_dim(params, "helix_radius", 17.5, unit)?
+    } else if params.get("coil_radius").is_some() {
+        get_positive_dim(params, "coil_radius", 17.5, unit)?
+    } else if params.get("mean_diameter").is_some() {
+        get_positive_dim(params, "mean_diameter", 35.0, unit)? * 0.5
+    } else if params.get("coil_diameter").is_some() {
+        get_positive_dim(params, "coil_diameter", 35.0, unit)? * 0.5
+    } else {
+        mm_to_unit(17.5, unit)
+    };
+
+    let wire_radius = if params.get("wire_radius").is_some() {
+        get_positive_dim(params, "wire_radius", 2.5, unit)?
+    } else if params.get("wire_diameter").is_some() {
+        get_positive_dim(params, "wire_diameter", 5.0, unit)? * 0.5
+    } else {
+        mm_to_unit(2.5, unit)
+    };
+
+    let active_coils_opt = if params.get("active_coils").is_some() {
+        let v = get_finite_f64(params, "active_coils", 5.0)?;
+        if v <= 0.0 {
+            return Err(ServerError::InvalidArgument(format!(
+                "Parameter 'active_coils' must be > 0, got {v}"
+            )));
+        }
+        Some(v)
+    } else if params.get("turns").is_some() {
+        let v = get_finite_f64(params, "turns", 5.0)?;
+        if v <= 0.0 {
+            return Err(ServerError::InvalidArgument(format!(
+                "Parameter 'turns' must be > 0, got {v}"
+            )));
+        }
+        Some(v)
+    } else {
+        None
+    };
+
+    let pitch_opt = if params.get("pitch").is_some() {
+        Some(get_positive_dim(params, "pitch", 12.0, unit)?)
+    } else {
+        None
+    };
+    let free_len_opt = if params.get("free_length").is_some() {
+        Some(get_positive_dim(params, "free_length", 60.0, unit)?)
+    } else if params.get("height").is_some() {
+        Some(get_positive_dim(params, "height", 60.0, unit)?)
+    } else {
+        None
+    };
+
+    let (pitch, free_length, active_coils) = match (pitch_opt, free_len_opt, active_coils_opt) {
+        (Some(p), Some(l0), _) => (p, l0, l0 / p),
+        (Some(p), None, Some(n)) => (p, p * n, n),
+        (None, Some(l0), Some(n)) => (l0 / n, l0, n),
+        (Some(p), None, None) => (p, p * 5.0, 5.0),
+        (None, Some(l0), None) => (l0 / 5.0, l0, 5.0),
+        (None, None, Some(n)) => {
+            let p = mm_to_unit(12.0, unit);
+            (p, p * n, n)
+        }
+        (None, None, None) => {
+            let p = mm_to_unit(12.0, unit);
+            (p, p * 5.0, 5.0)
+        }
+    };
+
+    let mean_diameter = 2.0 * helix_radius;
+    let wire_diameter = 2.0 * wire_radius;
+    if wire_radius >= helix_radius {
+        return Err(ServerError::InvalidArgument(format!(
+            "coil_spring requires wire_radius ({wire_radius}) < helix_radius ({helix_radius})"
+        )));
+    }
+    if pitch <= wire_diameter {
+        return Err(ServerError::InvalidArgument(format!(
+            "coil_spring requires pitch ({pitch}) > wire_diameter ({wire_diameter}) so adjacent coils do not collide"
+        )));
+    }
+
+    let u_str = unit.as_str();
+    let mut warnings = Vec::new();
+
+    cad::create_part(
+        &json!({
+            "part_id": part_id,
+            "name": name,
+            "material": material,
+            "is_fixed": is_fixed
+        }),
+        state,
+    )?;
+
+    let add_resp = cad::add_feature_primitive(
+        &json!({
+            "part_id": part_id,
+            "primitive_type": "helix",
+            "length_unit": u_str,
+            "params": {
+                "helix_radius": helix_radius,
+                "wire_radius": wire_radius,
+                "pitch": pitch,
+                "height": free_length,
+                "starts": 1,
+                "is_right_hand": is_right_hand
+            }
+        }),
+        state,
+    )?;
+    warnings.extend(extract_warnings(&add_resp));
+
+    let mesh_report = validate_created_part(&part_id, state)?;
+
+    // Analytical helical compression spring engineering metrics (SI)
+    let k_to_m = unit.to_meters_factor();
+    let d_mean_m = mean_diameter * k_to_m;
+    let d_wire_m = wire_diameter * k_to_m;
+    let pitch_m = pitch * k_to_m;
+    let spring_index = d_mean_m / d_wire_m;
+    let wahl_factor = if spring_index > 1.05 {
+        (4.0 * spring_index - 1.0) / (4.0 * spring_index - 4.0) + 0.615 / spring_index
+    } else {
+        1.0
+    };
+    let shear_modulus_gpa = state
+        .parts
+        .get(&part_id)
+        .map(|p| {
+            let mat = p.material();
+            mat.youngs_modulus_gpa / (2.0 * (1.0 + mat.poissons_ratio))
+        })
+        .unwrap_or(79.3);
+    let g_pa = shear_modulus_gpa * 1.0e9;
+    let spring_rate_n_per_m =
+        (g_pa * d_wire_m.powi(4)) / (8.0 * d_mean_m.powi(3) * active_coils);
+    let spring_rate_n_per_mm = spring_rate_n_per_m * 1.0e-3;
+    let solid_height = active_coils * wire_diameter;
+    let max_travel = (free_length - solid_height).max(0.0);
+    let wire_length_m =
+        active_coils * ((PI * d_mean_m).powi(2) + pitch_m * pitch_m).sqrt();
+    let wire_length = wire_length_m * unit.from_meters_factor();
+
+    let summary = json!({
+        "part_id": part_id,
+        "material": material,
+        "mean_diameter": mean_diameter,
+        "outer_diameter": mean_diameter + wire_diameter,
+        "inner_diameter": mean_diameter - wire_diameter,
+        "helix_radius": helix_radius,
+        "wire_diameter": wire_diameter,
+        "wire_radius": wire_radius,
+        "pitch": pitch,
+        "free_length": free_length,
+        "active_coils": active_coils,
+        "is_right_hand": is_right_hand,
+        "solid_height": solid_height,
+        "max_travel": max_travel,
+        "wire_length": wire_length,
+        "spring_index_c": spring_index,
+        "wahl_stress_factor_kw": wahl_factor,
+        "shear_modulus_gpa": shear_modulus_gpa,
+        "spring_rate_n_per_m": spring_rate_n_per_m,
+        "spring_rate_n_per_mm": spring_rate_n_per_mm,
+        "mesh_validation": mesh_report
+    });
+
+    Ok(RecipeOutcome {
+        created_parts: vec![part_id],
+        created_joints: Vec::new(),
+        details: summary,
+        warnings,
+    })
+}
+
+/// Applies a named parametric engineering recipe (`flanged_bushing`, `stepped_shaft`, `gear_transmission`, `coil_spring`).
 pub fn apply_recipe(args: &Value, state: &mut EngineState) -> Result<Value, ServerError> {
     let recipe_name = args
         .get("recipe")
@@ -950,8 +1144,9 @@ pub fn apply_recipe(args: &Value, state: &mut EngineState) -> Result<Value, Serv
         "flanged_bushing" => build_flanged_bushing(&params, unit, state),
         "stepped_shaft" => build_stepped_shaft(&params, unit, state),
         "gear_transmission" => build_gear_transmission(&params, unit, state),
+        "coil_spring" => build_coil_spring(&params, unit, state),
         other => Err(ServerError::InvalidArgument(format!(
-            "Unknown 'recipe' '{other}'. Supported recipes: flanged_bushing, stepped_shaft, gear_transmission"
+            "Unknown 'recipe' '{other}'. Supported recipes: flanged_bushing, stepped_shaft, gear_transmission, coil_spring"
         ))),
     };
 
@@ -1167,5 +1362,32 @@ mod tests {
         assert_eq!(state.parts.len(), initial_part_count);
         assert!(!state.parts.contains_key("gear_tx_frame"));
         assert!(!state.parts.contains_key("gear_tx_pinion"));
+    }
+
+    #[test]
+    fn recipe_coil_spring_builds_watertight_spring_with_metrics() {
+        let mut state = EngineState::new().unwrap();
+        let res = apply_recipe(
+            &json!({
+                "recipe": "coil_spring",
+                "params": {
+                    "part_id": "main_spring",
+                    "helix_radius": 17.5,
+                    "wire_radius": 2.5,
+                    "pitch": 12.0,
+                    "active_coils": 5.0
+                }
+            }),
+            &mut state,
+        )
+        .unwrap();
+
+        assert_eq!(res["status"], "recipe_applied");
+        assert_eq!(res["recipe"], "coil_spring");
+        assert_eq!(res["created_parts"], json!(["main_spring"]));
+        assert_eq!(res["details"]["mesh_validation"]["is_watertight"], true);
+        assert!((res["details"]["spring_index_c"].as_f64().unwrap() - 7.0).abs() < 1e-6);
+        assert!(res["details"]["spring_rate_n_per_mm"].as_f64().unwrap() > 10.0);
+        assert!((res["details"]["free_length"].as_f64().unwrap() - 60.0).abs() < 1e-6);
     }
 }

@@ -1,6 +1,13 @@
 import React from 'react';
 import { CadPart } from '../types/cad';
-import { Crosshair, Hash, Layers, CheckCircle2, Gauge } from 'lucide-react';
+import {
+  Crosshair,
+  Hash,
+  Layers,
+  CheckCircle2,
+  Gauge,
+  Radio,
+} from 'lucide-react';
 
 interface CadStatusBarProps {
   parts: CadPart[];
@@ -8,6 +15,10 @@ interface CadStatusBarProps {
   isSimulatingPhysics: boolean;
   fps: number;
   mcpToolsCount: number;
+  liveSyncEnabled?: boolean;
+  liveSyncConnected?: boolean;
+  livePartsCount?: number;
+  liveLastTool?: string;
 }
 
 export const CadStatusBar: React.FC<CadStatusBarProps> = ({
@@ -16,6 +27,10 @@ export const CadStatusBar: React.FC<CadStatusBarProps> = ({
   isSimulatingPhysics,
   fps,
   mcpToolsCount,
+  liveSyncEnabled = true,
+  liveSyncConnected = false,
+  livePartsCount = 0,
+  liveLastTool,
 }) => {
   const totalTriangles = parts.reduce(
     (acc, p) => acc + (p.visible ? p.mesh.triangleCount : 0),
@@ -68,7 +83,7 @@ export const CadStatusBar: React.FC<CadStatusBarProps> = ({
         </div>
       </div>
 
-      {/* Right: Kinematics & MCP Server Parity */}
+      {/* Right: Kinematics & MCP Live Sync */}
       <div className="flex items-center gap-3">
         <div className="hidden lg:flex items-center gap-1.5 text-[#cbd5e1]">
           <Gauge className="w-3 h-3 text-[#10b981]" />
@@ -85,10 +100,26 @@ export const CadStatusBar: React.FC<CadStatusBarProps> = ({
 
         <span className="text-[#334155] hidden sm:inline">|</span>
 
-        <div className="flex items-center gap-1 text-[#10b981]">
-          <CheckCircle2 className="w-3 h-3 text-[#10b981]" />
-          <span className="font-semibold text-[10px]">
-            MCP {mcpToolsCount}/{mcpToolsCount} Tools · WGPU Sync
+        <div
+          className={`flex items-center gap-1 ${
+            liveSyncEnabled && livePartsCount > 0
+              ? 'text-[#34d399]'
+              : liveSyncEnabled && liveSyncConnected
+                ? 'text-[#38bdf8]'
+                : 'text-[#10b981]'
+          }`}
+        >
+          {liveSyncConnected ? (
+            <Radio className="w-3 h-3 shrink-0" />
+          ) : (
+            <CheckCircle2 className="w-3 h-3 text-[#10b981] shrink-0" />
+          )}
+          <span className="font-semibold text-[10px] truncate max-w-[260px]">
+            {liveSyncEnabled
+              ? livePartsCount > 0
+                ? `Live MCP · ${liveLastTool || `${livePartsCount} дет.`}`
+                : `Live MCP · Ожидание агента (${mcpToolsCount} Tools)`
+              : `MCP ${mcpToolsCount} Tools · Пауза Live`}
           </span>
         </div>
       </div>

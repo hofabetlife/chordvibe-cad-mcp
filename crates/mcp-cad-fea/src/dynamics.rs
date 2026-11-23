@@ -2318,13 +2318,29 @@ fn evaluate_dynamic_contacts(
             .iter()
             .any(|p| matches!(p, ContactPairSpec::DeformableToRigid { .. }));
 
-    // Build updated deformed surfaces only when fresh BVH projection or rigid contact is needed
+    // Build updated deformed surfaces in parallel across bodies only when fresh BVH projection or rigid contact is needed
     let surfaces: Vec<DeformedSurfaceMesh> = if need_surfaces {
-        let mut s: Vec<DeformedSurfaceMesh> = bodies.iter().map(|b| b.surface.clone()).collect();
-        for (b, surf) in s.iter_mut().enumerate() {
-            surf.update_from_displacements(&bodies[b].mesh, &u_trial[b]);
+        if bodies.len() >= 2 {
+            bodies
+                .par_iter()
+                .enumerate()
+                .map(|(b, body)| {
+                    let mut surf = body.surface.clone();
+                    surf.update_from_displacements(&body.mesh, &u_trial[b]);
+                    surf
+                })
+                .collect()
+        } else {
+            bodies
+                .iter()
+                .enumerate()
+                .map(|(b, body)| {
+                    let mut surf = body.surface.clone();
+                    surf.update_from_displacements(&body.mesh, &u_trial[b]);
+                    surf
+                })
+                .collect()
         }
-        s
     } else {
         Vec::new()
     };
@@ -2649,20 +2665,60 @@ fn evaluate_dynamic_contacts(
                     };
 
                     let delta_smooth = 1e-3 * h;
-                    for snid in candidates {
-                        if !bodies[sb].active_nodes.get(snid).copied().unwrap_or(false) {
-                            continue;
-                        }
-                        let p = s_surf.current_positions[snid];
-                        let s_norm = s_surf.vertex_normals.get(snid).copied();
-                        let Some(proj) =
-                            m_surf.closest_point_signed(p, s_norm, max_search, max_ndot)
-                        else {
-                            continue;
+                    let active_nodes_sb = &bodies[sb].active_nodes;
+                    let proj_hits: Vec<(usize, [f64; 3], crate::contact::SurfaceContactProjection, f64)> =
+                        if candidates.len() >= 128 {
+                            candidates
+                                .par_iter()
+                                .filter_map(|&snid| {
+                                    if !active_nodes_sb.get(snid).copied().unwrap_or(false) {
+                                        return None;
+                                    }
+                                    let p = s_surf.current_positions[snid];
+                                    let s_norm = s_surf.vertex_normals.get(snid).copied();
+                                    let proj = m_surf.closest_point_signed(
+                                        p,
+                                        s_norm,
+                                        max_search,
+                                        max_ndot,
+                                    )?;
+                                    if proj.signed_gap >= 2.0 * delta_smooth {
+                                        return None;
+                                    }
+                                    let n = Vector3::from(proj.normal);
+                                    let area = (s_surf.contact_nodal_area(snid, n) * pass_weight)
+                                        .max(h * h * 1e-4);
+                                    Some((snid, p, proj, area))
+                                })
+                                .collect()
+                        } else {
+                            candidates
+                                .iter()
+                                .filter_map(|&snid| {
+                                    if !active_nodes_sb.get(snid).copied().unwrap_or(false) {
+                                        return None;
+                                    }
+                                    let p = s_surf.current_positions[snid];
+                                    let s_norm = s_surf.vertex_normals.get(snid).copied();
+                                    let proj = m_surf.closest_point_signed(
+                                        p,
+                                        s_norm,
+                                        max_search,
+                                        max_ndot,
+                                    )?;
+                                    if proj.signed_gap >= 2.0 * delta_smooth {
+                                        return None;
+                                    }
+                                    let n = Vector3::from(proj.normal);
+                                    let area = (s_surf.contact_nodal_area(snid, n) * pass_weight)
+                                        .max(h * h * 1e-4);
+                                    Some((snid, p, proj, area))
+                                })
+                                .collect()
                         };
+
+                    for (snid, p, proj, area) in proj_hits {
                         let n = Vector3::from(proj.normal);
-                        let area =
-                            (s_surf.contact_nodal_area(snid, n) * pass_weight).max(h * h * 1e-4);
                         if proj.signed_gap < 2.0 * delta_smooth {
                             if let Some(ref mut buf) = capture_frozen {
                                 buf.push(FrozenDeformableContact {
@@ -4086,7 +4142,7 @@ where
                         let mut best_scale = 1.0_f64;
                         let mut best_rc = f64::INFINITY;
                         let mut s = 1.0_f64;
-                        for _ls in 0..8 {
+                        for _ls in 0..6 {
                             let mut u_cand = u_trial.clone();
                             let mut v_cand = v_trial.clone();
                             let mut a_cand = a_trial.clone();

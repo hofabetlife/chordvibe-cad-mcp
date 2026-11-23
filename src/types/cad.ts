@@ -28,6 +28,7 @@ export type DagNodeType =
   | 'spur_gear'
   | 'revolve'
   | 'wheel_rim'
+  | 'helix'
   | 'cut_hole'
   | 'cut_helical_groove'
   | 'boolean_union'

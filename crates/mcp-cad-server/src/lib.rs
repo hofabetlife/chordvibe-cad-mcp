@@ -2,6 +2,7 @@
 //! MCP-CAD Server library: JSON-RPC MCP dispatcher, stdio/SSE transports, and 15 CAD/CAE tools.
 
 pub mod error;
+pub mod live_sync;
 pub mod protocol;
 pub mod sse;
 pub mod state;

@@ -2508,7 +2508,17 @@ pub fn extract_joint_hub_couplings(
         // is dynamic we negate coordinate/motor signs so positive velocity always moves `target_part`
         // along `+axis_world`.
         let (target_part, pivot_w, axis_w, force_w, torque_w, coord_sign) = if bb.is_dynamic {
-            let pivot = bb.position + bb.orientation * Vector3::from(j.data.anchor_b);
+            let mut pivot = bb.position + bb.orientation * Vector3::from(j.data.anchor_b);
+            if !ba.is_dynamic {
+                let pivot_a = ba.position + ba.orientation * Vector3::from(j.data.anchor_a);
+                let anchor_b_zero = Vector3::from(j.data.anchor_b).norm() < 1e-9;
+                if bb.position.norm() < 1e-9
+                    && anchor_b_zero
+                    && (pivot_a - bb.local_com).norm() + 1e-6 < (pivot - bb.local_com).norm()
+                {
+                    pivot = pivot_a;
+                }
+            }
             let axis_raw = bb.orientation * Vector3::from(j.data.local_axis_b);
             let axis = if axis_raw.norm() > 1e-12 {
                 axis_raw.normalize()
@@ -2524,7 +2534,17 @@ pub fn extract_joint_hub_couplings(
                 1.0_f64,
             )
         } else if ba.is_dynamic {
-            let pivot = ba.position + ba.orientation * Vector3::from(j.data.anchor_a);
+            let mut pivot = ba.position + ba.orientation * Vector3::from(j.data.anchor_a);
+            if !bb.is_dynamic {
+                let pivot_b = bb.position + bb.orientation * Vector3::from(j.data.anchor_b);
+                let anchor_a_zero = Vector3::from(j.data.anchor_a).norm() < 1e-9;
+                if ba.position.norm() < 1e-9
+                    && anchor_a_zero
+                    && (pivot_b - ba.local_com).norm() + 1e-6 < (pivot - ba.local_com).norm()
+                {
+                    pivot = pivot_b;
+                }
+            }
             let axis_raw = ba.orientation * Vector3::from(j.data.local_axis_a);
             let axis = if axis_raw.norm() > 1e-12 {
                 axis_raw.normalize()

@@ -22,6 +22,7 @@
   - **`spur_gear`**: эвольвентная шестерня DIN 867: центрирована по ширине венца $Z \in [-b/2, +b/2]$, со ступицей `hub_diameter`/`hub_length` и шпоночным пазом DIN 6885.
   - **`revolve`**: тело вращения 2D-профиля `[[r, z], ...]` вокруг оси $Z$ ($r \ge 0$).
   - **`wheel_rim`**: автомобильный колесный диск со ступичным отверстием, болтовой сеткой PCD и спицами.
+  - **`helix`** (алиас **`coil_spring`**): аддитивное тело винтовой цилиндрической пружины/спирали из круглой проволоки (`helix_radius`/`mean_diameter`, `wire_radius`/`wire_diameter`, любые 2 из `pitch`, `height`/`free_length`, `turns`/`active_coils`, `starts`, `is_right_hand`), центрированное по $Z \in [-h/2, +h/2]$ с гранями `cap_bottom`, `cap_top`, `side`. Для пружин используйте этот примитив напрямую (либо рецепт `apply_recipe("coil_spring")`), а не CSG-инверсию `cut_helical_groove`.
 
 ### 1.2. Семантика FeatureTree DAG
 1. Первый вызов `add_feature_primitive` создаёт корневое 3D-тело детали.
@@ -47,7 +48,7 @@
    - До или сразу после создания детали объявите инженерные ограничения (`bbox_max`, `bbox_min`, `mass_max`, `mesh_valid`, `min_safety_factor`, `mechanism_dof`) через `set_requirements` с флагом `"auto_check": true`.
    - При `auto_check: true` каждый мутирующий вызов (`add_feature_primitive`, `cut_hole`, `modify_feature`, `boolean_*`, `transform_part`, `batch_cad_operations`) автоматически возвращает `requirements_status: {passed, failed, stale}` и список нарушений `failed_requirements`.
 4. **Транзакции (`batch_cad_operations`) и рецепты (`apply_recipe`)**:
-   - Объединяйте серию шагов построения детали в `batch_cad_operations` или используйте параметрические рецепты `apply_recipe` (`flanged_bushing`, `stepped_shaft`, `gear_transmission`). При ошибке оба инструмента атомарно откатывают состояние сцены.
+   - Объединяйте серию шагов построения детали в `batch_cad_operations` или используйте параметрические рецепты `apply_recipe` (`flanged_bushing`, `stepped_shaft`, `gear_transmission`, `coil_spring`). При ошибке оба инструмента атомарно откатывают состояние сцены.
 5. **Обязательный `validate_mesh` после булевых операций и вырезов**:
    - После `boolean_difference`, `boolean_union`, `boolean_intersection`, `cut_hole` и `cut_helical_groove` обязательно вызывайте `validate_mesh` (или контролируйте требование `mesh_valid`). В обычном режиме `strict_slivers: false` микро-треугольники сложных винтовых канавок выводятся в `warnings`, сохраняя статус `PASS` (`is_valid_solid: true`, `fea_ready: true`).
 6. **Расчёт прочности (FEA) только после валидной сетки и по именованным граням**:

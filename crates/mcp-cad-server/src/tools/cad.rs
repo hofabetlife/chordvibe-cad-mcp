@@ -199,6 +199,25 @@ fn scale_feature_op_from_meters(op: &FeatureOp, k_from_m: f64) -> FeatureOp {
             position: position.map(|p| scale_vec3(p, k_from_m)),
             rotation_deg: *rotation_deg,
         },
+        FeatureOp::AddHelix {
+            helix_radius,
+            wire_radius,
+            pitch,
+            height,
+            starts,
+            is_right_hand,
+            position,
+            rotation_deg,
+        } => FeatureOp::AddHelix {
+            helix_radius: helix_radius * k_from_m,
+            wire_radius: wire_radius * k_from_m,
+            pitch: pitch * k_from_m,
+            height: height * k_from_m,
+            starts: *starts,
+            is_right_hand: *is_right_hand,
+            position: position.map(|p| scale_vec3(p, k_from_m)),
+            rotation_deg: *rotation_deg,
+        },
         FeatureOp::CutHelicalGroove {
             helix_radius,
             groove_radius,
@@ -900,9 +919,115 @@ pub fn add_feature_primitive(args: &Value, state: &mut EngineState) -> Result<Va
                 rotation_deg,
             }
         }
+        "helix" | "coil_spring" => {
+            let helix_radius = params
+                .get("helix_radius")
+                .or_else(|| params.get("coil_radius"))
+                .or_else(|| params.get("mean_radius"))
+                .and_then(|v| v.as_f64())
+                .or_else(|| {
+                    params
+                        .get("coil_diameter")
+                        .or_else(|| params.get("mean_diameter"))
+                        .and_then(|v| v.as_f64())
+                        .map(|d| d * 0.5)
+                })
+                .ok_or_else(|| {
+                    ServerError::InvalidArgument(
+                        "helix requires 'helix_radius' (or 'coil_radius' / 'mean_diameter' / 'coil_diameter')"
+                            .to_string(),
+                    )
+                })?
+                * k_to_m;
+
+            let wire_radius = params
+                .get("wire_radius")
+                .or_else(|| params.get("tube_radius"))
+                .or_else(|| params.get("groove_radius"))
+                .or_else(|| params.get("radius"))
+                .and_then(|v| v.as_f64())
+                .or_else(|| {
+                    params
+                        .get("wire_diameter")
+                        .or_else(|| params.get("tube_diameter"))
+                        .and_then(|v| v.as_f64())
+                        .map(|d| d * 0.5)
+                })
+                .ok_or_else(|| {
+                    ServerError::InvalidArgument(
+                        "helix requires 'wire_radius' (or 'wire_diameter' / 'tube_radius')"
+                            .to_string(),
+                    )
+                })?
+                * k_to_m;
+
+            let pitch_opt = params
+                .get("pitch")
+                .and_then(|v| v.as_f64())
+                .map(|v| v * k_to_m);
+            let height_opt = params
+                .get("height")
+                .or_else(|| params.get("free_length"))
+                .and_then(|v| v.as_f64())
+                .map(|v| v * k_to_m);
+            let turns_opt = params
+                .get("turns")
+                .or_else(|| params.get("active_coils"))
+                .and_then(|v| v.as_f64());
+
+            let (pitch, height) = match (pitch_opt, height_opt, turns_opt) {
+                (Some(p), Some(h), _) => (p, h),
+                (Some(p), None, Some(t)) => {
+                    if !t.is_finite() || t <= 0.0 {
+                        return Err(ServerError::InvalidArgument(
+                            "helix 'turns' must be positive and finite".to_string(),
+                        ));
+                    }
+                    (p, p * t)
+                }
+                (None, Some(h), Some(t)) => {
+                    if !t.is_finite() || t <= 0.0 {
+                        return Err(ServerError::InvalidArgument(
+                            "helix 'turns' must be positive and finite".to_string(),
+                        ));
+                    }
+                    (h / t, h)
+                }
+                _ => {
+                    return Err(ServerError::InvalidArgument(
+                        "helix requires at least two of 'pitch', 'height' (or 'free_length'), and 'turns' (or 'active_coils')"
+                            .to_string(),
+                    ));
+                }
+            };
+
+            let starts = params
+                .get("starts")
+                .and_then(|v| v.as_u64())
+                .map(|s| (s as usize).max(1))
+                .unwrap_or(1);
+
+            let is_right_hand = params
+                .get("is_right_hand")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+
+            extra_dims_m.extend_from_slice(&[helix_radius * 2.0, wire_radius * 2.0, pitch, height]);
+
+            FeatureOp::AddHelix {
+                helix_radius,
+                wire_radius,
+                pitch,
+                height,
+                starts,
+                is_right_hand,
+                position,
+                rotation_deg,
+            }
+        }
         other => {
             return Err(ServerError::InvalidArgument(format!(
-                "Unknown primitive_type '{}'. Supported: box, cylinder, sphere, cone, polygon_prism, spur_gear, revolve, wheel_rim",
+                "Unknown primitive_type '{}'. Supported: box, cylinder, sphere, cone, polygon_prism, spur_gear, revolve, wheel_rim, helix (alias: coil_spring)",
                 other
             )));
         }
@@ -1551,6 +1676,92 @@ pub fn modify_feature(args: &Value, state: &mut EngineState) -> Result<Value, Se
                     spoke_width: new_spoke_w,
                     spoke_thickness: new_spoke_t,
                     offset_et: new_et,
+                    position: pos,
+                    rotation_deg: rot,
+                }
+            }
+            FeatureOp::AddHelix {
+                helix_radius,
+                wire_radius,
+                pitch,
+                height,
+                starts,
+                is_right_hand,
+                position,
+                rotation_deg,
+            } => {
+                let new_helix_r = params
+                    .get("helix_radius")
+                    .or_else(|| params.get("coil_radius"))
+                    .or_else(|| params.get("mean_radius"))
+                    .and_then(|v| v.as_f64())
+                    .or_else(|| {
+                        params
+                            .get("coil_diameter")
+                            .or_else(|| params.get("mean_diameter"))
+                            .and_then(|v| v.as_f64())
+                            .map(|d| d * 0.5)
+                    })
+                    .map(|v| v * k_to_m)
+                    .unwrap_or(*helix_radius);
+                let new_wire_r = params
+                    .get("wire_radius")
+                    .or_else(|| params.get("tube_radius"))
+                    .or_else(|| params.get("groove_radius"))
+                    .or_else(|| params.get("radius"))
+                    .and_then(|v| v.as_f64())
+                    .or_else(|| {
+                        params
+                            .get("wire_diameter")
+                            .or_else(|| params.get("tube_diameter"))
+                            .and_then(|v| v.as_f64())
+                            .map(|d| d * 0.5)
+                    })
+                    .map(|v| v * k_to_m)
+                    .unwrap_or(*wire_radius);
+
+                let pitch_param = params.get("pitch").and_then(|v| v.as_f64()).map(|v| v * k_to_m);
+                let height_param = params
+                    .get("height")
+                    .or_else(|| params.get("free_length"))
+                    .and_then(|v| v.as_f64())
+                    .map(|v| v * k_to_m);
+                let turns_param = params
+                    .get("turns")
+                    .or_else(|| params.get("active_coils"))
+                    .and_then(|v| v.as_f64());
+
+                let (new_pitch, new_height) = match (pitch_param, height_param, turns_param) {
+                    (Some(p), Some(h), _) => (p, h),
+                    (Some(p), None, Some(t)) if t.is_finite() && t > 0.0 => (p, p * t),
+                    (None, Some(h), Some(t)) if t.is_finite() && t > 0.0 => (h / t, h),
+                    (None, None, Some(t)) if t.is_finite() && t > 0.0 => (*pitch, *pitch * t),
+                    (p_opt, h_opt, _) => (p_opt.unwrap_or(*pitch), h_opt.unwrap_or(*height)),
+                };
+
+                let new_starts = params
+                    .get("starts")
+                    .and_then(|v| v.as_u64())
+                    .map(|s| (s as usize).max(1))
+                    .unwrap_or(*starts);
+                let new_rh = params
+                    .get("is_right_hand")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(*is_right_hand);
+                let pos = parse_vec3(params, "position").map(|p| scale_vec3(p, k_to_m)).or(*position);
+                let rot = parse_vec3(params, "rotation_deg")
+                    .or_else(|| parse_vec3(params, "rotation_rpy_deg"))
+                    .or(*rotation_deg);
+
+                extra_dims_m.extend_from_slice(&[new_helix_r * 2.0, new_wire_r * 2.0, new_pitch, new_height]);
+
+                FeatureOp::AddHelix {
+                    helix_radius: new_helix_r,
+                    wire_radius: new_wire_r,
+                    pitch: new_pitch,
+                    height: new_height,
+                    starts: new_starts,
+                    is_right_hand: new_rh,
                     position: pos,
                     rotation_deg: rot,
                 }
@@ -6457,5 +6668,72 @@ mod tests {
             .filter_map(|f| f["role"].as_str())
             .collect();
         assert!(drill_roles.contains(&"helical_groove"));
+    }
+
+    #[test]
+    fn test_add_and_modify_helix_primitive_and_coil_spring_alias() {
+        let mut state = EngineState::new().unwrap();
+
+        // 1. Direct additive helix primitive (R=17.5 mm, r=2.5 mm, pitch=12 mm, turns=5 -> height=60 mm)
+        create_part(
+            &json!({ "part_id": "spring_1", "name": "Coil Spring", "material": "steel_4140" }),
+            &mut state,
+        )
+        .unwrap();
+        let add_res = add_feature_primitive(
+            &json!({
+                "part_id": "spring_1",
+                "primitive_type": "helix",
+                "params": {
+                    "helix_radius": 17.5,
+                    "wire_radius": 2.5,
+                    "pitch": 12.0,
+                    "turns": 5.0
+                }
+            }),
+            &mut state,
+        )
+        .unwrap();
+        let feat_id = add_res["feature_id"].as_str().unwrap().to_string();
+        let val = validate_mesh_tool(&json!({ "part_id": "spring_1" }), &mut state).unwrap();
+        assert_eq!(val["status"], "PASS");
+        assert_eq!(val["topology"]["is_watertight"], true);
+
+        // 2. Parametric modify_feature on AddHelix (update wire_radius and turns)
+        modify_feature(
+            &json!({
+                "part_id": "spring_1",
+                "feature_id": feat_id,
+                "params": { "wire_radius": 2.0, "turns": 6.0 }
+            }),
+            &mut state,
+        )
+        .unwrap();
+        let val2 = validate_mesh_tool(&json!({ "part_id": "spring_1" }), &mut state).unwrap();
+        assert_eq!(val2["status"], "PASS");
+        assert_eq!(val2["topology"]["is_watertight"], true);
+
+        // 3. Alias 'coil_spring' with diameter inputs
+        create_part(
+            &json!({ "part_id": "spring_alias", "name": "Alias Spring", "material": "steel_4140" }),
+            &mut state,
+        )
+        .unwrap();
+        add_feature_primitive(
+            &json!({
+                "part_id": "spring_alias",
+                "primitive_type": "coil_spring",
+                "params": {
+                    "mean_diameter": 35.0,
+                    "wire_diameter": 5.0,
+                    "pitch": 12.0,
+                    "height": 60.0
+                }
+            }),
+            &mut state,
+        )
+        .unwrap();
+        let val_alias = validate_mesh_tool(&json!({ "part_id": "spring_alias" }), &mut state).unwrap();
+        assert_eq!(val_alias["topology"]["is_watertight"], true);
     }
 }

@@ -16,7 +16,7 @@ import {
 import { getMaterialById } from '../cad/materials';
 import { computeOrthoCameraPose, OrthoViewId } from '../cad/ortho_views';
 import {
-  applyScaledDeformation,
+  applyRigidAwareScaledDeformation,
   buildFieldLegend,
   DEFORMATION_SCALE_PRESETS,
   evalDamageColormap,
@@ -121,7 +121,7 @@ export const CadViewport3D: React.FC<CadViewport3DProps> = ({
   destructionCache = null,
   destructionFrameIndex = 0,
   destructionFieldMode = 'shaded',
-  destructionDeformScale = 5,
+  destructionDeformScale = 1,
   onChangeDestructionFieldMode,
   onChangeDestructionDeformScale,
   showDestructionStressGlow = true,
@@ -1223,7 +1223,7 @@ export const CadViewport3D: React.FC<CadViewport3DProps> = ({
       if (destructionDeformScale === 1) {
         outPos.set(surf.deformedVertices.subarray(0, vCount * 3));
       } else {
-        applyScaledDeformation(
+        applyRigidAwareScaledDeformation(
           surf.referenceVertices,
           surf.displacements,
           destructionDeformScale,
@@ -1336,7 +1336,7 @@ export const CadViewport3D: React.FC<CadViewport3DProps> = ({
 
             if (posAttr && normAttr) {
               const outPos = posAttr.array as Float32Array;
-              const moved = applyScaledDeformation(
+              const moved = applyRigidAwareScaledDeformation(
                 basePos,
                 pState.deformedDisplacements,
                 destructionDeformScale,

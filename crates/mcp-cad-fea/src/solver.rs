@@ -58,24 +58,41 @@ impl CsrMatrix {
     pub fn from_row_entries(
         nrows: usize,
         ncols: usize,
-        row_entries: Vec<Vec<(usize, f64)>>,
+        mut row_entries: Vec<Vec<(usize, f64)>>,
     ) -> Self {
+        let compress_row = |entries: &mut Vec<(usize, f64)>| {
+            if entries.len() <= 1 {
+                return;
+            }
+            entries.sort_unstable_by_key(|&(col, _)| col);
+            let mut write = 0usize;
+            for read in 1..entries.len() {
+                if entries[read].0 == entries[write].0 {
+                    entries[write].1 += entries[read].1;
+                } else {
+                    write += 1;
+                    entries[write] = entries[read];
+                }
+            }
+            entries.truncate(write + 1);
+        };
+
+        if nrows >= 512 {
+            row_entries.par_iter_mut().for_each(compress_row);
+        } else {
+            row_entries.iter_mut().for_each(compress_row);
+        }
+
+        let total_nnz: usize = row_entries.iter().map(Vec::len).sum();
         let mut row_ptr = Vec::with_capacity(nrows + 1);
-        let mut col_indices = Vec::new();
-        let mut values = Vec::new();
+        let mut col_indices = Vec::with_capacity(total_nnz);
+        let mut values = Vec::with_capacity(total_nnz);
         row_ptr.push(0);
 
-        for mut entries in row_entries {
-            entries.sort_unstable_by_key(|&(col, _)| col);
-
+        for entries in row_entries {
             for (col, val) in entries {
-                let current_row_start = *row_ptr.last().unwrap();
-                if col_indices.len() > current_row_start && *col_indices.last().unwrap() == col {
-                    *values.last_mut().unwrap() += val;
-                } else {
-                    col_indices.push(col);
-                    values.push(val);
-                }
+                col_indices.push(col);
+                values.push(val);
             }
             row_ptr.push(col_indices.len());
         }
@@ -104,14 +121,33 @@ impl CsrMatrix {
     /// Performs Sparse Matrix-Vector multiplication: $y = A \cdot x$.
     #[inline]
     pub fn spmv(&self, x: &[f64], y: &mut [f64]) {
-        for (row, y_val) in y.iter_mut().enumerate().take(self.nrows) {
-            let start = self.row_ptr[row];
-            let end = self.row_ptr[row + 1];
-            let mut sum = 0.0;
-            for idx in start..end {
-                sum += self.values[idx] * x[self.col_indices[idx]];
+        let nrows = self.nrows.min(y.len());
+        if nrows >= 512 {
+            let row_ptr = &self.row_ptr;
+            let col_indices = &self.col_indices;
+            let values = &self.values;
+            y[..nrows]
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(row, y_val)| {
+                    let start = row_ptr[row];
+                    let end = row_ptr[row + 1];
+                    let mut sum = 0.0;
+                    for idx in start..end {
+                        sum += values[idx] * x[col_indices[idx]];
+                    }
+                    *y_val = sum;
+                });
+        } else {
+            for (row, y_val) in y.iter_mut().enumerate().take(nrows) {
+                let start = self.row_ptr[row];
+                let end = self.row_ptr[row + 1];
+                let mut sum = 0.0;
+                for idx in start..end {
+                    sum += self.values[idx] * x[self.col_indices[idx]];
+                }
+                *y_val = sum;
             }
-            *y_val = sum;
         }
     }
 

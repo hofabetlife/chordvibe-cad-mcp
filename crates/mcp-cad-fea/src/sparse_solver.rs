@@ -10,6 +10,7 @@
 
 use std::collections::VecDeque;
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::error::FeaError;
@@ -34,7 +35,11 @@ pub enum LinearSolverKind {
 
 #[inline]
 fn dot(a: &[f64], b: &[f64]) -> f64 {
-    a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum()
+    if a.len() >= 4096 {
+        a.par_iter().zip(b.par_iter()).map(|(&x, &y)| x * y).sum()
+    } else {
+        a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum()
+    }
 }
 
 #[inline]

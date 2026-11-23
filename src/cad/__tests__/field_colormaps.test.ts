@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  applyRigidAwareScaledDeformation,
   applyScaledDeformation,
   buildEnergyBalanceSeries,
   buildFieldLegend,
@@ -84,6 +85,72 @@ test('applyScaledDeformation scales displacements cleanly for 1x, 5x, 20x and ha
   // Fallback when displacements absent
   assert.equal(applyScaledDeformation(base, undefined, 20, out), false);
   assert.deepEqual(Array.from(out), Array.from(base));
+});
+
+test('applyRigidAwareScaledDeformation prevents bloating on 90° and 180° rotating gears at 5x/20x while amplifying tooth strain', () => {
+  // Build a 3D ring of 16 vertices centered at shaft (-0.022, 0, 0) with radius R = 0.020 m
+  const cx = -0.022;
+  const R = 0.02;
+  const n = 16;
+  const base = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    const a = (i * 2 * Math.PI) / n;
+    const z = i % 2 === 0 ? -0.008 : 0.008;
+    base[i * 3] = cx + R * Math.cos(a);
+    base[i * 3 + 1] = R * Math.sin(a);
+    base[i * 3 + 2] = z;
+  }
+
+  for (const theta of [Math.PI / 2, Math.PI]) {
+    const c = Math.cos(theta);
+    const s = Math.sin(theta);
+    const disp = new Float32Array(n * 3);
+    // Pure rigid rotation + local 0.25 mm radial indentation on tooth vertex 0
+    for (let i = 0; i < n; i++) {
+      const rx = base[i * 3] - cx;
+      const ry = base[i * 3 + 1];
+      const defX = cx + c * rx - s * ry;
+      const defY = s * rx + c * ry;
+      disp[i * 3] = defX - base[i * 3];
+      disp[i * 3 + 1] = defY - base[i * 3 + 1];
+      disp[i * 3 + 2] = 0;
+    }
+
+    // 1. Pure rigid rotation at 5x and 20x must preserve exact radius R (zero bloat!)
+    for (const scale of [5, 20]) {
+      const out = new Float32Array(n * 3);
+      assert.equal(applyRigidAwareScaledDeformation(base, disp, scale, out), true);
+      for (let i = 0; i < n; i++) {
+        const rOut = Math.hypot(out[i * 3] - cx, out[i * 3 + 1]);
+        assert.ok(
+          Math.abs(rOut - R) < 1e-5,
+          `At theta=${theta.toFixed(2)} scale=${scale}x, vertex ${i} radius bloated to ${rOut} (expected ${R})`
+        );
+      }
+    }
+
+    // 2. Add 0.25 mm local radial dent on vertex 0 -> at 5x, intact vertices keep radius R while dented vertex amplifies inward ~5x
+    const dentMm = 0.00025;
+    const def0X = base[0] + disp[0] - cx;
+    const def0Y = base[1] + disp[1];
+    const r0 = Math.hypot(def0X, def0Y);
+    disp[0] -= (def0X / r0) * dentMm;
+    disp[1] -= (def0Y / r0) * dentMm;
+
+    const out5 = new Float32Array(n * 3);
+    applyRigidAwareScaledDeformation(base, disp, 5, out5);
+    const rDent5 = Math.hypot(out5[0] - cx, out5[1]);
+    // Vertex 0 should dent inward by roughly 5x (~1.1-1.3 mm) while opposite vertex stays ~R
+    const rOpp5 = Math.hypot(out5[8 * 3] - cx, out5[8 * 3 + 1]);
+    assert.ok(
+      R - rDent5 > dentMm * 3.5 && R - rDent5 < dentMm * 6.0,
+      `Expected ~5x tooth dent (~${(dentMm * 5 * 1000).toFixed(2)}mm), got ${((R - rDent5) * 1000).toFixed(2)}mm`
+    );
+    assert.ok(
+      Math.abs(rOpp5 - R) < 0.0003,
+      `Opposite undeformed tooth should keep nominal radius, got error ${Math.abs(rOpp5 - R)}`
+    );
+  }
 });
 
 test('fillVertexFieldColors populates packed RGB buffer in-place for all 3 scalar modes', () => {

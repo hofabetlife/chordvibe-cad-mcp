@@ -422,6 +422,21 @@ export function estimateDagPlanCost(
         );
         break;
       }
+      case 'helix': {
+        const pitch = Math.max(1e-6, Number(p.pitch ?? 0.012));
+        const height = Number(p.height ?? p.free_length ?? pitch * Number(p.turns ?? p.active_coils ?? 5));
+        const turns = Math.max(0.25, height / pitch);
+        const starts = Math.max(1, Math.round(Number(p.starts ?? 1)));
+        const tris = Math.round((turns * 36 * 18 * 2 + 36) * starts * segMult);
+        const opCost = (4.8 + turns * 0.9) * segMult;
+        estimatedTimeMs += (0.8 + turns * 0.15) * segMult;
+        estimatedTriangles += tris;
+        fullMeshPasses += 1;
+        explainTree.push(
+          `  -> [AnalyticalHelixSweep: helix (turns=${turns.toFixed(1)}, starts=${starts})] ${node.name} (cost=0.0..${opCost.toFixed(1)} tris=${tris} sliver_risk=0%)`
+        );
+        break;
+      }
       case 'boolean_difference':
       case 'boolean_union':
       case 'boolean_intersection': {

@@ -1,4 +1,4 @@
-﻿[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $Host.UI.RawUI.WindowTitle = "MCP-CAD Studio Launcher"
 
 Write-Host "====================================================================" -ForegroundColor Cyan
@@ -27,12 +27,13 @@ if ($npm) {
     }
 
     Write-Host "[OK] Запуск Единого интерфейса MCP-CAD Studio на http://localhost:3000 ..." -ForegroundColor Green
+    Write-Host "[INFO] Live MCP Sync активен: модели агента (Antigravity / Claude Desktop) отображаются в реальном времени." -ForegroundColor Cyan
     Start-Job -ScriptBlock {
         Start-Sleep -Seconds 3
         try {
-            Start-Process "msedge.exe" -ArgumentList "--app=http://localhost:3000/?bridge=live", "--window-size=1440,900" -ErrorAction Stop
+            Start-Process "msedge.exe" -ArgumentList "--app=http://localhost:3000/?bridge=live&view=studio", "--window-size=1440,900" -ErrorAction Stop
         } catch {
-            Start-Process "http://localhost:3000/?bridge=live"
+            Start-Process "http://localhost:3000/?bridge=live&view=studio"
         }
     } | Out-Null
     npm run dev

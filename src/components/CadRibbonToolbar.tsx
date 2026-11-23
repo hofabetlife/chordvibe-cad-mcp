@@ -199,6 +199,20 @@ const PRIMITIVE_MATRIX_ITEMS: PrimitiveMatrixItem[] = [
       </svg>
     ),
   },
+  {
+    type: 'helix',
+    label: 'Спираль',
+    title: 'Добавить винтовую спираль / цилиндрическую пружину (helix)',
+    icon: (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" className="w-5 h-5">
+        <path
+          d="M6.5 5.5c0-1.4 2.5-2.5 5.5-2.5s5.5 1.1 5.5 2.5-2.5 2.5-5.5 2.5-5.5 1.1-5.5 2.5 2.5 2.5 5.5 2.5 5.5 1.1 5.5 2.5-2.5 2.5-5.5 2.5-5.5 1.1-5.5 2.5 2.5 2.5 5.5 2.5 5.5-1.1 5.5-2.5"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      </svg>
+    ),
+  },
 ];
 
 export interface AssemblyPresetItem {

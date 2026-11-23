@@ -9,8 +9,11 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::sse::{Event, KeepAlive, Sse},
+    http::{header, StatusCode},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse,
+    },
     routing::{get, post},
     Json, Router,
 };
@@ -42,6 +45,7 @@ pub struct AppState {
     pub tx: broadcast::Sender<String>,
     pub coupled_sim: SharedCoupledSimManager,
     pub coupled_sim_events_tx: broadcast::Sender<CoupledSimSseEvent>,
+    pub live_scene_events_tx: broadcast::Sender<u64>,
 }
 
 /// Lightweight Vulkan-independent state for the standalone coupled simulation router
@@ -87,6 +91,7 @@ async fn sse_handler(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx_rpc = app_state.tx.subscribe();
     let rx_sim = app_state.coupled_sim_events_tx.subscribe();
+    let rx_live = app_state.live_scene_events_tx.subscribe();
 
     let initial = tokio_stream::once(Ok::<_, Infallible>(
         Event::default().event("endpoint").data("/message"),
@@ -104,7 +109,14 @@ async fn sse_handler(
         Err(_) => None,
     });
 
-    let merged = rpc_stream.merge(sim_stream);
+    let live_stream = BroadcastStream::new(rx_live).filter_map(|res| match res {
+        Ok(rev) => Some(Ok(Event::default()
+            .event("scene_updated")
+            .data(json!({ "revision": rev }).to_string()))),
+        Err(_) => None,
+    });
+
+    let merged = rpc_stream.merge(sim_stream).merge(live_stream);
     let combined = initial.chain(merged);
 
     Sse::new(combined).keep_alive(KeepAlive::default())
@@ -292,15 +304,57 @@ async fn app_coupled_fragments_by_sim_handler(
     Ok(Json(res))
 }
 
+async fn app_live_scene_handler(State(app_state): State<AppState>) -> Json<Value> {
+    let guard = app_state.engine.read();
+    let snap = crate::live_sync::build_live_snapshot(&guard, "sse");
+    Json(serde_json::to_value(snap).unwrap_or_else(|_| json!({ "parts": [], "joints": [] })))
+}
+
+async fn app_live_part_stl_handler(
+    State(app_state): State<AppState>,
+    Path(part_id): Path<String>,
+) -> impl IntoResponse {
+    let mesh_opt = {
+        let guard = app_state.engine.read();
+        guard
+            .parts
+            .get(&part_id)
+            .or_else(|| {
+                guard
+                    .parts
+                    .values()
+                    .find(|p| crate::live_sync::sanitize_part_id(&p.id) == part_id)
+            })
+            .map(|p| p.mesh.clone())
+    };
+
+    let Some(mesh) = mesh_opt else {
+        return (StatusCode::NOT_FOUND, "Part not found").into_response();
+    };
+
+    let mut buf = Vec::with_capacity(84 + mesh.indices.len() * 50);
+    if let Err(e) = mcp_cad_core::export_stl::export_stl_binary(&mesh, &mut buf) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("STL export failed: {e}")).into_response();
+    }
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/octet-stream")],
+        buf,
+    )
+        .into_response()
+}
+
 /// Creates the Axum router for the MCP HTTP/SSE server including coupled simulation baking,
-/// real-time SSE progress streaming, job cancellation, and per-frame cache endpoints (`P5-T6`).
+/// real-time SSE progress streaming, job cancellation, live scene inspection, and per-frame cache endpoints (`P5-T6`).
 pub fn build_router(engine: SharedState) -> (Router, broadcast::Sender<String>) {
     let (tx, _) = broadcast::channel(128);
-    let (coupled_sim, coupled_sim_events_tx) = {
+    let (coupled_sim, coupled_sim_events_tx, live_scene_events_tx) = {
         let guard = engine.read();
         (
             Arc::clone(&guard.coupled_sim),
             guard.coupled_sim_events_tx.clone(),
+            guard.live_scene_events_tx.clone(),
         )
     };
     let app_state = AppState {
@@ -308,11 +362,14 @@ pub fn build_router(engine: SharedState) -> (Router, broadcast::Sender<String>) 
         tx: tx.clone(),
         coupled_sim,
         coupled_sim_events_tx,
+        live_scene_events_tx,
     };
 
     let router = Router::new()
         .route("/sse", get(sse_handler))
         .route("/message", post(message_handler))
+        .route("/api/live/scene", get(app_live_scene_handler))
+        .route("/api/live/part/:part_id", get(app_live_part_stl_handler))
         .route("/api/coupled-sim/events", get(app_coupled_events_handler))
         .route("/api/coupled-sim/bake", post(app_coupled_bake_handler))
         .route("/api/coupled-sim/status", get(app_coupled_status_latest_handler))

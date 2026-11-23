@@ -40,11 +40,13 @@ if not exist "%~dp0node_modules" (
     )
 )
 
-:: 4. Открываем веб-интерфейс в браузере / приложении
+:: 4. Открываем веб-интерфейс в браузере / приложении (полная инженерная студия + Live MCP Sync)
 echo.
 echo [OK] Запуск Web Studio на http://localhost:3000 ...
+echo [INFO] Live MCP Sync активен: все модели агента (Antigravity / Claude Desktop) будут появляться здесь автоматически.
+echo [INFO] Совет: если вы обновили код Rust, один раз выполните: cargo build --release -p mcp-cad-server
 echo [INFO] Открытие в окне приложения (Edge / Chrome / Браузер по умолчанию)...
-start "" cmd /c "timeout /t 3 /nobreak >nul & start msedge --app=http://localhost:3000/?bridge=live --window-size=1440,900 2>nul || start chrome --app=http://localhost:3000/?bridge=live 2>nul || start http://localhost:3000/?bridge=live"
+start "" cmd /c "timeout /t 3 /nobreak >nul & start msedge --app=http://localhost:3000/?bridge=live^&view=studio --window-size=1440,900 2>nul || start chrome --app=http://localhost:3000/?bridge=live^&view=studio 2>nul || start http://localhost:3000/?bridge=live^&view=studio"
 
 :: 5. Запускаем dev сервер Vite
 call npm run dev

@@ -838,10 +838,11 @@ impl DeformedSurfaceMesh {
             HashMap::with_capacity(self.triangles.len() * 2);
         self.nodal_areas.fill(0.0);
 
-        for (t_idx, &[i0, i1, i2]) in self.triangles.iter().enumerate() {
-            let p0 = Vector3::from(self.current_positions[i0]);
-            let p1 = Vector3::from(self.current_positions[i1]);
-            let p2 = Vector3::from(self.current_positions[i2]);
+        let positions = &self.current_positions;
+        let eval_tri = |&[i0, i1, i2]: &[usize; 3]| -> ([f64; 3], f64, [f64; 3]) {
+            let p0 = Vector3::from(positions[i0]);
+            let p1 = Vector3::from(positions[i1]);
+            let p2 = Vector3::from(positions[i2]);
             let e01 = p1 - p0;
             let e02 = p2 - p0;
             let cross = e01.cross(&e02);
@@ -849,33 +850,44 @@ impl DeformedSurfaceMesh {
             if norm > 1e-24 {
                 let n = cross / norm;
                 let area = 0.5 * norm;
-                self.tri_normals[t_idx] = [n.x, n.y, n.z];
-                self.tri_areas[t_idx] = area;
-
-                let share = area / 3.0;
-                self.nodal_areas[i0] += share;
-                self.nodal_areas[i1] += share;
-                self.nodal_areas[i2] += share;
-
-                // Bærentzen–Aanæs angle weights at each vertex of the triangle
                 let u01 = e01.normalize();
                 let u02 = e02.normalize();
                 let u12 = (p2 - p1).normalize();
                 let a0 = u01.dot(&u02).clamp(-1.0, 1.0).acos();
                 let a1 = (-u01).dot(&u12).clamp(-1.0, 1.0).acos();
                 let a2 = (-u02).dot(&(-u12)).clamp(-1.0, 1.0).acos();
+                ([n.x, n.y, n.z], area, [a0, a1, a2])
+            } else {
+                ([0.0, 0.0, 1.0], 0.0, [0.0, 0.0, 0.0])
+            }
+        };
 
-                v_accum[i0] += n * a0;
-                v_accum[i1] += n * a1;
-                v_accum[i2] += n * a2;
+        let tri_geom: Vec<([f64; 3], f64, [f64; 3])> = if self.triangles.len() >= 512 {
+            self.triangles.par_iter().map(eval_tri).collect()
+        } else {
+            self.triangles.iter().map(eval_tri).collect()
+        };
+
+        for (t_idx, (&[i0, i1, i2], &(n_arr, area, angles))) in
+            self.triangles.iter().zip(tri_geom.iter()).enumerate()
+        {
+            self.tri_normals[t_idx] = n_arr;
+            self.tri_areas[t_idx] = area;
+            if area > 0.0 {
+                let n = Vector3::from(n_arr);
+                let share = area / 3.0;
+                self.nodal_areas[i0] += share;
+                self.nodal_areas[i1] += share;
+                self.nodal_areas[i2] += share;
+
+                v_accum[i0] += n * angles[0];
+                v_accum[i1] += n * angles[1];
+                v_accum[i2] += n * angles[2];
 
                 for (ea, eb) in [(i0, i1), (i1, i2), (i2, i0)] {
                     let key = if ea < eb { (ea, eb) } else { (eb, ea) };
                     *e_accum.entry(key).or_insert_with(Vector3::zeros) += n;
                 }
-            } else {
-                self.tri_normals[t_idx] = [0.0, 0.0, 1.0];
-                self.tri_areas[t_idx] = 0.0;
             }
         }
 

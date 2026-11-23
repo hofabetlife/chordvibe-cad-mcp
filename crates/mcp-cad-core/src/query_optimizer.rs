@@ -349,6 +349,27 @@ fn estimate_primitive_aabb(op: &FeatureOp) -> Option<BoundingBox> {
                 *rotation_deg,
             ))
         }
+        FeatureOp::AddHelix {
+            helix_radius,
+            wire_radius,
+            height,
+            position,
+            rotation_deg,
+            ..
+        } => {
+            if *helix_radius <= 0.0 || *wire_radius <= 0.0 || *height <= 0.0 {
+                return None;
+            }
+            let r_max = *helix_radius + *wire_radius;
+            let hz = *height * 0.5 + *wire_radius;
+            Some(estimate_axial_cylinder_aabb(
+                r_max,
+                -hz,
+                hz,
+                *position,
+                *rotation_deg,
+            ))
+        }
         FeatureOp::ImportedMesh { mesh } => {
             if mesh.vertices.is_empty() {
                 None
@@ -613,6 +634,39 @@ pub fn estimate_dag_cost(
                     op_desc = format!("BspUnionJoin(wheel_rim, depth={bsp_depth})");
                 }
             }
+            FeatureOp::AddHelix {
+                pitch,
+                height,
+                starts,
+                ..
+            } => {
+                let turns = if *pitch > 1e-9 {
+                    (*height / *pitch).max(0.25)
+                } else {
+                    1.0
+                };
+                let num_starts = (*starts).max(1);
+                let prim_tris = ((turns * 32.0).round() as usize * 32 + 32) * num_starts;
+                if current_tris == 0 {
+                    current_tris = prim_tris;
+                    node_cost_ms = 0.8 + (prim_tris as f64) * 0.001;
+                    full_mesh_passes += 1;
+                    sliver_risk += 0.5;
+                    op_desc = format!(
+                        "AnalyticalHelixSweep(turns={turns:.2}, starts={num_starts}, tris={prim_tris})"
+                    );
+                } else {
+                    bsp_depth += 1;
+                    full_mesh_passes += 2;
+                    node_cost_ms = 2.2
+                        + ((current_tris * prim_tris) as f64)
+                            * 0.00018
+                            * (1.0 + bsp_depth as f64 * 0.25);
+                    sliver_risk += 12.0 * (1.0 + bsp_depth as f64 * 0.35);
+                    current_tris = ((current_tris + prim_tris) as f64 * 1.2) as usize;
+                    op_desc = format!("BspUnionJoin(helix, depth={bsp_depth})");
+                }
+            }
             FeatureOp::CutHole { radius, .. } => {
                 let segs = settings.calculate_segments(*radius);
                 let tool_tris = segs * 4;
@@ -776,6 +830,7 @@ fn apply_rule_r2_aabb_dead_op_culling(
                 | FeatureOp::AddSpurGear { .. }
                 | FeatureOp::AddRevolve { .. }
                 | FeatureOp::AddWheelRim { .. }
+                | FeatureOp::AddHelix { .. }
                 | FeatureOp::ImportedMesh { .. }
                 | FeatureOp::BooleanUnionMesh { .. }
                 | FeatureOp::Transform { .. } => {
@@ -958,7 +1013,8 @@ fn apply_rule_r1_transform_fusion(
                         | FeatureOp::AddCone { position, .. }
                         | FeatureOp::AddSpurGear { position, .. }
                         | FeatureOp::AddRevolve { position, .. }
-                        | FeatureOp::AddWheelRim { position, .. } => {
+                        | FeatureOp::AddWheelRim { position, .. }
+                        | FeatureOp::AddHelix { position, .. } => {
                             let p = position.unwrap_or([0.0, 0.0, 0.0]);
                             *position = Some([p[0] + t2[0], p[1] + t2[1], p[2] + t2[2]]);
                             true
@@ -1028,6 +1084,7 @@ fn apply_rule_r3_demorgan_csg_batch(
                 | FeatureOp::AddSpurGear { .. }
                 | FeatureOp::AddRevolve { .. }
                 | FeatureOp::AddWheelRim { .. }
+                | FeatureOp::AddHelix { .. }
                 | FeatureOp::ImportedMesh { .. }
                 | FeatureOp::BooleanUnionMesh { .. }
                 | FeatureOp::BooleanIntersectionMesh { .. }
@@ -1088,6 +1145,7 @@ fn apply_rule_r3_demorgan_csg_batch(
                                 | FeatureOp::AddSpurGear { .. }
                                 | FeatureOp::AddRevolve { .. }
                                 | FeatureOp::AddWheelRim { .. }
+                                | FeatureOp::AddHelix { .. }
                                 | FeatureOp::ImportedMesh { .. }
                                 | FeatureOp::BooleanUnionMesh { .. }
                                 | FeatureOp::BooleanIntersectionMesh { .. }
@@ -1239,6 +1297,7 @@ fn apply_rule_r4_coaxial_revolve_reduction(
                 | FeatureOp::AddSpurGear { .. }
                 | FeatureOp::AddRevolve { .. }
                 | FeatureOp::AddWheelRim { .. }
+                | FeatureOp::AddHelix { .. }
                 | FeatureOp::ImportedMesh { .. }
                 | FeatureOp::BooleanUnionMesh { .. }
                 | FeatureOp::BooleanIntersectionMesh { .. }
@@ -1409,6 +1468,7 @@ fn check_rule_r5_prism_thread_fusion(
                 | FeatureOp::AddSpurGear { .. }
                 | FeatureOp::AddRevolve { .. }
                 | FeatureOp::AddWheelRim { .. }
+                | FeatureOp::AddHelix { .. }
                 | FeatureOp::ImportedMesh { .. }
                 | FeatureOp::BooleanUnionMesh { .. }
                 | FeatureOp::BooleanIntersectionMesh { .. }

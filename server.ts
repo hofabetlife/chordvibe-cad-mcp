@@ -4,6 +4,12 @@ import { spawn, execFile, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import {
+  LiveSyncStore,
+  isSafeLivePartId,
+  type PushLiveSnapshotPayload,
+} from './src/server/live_sync_store.ts';
+import type { LiveSyncApiResponse } from './src/cad/live_sync_adapter.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -19,7 +25,7 @@ const CARGO_BIN = process.env.CARGO_BIN || '/root/.cargo/bin/cargo';
 function resolveRustBinaryPath(): string {
   if (fs.existsSync(RELEASE_BINARY_PATH)) return RELEASE_BINARY_PATH;
   if (fs.existsSync(DEBUG_BINARY_PATH)) return DEBUG_BINARY_PATH;
-  return DEBUG_BINARY_PATH;
+  return RELEASE_BINARY_PATH;
 }
 
 let rustProcess: ChildProcess | null = null;
@@ -77,9 +83,9 @@ async function ensureRustMcpServer(): Promise<boolean> {
           pushLog(`Rust toolchain not yet installed at ${CARGO_BIN}`);
           return false;
         }
-        pushLog(`Building mcp-cad-server into ${CARGO_TARGET_DIR}...`);
+        pushLog(`Building release mcp-cad-server into ${CARGO_TARGET_DIR}...`);
         try {
-          await execFileAsync(CARGO_BIN, ['build', '--bin', 'mcp-cad-server'], {
+          await execFileAsync(CARGO_BIN, ['build', '--release', '--bin', 'mcp-cad-server'], {
             cwd: WORKSPACE_ROOT,
             env: {
               ...process.env,
@@ -90,7 +96,7 @@ async function ensureRustMcpServer(): Promise<boolean> {
           });
           binPath = resolveRustBinaryPath();
         } catch (err) {
-          pushLog(`Cargo build failed: ${String(err)}`);
+          pushLog(`Cargo release build failed: ${String(err)}`);
           return false;
         }
       }
@@ -160,6 +166,165 @@ async function callRustMcp(
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '50mb' }));
+
+  // 0. Cross-Process Live MCP Sync Store (bridges stdio/sse MCP agents <-> Web CAD Studio)
+  const liveSyncStore = new LiveSyncStore({
+    workspaceRoot: WORKSPACE_ROOT,
+  });
+  liveSyncStore.startWatching();
+
+  const liveSseClients = new Set<express.Response>();
+  const writeSseEvent = (
+    res: express.Response,
+    eventName: string,
+    payload: unknown
+  ) => {
+    if (res.writableEnded) return;
+    try {
+      res.write(`event: ${eventName}\ndata: ${JSON.stringify(payload)}\n\n`);
+    } catch {
+      liveSseClients.delete(res);
+    }
+  };
+
+  const broadcastLiveEvent = (eventName: string, payload: LiveSyncApiResponse) => {
+    for (const client of Array.from(liveSseClients)) {
+      writeSseEvent(client, eventName, payload);
+    }
+  };
+
+  liveSyncStore.on('update', (payload: LiveSyncApiResponse) => {
+    broadcastLiveEvent('scene_updated', payload);
+  });
+  liveSyncStore.on('clear', (payload: LiveSyncApiResponse) => {
+    broadcastLiveEvent('scene_cleared', payload);
+  });
+
+  const heartbeatTimer = setInterval(() => {
+    if (liveSseClients.size > 0) {
+      liveSyncStore.writeStudioHeartbeat(liveSseClients.size);
+    }
+  }, 5000);
+  heartbeatTimer.unref?.();
+
+  // 0a. Query current live MCP agent scene (disk bus -> legacy _mcp_preview_live.stl -> local Rust SSE fallback)
+  app.get('/api/live-sync/scene', async (_req, res) => {
+    const localScene = liveSyncStore.readCurrentScene();
+    if (localScene.active && localScene.snapshot) {
+      res.json(localScene);
+      return;
+    }
+
+    // Optional fallback: if local Rust SSE daemon is running on :8080 and has in-memory parts
+    if (await isRustServerHealthy()) {
+      try {
+        const upstream = await fetch(`http://127.0.0.1:${RUST_MCP_PORT}/api/live/scene`);
+        if (upstream.ok) {
+          const snapshot = await upstream.json();
+          if (snapshot && Array.isArray(snapshot.parts) && snapshot.parts.length > 0) {
+            res.json({
+              active: true,
+              sourceKind: 'rust_http',
+              snapshot,
+            } satisfies LiveSyncApiResponse);
+            return;
+          }
+        }
+      } catch {
+        // Ignore upstream errors
+      }
+    }
+
+    res.json(localScene);
+  });
+
+  // 0b. Stream binary STL for a part in the active live MCP agent scene
+  app.get('/api/live-sync/stl/:partId', async (req, res) => {
+    const { partId } = req.params;
+    if (!isSafeLivePartId(partId)) {
+      res.status(400).json({ error: 'Invalid part_id format' });
+      return;
+    }
+
+    const diskStl = liveSyncStore.readPartStlBuffer(partId);
+    if (diskStl) {
+      res.setHeader('Content-Type', 'application/octet-stream');
+      res.setHeader('Cache-Control', 'no-store');
+      res.send(diskStl);
+      return;
+    }
+
+    // Optional fallback to local Rust SSE daemon live STL endpoint
+    if (await isRustServerHealthy()) {
+      try {
+        const upstream = await fetch(
+          `http://127.0.0.1:${RUST_MCP_PORT}/api/live/part/${encodeURIComponent(partId)}`
+        );
+        if (upstream.ok) {
+          const buf = Buffer.from(await upstream.arrayBuffer());
+          res.setHeader('Content-Type', 'application/octet-stream');
+          res.setHeader('Cache-Control', 'no-store');
+          res.send(buf);
+          return;
+        }
+      } catch {
+        // Ignore upstream errors
+      }
+    }
+
+    res.status(404).json({ error: `Live STL not found for part '${partId}'` });
+  });
+
+  // 0c. Server-Sent Events stream pushing real-time MCP agent scene updates to Web Studio
+  app.get('/api/live-sync/events', (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+
+    liveSseClients.add(res);
+    liveSyncStore.writeStudioHeartbeat(liveSseClients.size);
+
+    const initial = liveSyncStore.readCurrentScene();
+    writeSseEvent(res, 'ready', initial);
+
+    const keepalive = setInterval(() => {
+      if (!res.writableEnded) {
+        res.write(': keepalive\n\n');
+      }
+    }, 15_000);
+
+    req.on('close', () => {
+      clearInterval(keepalive);
+      liveSseClients.delete(res);
+      liveSyncStore.writeStudioHeartbeat(liveSseClients.size);
+    });
+  });
+
+  // 0d. Push a live snapshot over HTTP (useful for external bridges, scripts, and E2E verification)
+  app.post('/api/live-sync/push', (req, res) => {
+    const body = req.body as PushLiveSnapshotPayload | undefined;
+    if (!body || !Array.isArray(body.parts)) {
+      res.status(400).json({ error: 'Payload must contain a parts array' });
+      return;
+    }
+    try {
+      const snapshot = liveSyncStore.pushSnapshot(body);
+      res.json({ ok: true, snapshot });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // 0e. Clear active live agent snapshot from disk bus
+  app.post('/api/live-sync/clear', (req, res) => {
+    try {
+      liveSyncStore.clearSnapshot(Boolean(req.body?.clearLegacyStl));
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
 
   // 1. Health & Rust Engine Status
   app.get('/api/rust/status', async (_req, res) => {

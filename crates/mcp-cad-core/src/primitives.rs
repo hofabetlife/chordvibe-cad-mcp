@@ -2022,6 +2022,269 @@ pub fn create_helical_cutter_with_settings(
     TriangleMesh::with_faces(all_vertices, all_indices, face_ids, faces)
 }
 
+/// Generates a watertight additive 3D helical wire / coil spring solid centered along Z
+/// (`z in [-height/2, +height/2]`) using default tessellation settings.
+///
+/// The cross-section is a circular wire of radius `wire_radius` swept along a helix of
+/// mean coil radius `helix_radius`, axial pitch `pitch`, and axial span `height`
+/// (`turns = height / pitch`).
+///
+/// Geometric validity invariants (returns empty mesh if violated):
+/// - `helix_radius > 0`, `wire_radius > 0`, `pitch > 0`, `height > 0`, `starts >= 1`
+/// - `helix_radius > wire_radius` (prevents inner self-intersection through the Z-axis)
+/// - `pitch / starts > 2 * wire_radius` (prevents adjacent coils from self-intersecting)
+#[allow(clippy::too_many_arguments)]
+pub fn create_helix(
+    helix_radius: f64,
+    wire_radius: f64,
+    pitch: f64,
+    height: f64,
+    starts: usize,
+    is_right_hand: bool,
+) -> TriangleMesh {
+    create_helix_with_settings(
+        helix_radius,
+        wire_radius,
+        pitch,
+        height,
+        starts,
+        is_right_hand,
+        &TessellationSettings::default(),
+    )
+}
+
+/// Generates a watertight additive 3D helical wire / coil spring solid centered along Z
+/// (`z in [-height/2, +height/2]`) with adaptive tessellation based on `TessellationSettings`.
+///
+/// Exposes three named faces for downstream FEA boundary conditions and inspection:
+/// - Face 1 (`cap_bottom`, aliases `bottom`, `start_cap`, `min_z`, `-z`)
+/// - Face 2 (`cap_top`, aliases `top`, `end_cap`, `max_z`, `+z`)
+/// - Face 3 (`side`, aliases `wire_surface`, `coil_surface`, `helix_surface`, `outer`)
+#[allow(clippy::too_many_arguments)]
+pub fn create_helix_with_settings(
+    helix_radius: f64,
+    wire_radius: f64,
+    pitch: f64,
+    height: f64,
+    starts: usize,
+    is_right_hand: bool,
+    settings: &TessellationSettings,
+) -> TriangleMesh {
+    let num_starts = starts.max(1);
+    if !helix_radius.is_finite()
+        || !wire_radius.is_finite()
+        || !pitch.is_finite()
+        || !height.is_finite()
+        || helix_radius <= 1e-9
+        || wire_radius <= 1e-9
+        || pitch <= 1e-9
+        || height <= 1e-9
+    {
+        return TriangleMesh::empty();
+    }
+    if wire_radius >= helix_radius - 1e-9 {
+        return TriangleMesh::empty();
+    }
+    let pitch_per_start = pitch / (num_starts as f64);
+    if 2.0 * wire_radius >= pitch_per_start - 1e-9 {
+        return TriangleMesh::empty();
+    }
+
+    let effective_turns = height / pitch;
+    if effective_turns <= 1e-9 {
+        return TriangleMesh::empty();
+    }
+
+    let start_z = -0.5 * height;
+    let cross_segments: usize = match settings.quality {
+        TessellationQuality::Coarse => 12,
+        TessellationQuality::Medium => 16,
+        TessellationQuality::Fine => 24,
+        TessellationQuality::Custom { .. } => settings.calculate_segments(wire_radius).clamp(12, 32),
+    };
+    let steps_per_turn: usize = match settings.quality {
+        TessellationQuality::Coarse => 20,
+        TessellationQuality::Medium => 32,
+        TessellationQuality::Fine => 48,
+        TessellationQuality::Custom { .. } => settings.calculate_segments(helix_radius).clamp(20, 64),
+    };
+    let k_steps = ((effective_turns * steps_per_turn as f64).round() as usize).max(12);
+
+    let mut all_vertices = Vec::new();
+    let mut all_indices = Vec::new();
+    let mut face_ids = Vec::new();
+
+    let s = if is_right_hand { 1.0 } else { -1.0 };
+    let c = pitch / (2.0 * PI);
+    let h_len = (helix_radius * helix_radius + c * c).sqrt();
+    let total_sweep_angle = 2.0 * PI * effective_turns;
+
+    let mut start_cap_normal_first = [0.0, 0.0, -1.0];
+    let mut end_cap_normal_first = [0.0, 0.0, 1.0];
+
+    for start_idx in 0..num_starts {
+        let phi_0 = (start_idx as f64) * 2.0 * PI / (num_starts as f64);
+        let start_vertex_offset = all_vertices.len() as u32;
+        let m = cross_segments;
+
+        for j in 0..=k_steps {
+            let u = (j as f64) / (k_steps as f64);
+            let t = u * total_sweep_angle;
+            let theta = phi_0 + s * t;
+            let z = start_z + (t / (2.0 * PI)) * pitch;
+
+            let cos_t = theta.cos();
+            let sin_t = theta.sin();
+
+            let center = Vector3::new(helix_radius * cos_t, helix_radius * sin_t, z);
+            let e_r = Vector3::new(cos_t, sin_t, 0.0);
+            let e_b = if h_len > 1e-12 {
+                Vector3::new(
+                    -c * sin_t / h_len,
+                    c * cos_t / h_len,
+                    -s * helix_radius / h_len,
+                )
+            } else {
+                Vector3::new(0.0, 0.0, 1.0)
+            };
+
+            for i in 0..m {
+                let alpha = ((i as f64) + 0.5) * 2.0 * PI / (m as f64);
+                let cos_a = alpha.cos();
+                let sin_a = alpha.sin();
+
+                let n = e_r * cos_a + e_b * sin_a;
+                let pos = center + n * wire_radius;
+
+                all_vertices.push(Vertex::new([pos.x, pos.y, pos.z], [n.x, n.y, n.z]));
+            }
+        }
+
+        // Helical tube side surface (face id = 3)
+        for j in 0..k_steps {
+            for i in 0..m {
+                let next_i = (i + 1) % m;
+                let v00 = start_vertex_offset + (j * m + i) as u32;
+                let v01 = start_vertex_offset + (j * m + next_i) as u32;
+                let v10 = start_vertex_offset + ((j + 1) * m + i) as u32;
+                let v11 = start_vertex_offset + ((j + 1) * m + next_i) as u32;
+
+                all_indices.push([v00, v01, v11]);
+                face_ids.push(3);
+                all_indices.push([v00, v11, v10]);
+                face_ids.push(3);
+            }
+        }
+
+        // Start cap at j = 0 (face id = 1, outward normal = -T_unit)
+        let theta0 = phi_0;
+        let z0 = start_z;
+        let c0 = Vector3::new(helix_radius * theta0.cos(), helix_radius * theta0.sin(), z0);
+        let tan0 = Vector3::new(
+            -s * helix_radius * theta0.sin(),
+            s * helix_radius * theta0.cos(),
+            c,
+        );
+        let n_start = if h_len > 1e-12 {
+            -tan0 / h_len
+        } else {
+            Vector3::new(0.0, 0.0, -1.0)
+        };
+        if start_idx == 0 {
+            start_cap_normal_first = [n_start.x, n_start.y, n_start.z];
+        }
+
+        let start_cap_center_idx = all_vertices.len() as u32;
+        all_vertices.push(Vertex::new(
+            [c0.x, c0.y, c0.z],
+            [n_start.x, n_start.y, n_start.z],
+        ));
+        for i in 0..m {
+            let next_i = (i + 1) % m;
+            let vi = start_vertex_offset + i as u32;
+            let v_next = start_vertex_offset + next_i as u32;
+            all_indices.push([start_cap_center_idx, v_next, vi]);
+            face_ids.push(1);
+        }
+
+        // End cap at j = k_steps (face id = 2, outward normal = +T_unit)
+        let tk = total_sweep_angle;
+        let thetak = phi_0 + s * tk;
+        let zk = start_z + (tk / (2.0 * PI)) * pitch;
+        let ck = Vector3::new(helix_radius * thetak.cos(), helix_radius * thetak.sin(), zk);
+        let tank = Vector3::new(
+            -s * helix_radius * thetak.sin(),
+            s * helix_radius * thetak.cos(),
+            c,
+        );
+        let n_end = if h_len > 1e-12 {
+            tank / h_len
+        } else {
+            Vector3::new(0.0, 0.0, 1.0)
+        };
+        if start_idx == 0 {
+            end_cap_normal_first = [n_end.x, n_end.y, n_end.z];
+        }
+
+        let end_cap_center_idx = all_vertices.len() as u32;
+        all_vertices.push(Vertex::new(
+            [ck.x, ck.y, ck.z],
+            [n_end.x, n_end.y, n_end.z],
+        ));
+        for i in 0..m {
+            let next_i = (i + 1) % m;
+            let vi = start_vertex_offset + (k_steps * m + i) as u32;
+            let v_next = start_vertex_offset + (k_steps * m + next_i) as u32;
+            all_indices.push([end_cap_center_idx, vi, v_next]);
+            face_ids.push(2);
+        }
+    }
+
+    let faces = vec![
+        FaceInfo::new_descriptor(
+            1,
+            "cap_bottom",
+            vec![
+                "bottom".to_string(),
+                "start_cap".to_string(),
+                "min_z".to_string(),
+                "-z".to_string(),
+            ],
+            FaceKind::Plane,
+            start_cap_normal_first,
+            Some(wire_radius),
+        ),
+        FaceInfo::new_descriptor(
+            2,
+            "cap_top",
+            vec![
+                "top".to_string(),
+                "end_cap".to_string(),
+                "max_z".to_string(),
+                "+z".to_string(),
+            ],
+            FaceKind::Plane,
+            end_cap_normal_first,
+            Some(wire_radius),
+        ),
+        FaceInfo::new_descriptor(
+            3,
+            "side",
+            vec![
+                "wire_surface".to_string(),
+                "coil_surface".to_string(),
+                "helix_surface".to_string(),
+                "outer".to_string(),
+            ],
+            FaceKind::Helical,
+            [0.0, 0.0, 1.0],
+            Some(helix_radius),
+        ),
+    ];
+
+    TriangleMesh::with_faces(all_vertices, all_indices, face_ids, faces)
+}
+
 /// Generates a solid 3D parametric spur gear centered at origin along the Z axis.
 ///
 /// Features:
@@ -4777,5 +5040,53 @@ mod tests {
             assert_eq!(report.geometry.lt_1_deg_count, 0);
             assert!(report.geometry.lt_5_deg_ratio <= 0.01);
         }
+    }
+
+    #[test]
+    fn test_helix_coil_spring_watertight_volume_and_faces() {
+        // User's reference coil spring: R_helix = 17.5 mm, r_wire = 2.5 mm, pitch = 12 mm, 5 turns (height = 60 mm)
+        let r_helix = 0.0175;
+        let r_wire = 0.0025;
+        let pitch = 0.012;
+        let turns = 5.0;
+        let height = pitch * turns;
+
+        for is_right_hand in [true, false] {
+            let mesh = create_helix(r_helix, r_wire, pitch, height, 1, is_right_hand);
+            assert!(!mesh.is_empty(), "Helix mesh must not be empty");
+
+            let report = crate::diagnostics::validate_mesh(&mesh, Some(0));
+            assert_eq!(
+                report.status, "PASS",
+                "Helix (right_hand={is_right_hand}) failed validate_mesh: {:?}",
+                report.issues
+            );
+            assert!(report.topology.is_watertight);
+            assert_eq!(report.topology.boundary_edges_count, 0);
+            assert_eq!(report.topology.non_manifold_edges_count, 0);
+            assert_eq!(report.topology.euler_characteristic, 2);
+
+            // Analytical volume of helical wire: V = pi * r_wire^2 * L_wire
+            // where L_wire = turns * sqrt((2*pi*R)^2 + pitch^2)
+            let wire_len = turns * ((2.0 * PI * r_helix).powi(2) + pitch * pitch).sqrt();
+            let v_expected = PI * r_wire * r_wire * wire_len;
+            let v_actual = mesh.signed_volume();
+            let rel_err = (v_actual - v_expected).abs() / v_expected;
+            assert!(
+                rel_err < 0.04,
+                "Helix signed volume {v_actual} differs from analytical {v_expected} by {:.2}%",
+                rel_err * 100.0
+            );
+
+            // Verify 3 distinct named faces: cap_bottom, cap_top, side
+            assert_eq!(mesh.faces.len(), 3);
+            assert_eq!(mesh.faces[0].name, "cap_bottom");
+            assert_eq!(mesh.faces[1].name, "cap_top");
+            assert_eq!(mesh.faces[2].name, "side");
+        }
+
+        // Invalid self-intersecting cases must return empty mesh
+        assert!(create_helix(0.010, 0.010, 0.030, 0.060, 1, true).is_empty());
+        assert!(create_helix(0.0175, 0.006, 0.012, 0.060, 1, true).is_empty());
     }
 }

@@ -8,8 +8,8 @@ use crate::csg::{csg_difference, csg_intersection, csg_union};
 use crate::error::CadError;
 use crate::primitives::{
     create_box, create_cone, create_cylinder, create_helical_cutter_with_settings,
-    create_polygon_prism, create_revolve, create_sphere, create_spur_gear_with_settings,
-    create_wheel_rim_with_settings, cut_hole_with_settings,
+    create_helix_with_settings, create_polygon_prism, create_revolve, create_sphere,
+    create_spur_gear_with_settings, create_wheel_rim_with_settings, cut_hole_with_settings,
 };
 use crate::tessellation::TessellationSettings;
 use crate::topology::TriangleMesh;
@@ -141,6 +141,21 @@ pub enum FeatureOp {
         #[serde(default)]
         rotation_deg: Option<[f64; 3]>,
     },
+    /// Add a watertight 3D helical wire / coil spring solid centered along Z.
+    AddHelix {
+        helix_radius: f64,
+        wire_radius: f64,
+        pitch: f64,
+        height: f64,
+        #[serde(default = "default_helix_starts")]
+        starts: usize,
+        #[serde(default = "default_right_hand")]
+        is_right_hand: bool,
+        #[serde(default)]
+        position: Option<[f64; 3]>,
+        #[serde(default)]
+        rotation_deg: Option<[f64; 3]>,
+    },
     /// Cut a cylindrical hole from the current solid, with optional DIN 6885 keyway.
     CutHole {
         center: [f64; 3],
@@ -235,6 +250,10 @@ fn default_stacks() -> usize {
 
 fn default_starts() -> usize {
     2
+}
+
+fn default_helix_starts() -> usize {
+    1
 }
 
 fn default_right_hand() -> bool {
@@ -484,6 +503,7 @@ impl FeatureTree {
             FeatureOp::AddSpurGear { .. } => "Spur Gear".to_string(),
             FeatureOp::AddRevolve { .. } => "Revolve".to_string(),
             FeatureOp::AddWheelRim { .. } => "Wheel Rim".to_string(),
+            FeatureOp::AddHelix { .. } => "Helix".to_string(),
             FeatureOp::CutHole { .. } => "Cut Hole".to_string(),
             FeatureOp::CutHelicalGroove { .. } => "Cut Helical Groove".to_string(),
             FeatureOp::BooleanDifferenceMesh { .. } => "Boolean Difference Mesh".to_string(),
@@ -886,6 +906,66 @@ impl FeatureTree {
                         *offset_et,
                         settings,
                     );
+                    apply_pos_rot(&mut mesh, position, rotation_deg);
+                    tag_node_faces(&mut mesh, node, node_idx);
+                    current_mesh = match current_mesh {
+                        Some(m) => Some(csg_union(&m, &mesh)),
+                        None => Some(mesh),
+                    };
+                }
+                FeatureOp::AddHelix {
+                    helix_radius,
+                    wire_radius,
+                    pitch,
+                    height,
+                    starts,
+                    is_right_hand,
+                    position,
+                    rotation_deg,
+                } => {
+                    if !helix_radius.is_finite()
+                        || !wire_radius.is_finite()
+                        || !pitch.is_finite()
+                        || !height.is_finite()
+                        || *helix_radius <= 0.0
+                        || *wire_radius <= 0.0
+                        || *pitch <= 0.0
+                        || *height <= 0.0
+                    {
+                        return Err(CadError::InvalidParameter(format!(
+                            "Helix parameters must be positive and finite: helix_radius={}, wire_radius={}, pitch={}, height={}",
+                            helix_radius, wire_radius, pitch, height
+                        )));
+                    }
+                    let num_starts = (*starts).max(1);
+                    if *wire_radius >= *helix_radius - 1e-9 {
+                        return Err(CadError::InvalidParameter(format!(
+                            "Helix wire_radius ({}) must be strictly smaller than helix_radius ({}) to avoid inner self-intersection",
+                            wire_radius, helix_radius
+                        )));
+                    }
+                    let pitch_per_start = *pitch / (num_starts as f64);
+                    if 2.0 * *wire_radius >= pitch_per_start - 1e-9 {
+                        return Err(CadError::InvalidParameter(format!(
+                            "Helix pitch per start ({:.6} m) must be strictly greater than wire diameter 2*wire_radius ({:.6} m) to avoid coil self-intersection",
+                            pitch_per_start,
+                            2.0 * *wire_radius
+                        )));
+                    }
+                    let mut mesh = create_helix_with_settings(
+                        *helix_radius,
+                        *wire_radius,
+                        *pitch,
+                        *height,
+                        num_starts,
+                        *is_right_hand,
+                        settings,
+                    );
+                    if mesh.is_empty() {
+                        return Err(CadError::GeometryError(
+                            "Helix generator produced an empty mesh".into(),
+                        ));
+                    }
                     apply_pos_rot(&mut mesh, position, rotation_deg);
                     tag_node_faces(&mut mesh, node, node_idx);
                     current_mesh = match current_mesh {

@@ -205,6 +205,21 @@ pub fn open_preview_window(args: &Value, state: &EngineState) -> Result<Value, S
             }));
         }
 
+        let force_native = args
+            .get("force_native")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if !force_native && crate::live_sync::is_web_studio_active() {
+            return Ok(json!({
+                "status": "opened",
+                "mode": "web_studio_live",
+                "stl_path": preview_stl_path.to_string_lossy(),
+                "part_id": part_id_opt,
+                "message": "Scene synced directly to active MCP-CAD Web Studio (http://localhost:3000) via Live Sync."
+            }));
+        }
+
         let exe_path = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => {

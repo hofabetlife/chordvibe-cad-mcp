@@ -1239,8 +1239,8 @@ pub fn prepare_coupled_bake_from_parts_with_physics(
             )));
         }
 
-        // Parts participating in a Gear joint require boundary-snapped teeth so staircase voxels
-        // cannot artificially interpenetrate across the involute pitch clearance at t = 0.
+        // Parts participating in a Gear joint require boundary-snapped teeth and sufficient
+        // resolution so coarse tetrahedra cannot bridge tooth valleys or interpenetrate at t = 0.
         let is_gear_part = applied_gear_couplings
             .iter()
             .any(|g| g.part_a == *pid || g.part_b == *pid);
@@ -1249,9 +1249,26 @@ pub fn prepare_coupled_bake_from_parts_with_physics(
         } else {
             acc_mode
         };
-        let tet_mesh =
-            TetrahedralMesh::from_mesh_with_accuracy(&part.mesh, mesh_density, part_acc_mode)
-                .map_err(ServerError::Fea)?;
+        let part_mesh_density = if is_gear_part
+            && args.get("mesh_density").is_none()
+            && matches!(mesh_density, MeshDensity::Coarse)
+        {
+            let dims = part.bounding_box().dimensions();
+            let max_dim = dims[0].max(dims[1]).max(dims[2]);
+            let min_dim = dims[0].min(dims[1]).min(dims[2]);
+            let h_gear = (max_dim / 14.0).min(min_dim / 3.0).max(1e-4);
+            MeshDensity::Custom {
+                max_element_size: h_gear,
+            }
+        } else {
+            mesh_density
+        };
+        let tet_mesh = TetrahedralMesh::from_mesh_with_accuracy(
+            &part.mesh,
+            part_mesh_density,
+            part_acc_mode,
+        )
+        .map_err(ServerError::Fea)?;
 
         let j2_mat =
             J2MaterialParams::from_material(&part.material).map_err(ServerError::Fea)?;

@@ -406,8 +406,8 @@
 | Параметр | Тип | Обязательный | Описание |
 |---|---|---|---|
 | `part_id` | `string` | Да | Идентификатор целевой детали |
-| `primitive_type` | `string` | Да | Тип примитива: `"box"`, `"cylinder"`, `"sphere"`, `"cone"`, `"polygon_prism"`, `"spur_gear"`, `"revolve"`, `"wheel_rim"` |
-| `params` | `object` | Да | Геометрические размеры в метрах (см. таблицу ниже) |
+| `primitive_type` | `string` | Да | Тип примитива: `"box"`, `"cylinder"`, `"sphere"`, `"cone"`, `"polygon_prism"`, `"spur_gear"`, `"revolve"`, `"wheel_rim"`, `"helix"` (алиас `"coil_spring"`) |
+| `params` | `object` | Да | Геометрические размеры в активном `length_unit` (см. таблицу ниже) |
 
 **Спецификация параметров примитивов**:
 - `"box"`: `{"width": number, "height": number, "depth": number}`
@@ -418,6 +418,7 @@
 - `"spur_gear"`: `{"module": number, "teeth": integer, "face_width": number, "pressure_angle_deg"?: number, "bore_radius"?: number, "bore_diameter"?: number, "keyway_width"?: number, "keyway_depth"?: number, "hub_diameter"?: number, "hub_length"?: number}` (прямозубая цилиндрическая шестерня с точным эвольвентным профилем по DIN 867 / ISO 53, опциональной ступицей и шпоночным пазом DIN 6885)
 - `"revolve"`: `{"profile": [[r, z], ...], "inner_radius"?: number, "angle_deg"?: number, "segments"?: integer}` (тело вращения 2D-профиля вокруг оси Z; при задании 2-точечной внешней образующей `[[r0, z0], [r1, z1]]` и `inner_radius` автоматически формируется 4-точечный кольцевой профиль `[[inner_r, z0], [r0, z0], [r1, z1], [inner_r, z1]]`; угол поворота `angle_deg` по умолчанию 360°, с плоскими крышками для углов < 360°)
 - `"wheel_rim"`: `{"rim_diameter": number, "rim_width": number, "flange_diameter"?: number, "hub_diameter"?: number, "hub_bore_diameter"?: number, "pcd_diameter"?: number, "bolt_holes_count"?: integer, "bolt_hole_diameter"?: number, "spokes_count"?: integer, "spoke_width"?: number, "spoke_thickness"?: number, "offset_et"?: number}` (параметрический легкосплавный колесный диск со ступенчатым ободом, закраинами, монтажным ручьем, ступицей, PCD разболтовкой и спицами с открытыми окнами вентиляции тормозов)
+- `"helix"` (алиас `"coil_spring"`): `{"helix_radius": number, "wire_radius": number, "pitch"?: number, "height"?: number, "turns"?: number, "starts"?: integer, "is_right_hand"?: boolean}` (водонепроницаемая аддитивная винтовая спираль / цилиндрическая пружина из круглой проволоки, центрированная по $Z \in [-height/2, +height/2]$; поддерживаются алиасы `coil_radius`/`mean_diameter`/`coil_diameter`, `wire_diameter`/`tube_radius`, `free_length`, `active_coils`; достаточно задать любые 2 из `pitch`, `height`, `turns`; именованные грани: `cap_bottom`, `cap_top`, `side`)
 - *Общие опциональные параметры*: `"position"?: [x, y, z]`, `"rotation_deg"?: [rx, ry, rz]`
 
 #### Пример запроса
@@ -2224,11 +2225,12 @@
 - `"flanged_bushing"`: фланцевая втулка со сквозным центральным отверстием и болтовой разболтовкой на фланце (`bottom` | `top` | `center`).
 - `"stepped_shaft"`: многоступенчатый вал вращения (`revolve`) с внешним шпоночным пазом на выбранной ступени (`keyway_step_index`).
 - `"gear_transmission"`: прямозубая эвольвентная передача (`pinion` + `gear`) на общей зафиксированной раме (`frame`) с двумя вращательными шарнирами (`revolute`), зубчатым зацеплением (`gear`) и опциональным приводом (`motor_velocity_rad_s`).
+- `"coil_spring"`: винтовая цилиндрическая пружина из круглой проволоки (`helix_radius` / `mean_diameter`, `wire_radius` / `wire_diameter`, `pitch`, `active_coils` / `free_length`, `is_right_hand`) с автоматическим расчётом индекса пружины $C$, коэффициента Валя $K_w$, жёсткости $k$ (Н/м и Н/мм), сомкнутой высоты и длины проволоки.
 
 #### Входные параметры
 | Параметр | Тип | Обязательный | Описание |
 |---|---|:---:|---|
-| `recipe` | `"flanged_bushing" \| "stepped_shaft" \| "gear_transmission"` | **Да** | Имя инженерного рецепта |
+| `recipe` | `"flanged_bushing" \| "stepped_shaft" \| "gear_transmission" \| "coil_spring"` | **Да** | Имя инженерного рецепта |
 | `length_unit` | `"mm" \| "m"` | Нет | Переопределение единицы длины для этого вызова (по умолчанию активная единица сессии) |
 | `params` | `object` | Нет | Параметры рецепта (материалы, размеры в активном `length_unit`, префиксы ID, угловая скорость мотора в `rad/s`, момент в `N*m`; опущенные поля используют инженерные значения по умолчанию) |
 

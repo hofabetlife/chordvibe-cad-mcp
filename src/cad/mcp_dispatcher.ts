@@ -79,7 +79,7 @@ export const MCP_TOOLS_CATALOG: McpToolDefinition[] = [
     name: 'add_feature_primitive',
     category: 'Features & CSG',
     description:
-      'Add a parametric solid primitive (box, cylinder, sphere, cone, spur_gear, polygon_prism, revolve, wheel_rim)',
+      'Add a parametric solid primitive (box, cylinder, sphere, cone, spur_gear, polygon_prism, revolve, wheel_rim, helix / coil_spring)',
     defaultParams: {
       part_id: 'gear_pinion',
       primitive_type: 'spur_gear',
@@ -589,14 +589,18 @@ export function executeMcpToolOnEngineState(
     case 'add_feature_primitive': {
       const rawPartId = String(params.part_id || state.selectedPartId || 'part_1');
       const resolvedId = rawPartId === 'active' ? state.selectedPartId : rawPartId;
-      const primType = String(params.primitive_type || 'box') as any;
+      const rawPrimType = String(params.primitive_type || 'box').trim();
+      const primType = (rawPrimType === 'coil_spring' ? 'helix' : rawPrimType) as any;
       const primParams = params.params || {};
 
       let part = state.parts.find((p) => p.id === resolvedId);
       const nodeId = `node_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
       const newNode = {
         id: nodeId,
-        name: `${primType.toUpperCase()} Primitive`,
+        name:
+          rawPrimType === 'coil_spring'
+            ? 'COIL_SPRING (Helix) Primitive'
+            : `${primType.toUpperCase()} Primitive`,
         type: primType,
         params: { ...primParams },
         enabled: true,
