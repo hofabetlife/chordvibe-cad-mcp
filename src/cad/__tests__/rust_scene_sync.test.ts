@@ -650,3 +650,52 @@ test('end-to-end Rust HTTP bridge round-trip (probe -> sync -> bake -> poll -> f
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });
+
+test('buildRustSceneSyncPlan preserves prismatic motorLinearSpeedMs in m/s', () => {
+  const pressPlate: CadPart = {
+    id: 'press_plate',
+    name: 'Press Plate',
+    materialId: 'steel_1045',
+    visible: true,
+    isFixed: false,
+    position: [0, 0, 0.03695],
+    rotation: [0, 0, 0],
+    scale: [1, 1, 1],
+    dag: [{ id: 'b', name: 'Box', type: 'box', enabled: true, params: { width: 0.06, height: 0.06, depth: 0.01 } }],
+    mesh: makeDummyMesh(0.06),
+  };
+  const joint: KinematicJoint = {
+    id: 'press_slider',
+    name: 'press_slider (prismatic)',
+    type: 'prismatic',
+    partA: 'ground',
+    partB: 'press_plate',
+    anchor: [0, 0, 0.03195],
+    axis: [0, 0, 1],
+    limits: [0, -0.036],
+    motorSpeedRpm: 0,
+    motorLinearSpeedMs: -0.05,
+    motorTorqueNm: 2000,
+    motorEnabled: true,
+    currentAngleRad: 0,
+  };
+  const cfg: DestructionSimConfig = {
+    scenarioMode: 'impact_crush',
+    durationSec: 2.0,
+    fps: 60,
+    motorRpmLeft: 0,
+    motorRpmRight: 0,
+    impactTorqueNm: 200,
+    brittleness: 0.55,
+    shardCountPerPart: 12,
+    gravityY: -9.81,
+    restitution: 0.3,
+    seed: 42,
+  };
+  const plan = buildRustSceneSyncPlan([pressPlate], [joint], DEFAULT_MATERIALS, cfg, 'standard');
+  const motorOp = plan.operations.find((op) => op.tool === 'set_joint_motor');
+  assert.ok(motorOp, 'Expected set_joint_motor operation for prismatic joint');
+  assert.equal(motorOp.args.target_velocity, -0.05);
+  assert.equal(motorOp.args.max_force, 2000);
+});
+

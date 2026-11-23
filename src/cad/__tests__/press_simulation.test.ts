@@ -440,3 +440,210 @@ test('shouldAutoSimulateLiveSnapshot and LiveSyncStore preserve physics_simulati
     fs.rmSync(tmpBus, { recursive: true, force: true });
   }
 });
+
+test('helical spring compression preserves circular wire cross-section and achieves real coil-to-coil bind contact', () => {
+  const { parts, joints } = buildClampedSpringPressAssembly();
+  const spring = parts[1];
+  const wireDiam = 0.004;
+
+  const cache = bakeDestructionCacheSync(parts, joints, DEFAULT_MATERIALS, {
+    ...DEFAULT_DESTRUCTION_CONFIG,
+    scenarioMode: 'impact_crush',
+    durationSec: 2.0,
+    fps: 30,
+  });
+
+  // Reference undeformed vertices around azimuth phi ≈ 0 (x > 0, |y| small)
+  const verts = spring.mesh.vertices;
+  const vCount = spring.mesh.vertexCount;
+  const sectorVerts: { vi: number; z: number }[] = [];
+  for (let vi = 0; vi < vCount; vi++) {
+    const x = verts[vi * 3];
+    const y = verts[vi * 3 + 1];
+    const z = verts[vi * 3 + 2];
+    const r = Math.hypot(x, y);
+    if (r > 0.01 && Math.abs(Math.atan2(y, x)) < 0.22) {
+      sectorVerts.push({ vi, z });
+    }
+  }
+
+  // Cluster sector vertices by initial axial Z into distinct coil turns (initial pitch = 10 mm)
+  sectorVerts.sort((a, b) => a.z - b.z);
+  const turnClusters: number[][] = [];
+  for (const item of sectorVerts) {
+    const last = turnClusters[turnClusters.length - 1];
+    if (!last) {
+      turnClusters.push([item.vi]);
+    } else {
+      const prevZ = verts[last[last.length - 1] * 3 + 2];
+      if (item.z - prevZ < 0.005) {
+        last.push(item.vi);
+      } else {
+        turnClusters.push([item.vi]);
+      }
+    }
+  }
+  assert.ok(turnClusters.length >= 5, `Expected at least 5 turns in sector, found ${turnClusters.length}`);
+
+  const midIdx = Math.floor(turnClusters.length / 2);
+  const turnA = turnClusters[midIdx - 1];
+  const turnB = turnClusters[midIdx];
+  const endTurn0 = turnClusters[0];
+  const endTurn1 = turnClusters[1];
+
+  const turnBoundsAtFrame = (frameIdx: number, cluster: number[]) => {
+    const disp = cache.frames[frameIdx].partStates.spring_1.deformedDisplacements!;
+    let minZ = Infinity;
+    let maxZ = -Infinity;
+    let sumZ = 0;
+    let sumR = 0;
+    for (const vi of cluster) {
+      const o = vi * 3;
+      const x = verts[o] + disp[o];
+      const y = verts[o + 1] + disp[o + 1];
+      const z = verts[o + 2] + disp[o + 2];
+      if (z < minZ) minZ = z;
+      if (z > maxZ) maxZ = z;
+      sumZ += z;
+      sumR += Math.hypot(x, y);
+    }
+    return {
+      thicknessZ: maxZ - minZ,
+      centerZ: sumZ / cluster.length,
+      meanR: sumR / cluster.length,
+    };
+  };
+
+  // Mid-stroke (~35% duration, frame 21): center coils compress faster than end coils
+  const midStrokeFrame = Math.floor(cache.frames.length * 0.35);
+  const midA = turnBoundsAtFrame(midStrokeFrame, turnA);
+  const midB = turnBoundsAtFrame(midStrokeFrame, turnB);
+  const end0 = turnBoundsAtFrame(midStrokeFrame, endTurn0);
+  const end1 = turnBoundsAtFrame(midStrokeFrame, endTurn1);
+  const midPitch = Math.abs(midB.centerZ - midA.centerZ);
+  const endPitch = Math.abs(end1.centerZ - end0.centerZ);
+  assert.ok(
+    midPitch < endPitch,
+    `Expected progressive center-first closure (midPitch=${midPitch.toFixed(5)} < endPitch=${endPitch.toFixed(5)})`
+  );
+
+  // At coil bind (~54% duration, frame 32): wire diameter is preserved AND adjacent coils touch
+  const bindFrame = Math.floor(cache.frames.length * 0.54);
+  const bindA = turnBoundsAtFrame(bindFrame, turnA);
+  const bindB = turnBoundsAtFrame(bindFrame, turnB);
+  const bindPitch = Math.abs(bindB.centerZ - bindA.centerZ);
+
+  assert.ok(
+    bindA.thicknessZ >= wireDiam * 0.85,
+    `Wire cross-section must not be axially squashed! Expected >= ${(wireDiam * 0.85).toFixed(4)}m, got ${bindA.thicknessZ.toFixed(5)}m`
+  );
+  assert.ok(
+    bindPitch <= wireDiam * 1.12,
+    `Coils must physically touch at bind! Expected pitch <= ${(wireDiam * 1.12).toFixed(4)}m, got ${bindPitch.toFixed(5)}m`
+  );
+  assert.ok(
+    bindA.meanR > 0.016,
+    `Expected radial barreling expansion > 16 mm during bind, got ${(bindA.meanR * 1000).toFixed(2)} mm`
+  );
+
+  // Verify fracture shards form curved coil-arc pieces rather than overly huge cross-coil chunks
+  assert.ok(cache.shards.length >= 8);
+  for (const s of cache.shards) {
+    assert.ok(s.boundingRadius < 0.028, `Shard radius too large (${s.boundingRadius}), coils may have fused`);
+  }
+});
+
+test('helical spring Kirchhoff deformation works for Y-up right-handed springs', () => {
+  const steelMat = getMaterialById('steel_1045', DEFAULT_MATERIALS);
+  const aluMat = getMaterialById('alu_6061', DEFAULT_MATERIALS);
+
+  const baseMesh = translateMeshInPlace(createBoxMesh(0.06, 0.01, 0.06, steelMat.density), [0, -0.03695, 0]);
+  const pressMesh = translateMeshInPlace(createBoxMesh(0.06, 0.01, 0.06, steelMat.density), [0, 0.03695, 0]);
+  const springMesh = createHelixMesh(0.016, 0.002, 0.01, 0.06, 1, false, 'draft', aluMat.density);
+
+  const parts: CadPart[] = [
+    {
+      id: 'base_y',
+      name: 'Base',
+      materialId: 'steel_1045',
+      dag: [{ id: 'b', name: 'Box', type: 'box', params: { width: 0.06, height: 0.01, depth: 0.06 }, enabled: true }],
+      mesh: baseMesh,
+      visible: true,
+      isFixed: true,
+      position: [0, 0, 0],
+      rotation: [0, 0, 0],
+      scale: [1, 1, 1],
+    },
+    {
+      id: 'spring_y',
+      name: 'Y Spring',
+      materialId: 'alu_6061',
+      dag: [{ id: 'h', name: 'Helix', type: 'helix', params: { helix_radius: 0.016, wire_radius: 0.002, pitch: 0.01, height: 0.06 }, enabled: true }],
+      mesh: springMesh,
+      visible: true,
+      isFixed: false,
+      position: [0, 0, 0],
+      rotation: [0, 0, 0],
+      scale: [1, 1, 1],
+    },
+    {
+      id: 'press_y',
+      name: 'Press Y',
+      materialId: 'steel_1045',
+      dag: [{ id: 'p', name: 'Box', type: 'box', params: { width: 0.06, height: 0.01, depth: 0.06 }, enabled: true }],
+      mesh: pressMesh,
+      visible: true,
+      isFixed: false,
+      position: [0, 0, 0],
+      rotation: [0, 0, 0],
+      scale: [1, 1, 1],
+    },
+  ];
+
+  const joints = mapRustJointsToWebStudio([
+    {
+      id: 'slider_y',
+      part_a: 'base_y',
+      part_b: 'press_y',
+      joint_type: 'prismatic',
+      anchor_a_m: [0, -0.03195, 0],
+      anchor_b_m: [0, 0.03195, 0],
+      axis: [0, 1, 0],
+      limits: [0, -0.036],
+      motor_target_velocity: -0.05,
+      motor_max_force: 2000,
+    },
+  ]);
+
+  const cache = bakeDestructionCacheSync(parts, joints, DEFAULT_MATERIALS, {
+    ...DEFAULT_DESTRUCTION_CONFIG,
+    scenarioMode: 'impact_crush',
+    durationSec: 2.0,
+    fps: 30,
+  });
+
+  const bindFrame = Math.floor(cache.frames.length * 0.54);
+  const disp = cache.frames[bindFrame].partStates.spring_y.deformedDisplacements!;
+  assert.ok(disp, 'Expected deformedDisplacements on Y-up spring');
+
+  // Check single mid-turn wire Y-thickness around (x > 0, z ≈ 0, y near 0)
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (let vi = 0; vi < springMesh.vertexCount; vi++) {
+    const o = vi * 3;
+    const x = springMesh.vertices[o];
+    const y = springMesh.vertices[o + 1];
+    const z = springMesh.vertices[o + 2];
+    if (x > 0.01 && Math.abs(z) < 0.0035 && Math.abs(y) < 0.0045) {
+      const dy = y + disp[o + 1];
+      if (dy < minY) minY = dy;
+      if (dy > maxY) maxY = dy;
+    }
+  }
+  const wireThickY = maxY - minY;
+  assert.ok(
+    wireThickY >= 0.0034,
+    `Expected Y-up wire thickness preserved (>= 3.4 mm), got ${(wireThickY * 1000).toFixed(2)} mm`
+  );
+});
+

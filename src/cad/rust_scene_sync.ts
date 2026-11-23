@@ -683,22 +683,31 @@ export function buildRustSceneSyncPlan(
     // Override motor speeds & max torque with current DestructionSimConfig when driving revolute/prismatic joints
     if (joint.type === 'revolute' || joint.type === 'prismatic') {
       const destrIdx = activePartIds.indexOf(targetPartId);
-      let targetVelRadS = (joint.motorSpeedRpm * 2 * Math.PI) / 60;
+      let targetVel =
+        joint.type === 'prismatic'
+          ? joint.motorLinearSpeedMs ?? 0
+          : (joint.motorSpeedRpm * 2 * Math.PI) / 60;
       let maxTorqueNm = Math.max(0.5, joint.motorTorqueNm || config.impactTorqueNm);
       let shouldDrive = joint.motorEnabled;
 
       if (destrIdx === 0 && config.scenarioMode !== 'impact_crush') {
-        targetVelRadS = (config.motorRpmLeft * 2 * Math.PI) / 60;
+        targetVel =
+          joint.type === 'prismatic'
+            ? joint.motorLinearSpeedMs ?? 0
+            : (config.motorRpmLeft * 2 * Math.PI) / 60;
         maxTorqueNm = Math.max(1, config.impactTorqueNm);
         shouldDrive = true;
       } else if (destrIdx === 1 && config.scenarioMode !== 'impact_crush') {
         if (config.scenarioMode === 'torque_overload') {
           // Driven wheel resists with heavy braking torque (zero target velocity, capped braking torque)
-          targetVelRadS = 0;
+          targetVel = 0;
           maxTorqueNm = Math.max(1, config.impactTorqueNm * 0.85);
           shouldDrive = true;
         } else {
-          targetVelRadS = (config.motorRpmRight * 2 * Math.PI) / 60;
+          targetVel =
+            joint.type === 'prismatic'
+              ? joint.motorLinearSpeedMs ?? 0
+              : (config.motorRpmRight * 2 * Math.PI) / 60;
           maxTorqueNm = Math.max(1, config.impactTorqueNm);
           shouldDrive = true;
         }
@@ -709,7 +718,7 @@ export function buildRustSceneSyncPlan(
           tool: 'set_joint_motor',
           args: {
             joint_id: jointId,
-            target_velocity: Number(targetVelRadS.toFixed(6)),
+            target_velocity: Number(targetVel.toFixed(6)),
             max_force: Number(maxTorqueNm.toFixed(4)),
           },
         });

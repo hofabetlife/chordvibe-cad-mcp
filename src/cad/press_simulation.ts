@@ -157,6 +157,40 @@ function eulerFromQuatXYZ(q: Quat): Vec3 {
   return [rx, ry, rz];
 }
 
+function cross3(a: Vec3, b: Vec3): Vec3 {
+  return [
+    a[1] * b[2] - a[2] * b[1],
+    a[2] * b[0] - a[0] * b[2],
+    a[0] * b[1] - a[1] * b[0],
+  ];
+}
+
+function wrapAnglePi(a: number): number {
+  let r = a % (2 * Math.PI);
+  if (r > Math.PI) r -= 2 * Math.PI;
+  if (r < -Math.PI) r += 2 * Math.PI;
+  return r;
+}
+
+function clamp(v: number, lo: number, hi: number): number {
+  return v < lo ? lo : v > hi ? hi : v;
+}
+
+function quatFromEulerXYZ(rot: Vec3): Quat {
+  const c1 = Math.cos(rot[0] * 0.5);
+  const c2 = Math.cos(rot[1] * 0.5);
+  const c3 = Math.cos(rot[2] * 0.5);
+  const s1 = Math.sin(rot[0] * 0.5);
+  const s2 = Math.sin(rot[1] * 0.5);
+  const s3 = Math.sin(rot[2] * 0.5);
+  return quatNormalize([
+    s1 * c2 * c3 + c1 * s2 * s3,
+    c1 * s2 * c3 - s1 * c2 * s3,
+    c1 * c2 * s3 + s1 * s2 * c3,
+    c1 * c2 * c3 - s1 * s2 * s3,
+  ]);
+}
+
 /**
  * Computes world-space axis-aligned bounding box of a part.
  */
@@ -456,7 +490,8 @@ function buildSpecimenShards(
   part: CadPart,
   mat: MaterialSpec,
   targetCount: number,
-  seed: number
+  seed: number,
+  helixU?: Float32Array | null
 ): { shards: FractureShardGeometry[]; localComs: Vec3[] } {
   const rng = mulberry32(seed + 4099);
   const verts = part.mesh.vertices;
@@ -465,47 +500,76 @@ function buildSpecimenShards(
   if (triCount < 6) return { shards: [], localComs: [] };
 
   const count = Math.max(6, Math.min(24, targetCount));
-  const bb = part.mesh.boundingBox;
-  const cx = 0.5 * (bb.min[0] + bb.max[0]);
-  const cy = 0.5 * (bb.min[1] + bb.max[1]);
-  const cz = 0.5 * (bb.min[2] + bb.max[2]);
-  const sx = Math.max(1e-4, bb.max[0] - bb.min[0]);
-  const sy = Math.max(1e-4, bb.max[1] - bb.min[1]);
-  const sz = Math.max(1e-4, bb.max[2] - bb.min[2]);
-
-  // Seed shard centroids inside the part's bounding volume
-  const seeds: Vec3[] = [];
-  for (let i = 0; i < count; i++) {
-    seeds.push([
-      cx + (rng() - 0.5) * sx * 0.85,
-      cy + (rng() - 0.5) * sy * 0.85,
-      cz + (rng() - 0.5) * sz * 0.85,
-    ]);
-  }
-
-  // Assign each triangle to its nearest Voronoi seed
   const buckets: number[][] = Array.from({ length: count }, () => []);
-  for (let t = 0; t < triCount; t++) {
-    const i0 = indices[t * 3];
-    const i1 = indices[t * 3 + 1];
-    const i2 = indices[t * 3 + 2];
-    const mx = (verts[i0 * 3] + verts[i1 * 3] + verts[i2 * 3]) / 3;
-    const my = (verts[i0 * 3 + 1] + verts[i1 * 3 + 1] + verts[i2 * 3 + 1]) / 3;
-    const mz = (verts[i0 * 3 + 2] + verts[i1 * 3 + 2] + verts[i2 * 3 + 2]) / 3;
 
-    let best = 0;
-    let bestD = Infinity;
-    for (let s = 0; s < count; s++) {
-      const dx = mx - seeds[s][0];
-      const dy = my - seeds[s][1];
-      const dz = mz - seeds[s][2];
-      const d = dx * dx + dy * dy + dz * dz;
-      if (d < bestD) {
-        bestD = d;
-        best = s;
-      }
+  if (helixU && helixU.length >= part.mesh.vertexCount) {
+    // Partition helical spring strictly along its wire arc parameter u in [0, 1]
+    // so broken fragments become clean curved coil-arc pieces instead of fusing touching coils
+    const weights: number[] = [];
+    let weightSum = 0;
+    for (let i = 0; i < count; i++) {
+      const w = 0.65 + rng() * 0.7;
+      weights.push(w);
+      weightSum += w;
     }
-    buckets[best].push(t);
+    const cuts: number[] = [];
+    let acc = 0;
+    for (let i = 0; i < count - 1; i++) {
+      acc += weights[i] / weightSum;
+      cuts.push(acc);
+    }
+
+    for (let t = 0; t < triCount; t++) {
+      const i0 = indices[t * 3];
+      const i1 = indices[t * 3 + 1];
+      const i2 = indices[t * 3 + 2];
+      const uTri = (helixU[i0] + helixU[i1] + helixU[i2]) / 3;
+      let b = 0;
+      while (b < cuts.length && uTri > cuts[b]) b++;
+      buckets[b].push(t);
+    }
+  } else {
+    const bb = part.mesh.boundingBox;
+    const cx = 0.5 * (bb.min[0] + bb.max[0]);
+    const cy = 0.5 * (bb.min[1] + bb.max[1]);
+    const cz = 0.5 * (bb.min[2] + bb.max[2]);
+    const sx = Math.max(1e-4, bb.max[0] - bb.min[0]);
+    const sy = Math.max(1e-4, bb.max[1] - bb.min[1]);
+    const sz = Math.max(1e-4, bb.max[2] - bb.min[2]);
+
+    // Seed shard centroids inside the part's bounding volume
+    const seeds: Vec3[] = [];
+    for (let i = 0; i < count; i++) {
+      seeds.push([
+        cx + (rng() - 0.5) * sx * 0.85,
+        cy + (rng() - 0.5) * sy * 0.85,
+        cz + (rng() - 0.5) * sz * 0.85,
+      ]);
+    }
+
+    // Assign each triangle to its nearest Voronoi seed
+    for (let t = 0; t < triCount; t++) {
+      const i0 = indices[t * 3];
+      const i1 = indices[t * 3 + 1];
+      const i2 = indices[t * 3 + 2];
+      const mx = (verts[i0 * 3] + verts[i1 * 3] + verts[i2 * 3]) / 3;
+      const my = (verts[i0 * 3 + 1] + verts[i1 * 3 + 1] + verts[i2 * 3 + 1]) / 3;
+      const mz = (verts[i0 * 3 + 2] + verts[i1 * 3 + 2] + verts[i2 * 3 + 2]) / 3;
+
+      let best = 0;
+      let bestD = Infinity;
+      for (let s = 0; s < count; s++) {
+        const dx = mx - seeds[s][0];
+        const dy = my - seeds[s][1];
+        const dz = mz - seeds[s][2];
+        const d = dx * dx + dy * dy + dz * dz;
+        if (d < bestD) {
+          bestD = d;
+          best = s;
+        }
+      }
+      buckets[best].push(t);
+    }
   }
 
   const shards: FractureShardGeometry[] = [];
@@ -593,14 +657,356 @@ function buildSpecimenShards(
   return { shards, localComs };
 }
 
+interface HelixKinematicsData {
+  /** Local orthonormal basis in part-local coordinates: eU x eV = eAx (eAx = pushDir) */
+  eU: Vec3;
+  eV: Vec3;
+  eAx: Vec3;
+  /** Center of helix axis in (eU, eV) coordinates */
+  cU: number;
+  cV: number;
+  /** Axial bounds in part-local space along eAx */
+  sNear: number;
+  sFar: number;
+  /** Centerline axial coordinates at u=0 (base end) and u=1 (press end) */
+  sBaseCenter: number;
+  sPressCenter: number;
+  freeCenterlineH: number;
+  meanCoilRadius: number;
+  wireRadius: number;
+  pitch0: number;
+  turns: number;
+  totalSweep: number;
+  phiBase: number;
+  handedness: 1 | -1;
+  /** Per-vertex centerline parameter u in [0, 1] (0 = base end, 1 = press end) */
+  vertU: Float32Array;
+  /** Per-vertex local cross-section components in reference Frenet-radial frame */
+  vertRad: Float32Array;
+  vertBin: Float32Array;
+  vertTan: Float32Array;
+}
+
 /**
- * Evaluates elastoplastic compression, stress, plastic strain, and damage fields for a single
- * specimen vertex mesh at a given compressive stroke and applied load.
+ * Extracts exact Kirchhoff helical rod coordinates `(u, u_rad, u_bin, u_tan)` for every vertex
+ * of a helical coil spring mesh so compression deforms the 3D centerline without squashing the
+ * circular wire cross-section.
  */
-function evaluateSpecimenDeformationField(
+function buildHelixKinematicsData(
+  part: CadPart,
+  press: DetectedPressAssembly
+): HelixKinematicsData | null {
+  const verts = part.mesh.vertices;
+  const vCount = part.mesh.vertexCount;
+  if (vCount < 16) return null;
+
+  const invPartQ = quatConjugate(quatFromEulerXYZ(part.rotation));
+  const eAx = normalize3(rotateVecByQuat(press.pushDir, invPartQ));
+  const refVec: Vec3 = Math.abs(eAx[0]) < 0.8 ? [1, 0, 0] : [0, 1, 0];
+  const eU = normalize3(cross3(refVec, eAx));
+  const eV = normalize3(cross3(eAx, eU));
+
+  const sArr = new Float32Array(vCount);
+  const uRaw = new Float32Array(vCount);
+  const vRaw = new Float32Array(vCount);
+
+  let uMin = Infinity, uMax = -Infinity;
+  let vMin = Infinity, vMax = -Infinity;
+  let sMin = Infinity, sMax = -Infinity;
+
+  for (let i = 0; i < vCount; i++) {
+    const o = i * 3;
+    const x = verts[o];
+    const y = verts[o + 1];
+    const z = verts[o + 2];
+    const pu = x * eU[0] + y * eU[1] + z * eU[2];
+    const pv = x * eV[0] + y * eV[1] + z * eV[2];
+    const ps = x * eAx[0] + y * eAx[1] + z * eAx[2];
+    uRaw[i] = pu;
+    vRaw[i] = pv;
+    sArr[i] = ps;
+    if (pu < uMin) uMin = pu;
+    if (pu > uMax) uMax = pu;
+    if (pv < vMin) vMin = pv;
+    if (pv > vMax) vMax = pv;
+    if (ps < sMin) sMin = ps;
+    if (ps > sMax) sMax = ps;
+  }
+
+  const L0 = sMax - sMin;
+  if (!(L0 > 1e-4)) return null;
+
+  const cU = 0.5 * (uMin + uMax);
+  const cV = 0.5 * (vMin + vMax);
+
+  const rArr = new Float32Array(vCount);
+  const phiArr = new Float32Array(vCount);
+  let rMin = Infinity, rMax = -Infinity;
+
+  for (let i = 0; i < vCount; i++) {
+    const du = uRaw[i] - cU;
+    const dv = vRaw[i] - cV;
+    const r = Math.hypot(du, dv);
+    rArr[i] = r;
+    phiArr[i] = Math.atan2(dv, du);
+    if (r < rMin) rMin = r;
+    if (r > rMax) rMax = r;
+  }
+
+  const R = 0.5 * (rMin + rMax);
+  const rW = 0.5 * (rMax - rMin);
+  if (!(R > 1e-4) || !(rW > 5e-5) || rW >= R * 0.85) return null;
+
+  // Estimate pitch P by clustering outer-ridge vertices in the densest azimuthal sector
+  const numSectors = 8;
+  const sectorWidth = 0.28;
+  let bestSectorIdx = 0;
+  let bestSectorCount = 0;
+  const sectorBuckets: number[][] = Array.from({ length: numSectors }, () => []);
+  const rThresh = R + 0.45 * rW;
+
+  for (let i = 0; i < vCount; i++) {
+    if (rArr[i] < rThresh) continue;
+    const p = phiArr[i];
+    for (let sIdx = 0; sIdx < numSectors; sIdx++) {
+      const targetPhi = -Math.PI + ((sIdx + 0.5) / numSectors) * (2 * Math.PI);
+      if (Math.abs(wrapAnglePi(p - targetPhi)) <= sectorWidth) {
+        sectorBuckets[sIdx].push(sArr[i]);
+        if (sectorBuckets[sIdx].length > bestSectorCount) {
+          bestSectorCount = sectorBuckets[sIdx].length;
+          bestSectorIdx = sIdx;
+        }
+      }
+    }
+  }
+
+  let pitchEst = press.freeLengthM / 5.5;
+  const helixNode = part.dag.find((n) => n.type === 'helix');
+  const hpRaw = (helixNode?.params ?? {}) as Record<string, unknown>;
+  if (typeof hpRaw.pitch === 'number' && hpRaw.pitch > 0) {
+    const dagP = hpRaw.pitch > 0.5 ? hpRaw.pitch * 1e-3 : hpRaw.pitch;
+    if (dagP > 2 * rW && dagP < L0 * 0.95) {
+      pitchEst = dagP;
+    }
+  }
+
+  const secVals = sectorBuckets[bestSectorIdx];
+  if (secVals.length >= 2) {
+    secVals.sort((a, b) => a - b);
+    const clusterMeans: number[] = [];
+    let sum = secVals[0];
+    let cnt = 1;
+    const gapTol = Math.max(1.5 * rW, pitchEst * 0.35);
+    for (let i = 1; i < secVals.length; i++) {
+      if (secVals[i] - secVals[i - 1] <= gapTol) {
+        sum += secVals[i];
+        cnt++;
+      } else {
+        clusterMeans.push(sum / cnt);
+        sum = secVals[i];
+        cnt = 1;
+      }
+    }
+    clusterMeans.push(sum / cnt);
+    if (clusterMeans.length >= 2) {
+      const diffs: number[] = [];
+      for (let k = 1; k < clusterMeans.length; k++) {
+        const d = clusterMeans[k] - clusterMeans[k - 1];
+        if (d > 1.8 * rW) diffs.push(d);
+      }
+      if (diffs.length > 0) {
+        diffs.sort((a, b) => a - b);
+        pitchEst = diffs[Math.floor(diffs.length / 2)];
+      }
+    }
+  }
+
+  if (!(pitchEst > 1.5 * rW)) return null;
+
+  // Determine handedness (+1 or -1) and reference phase via circular coherence on outer vertices
+  const sMid = 0.5 * (sMin + sMax);
+  const sampleStride = Math.max(1, Math.floor(vCount / 600));
+  const sampleIdx: number[] = [];
+  for (let i = 0; i < vCount; i += sampleStride) {
+    if (rArr[i] > R + 0.3 * rW) sampleIdx.push(i);
+  }
+  if (sampleIdx.length < 8) {
+    for (let i = 0; i < vCount; i += sampleStride) sampleIdx.push(i);
+  }
+
+  let bestH: 1 | -1 = 1;
+  let bestScore = -1;
+  let phiMid = 0;
+  for (const candH of [1, -1] as const) {
+    const kSlope = (candH * 2 * Math.PI) / pitchEst;
+    let sumC = 0;
+    let sumS = 0;
+    for (const idx of sampleIdx) {
+      const err = phiArr[idx] - kSlope * (sArr[idx] - sMid);
+      sumC += Math.cos(err);
+      sumS += Math.sin(err);
+    }
+    const score = Math.hypot(sumC, sumS) / Math.max(1, sampleIdx.length);
+    if (score > bestScore) {
+      bestScore = score;
+      bestH = candH;
+      phiMid = Math.atan2(sumS, sumC);
+    }
+  }
+
+  // Refine pitch & phiMid via 2 linear-regression steps on wrapped phase residuals
+  let kSlope = (bestH * 2 * Math.PI) / pitchEst;
+  for (let iter = 0; iter < 2; iter++) {
+    let sumX = 0, sumY = 0, sumXX = 0, sumXY = 0;
+    const n = sampleIdx.length;
+    for (const idx of sampleIdx) {
+      const ds = sArr[idx] - sMid;
+      const res = wrapAnglePi(phiArr[idx] - (phiMid + kSlope * ds));
+      sumX += ds;
+      sumY += res;
+      sumXX += ds * ds;
+      sumXY += ds * res;
+    }
+    const denom = n * sumXX - sumX * sumX;
+    if (Math.abs(denom) > 1e-12) {
+      const dSlope = (n * sumXY - sumX * sumY) / denom;
+      const dPhi0 = (sumY - dSlope * sumX) / n;
+      kSlope += dSlope;
+      phiMid = wrapAnglePi(phiMid + dPhi0);
+    }
+  }
+
+  const pitch0 = (2 * Math.PI) / Math.max(1e-6, Math.abs(kSlope));
+  const cPitch = pitch0 / (2 * Math.PI);
+
+  // Closest point parameter t_i on centerline:
+  // s_c(t) = sMid - cPitch * t, phi_c(t) = phiMid - bestH * t
+  const rawT = new Float32Array(vCount);
+  let tMin = Infinity;
+  let tMax = -Infinity;
+
+  for (let i = 0; i < vCount; i++) {
+    const px = uRaw[i] - cU;
+    const py = vRaw[i] - cV;
+    const ps = sArr[i];
+
+    const tApprox = (sMid - ps) / cPitch;
+    const phiApprox = phiMid - bestH * tApprox;
+    const dPhi = wrapAnglePi(phiArr[i] - phiApprox);
+    let t = tApprox - bestH * dPhi;
+
+    for (let it = 0; it < 3; it++) {
+      const phi = phiMid - bestH * t;
+      const cosP = Math.cos(phi);
+      const sinP = Math.sin(phi);
+      const cx = R * cosP;
+      const cy = R * sinP;
+      const cs = sMid - cPitch * t;
+
+      const dpx = cx - px;
+      const dpy = cy - py;
+      const dps = cs - ps;
+
+      const tx = bestH * R * sinP;
+      const ty = -bestH * R * cosP;
+      const ts = -cPitch;
+
+      const g = tx * dpx + ty * dpy + ts * dps;
+      const hVal =
+        tx * tx +
+        ty * ty +
+        ts * ts +
+        (-cx * dpx - cy * dpy);
+      if (Math.abs(hVal) > 1e-12) {
+        t -= clamp(g / hVal, -0.35, 0.35);
+      }
+    }
+
+    rawT[i] = t;
+    if (t < tMin) tMin = t;
+    if (t > tMax) tMax = t;
+  }
+
+  const totalSweep = tMax - tMin;
+  if (!(totalSweep > Math.PI)) return null;
+
+  const turns = totalSweep / (2 * Math.PI);
+  const sBaseCenter = sMid - cPitch * tMin;
+  const sPressCenter = sMid - cPitch * tMax;
+  const freeCenterlineH = Math.max(1e-4, sBaseCenter - sPressCenter);
+  const phiBase = phiMid - bestH * tMin;
+
+  const vertU = new Float32Array(vCount);
+  const vertRad = new Float32Array(vCount);
+  const vertBin = new Float32Array(vCount);
+  const vertTan = new Float32Array(vCount);
+
+  for (let i = 0; i < vCount; i++) {
+    const u = clamp((rawT[i] - tMin) / totalSweep, 0, 1);
+    vertU[i] = u;
+
+    const tRel = tMin + u * totalSweep;
+    const phi = phiMid - bestH * tRel;
+    const cosP = Math.cos(phi);
+    const sinP = Math.sin(phi);
+
+    const cx = R * cosP;
+    const cy = R * sinP;
+    const cs = sMid - cPitch * tRel;
+
+    const tangent = normalize3([bestH * R * sinP, -bestH * R * cosP, -cPitch]);
+    const radDotT = cosP * tangent[0] + sinP * tangent[1];
+    const er = normalize3([
+      cosP - radDotT * tangent[0],
+      sinP - radDotT * tangent[1],
+      -radDotT * tangent[2],
+    ]);
+    const eb = cross3(tangent, er);
+
+    const dx = uRaw[i] - cU - cx;
+    const dy = vRaw[i] - cV - cy;
+    const ds = sArr[i] - cs;
+
+    vertRad[i] = dx * er[0] + dy * er[1] + ds * er[2];
+    vertBin[i] = dx * eb[0] + dy * eb[1] + ds * eb[2];
+    vertTan[i] = dx * tangent[0] + dy * tangent[1] + ds * tangent[2];
+  }
+
+  return {
+    eU,
+    eV,
+    eAx,
+    cU,
+    cV,
+    sNear: sMin,
+    sFar: sMax,
+    sBaseCenter,
+    sPressCenter,
+    freeCenterlineH,
+    meanCoilRadius: R,
+    wireRadius: rW,
+    pitch0,
+    turns,
+    totalSweep,
+    phiBase,
+    handedness: bestH,
+    vertU,
+    vertRad,
+    vertBin,
+    vertTan,
+  };
+}
+
+/**
+ * Evaluates true Kirchhoff helical rod compression, progressive coil-to-coil bind contact,
+ * arc-length radial barreling, torsional wind-up, and plastic lateral buckling without squashing
+ * the wire cross-section.
+ */
+function evaluateHelixDeformationField(
   part: CadPart,
   mat: MaterialSpec,
   press: DetectedPressAssembly,
+  helix: HelixKinematicsData,
   compressionM: number,
   appliedForceN: number,
   accumPlastic: Float32Array,
@@ -619,6 +1025,336 @@ function evaluateSpecimenDeformationField(
   elasticEnergyJ: number;
   plasticEnergyDeltaJ: number;
 } {
+  const verts = part.mesh.vertices;
+  const vCount = part.mesh.vertexCount;
+  const disp = new Float32Array(vCount * 3);
+  const stressArr = new Float32Array(vCount);
+  const epArr = new Float32Array(vCount);
+  const dmgArr = new Float32Array(vCount);
+
+  const yieldMPa = Math.max(30, mat.yieldStrength / 1e6);
+  const youngsMPa = Math.max(1000, mat.youngsModulus / 1e6);
+  const hardeningMPa = Math.max(120, mat.hardeningModulusPa / 1e6 || youngsMPa * 0.02);
+  const epsFrac = Math.max(0.02, mat.fractureStrain || 0.12);
+
+  const tauWahlPa =
+    (press.wahlFactor * 8 * appliedForceN * press.meanCoilDiameterM) /
+    Math.max(1e-12, Math.PI * Math.pow(press.wireDiameterM, 3));
+  const nominalPeakMPa = Math.min(4500, (tauWahlPa * 1.15) / 1e6);
+
+  // Measure previous accumulated mean plastic strain to drive continuous irreversible plastic buckling
+  let meanPlasticPrev = 0;
+  for (let i = 0; i < vCount; i++) meanPlasticPrev += accumPlastic[i];
+  meanPlasticPrev /= Math.max(1, vCount);
+
+  const R0 = helix.meanCoilRadius;
+  const rW = helix.wireRadius;
+  const wireDiam = 2 * rW;
+  const H0 = helix.freeCenterlineH;
+  const P0 = helix.pitch0;
+  const N = helix.turns;
+
+  // Target compressed centerline span H_curr (anchored at u=0 base end, compressed at u=1 press end)
+  const Hcurr = Math.max(wireDiam * 1.15, H0 - Math.max(0, compressionM));
+  const Pavg = Hcurr / Math.max(0.5, N);
+  const Pbind = wireDiam * 0.992;
+  const Pfloor =
+    Pavg >= Pbind
+      ? Pbind
+      : Math.max(Pavg * 0.9, Pbind - (Pbind - Pavg) * 1.15);
+
+  const bindStrokeRef = Math.max(1e-4, H0 - N * Pbind);
+  const bindRatio = clamp(compressionM / bindStrokeRef, 0, 1.25);
+  const overCrushM = Math.max(0, N * Pbind - Hcurr);
+  const overCrushRatio = clamp(overCrushM / Math.max(1e-4, N * Pbind * 0.28), 0, 1);
+  const plasticNorm = clamp(meanPlasticPrev / 0.045, 0, 1);
+
+  // Solve progressive non-uniform coil pitch p[k] >= Pfloor with mean(p) = Pavg
+  const M = 128;
+  const pitchGrid = new Float64Array(M);
+  const weightGrid = new Float64Array(M);
+  for (let k = 0; k < M; k++) {
+    const uMid = (k + 0.5) / M;
+    // Active mid-coils are ~45% more compliant than plate-seated end turns -> center coils bind first
+    weightGrid[k] = 0.8 + 0.38 * Math.sin(Math.PI * uMid);
+  }
+
+  let lamLo = 0;
+  let lamHi = Math.max(0, P0 - Pfloor) * 4.5 + 1e-4;
+  for (let iter = 0; iter < 24; iter++) {
+    const lamMid = 0.5 * (lamLo + lamHi);
+    let sumP = 0;
+    for (let k = 0; k < M; k++) {
+      sumP += Math.max(Pfloor, P0 - lamMid * weightGrid[k]);
+    }
+    if (sumP / M > Pavg) lamLo = lamMid;
+    else lamHi = lamMid;
+  }
+  const lamSol = 0.5 * (lamLo + lamHi);
+  let sumP = 0;
+  for (let k = 0; k < M; k++) {
+    const pk = Math.max(Pfloor, P0 - lamSol * weightGrid[k]);
+    pitchGrid[k] = pk;
+    sumP += pk;
+  }
+  const avgSolved = sumP / M;
+  const corrScale = avgSolved > 1e-9 ? Pavg / avgSolved : 1;
+
+  // Build deformed centerline nodes C_def[0..M] and orthonormal frames (T, e_r, e_b)
+  const cX = new Float64Array(M + 1);
+  const cY = new Float64Array(M + 1);
+  const cS = new Float64Array(M + 1);
+  const thGrid = new Float64Array(M + 1);
+  const nodePitch = new Float64Array(M + 1);
+
+  const sGrid = new Float64Array(M + 1);
+  sGrid[0] = helix.sBaseCenter;
+  const dTurns = N / M;
+  for (let k = 0; k < M; k++) {
+    const pk = pitchGrid[k] * corrScale;
+    pitchGrid[k] = pk;
+    sGrid[k + 1] = sGrid[k] - pk * dTurns;
+  }
+
+  for (let k = 0; k <= M; k++) {
+    const u = k / M;
+    const pk = k === 0 ? pitchGrid[0] : k === M ? pitchGrid[M - 1] : 0.5 * (pitchGrid[k - 1] + pitchGrid[k]);
+    nodePitch[k] = pk;
+
+    // Wire arc-length conservation as local pitch drops from P0 to pk
+    const rArc = Math.sqrt(
+      R0 * R0 + Math.max(0, P0 * P0 - pk * pk) / (4 * Math.PI * Math.PI)
+    );
+    const endClamp = Math.sin(Math.PI * u);
+    const barrelBoost =
+      1 +
+      (0.035 * Math.min(1, bindRatio) + 0.085 * plasticNorm + 0.075 * overCrushRatio) *
+        Math.pow(endClamp, 0.85);
+    const coilSlipStagger =
+      overCrushM * 0.44 * endClamp * Math.cos(Math.PI * N * u);
+    const rDef = (R0 + (rArc - R0) * endClamp) * barrelBoost + coilSlipStagger;
+
+    // Clamped torsional wind-up & plastic lateral buckling bow
+    const deltaTheta =
+      -helix.handedness *
+      (0.12 * Math.min(1, bindRatio) + 0.16 * plasticNorm) *
+      Math.sin(Math.PI * u);
+    const theta = helix.phiBase - helix.handedness * u * helix.totalSweep + deltaTheta;
+    thGrid[k] = theta;
+
+    const buckleAmp = R0 * (0.11 * plasticNorm + 0.17 * overCrushRatio);
+    const buckleEnv = Math.pow(endClamp, 1.35);
+
+    cX[k] = rDef * Math.cos(theta) + buckleAmp * buckleEnv * 0.86;
+    cY[k] = rDef * Math.sin(theta) + buckleAmp * buckleEnv * 0.51;
+    cS[k] = sGrid[k];
+  }
+
+  const tX = new Float64Array(M + 1);
+  const tY = new Float64Array(M + 1);
+  const tS = new Float64Array(M + 1);
+  const erX = new Float64Array(M + 1);
+  const erY = new Float64Array(M + 1);
+  const erS = new Float64Array(M + 1);
+  const ebX = new Float64Array(M + 1);
+  const ebY = new Float64Array(M + 1);
+  const ebS = new Float64Array(M + 1);
+
+  for (let k = 0; k <= M; k++) {
+    const k0 = Math.max(0, k - 1);
+    const k1 = Math.min(M, k + 1);
+    const T = normalize3([cX[k1] - cX[k0], cY[k1] - cY[k0], cS[k1] - cS[k0]]);
+    const cosP = Math.cos(thGrid[k]);
+    const sinP = Math.sin(thGrid[k]);
+    const rDotT = cosP * T[0] + sinP * T[1];
+    const er = normalize3([
+      cosP - rDotT * T[0],
+      sinP - rDotT * T[1],
+      -rDotT * T[2],
+    ]);
+    const eb = cross3(T, er);
+
+    tX[k] = T[0]; tY[k] = T[1]; tS[k] = T[2];
+    erX[k] = er[0]; erY[k] = er[1]; erS[k] = er[2];
+    ebX[k] = eb[0]; ebY[k] = eb[1]; ebS[k] = eb[2];
+  }
+
+  // Keep cross-section circular through bind; mild Poisson contact bulge only under over-crush
+  const scaleRad = 1 + 0.07 * overCrushRatio;
+  const scaleBin = 1 - 0.05 * overCrushRatio;
+  const sPlatePress = helix.sNear + Math.max(0, compressionM);
+  const sPlateBase = helix.sFar;
+
+  let peakStressMPa = 0;
+  let maxDispMm = 0;
+  let maxPlasticPct = 0;
+  let maxDamage = 0;
+  let stressSqSum = 0;
+  let plasticIncSum = 0;
+
+  const { eU, eV, eAx, cU, cV } = helix;
+
+  for (let vi = 0; vi < vCount; vi++) {
+    const u = helix.vertU[vi];
+    const fIdx = u * M;
+    const k0 = Math.min(M - 1, Math.floor(fIdx));
+    const frac = fIdx - k0;
+    const k1 = k0 + 1;
+
+    const cx = cX[k0] + (cX[k1] - cX[k0]) * frac;
+    const cy = cY[k0] + (cY[k1] - cY[k0]) * frac;
+    const cs = cS[k0] + (cS[k1] - cS[k0]) * frac;
+
+    const tx = tX[k0] + (tX[k1] - tX[k0]) * frac;
+    const ty = tY[k0] + (tY[k1] - tY[k0]) * frac;
+    const ts = tS[k0] + (tS[k1] - tS[k0]) * frac;
+    const tLen = Math.hypot(tx, ty, ts) || 1;
+    const uxT = tx / tLen, uyT = ty / tLen, usT = ts / tLen;
+
+    const rxRaw = erX[k0] + (erX[k1] - erX[k0]) * frac;
+    const ryRaw = erY[k0] + (erY[k1] - erY[k0]) * frac;
+    const rsRaw = erS[k0] + (erS[k1] - erS[k0]) * frac;
+    const rLen = Math.hypot(rxRaw, ryRaw, rsRaw) || 1;
+    const uxR = rxRaw / rLen, uyR = ryRaw / rLen, usR = rsRaw / rLen;
+
+    const bxRaw = ebX[k0] + (ebX[k1] - ebX[k0]) * frac;
+    const byRaw = ebY[k0] + (ebY[k1] - ebY[k0]) * frac;
+    const bsRaw = ebS[k0] + (ebS[k1] - ebS[k0]) * frac;
+    const bLen = Math.hypot(bxRaw, byRaw, bsRaw) || 1;
+    const uxB = bxRaw / bLen, uyB = byRaw / bLen, usB = bsRaw / bLen;
+
+    const vR = helix.vertRad[vi] * scaleRad;
+    const vB = helix.vertBin[vi] * scaleBin;
+    const vT = helix.vertTan[vi];
+
+    const defU = cU + cx + vR * uxR + vB * uxB + vT * uxT;
+    const defV = cV + cy + vR * uyR + vB * uyB + vT * uyT;
+    let defS = cs + vR * usR + vB * usB + vT * usT;
+
+    // Prevent end-turn skin from poking past the moving press plate or fixed base plate
+    if (defS < sPlatePress) defS = sPlatePress;
+    else if (defS > sPlateBase) defS = sPlateBase;
+
+    const defX = defU * eU[0] + defV * eV[0] + defS * eAx[0];
+    const defY = defU * eU[1] + defV * eV[1] + defS * eAx[1];
+    const defZ = defU * eU[2] + defV * eV[2] + defS * eAx[2];
+
+    const o = vi * 3;
+    const dx = defX - verts[o];
+    const dy = defY - verts[o + 1];
+    const dz = defZ - verts[o + 2];
+
+    disp[o] = dx;
+    disp[o + 1] = dy;
+    disp[o + 2] = dz;
+
+    const dMm = Math.hypot(dx, dy, dz) * 1000;
+    if (dMm > maxDispMm) maxDispMm = dMm;
+
+    // Physical Wahl inner-coil curvature stress concentration + local coil-bind contact loading
+    const uRadNorm = clamp(helix.vertRad[vi] / Math.max(1e-5, rW), -1, 1);
+    const innerCoilFactor = 0.5 - 0.5 * uRadNorm; // 1.0 on inner coil face, 0.0 on outer face
+    const innerCoilBoost = 0.64 + 0.36 * innerCoilFactor;
+
+    const pLocal = nodePitch[k0] + (nodePitch[k1] - nodePitch[k0]) * frac;
+    const localClosure = clamp((P0 - pLocal) / Math.max(1e-5, P0 - Pfloor), 0, 1);
+    const midEnv = Math.sin(Math.PI * u);
+    const axialProfile = 0.58 + 0.42 * (0.3 + 0.45 * midEnv + 0.25 * localClosure);
+
+    const localStress = nominalPeakMPa * innerCoilBoost * axialProfile;
+    stressArr[vi] = localStress;
+    stressSqSum += localStress * localStress;
+    if (localStress > peakStressMPa) peakStressMPa = localStress;
+
+    if (localStress > yieldMPa && dt > 0) {
+      const overstress = localStress - yieldMPa;
+      const dEp =
+        (overstress / (hardeningMPa + youngsMPa * 0.045)) * dt * 1.65;
+      const nextEp = Math.min(epsFrac * 1.6, accumPlastic[vi] + dEp);
+      const inc = nextEp - accumPlastic[vi];
+      accumPlastic[vi] = nextEp;
+      plasticIncSum += inc;
+
+      const dmgInc =
+        (inc / epsFrac) *
+        (0.75 + 0.85 * innerCoilBoost) *
+        (0.75 + 0.65 * brittleness);
+      accumDamage[vi] = Math.min(1.0, accumDamage[vi] + dmgInc);
+    }
+
+    epArr[vi] = accumPlastic[vi];
+    dmgArr[vi] = accumDamage[vi];
+    const epPct = accumPlastic[vi] * 100;
+    if (epPct > maxPlasticPct) maxPlasticPct = epPct;
+    if (accumDamage[vi] > maxDamage) maxDamage = accumDamage[vi];
+  }
+
+  const volM3 = Math.max(1e-7, part.mesh.volume || 6.9e-6);
+  const avgStressSqPa2 = (stressSqSum / Math.max(1, vCount)) * 1e12;
+  const elasticEnergyJ =
+    (avgStressSqPa2 / Math.max(1e6, 2 * mat.youngsModulus)) * volM3 * 0.5 +
+    0.5 * press.stiffnessNPerM * compressionM * compressionM;
+  const plasticEnergyDeltaJ =
+    plasticIncSum > 0
+      ? mat.yieldStrength * (plasticIncSum / Math.max(1, vCount)) * volM3 * 1.15
+      : 0;
+
+  return {
+    displacements: disp,
+    nodalStressMPa: stressArr,
+    nodalPlasticStrain: epArr,
+    nodalDamage: dmgArr,
+    peakStressMPa,
+    maxDispMm,
+    maxPlasticPct,
+    maxDamage,
+    elasticEnergyJ,
+    plasticEnergyDeltaJ,
+  };
+}
+
+/**
+ * Evaluates elastoplastic compression, stress, plastic strain, and damage fields for a single
+ * specimen vertex mesh at a given compressive stroke and applied load.
+ */
+function evaluateSpecimenDeformationField(
+  part: CadPart,
+  mat: MaterialSpec,
+  press: DetectedPressAssembly,
+  compressionM: number,
+  appliedForceN: number,
+  accumPlastic: Float32Array,
+  accumDamage: Float32Array,
+  dt: number,
+  brittleness: number,
+  helixKinematics?: HelixKinematicsData | null
+): {
+  displacements: Float32Array;
+  nodalStressMPa: Float32Array;
+  nodalPlasticStrain: Float32Array;
+  nodalDamage: Float32Array;
+  peakStressMPa: number;
+  maxDispMm: number;
+  maxPlasticPct: number;
+  maxDamage: number;
+  elasticEnergyJ: number;
+  plasticEnergyDeltaJ: number;
+} {
+  if (helixKinematics) {
+    return evaluateHelixDeformationField(
+      part,
+      mat,
+      press,
+      helixKinematics,
+      compressionM,
+      appliedForceN,
+      accumPlastic,
+      accumDamage,
+      dt,
+      brittleness
+    );
+  }
+
   const verts = part.mesh.vertices;
   const vCount = part.mesh.vertexCount;
   const disp = new Float32Array(vCount * 3);
@@ -645,7 +1381,6 @@ function evaluateSpecimenDeformationField(
     const tauWahlPa =
       (press.wahlFactor * 8 * appliedForceN * press.meanCoilDiameterM) /
       Math.max(1e-12, Math.PI * Math.pow(press.wireDiameterM, 3));
-    // Clamp numerical peak cleanly while faithfully showing severe overload (e.g. 2000 N -> ~2865 MPa τ_Wahl)
     nominalPeakMPa = Math.min(4500, (tauWahlPa * 1.15) / 1e6);
   } else {
     const areaM2 = Math.max(1e-5, (part.mesh.volume || 1e-5) / L0);
@@ -806,7 +1541,31 @@ export function bakePressDestructionCache(
   }
   if (!Number.isFinite(floorY)) floorY = -0.05;
 
-  // Build Voronoi fracture shards for specimen parts so severe overload can visibly snap/shatter coils
+  // Precompute helical rod kinematics and plastic & damage accumulators for specimen parts
+  const helixByPart = new Map<string, HelixKinematicsData | null>();
+  const plasticByPart = new Map<string, Float32Array>();
+  const damageByPart = new Map<string, Float32Array>();
+  const plasticEnergyByPart = new Map<string, number>();
+  for (const sp of press.specimenParts) {
+    helixByPart.set(
+      sp.id,
+      isHelixPart(sp) ? buildHelixKinematicsData(sp, press) : null
+    );
+    plasticByPart.set(sp.id, new Float32Array(sp.mesh.vertexCount));
+    damageByPart.set(sp.id, new Float32Array(sp.mesh.vertexCount));
+    plasticEnergyByPart.set(sp.id, 0);
+  }
+
+  // Compute physical coil-bind force and whether overload destroys the specimen
+  const bindForceN = press.stiffnessNPerM * press.maxStrokeM;
+  const effectiveMaxForceN = press.maxForceN;
+  const reachesBind = effectiveMaxForceN >= bindForceN * 0.85;
+  const maxAchievableCompressionM = reachesBind
+    ? press.maxStrokeM
+    : Math.min(press.maxStrokeM, effectiveMaxForceN / Math.max(1, press.stiffnessNPerM));
+
+  // Build fracture shards from the pre-fracture compressed/buckled specimen geometry
+  // so broken coil arcs seamlessly continue from the compressed spring state
   const allShards: FractureShardGeometry[] = [];
   interface PressShardRt {
     parentPartId: string;
@@ -828,11 +1587,60 @@ export function bakePressDestructionCache(
   for (let si = 0; si < press.specimenParts.length; si++) {
     const sp = press.specimenParts[si];
     const mat = getMaterialById(sp.materialId, materials as MaterialSpec[]);
+    const hData = helixByPart.get(sp.id) ?? null;
+
+    let shardSourcePart = sp;
+    if (hData) {
+      const preCompM =
+        maxAchievableCompressionM + (reachesBind ? press.solidHeightM * 0.22 : 0);
+      const dummyPlastic = new Float32Array(sp.mesh.vertexCount).fill(0.045);
+      const dummyDamage = new Float32Array(sp.mesh.vertexCount);
+      const preEval = evaluateHelixDeformationField(
+        sp,
+        mat,
+        press,
+        hData,
+        preCompM,
+        effectiveMaxForceN,
+        dummyPlastic,
+        dummyDamage,
+        0,
+        config.brittleness ?? 0.55
+      );
+      const defVerts = new Float32Array(sp.mesh.vertices.length);
+      let minX = Infinity, minY = Infinity, minZ = Infinity;
+      let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+      for (let vi = 0; vi < sp.mesh.vertexCount; vi++) {
+        const o = vi * 3;
+        const x = sp.mesh.vertices[o] + preEval.displacements[o];
+        const y = sp.mesh.vertices[o + 1] + preEval.displacements[o + 1];
+        const z = sp.mesh.vertices[o + 2] + preEval.displacements[o + 2];
+        defVerts[o] = x;
+        defVerts[o + 1] = y;
+        defVerts[o + 2] = z;
+        if (x < minX) minX = x;
+        if (y < minY) minY = y;
+        if (z < minZ) minZ = z;
+        if (x > maxX) maxX = x;
+        if (y > maxY) maxY = y;
+        if (z > maxZ) maxZ = z;
+      }
+      shardSourcePart = {
+        ...sp,
+        mesh: {
+          ...sp.mesh,
+          vertices: defVerts,
+          boundingBox: { min: [minX, minY, minZ], max: [maxX, maxY, maxZ] },
+        },
+      };
+    }
+
     const built = buildSpecimenShards(
-      sp,
+      shardSourcePart,
       mat,
       Math.min(18, Math.max(8, config.shardCountPerPart || 14)),
-      (config.seed || 42) + si * 97
+      (config.seed || 42) + si * 97,
+      hData?.vertU ?? null
     );
     for (const s of built.shards) {
       allShards.push(s);
@@ -852,16 +1660,6 @@ export function bakePressDestructionCache(
         damage: 0,
       });
     }
-  }
-
-  // Per-specimen plastic & damage accumulators
-  const plasticByPart = new Map<string, Float32Array>();
-  const damageByPart = new Map<string, Float32Array>();
-  const plasticEnergyByPart = new Map<string, number>();
-  for (const sp of press.specimenParts) {
-    plasticByPart.set(sp.id, new Float32Array(sp.mesh.vertexCount));
-    damageByPart.set(sp.id, new Float32Array(sp.mesh.vertexCount));
-    plasticEnergyByPart.set(sp.id, 0);
   }
 
   interface SparkRt {
@@ -891,14 +1689,6 @@ export function bakePressDestructionCache(
       });
     }
   };
-
-  // Compute physical coil-bind force and whether overload destroys the specimen
-  const bindForceN = press.stiffnessNPerM * press.maxStrokeM;
-  const effectiveMaxForceN = press.maxForceN;
-  const reachesBind = effectiveMaxForceN >= bindForceN * 0.85;
-  const maxAchievableCompressionM = reachesBind
-    ? press.maxStrokeM
-    : Math.min(press.maxStrokeM, effectiveMaxForceN / Math.max(1, press.stiffnessNPerM));
 
   // Contact point is at the middle of the specimen's contact interface
   const specAabb = getWorldAabb(primarySpec);
@@ -1036,7 +1826,8 @@ export function bakePressDestructionCache(
         pAccum,
         dAccum,
         frameIdx > 0 && !fractured ? dt : 0,
-        config.brittleness ?? 0.55
+        config.brittleness ?? 0.55,
+        helixByPart.get(sp.id) ?? null
       );
 
       const prevPlJ = plasticEnergyByPart.get(sp.id) || 0;
@@ -1085,14 +1876,19 @@ export function bakePressDestructionCache(
         // Launch fractured coil shards radially outward from the compressed specimen zone
         const [sNear, sFar] = projectAabbOnAxis(getWorldAabb(sp), press.pushDir);
         const L0 = Math.max(0.004, sFar - sNear);
+        const hasHelixShards = Boolean(helixByPart.get(sp.id));
         for (const sr of shardRuntimes) {
           if (sr.parentPartId !== sp.id) continue;
           sr.active = true;
           const worldOrig = add3(sp.position, sr.localCom);
-          const sCoord = dot3(worldOrig, press.pushDir);
-          const eta = Math.max(0, Math.min(1, (sFar - sCoord) / L0));
-          // Start shard at its compressed position!
-          sr.pos = add3(worldOrig, scale3(press.pushDir, compressionM * eta));
+          if (hasHelixShards) {
+            // Shards were already extracted from the compressed/buckled coil geometry
+            sr.pos = worldOrig;
+          } else {
+            const sCoord = dot3(worldOrig, press.pushDir);
+            const eta = Math.max(0, Math.min(1, (sFar - sCoord) / L0));
+            sr.pos = add3(worldOrig, scale3(press.pushDir, compressionM * eta));
+          }
           sr.quat = [0, 0, 0, 1];
           sr.stressGlow = 1.0;
           sr.stressMPa = evalRes.peakStressMPa;
@@ -1488,6 +2284,10 @@ export function buildDestructionCacheFromLivePhysics(
   const damageAccum = detectedPress
     ? new Float32Array(detectedPress.specimenParts[0].mesh.vertexCount)
     : null;
+  const liveHelixKinematics =
+    detectedPress && isHelixPart(detectedPress.specimenParts[0])
+      ? buildHelixKinematicsData(detectedPress.specimenParts[0], detectedPress)
+      : null;
 
   for (let i = 0; i < sampleCount; i++) {
     const u = i / Math.max(1, sampleCount - 1);
@@ -1575,7 +2375,8 @@ export function buildDestructionCacheFromLivePhysics(
         plasticAccum,
         damageAccum,
         i > 0 ? dtStep : 0,
-        config.brittleness ?? 0.5
+        config.brittleness ?? 0.5,
+        liveHelixKinematics
       );
       framePeakStress = ev.peakStressMPa;
       frameMaxPlasticPct = ev.maxPlasticPct;

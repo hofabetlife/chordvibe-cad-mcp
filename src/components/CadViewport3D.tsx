@@ -1156,7 +1156,15 @@ export const CadViewport3D: React.FC<CadViewport3DProps> = ({
               (normAttr.array as Float32Array).set(child.userData.baseNormals);
               posAttr.needsUpdate = true;
               normAttr.needsUpdate = true;
+              geom.computeBoundingSphere();
               child.userData.isDeformed = false;
+              for (const sub of child.children) {
+                if (sub.userData?.isCadEdgesOverlay || sub.userData?.isWfOverlay) {
+                  sub.visible = true;
+                } else if (sub.userData?.isC4dLines) {
+                  sub.visible = renderMode === 'wireframe' || activeView !== 'perspective';
+                }
+              }
             }
             if (
               child.material instanceof THREE.MeshStandardMaterial &&
@@ -1354,13 +1362,33 @@ export const CadViewport3D: React.FC<CadViewport3DProps> = ({
               if (moved) {
                 posAttr.needsUpdate = true;
                 geom.computeVertexNormals();
-                child.userData.isDeformed = true;
+                geom.computeBoundingSphere();
+                if (!child.userData.isDeformed) {
+                  child.userData.isDeformed = true;
+                  for (const sub of child.children) {
+                    if (
+                      sub.userData?.isCadEdgesOverlay ||
+                      sub.userData?.isWfOverlay ||
+                      sub.userData?.isC4dLines
+                    ) {
+                      sub.visible = false;
+                    }
+                  }
+                }
               } else if (child.userData.isDeformed) {
                 outPos.set(basePos);
                 (normAttr.array as Float32Array).set(baseNorm);
                 posAttr.needsUpdate = true;
                 normAttr.needsUpdate = true;
+                geom.computeBoundingSphere();
                 child.userData.isDeformed = false;
+                for (const sub of child.children) {
+                  if (sub.userData?.isCadEdgesOverlay || sub.userData?.isWfOverlay) {
+                    sub.visible = true;
+                  } else if (sub.userData?.isC4dLines) {
+                    sub.visible = renderMode === 'wireframe' || activeView !== 'perspective';
+                  }
+                }
               }
             }
 
