@@ -29,7 +29,12 @@ import {
   csgUnionMesh,
 } from './csg_bsp';
 import { optimizeCadFeatureTree } from './query_optimizer';
-import { getMaterialById, resolveMaterialAlias } from './materials';
+import {
+  assertValidMaterialSpec,
+  getMaterialById,
+  normalizeMaterialSpec,
+  resolveMaterialAlias,
+} from './materials';
 
 export interface McpToolDefinition {
   name: string;
@@ -1291,11 +1296,11 @@ export function executeMcpToolOnEngineState(
     case 'define_material': {
       const matId = String(params.material_id || params.id || `mat_${Date.now()}`);
       const density = Number(params.density_kg_m3 ?? params.density ?? 7850);
-      const E_gpa = Number(params.youngs_modulus_gpa ?? 205);
+      const E_gpa = Number(params.youngs_modulus_gpa ?? params.young_modulus_gpa ?? 205);
       const E_pa = params.youngs_modulus_pa
         ? Number(params.youngs_modulus_pa)
         : E_gpa * 1e9;
-      const nu = Number(params.poissons_ratio ?? 0.29);
+      const nu = Number(params.poissons_ratio ?? params.poisson_ratio ?? 0.29);
       const yieldMpa = Number(params.yield_strength_mpa ?? 350);
       const yieldPa = params.yield_strength_pa
         ? Number(params.yield_strength_pa)
@@ -1307,7 +1312,8 @@ export function executeMcpToolOnEngineState(
         );
       }
 
-      const newMat: MaterialSpec = {
+      const newMat = normalizeMaterialSpec({
+        ...params,
         id: matId,
         name: String(params.name || matId),
         category: 'Custom',
@@ -1318,7 +1324,9 @@ export function executeMcpToolOnEngineState(
         colorHex: String(params.color_hex || '#7a8a9e'),
         roughness: 0.3,
         metalness: 0.8,
-      };
+      });
+
+      assertValidMaterialSpec(newMat);
 
       state.materials = [
         ...state.materials.filter((m) => m.id !== matId),
@@ -1342,6 +1350,12 @@ export function executeMcpToolOnEngineState(
         density_kg_m3: density,
         youngs_modulus_gpa: E_pa / 1e9,
         yield_strength_mpa: yieldPa / 1e6,
+        ultimate_strength_pa: newMat.ultimateStrengthPa,
+        hardening_modulus_pa: newMat.hardeningModulusPa,
+        fracture_strain: newMat.fractureStrain,
+        fracture_energy_j_m2: newMat.fractureEnergyJM2,
+        friction_coeff: newMat.frictionCoeff,
+        failure_mode: newMat.failureMode,
       };
       break;
     }
@@ -1767,9 +1781,7 @@ export function executeMcpToolOnEngineState(
 
     case 'run_fea_analysis': {
       const part = resolveTargetPart(state, params.part_id);
-      const mat =
-        state.materials.find((m) => m.id === part.materialId) ||
-        state.materials[0];
+      const mat = getMaterialById(part.materialId, state.materials);
 
       const conditions: FeaBoundaryCondition[] = [];
       const hasExplicitFixedParam =
@@ -1884,9 +1896,7 @@ export function executeMcpToolOnEngineState(
         throw new Error('Image width and height must be > 0');
       }
       if (!part.mesh.feaStressMPa) {
-        const mat =
-          state.materials.find((m) => m.id === part.materialId) ||
-          state.materials[0];
+        const mat = getMaterialById(part.materialId, state.materials);
         const { result, stressMPa, displacements } = runLinearFeaSolver(
           part,
           mat,

@@ -7,6 +7,7 @@ use mcp_cad_core::csg::csg_intersection;
 use mcp_cad_core::topology::{BoundingBox, TriangleMesh, Vertex};
 use mcp_cad_core::Part;
 use nalgebra::{DMatrix, Matrix3, Quaternion, UnitQuaternion, Vector3};
+use serde::{Deserialize, Serialize};
 
 use crate::error::PhysicsError;
 use crate::joint::{
@@ -14,15 +15,87 @@ use crate::joint::{
     is_zero_range_limits, local_orthonormal_basis, perpendicular_axes, quat_to_matrix,
 };
 use crate::rigid_body::{
-    BodyHandle, BodyRegistry, ColliderHandle, ColliderRegistry, ColliderType,
+    BodyHandle, BodyRegistry, Collider, ColliderHandle, ColliderRegistry, ColliderType,
     RigidBody as NativeRigidBody, create_collider, create_rigid_body,
 };
-use crate::solver::{MultiBodySolver, SolvedJointRecord, create_solved_joint_record};
+use crate::solver::{
+    GearJointCouplingSpec, JointHubCouplingSpec, MultiBodySolver, SolvedJointRecord,
+    create_solved_joint_record, extract_gear_joint_couplings, extract_joint_hub_couplings,
+};
 use crate::telemetry::{
     BodyState, BodyTelemetry, CollisionRecord, InterferenceReport, JointLoadCase,
     JointReactionForce, JointSweepReport, LoadCaseSelector, PairInterferenceResult,
     PartInertialLoad, PartLoadCase, SimulationSummary, SweepStepResult,
 };
+
+/// Descriptor for spawning a detached fractured fragment (e.g. broken gear tooth from FEA)
+/// into [`PhysicsWorld`] as an independent dynamic rigid body with exact mass, COM, inertia,
+/// and initial linear/angular velocities (`P5-T5`).
+#[derive(Debug, Clone)]
+pub struct FragmentSpawnSpec {
+    /// Unique identifier for the fragment body (e.g. `"brass_gear_frag_0"`).
+    pub fragment_id: String,
+    /// Watertight surface mesh in the fragment's local coordinate frame (typically COM-centered).
+    pub mesh_local: TriangleMesh,
+    /// Material density $\rho$ in kg/m³.
+    pub density_kg_m3: f64,
+    /// Exact fragment mass $m$ in kilograms.
+    pub mass_kg: f64,
+    /// Center of mass in `mesh_local` coordinates (`[0, 0, 0]` when `mesh_local` is COM-centered).
+    pub local_com: [f64; 3],
+    /// Exact symmetric $3\times 3$ inertia tensor about `local_com` in local axes (kg·m²).
+    pub inertia_tensor_com: [[f64; 3]; 3],
+    /// Initial world-space position of the fragment's local origin (m).
+    pub position: [f64; 3],
+    /// Initial world-space orientation quaternion `[qx, qy, qz, qw]`.
+    pub orientation_quat: [f64; 4],
+    /// Initial world-space COM linear velocity `[vx, vy, vz]` (m/s).
+    pub linear_velocity: [f64; 3],
+    /// Initial world-space angular velocity `[wx, wy, wz]` (rad/s).
+    pub angular_velocity: [f64; 3],
+    /// Collision shape strategy (defaults to `ColliderType::ConvexHull` or `ColliderType::TriMesh`).
+    pub collider_type: ColliderType,
+    /// Coulomb friction coefficient $\mu \ge 0$.
+    pub friction: f64,
+    /// Coefficient of restitution $e \in [0, 1]$.
+    pub restitution: f64,
+}
+
+/// Instantaneous total mass, linear momentum, and angular momentum about the world origin across
+/// all dynamic rigid bodies in [`PhysicsWorld`] (`P5-T5` conservation audit).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SystemMomentumSummary {
+    /// Sum of masses of all dynamic rigid bodies (kg).
+    pub total_mass_kg: f64,
+    /// Total linear momentum $\mathbf{P} = \sum_i m_i \mathbf{v}_i$ (kg·m/s).
+    pub linear_momentum: [f64; 3],
+    /// Total angular momentum about world origin $\mathbf{L}_O = \sum_i (\mathbf{x}_{\text{com},i} \times m_i \mathbf{v}_i + \mathbf{I}_{w,i} \boldsymbol{\omega}_i)$ (kg·m²/s).
+    pub angular_momentum_origin: [f64; 3],
+    /// Number of dynamic bodies included in the sum.
+    pub dynamic_body_count: usize,
+}
+
+/// Compact pose & kinetic energy snapshot for a detached fractured rigid fragment stepped
+/// synchronously with an adaptive HHT-α implicit dynamic FEA step (`P5-T6`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CoupledFragmentPose {
+    /// Unique identifier of the detached rigid fragment body.
+    pub fragment_id: String,
+    /// Simulation timestamp in seconds (s).
+    pub time_s: f64,
+    /// World-space position of the fragment origin `[x, y, z]` (m).
+    pub position: [f64; 3],
+    /// World-space orientation quaternion `[qx, qy, qz, qw]`.
+    pub orientation_quat: [f64; 4],
+    /// World-space linear velocity `[vx, vy, vz]` (m/s).
+    pub linear_velocity: [f64; 3],
+    /// World-space angular velocity `[wx, wy, wz]` (rad/s).
+    pub angular_velocity: [f64; 3],
+    /// Translational + rotational kinetic energy $\frac{1}{2} m \|\mathbf{v}\|^2 + \frac{1}{2} \boldsymbol{\omega}^T \mathbf{I}_w \boldsymbol{\omega}$ (J).
+    pub kinetic_energy_j: f64,
+    /// Fragment mass in kilograms (kg).
+    pub mass_kg: f64,
+}
 
 /// Internal record of a kinematic joint registered in the physics world.
 #[derive(Debug, Clone)]
@@ -312,6 +385,192 @@ impl PhysicsWorld {
         Ok(rb_handle)
     }
 
+    /// Spawns a detached fractured fragment (e.g. broken gear tooth extracted by FEA) into
+    /// [`PhysicsWorld`] as an independent dynamic rigid body with exact mass, COM, $3\times 3$
+    /// inertia tensor, linear & angular velocity, and collision geometry (`P5-T5`).
+    pub fn spawn_detached_fragment(
+        &mut self,
+        spec: &FragmentSpawnSpec,
+    ) -> Result<BodyHandle, PhysicsError> {
+        if self.part_to_body.contains_key(&spec.fragment_id)
+            || spec.fragment_id.eq_ignore_ascii_case("ground")
+            || spec.fragment_id.eq_ignore_ascii_case("world")
+        {
+            return Err(PhysicsError::PartAlreadyExists(spec.fragment_id.clone()));
+        }
+        if !spec.mass_kg.is_finite() || spec.mass_kg <= 1e-15 {
+            return Err(PhysicsError::SimulationError(format!(
+                "Detached fragment '{}' must have finite positive mass, got {}",
+                spec.fragment_id, spec.mass_kg
+            )));
+        }
+
+        let rb = NativeRigidBody::from_exact_mass_properties(
+            &spec.fragment_id,
+            spec.mass_kg,
+            spec.local_com,
+            spec.inertia_tensor_com,
+            spec.position,
+            spec.orientation_quat,
+            spec.linear_velocity,
+            spec.angular_velocity,
+        );
+        let col = Collider::from_mesh(
+            &spec.fragment_id,
+            &spec.mesh_local,
+            spec.density_kg_m3,
+            spec.collider_type,
+            spec.friction,
+            spec.restitution,
+        )?;
+
+        let rb_pos = rb.position;
+        let rb_rot = rb.orientation;
+        let rb_handle = self.bodies.insert(rb);
+        let col_handle = self
+            .colliders
+            .insert_with_parent(col, rb_handle, &mut self.bodies);
+        if let Some(c) = self.colliders.get_mut(col_handle) {
+            c.update_world_pose(rb_pos, rb_rot);
+        }
+
+        self.part_to_body.insert(spec.fragment_id.clone(), rb_handle);
+        self.body_to_part.insert(rb_handle, spec.fragment_id.clone());
+        self.collider_to_part
+            .insert(col_handle, spec.fragment_id.clone());
+        self.part_to_colliders
+            .entry(spec.fragment_id.clone())
+            .or_default()
+            .push(col_handle);
+        self.part_meshes
+            .insert(spec.fragment_id.clone(), spec.mesh_local.clone());
+
+        Ok(rb_handle)
+    }
+
+    /// Updates the collision mesh and exact mass-inertia properties of an existing parent body
+    /// after local fracture detachment (e.g. gear with a broken tooth) while preserving its
+    /// [`BodyHandle`], world pose, linear/angular velocity, and all attached shaft joints/motors (`P5-T5`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_fractured_parent_geometry(
+        &mut self,
+        part_id: &str,
+        surviving_mesh_local: TriangleMesh,
+        density_kg_m3: f64,
+        mass_kg: f64,
+        local_com: [f64; 3],
+        inertia_tensor_com: [[f64; 3]; 3],
+        collider_type: ColliderType,
+    ) -> Result<BodyHandle, PhysicsError> {
+        if part_id.eq_ignore_ascii_case("ground") || part_id.eq_ignore_ascii_case("world") {
+            return Err(PhysicsError::InvalidJointConfiguration(format!(
+                "Cannot modify geometry of reserved static anchor '{part_id}'"
+            )));
+        }
+        let rb_handle = *self
+            .part_to_body
+            .get(part_id)
+            .ok_or_else(|| PhysicsError::PartNotFound(part_id.to_string()))?;
+
+        // Preserve friction & restitution from previous collider
+        let (prev_friction, prev_restitution) = self
+            .part_to_colliders
+            .get(part_id)
+            .and_then(|list| list.first())
+            .and_then(|&ch| self.colliders.get(ch))
+            .map_or((0.5, 0.0), |c| (c.friction, c.restitution));
+
+        let new_col = Collider::from_mesh(
+            part_id,
+            &surviving_mesh_local,
+            density_kg_m3,
+            collider_type,
+            prev_friction,
+            prev_restitution,
+        )?;
+
+        if let Some(old_colliders) = self.part_to_colliders.remove(part_id) {
+            for col_h in old_colliders {
+                self.collider_to_part.remove(&col_h);
+                self.colliders.remove(col_h, &mut self.bodies);
+            }
+        }
+
+        let (rb_pos, rb_rot) = if let Some(rb) = self.bodies.get_mut(rb_handle) {
+            rb.update_exact_mass_properties(mass_kg, local_com, inertia_tensor_com);
+            (rb.position, rb.orientation)
+        } else {
+            return Err(PhysicsError::PartNotFound(part_id.to_string()));
+        };
+
+        let col_handle = self
+            .colliders
+            .insert_with_parent(new_col, rb_handle, &mut self.bodies);
+        if let Some(c) = self.colliders.get_mut(col_handle) {
+            c.update_world_pose(rb_pos, rb_rot);
+        }
+        self.collider_to_part
+            .insert(col_handle, part_id.to_string());
+        self.part_to_colliders
+            .entry(part_id.to_string())
+            .or_default()
+            .push(col_handle);
+        self.part_meshes
+            .insert(part_id.to_string(), surviving_mesh_local);
+
+        // Wake up all bodies coupled via joints
+        let coupled_body_handles: Vec<BodyHandle> = self
+            .joints
+            .values()
+            .filter(|rec| rec.part_a == part_id || rec.part_b == part_id)
+            .flat_map(|rec| {
+                [
+                    self.part_to_body.get(&rec.part_a).copied(),
+                    self.part_to_body.get(&rec.part_b).copied(),
+                ]
+            })
+            .flatten()
+            .collect();
+        for h in coupled_body_handles {
+            if let Some(rb) = self.bodies.get_mut(h) {
+                rb.wake_up();
+            }
+        }
+
+        Ok(rb_handle)
+    }
+
+    /// Computes exact total mass, linear momentum $\mathbf{P}$, and angular momentum about
+    /// the world origin $\mathbf{L}_O$ across all dynamic bodies in the world (`P5-T5`).
+    #[must_use]
+    pub fn total_system_momentum(&self) -> SystemMomentumSummary {
+        let mut total_mass = 0.0_f64;
+        let mut total_p = Vector3::<f64>::zeros();
+        let mut total_l = Vector3::<f64>::zeros();
+        let mut dynamic_count = 0usize;
+
+        for (_, rb) in self.bodies.iter() {
+            if !rb.is_dynamic() || rb.mass() <= 0.0 {
+                continue;
+            }
+            dynamic_count += 1;
+            let m = rb.mass();
+            let x_com = rb.world_com();
+            let p_i = rb.linear_velocity * m;
+            let l_i = x_com.cross(&p_i) + rb.world_inertia() * rb.angular_velocity;
+            total_mass += m;
+            total_p += p_i;
+            total_l += l_i;
+        }
+
+        SystemMomentumSummary {
+            total_mass_kg: total_mass,
+            linear_momentum: [total_p.x, total_p.y, total_p.z],
+            angular_momentum_origin: [total_l.x, total_l.y, total_l.z],
+            dynamic_body_count: dynamic_count,
+        }
+    }
+
     /// Removes a CAD part, its colliders, and all attached joints from the world.
     pub fn remove_part(&mut self, part_id: &str) -> Result<(), PhysicsError> {
         if part_id.eq_ignore_ascii_case("ground") || part_id.eq_ignore_ascii_case("world") {
@@ -426,6 +685,25 @@ impl PhysicsWorld {
     #[must_use]
     pub fn joints(&self) -> &HashMap<String, CadJointRecord> {
         &self.joints
+    }
+
+    /// Returns a slice of all active solved joint records (`P5-T14`).
+    #[must_use]
+    pub fn solved_joints(&self) -> &[SolvedJointRecord] {
+        &self.solved_joints
+    }
+
+    /// Extracts deformable hub coupling descriptors (`Revolute`, `Prismatic`, `Fixed` + motors)
+    /// for all active joints acting on dynamic bodies in this physics world (`P5-T14`).
+    #[must_use]
+    pub fn extract_joint_hub_couplings(&self) -> Vec<JointHubCouplingSpec> {
+        extract_joint_hub_couplings(&self.bodies, &self.solved_joints)
+    }
+
+    /// Extracts all active [`CadJointType::Gear`] descriptors from this physics world (`P5-T14`).
+    #[must_use]
+    pub fn extract_gear_joint_couplings(&self) -> Vec<GearJointCouplingSpec> {
+        extract_gear_joint_couplings(&self.bodies, &self.solved_joints)
     }
 
     /// Updates motor actuation on an existing joint transactionally.
@@ -553,6 +831,73 @@ impl PhysicsWorld {
         self.step_counter += 1;
         self.current_time_s = next_time;
         records
+    }
+
+    /// Advances the `f64` physics world across an arbitrary adaptive HHT-α macro step `total_dt_s`
+    /// by automatically subdividing into uniform substeps no larger than `max_substep_s` (`P5-T6`).
+    ///
+    /// Preserves exact synchronization between an adaptive implicit FEA integrator (whose step size
+    /// may grow far beyond CFL or bisect on contact/fracture) and rigid-body contact resolution.
+    pub fn step_adaptive_substeps(
+        &mut self,
+        total_dt_s: f64,
+        max_substep_s: f64,
+    ) -> Vec<CollisionRecord> {
+        if !total_dt_s.is_finite() || total_dt_s <= 0.0 {
+            return Vec::new();
+        }
+        let sub_limit = if max_substep_s.is_finite() && max_substep_s > 0.0 {
+            max_substep_s
+        } else {
+            1.0 / 240.0
+        };
+        let n_sub = ((total_dt_s / sub_limit).ceil() as usize).clamp(1, 2048);
+        let sub_dt = total_dt_s / (n_sub as f64);
+        let mut all_collisions = Vec::new();
+        for _ in 0..n_sub {
+            let mut recs = self.step(sub_dt);
+            all_collisions.append(&mut recs);
+        }
+        all_collisions
+    }
+
+    /// Advances the physics world across `dt_s` (using adaptive substepping capped at `max_substep_s`)
+    /// and extracts compact [`CoupledFragmentPose`] snapshots for all requested detached fragment IDs
+    /// at timestamp `current_time_s` (`P5-T6`).
+    pub fn step_coupled_fragments_for_dt(
+        &mut self,
+        dt_s: f64,
+        max_substep_s: f64,
+        fragment_ids: &[String],
+        current_time_s: f64,
+    ) -> (Vec<CoupledFragmentPose>, Vec<CollisionRecord>) {
+        let collisions = self.step_adaptive_substeps(dt_s, max_substep_s);
+        let mut poses = Vec::with_capacity(fragment_ids.len());
+        for frag_id in fragment_ids {
+            if let Some(&rb_handle) = self.part_to_body.get(frag_id) {
+                if let Some(rb) = self.bodies.get(rb_handle) {
+                    let pos = rb.position;
+                    let q = rb.orientation.quaternion();
+                    let lv = rb.linear_velocity;
+                    let av = rb.angular_velocity;
+                    let m = rb.mass();
+                    let ke_trans = 0.5 * m * lv.norm_squared();
+                    let iw_omega = rb.world_inertia() * av;
+                    let ke_rot = 0.5 * av.dot(&iw_omega).max(0.0);
+                    poses.push(CoupledFragmentPose {
+                        fragment_id: frag_id.clone(),
+                        time_s: current_time_s,
+                        position: [pos.x, pos.y, pos.z],
+                        orientation_quat: [q.coords.x, q.coords.y, q.coords.z, q.coords.w],
+                        linear_velocity: [lv.x, lv.y, lv.z],
+                        angular_velocity: [av.x, av.y, av.z],
+                        kinetic_energy_j: ke_trans + ke_rot,
+                        mass_kg: m,
+                    });
+                }
+            }
+        }
+        (poses, collisions)
     }
 
     /// Records an instantaneous telemetry snapshot for all bodies and joints.

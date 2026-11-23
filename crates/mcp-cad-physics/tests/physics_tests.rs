@@ -3925,5 +3925,603 @@ fn test_p4_t7_f64_solver_comprehensive_benchmarks_euler_top_10rev_gear_4bar_fric
     );
 }
 
+#[test]
+fn test_p5_t5_detached_tooth_free_flight_collisions_and_gear_continues_rotating() {
+    use mcp_cad_physics::{FragmentSpawnSpec, MassProperties, MotorConfig};
+
+    // Simulate a brass gear rotating on its Revolute shaft joint when one tooth breaks off:
+    // 1. Before detachment: single spinning intact gear + static test stand floor below.
+    // 2. At detachment instant:
+    //    - Parent gear collider & mass-inertia are updated via `update_fractured_parent_geometry`
+    //      (preserving its BodyHandle, pose, angular velocity, and active Revolute shaft joint!).
+    //    - Detached tooth is spawned via `spawn_detached_fragment` with exact mass, COM, inertia,
+    //      and initial linear/angular velocities matching the rigid-body decomposition of the intact gear.
+    // 3. Verify:
+    //    - Total mass, linear momentum, and angular momentum before vs immediately after detachment
+    //      are conserved to relative error <= 1e-12 (far tighter than 1e-6).
+    //    - Detached tooth flies freely under gravity and collides with the static test stand floor
+    //      (producing real CollisionRecord events and rebounding).
+    //    - Remaining fractured gear continues rotating smoothly on its Revolute shaft joint.
+    let mut world = PhysicsWorld::with_gravity([0.0, -9.81, 0.0]);
+    let registry = MaterialRegistry::new();
+    let brass = registry.get("brass_c360").unwrap().clone();
+    let rho = brass.density_kg_m3;
+
+    // Static test stand table directly below the gear at y = -0.060 m
+    let stand = create_test_box("test_stand", "Test Stand", 0.25, 0.02, 0.10);
+    world
+        .add_part_with_options(
+            &stand,
+            false,
+            ColliderType::TriMesh,
+            Some([0.0, -0.060, 0.0]),
+            None,
+        )
+        .expect("add stand");
+    world
+        .set_part_contact_properties("test_stand", 0.3, 0.4)
+        .expect("stand contact props");
+
+    // Surviving gear hub cylinder (r = 0.022 m, width = 0.008 m)
+    let mut hub_part = Part::new("brass_gear", "Brass Gear Hub", brass.clone());
+    hub_part.dag.add_feature(
+        FeatureOp::AddCylinder {
+            radius: 0.022,
+            height: 0.008,
+            segments: 32,
+            position: None,
+            rotation_deg: None,
+        },
+        None,
+    );
+    hub_part.rebuild().expect("rebuild hub");
+    let hub_mp = MassProperties::from_mesh_and_density(hub_part.mesh(), rho);
+
+    // Detached tooth prism centered at local origin (6 mm x 5 mm x 8 mm), originally located at r_tooth = [0.026, 0, 0]
+    let mut tooth_part = Part::new("tooth_geom", "Broken Tooth", brass);
+    tooth_part.dag.add_feature(
+        FeatureOp::AddBox {
+            width: 0.006,
+            height: 0.005,
+            depth: 0.008,
+            position: None,
+            rotation_deg: None,
+        },
+        None,
+    );
+    tooth_part.rebuild().expect("rebuild tooth");
+    let tooth_mp = MassProperties::from_mesh_and_density(tooth_part.mesh(), rho);
+    let r_tooth = nalgebra::Vector3::new(0.026, 0.0, 0.0);
+
+    // Compute exact composite intact gear mass, COM, and 3x3 inertia about composite COM (Steiner theorem)
+    let m_total = hub_mp.mass + tooth_mp.mass;
+    let c_hub = hub_mp.local_com;
+    let c_tooth = r_tooth + tooth_mp.local_com;
+    let c_total = (c_hub * hub_mp.mass + c_tooth * tooth_mp.mass) / m_total;
+
+    let d_hub = c_hub - c_total;
+    let d_tooth = c_tooth - c_total;
+    let steiner = |m: f64, d: nalgebra::Vector3<f64>| {
+        m * (nalgebra::Matrix3::from_diagonal_element(d.norm_squared()) - d * d.transpose())
+    };
+    let i_total = hub_mp.inertia_tensor
+        + steiner(hub_mp.mass, d_hub)
+        + tooth_mp.inertia_tensor
+        + steiner(tooth_mp.mass, d_tooth);
+    let mat_to_arr = |m: nalgebra::Matrix3<f64>| {
+        [
+            [m[(0, 0)], m[(0, 1)], m[(0, 2)]],
+            [m[(1, 0)], m[(1, 1)], m[(1, 2)]],
+            [m[(2, 0)], m[(2, 1)], m[(2, 2)]],
+        ]
+    };
+
+    // Add initial intact gear mounted on a motorized Revolute shaft at origin
+    let gear_handle = world
+        .add_part_with_options(
+            &hub_part,
+            true,
+            ColliderType::ConvexHull,
+            Some([0.0, 0.0, 0.0]),
+            None,
+        )
+        .expect("add intact gear");
+    world
+        .update_fractured_parent_geometry(
+            "brass_gear",
+            hub_part.mesh().clone(),
+            rho,
+            m_total,
+            [c_total.x, c_total.y, c_total.z],
+            mat_to_arr(i_total),
+            ColliderType::ConvexHull,
+        )
+        .expect("set composite intact mass properties");
+
+    world
+        .add_joint(
+            "j_gear_shaft",
+            "ground",
+            "brass_gear",
+            CadJointType::Revolute {
+                anchor_a: [0.0, 0.0, 0.0],
+                anchor_b: [0.0, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                limits: None,
+            },
+            Some(MotorConfig::new(20.0, 50.0)),
+        )
+        .expect("add shaft revolute joint");
+
+    // Spin intact gear at omega = [0, 0, -20] rad/s (so tooth at +X moves downward at v_y = -0.52 m/s toward test stand!)
+    let omega = nalgebra::Vector3::new(0.0, 0.0, -20.0);
+    let v_com_total = omega.cross(&c_total);
+    world
+        .set_part_velocity("brass_gear", [v_com_total.x, v_com_total.y, v_com_total.z])
+        .unwrap();
+    world
+        .set_part_angular_velocity("brass_gear", [omega.x, omega.y, omega.z])
+        .unwrap();
+
+    // Audit system momentum IMMEDIATELY BEFORE detachment
+    let mom_before = world.total_system_momentum();
+    assert_eq!(mom_before.dynamic_body_count, 1);
+
+    // Detach tooth: update parent gear to surviving hub properties + spawn detached tooth fragment!
+    let v_com_hub = omega.cross(&c_hub);
+    let v_com_tooth = omega.cross(&c_tooth);
+
+    let updated_handle = world
+        .update_fractured_parent_geometry(
+            "brass_gear",
+            hub_part.mesh().clone(),
+            rho,
+            hub_mp.mass,
+            [c_hub.x, c_hub.y, c_hub.z],
+            mat_to_arr(hub_mp.inertia_tensor),
+            ColliderType::ConvexHull,
+        )
+        .expect("update fractured parent gear");
+    assert_eq!(
+        updated_handle, gear_handle,
+        "Updating fractured parent geometry must preserve BodyHandle and shaft joint"
+    );
+    world
+        .set_part_velocity("brass_gear", [v_com_hub.x, v_com_hub.y, v_com_hub.z])
+        .unwrap();
+
+    let frag_spec = FragmentSpawnSpec {
+        fragment_id: "brass_gear_frag_0".to_string(),
+        mesh_local: tooth_part.mesh().clone(),
+        density_kg_m3: rho,
+        mass_kg: tooth_mp.mass,
+        local_com: [0.0, 0.0, 0.0],
+        inertia_tensor_com: mat_to_arr(tooth_mp.inertia_tensor),
+        position: [c_tooth.x, c_tooth.y, c_tooth.z],
+        orientation_quat: [0.0, 0.0, 0.0, 1.0],
+        linear_velocity: [v_com_tooth.x, v_com_tooth.y, v_com_tooth.z],
+        angular_velocity: [omega.x, omega.y, omega.z],
+        collider_type: ColliderType::ConvexHull,
+        friction: 0.3,
+        restitution: 0.4,
+    };
+    world
+        .spawn_detached_fragment(&frag_spec)
+        .expect("spawn detached tooth fragment");
+
+    // Audit system momentum IMMEDIATELY AFTER detachment -> exact conservation <= 1e-12
+    let mom_after = world.total_system_momentum();
+    assert_eq!(mom_after.dynamic_body_count, 2);
+
+    let mass_rel_err =
+        (mom_before.total_mass_kg - mom_after.total_mass_kg).abs() / mom_before.total_mass_kg;
+    let p_bef = nalgebra::Vector3::from(mom_before.linear_momentum);
+    let p_aft = nalgebra::Vector3::from(mom_after.linear_momentum);
+    let p_rel_err = (p_bef - p_aft).norm() / p_bef.norm().max(1e-12);
+    let l_bef = nalgebra::Vector3::from(mom_before.angular_momentum_origin);
+    let l_aft = nalgebra::Vector3::from(mom_after.angular_momentum_origin);
+    let l_rel_err = (l_bef - l_aft).norm() / l_bef.norm().max(1e-12);
+
+    assert!(mass_rel_err < 1e-12, "PhysicsWorld mass error = {mass_rel_err:.3e}");
+    assert!(p_rel_err < 1e-12, "PhysicsWorld linear momentum error = {p_rel_err:.3e}");
+    assert!(l_rel_err < 1e-12, "PhysicsWorld angular momentum error = {l_rel_err:.3e}");
+
+    // Simulate 0.15 s at dt = 0.002 s:
+    // - Tooth falls & flies downward from y = 0.0 to hit the static test stand top surface (y = -0.050 m)
+    // - Surviving brass gear keeps rotating smoothly on its Revolute shaft joint!
+    let sim = world.simulate(0.15, 0.002);
+    assert!(sim.success, "Post-fracture simulation must succeed");
+
+    let tooth_hit_stand = sim.collisions.iter().any(|c| {
+        (c.body_a == "brass_gear_frag_0" && c.body_b == "test_stand")
+            || (c.body_b == "brass_gear_frag_0" && c.body_a == "test_stand")
+    });
+    assert!(
+        tooth_hit_stand,
+        "Detached tooth fragment must fly freely and collide with the static test stand"
+    );
+
+    // Tooth did not tunnel through the stand (center remains above stand top y = -0.050 m)
+    let final_tooth_pos = world.part_position("brass_gear_frag_0").unwrap();
+    assert!(
+        final_tooth_pos[1] > -0.052,
+        "Detached tooth tunneled through test stand: final y = {:.4} m",
+        final_tooth_pos[1]
+    );
+
+    // Remaining parent gear stayed anchored on its shaft origin and kept rotating!
+    let final_gear_pos = world.part_position("brass_gear").unwrap();
+    let gear_drift = (final_gear_pos[0].powi(2) + final_gear_pos[1].powi(2) + final_gear_pos[2].powi(2)).sqrt();
+    assert!(
+        gear_drift < 1e-4,
+        "Remaining gear must remain constrained on its Revolute shaft (drift = {:.3e} m)",
+        gear_drift
+    );
+    let final_gear_omega = world.part_angular_velocity("brass_gear").unwrap();
+    assert!(
+        final_gear_omega[2].abs() > 1.0,
+        "Remaining fractured gear must continue rotating on its shaft (omega_z = {:.3} rad/s)",
+        final_gear_omega[2]
+    );
+}
+
+#[test]
+fn test_p5_t6_adaptive_hht_coupled_fragment_stepping_and_energy_balance() {
+    use mcp_cad_physics::{compute_mesh_mass_properties, CoupledFragmentPose, FragmentSpawnSpec};
+
+    let mut world = PhysicsWorld::with_gravity([0.0, -9.81, 0.0]);
+    let rho = 7850.0;
+    let frag_part = create_test_box("frag_box", "Detached Fragment", 0.02, 0.02, 0.02);
+    let mp = compute_mesh_mass_properties(frag_part.mesh(), rho);
+    let mat_to_arr = |m: nalgebra::Matrix3<f64>| -> [[f64; 3]; 3] {
+        [
+            [m[(0, 0)], m[(0, 1)], m[(0, 2)]],
+            [m[(1, 0)], m[(1, 1)], m[(1, 2)]],
+            [m[(2, 0)], m[(2, 1)], m[(2, 2)]],
+        ]
+    };
+
+    let v0: [f64; 3] = [2.5, 4.0, 0.0];
+    let w0: [f64; 3] = [0.0, 0.0, 12.0];
+    let y0: f64 = 1.0;
+    let spec = FragmentSpawnSpec {
+        fragment_id: "frag_0".to_string(),
+        mesh_local: frag_part.mesh().clone(),
+        density_kg_m3: rho,
+        mass_kg: mp.mass,
+        local_com: [0.0, 0.0, 0.0],
+        inertia_tensor_com: mat_to_arr(mp.inertia_tensor),
+        position: [0.0, y0, 0.0],
+        orientation_quat: [0.0, 0.0, 0.0, 1.0],
+        linear_velocity: v0,
+        angular_velocity: w0,
+        collider_type: ColliderType::ConvexHull,
+        friction: 0.3,
+        restitution: 0.4,
+    };
+    world.spawn_detached_fragment(&spec).expect("spawn frag_0");
+
+    // Simulate non-uniform adaptive HHT-alpha macro steps (bisected then recovered) totaling 0.25 s
+    let adaptive_dts = [0.0025, 0.0025, 0.005, 0.01, 0.03, 0.05, 0.075, 0.075];
+    let mut t = 0.0;
+    let frag_ids = vec!["frag_0".to_string()];
+    let mut last_pose: Option<CoupledFragmentPose> = None;
+
+    let initial_ke = 0.5 * mp.mass * (v0[0].powi(2) + v0[1].powi(2) + v0[2].powi(2))
+        + 0.5 * mp.inertia_tensor[(2, 2)] * w0[2].powi(2);
+    let initial_pe = mp.mass * 9.81 * y0;
+    let initial_total_e = initial_ke + initial_pe;
+
+    for &dt in &adaptive_dts {
+        t += dt;
+        let (poses, _cols) = world.step_coupled_fragments_for_dt(dt, 0.002, &frag_ids, t);
+        assert_eq!(poses.len(), 1);
+        assert!((poses[0].time_s - t).abs() < 1e-12);
+        last_pose = Some(poses[0].clone());
+    }
+
+    let pose = last_pose.expect("final pose");
+    // Analytical ballistic kinematics at t = 0.25 s:
+    // x(t) = v0_x * t = 0.625 m
+    // y(t) = y0 + v0_y * t - 0.5 * g * t^2 = 1.0 + 1.0 - 0.5 * 9.81 * 0.0625 = 1.6934375 m
+    let expected_x = v0[0] * t;
+    let expected_y = y0 + v0[1] * t - 0.5 * 9.81 * t * t;
+    assert!(
+        (pose.position[0] - expected_x).abs() < 1e-3,
+        "Expected x = {expected_x:.4} m, got {:.4} m",
+        pose.position[0]
+    );
+    assert!(
+        (pose.position[1] - expected_y).abs() < 5e-3,
+        "Expected y = {expected_y:.4} m, got {:.4} m",
+        pose.position[1]
+    );
+    let final_total_e = pose.kinetic_energy_j + pose.mass_kg * 9.81 * pose.position[1];
+    let rel_e_err = (final_total_e - initial_total_e).abs() / initial_total_e;
+    assert!(
+        rel_e_err < 0.01,
+        "Ballistic fragment energy drift {:.4}% must be < 1%",
+        rel_e_err * 100.0
+    );
+}
+
+#[test]
+fn test_p5_t8_gear_pair_dynamic_collision_three_regimes_and_fragment_conservation() {
+    use mcp_cad_physics::{compute_mesh_mass_properties, FragmentSpawnSpec, MassProperties, MotorConfig};
+    use std::time::Instant;
+
+    let t0 = Instant::now();
+    let registry = MaterialRegistry::new();
+    let steel = registry.get("steel_4140").unwrap().clone();
+    let brass = registry.get("brass_c360").unwrap().clone();
+    let rho_brass = brass.density_kg_m3;
+
+    // ------------------------------------------------------------------------
+    // Regime (a): Elastic head-on collision in f64 PhysicsWorld (restitution = 0.98)
+    // ------------------------------------------------------------------------
+    let mut world_el = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
+    let mut cyl_a = Part::new("gear_a_el", "Elastic Pinion", steel.clone());
+    cyl_a.dag.add_feature(
+        FeatureOp::AddBox {
+            width: 0.02,
+            height: 0.02,
+            depth: 0.02,
+            position: None,
+            rotation_deg: None,
+        },
+        None,
+    );
+    cyl_a.rebuild().expect("rebuild cyl_a");
+
+    let mut cyl_b = Part::new("gear_b_el", "Elastic Gear", steel.clone());
+    cyl_b.dag.add_feature(
+        FeatureOp::AddBox {
+            width: 0.02,
+            height: 0.02,
+            depth: 0.02,
+            position: None,
+            rotation_deg: None,
+        },
+        None,
+    );
+    cyl_b.rebuild().expect("rebuild cyl_b");
+
+    world_el
+        .add_part_with_options(&cyl_a, true, ColliderType::ConvexHull, Some([-0.015, 0.0, 0.0]), None)
+        .unwrap();
+    world_el
+        .add_part_with_options(&cyl_b, true, ColliderType::ConvexHull, Some([0.015, 0.0, 0.0]), None)
+        .unwrap();
+    world_el.set_part_contact_properties("gear_a_el", 0.0, 0.98).unwrap();
+    world_el.set_part_contact_properties("gear_b_el", 0.0, 0.98).unwrap();
+    world_el.set_part_velocity("gear_a_el", [2.0, 0.0, 0.0]).unwrap();
+    world_el.set_part_velocity("gear_b_el", [0.0, 0.0, 0.0]).unwrap();
+
+    let mom_el_before = world_el.total_system_momentum();
+    let sim_el = world_el.simulate(0.04, 0.0005);
+    assert!(sim_el.success);
+    let mom_el_after = world_el.total_system_momentum();
+    let va_after = world_el.part_velocity("gear_a_el").unwrap();
+    let vb_after = world_el.part_velocity("gear_b_el").unwrap();
+    let p_el_err = (nalgebra::Vector3::from(mom_el_before.linear_momentum)
+        - nalgebra::Vector3::from(mom_el_after.linear_momentum))
+    .norm()
+        / nalgebra::Vector3::from(mom_el_before.linear_momentum).norm();
+    assert!(!sim_el.collisions.is_empty(), "Elastic impact must record collision");
+    assert!(p_el_err < 1e-10, "Elastic collision linear momentum error {p_el_err:.3e}");
+    assert!(vb_after[0] > 1.80, "Target body should acquire ~2.0 m/s in elastic impact, got {:.3}", vb_after[0]);
+    assert!(va_after[0].abs() < 0.20, "Striker should nearly stop in equal-mass elastic impact, got {:.3}", va_after[0]);
+
+    // ------------------------------------------------------------------------
+    // Regime (b): Inelastic / plastic energy-dissipating collision (restitution = 0.05)
+    // ------------------------------------------------------------------------
+    let mut world_pl = PhysicsWorld::with_gravity([0.0, 0.0, 0.0]);
+    world_pl
+        .add_part_with_options(&cyl_a, true, ColliderType::ConvexHull, Some([-0.015, 0.0, 0.0]), None)
+        .unwrap();
+    world_pl
+        .add_part_with_options(&cyl_b, true, ColliderType::ConvexHull, Some([0.015, 0.0, 0.0]), None)
+        .unwrap();
+    world_pl.set_part_contact_properties("gear_a_el", 0.30, 0.05).unwrap();
+    world_pl.set_part_contact_properties("gear_b_el", 0.30, 0.05).unwrap();
+    world_pl.set_part_velocity("gear_a_el", [2.0, 0.0, 0.0]).unwrap();
+    world_pl.set_part_velocity("gear_b_el", [0.0, 0.0, 0.0]).unwrap();
+
+    let mom_pl_before = world_pl.total_system_momentum();
+    let sim_pl = world_pl.simulate(0.04, 0.0005);
+    assert!(sim_pl.success);
+    let mom_pl_after = world_pl.total_system_momentum();
+    let va_pl = world_pl.part_velocity("gear_a_el").unwrap();
+    let vb_pl = world_pl.part_velocity("gear_b_el").unwrap();
+    let p_pl_err = (nalgebra::Vector3::from(mom_pl_before.linear_momentum)
+        - nalgebra::Vector3::from(mom_pl_after.linear_momentum))
+    .norm()
+        / nalgebra::Vector3::from(mom_pl_before.linear_momentum).norm();
+    let ke_ratio_pl = (va_pl[0].powi(2) + vb_pl[0].powi(2)) / (2.0_f64.powi(2));
+    assert!(p_pl_err < 1e-10, "Inelastic collision linear momentum error {p_pl_err:.3e}");
+    // Equal-mass perfectly inelastic collision retains 50% KE; e = 0.05 retains ~50.1% KE
+    assert!(
+        (ke_ratio_pl - 0.50125).abs() < 0.05,
+        "Expected ~50% KE retention in inelastic impact, got {:.2}%",
+        ke_ratio_pl * 100.0
+    );
+
+    // ------------------------------------------------------------------------
+    // Regime (c): Fractured gear tooth detachment + free-flight impact + shaft continuation
+    // ------------------------------------------------------------------------
+    let mut world_fr = PhysicsWorld::with_gravity([0.0, -9.81, 0.0]);
+    let stand = create_test_box("p5_t8_stand", "Test Stand", 0.25, 0.02, 0.10);
+    world_fr
+        .add_part_with_options(&stand, false, ColliderType::TriMesh, Some([0.0, -0.060, 0.0]), None)
+        .unwrap();
+    world_fr.set_part_contact_properties("p5_t8_stand", 0.3, 0.4).unwrap();
+
+    let mut hub_part = Part::new("p5_t8_brass_gear", "Brass Gear Hub", brass.clone());
+    hub_part.dag.add_feature(
+        FeatureOp::AddCylinder {
+            radius: 0.022,
+            height: 0.008,
+            segments: 32,
+            position: None,
+            rotation_deg: None,
+        },
+        None,
+    );
+    hub_part.rebuild().unwrap();
+    let hub_mp = MassProperties::from_mesh_and_density(hub_part.mesh(), rho_brass);
+
+    let mut tooth_part = Part::new("p5_t8_tooth", "Broken Tooth", brass);
+    tooth_part.dag.add_feature(
+        FeatureOp::AddBox {
+            width: 0.006,
+            height: 0.005,
+            depth: 0.008,
+            position: None,
+            rotation_deg: None,
+        },
+        None,
+    );
+    tooth_part.rebuild().unwrap();
+    let tooth_mp = compute_mesh_mass_properties(tooth_part.mesh(), rho_brass);
+    let r_tooth = nalgebra::Vector3::new(0.026, 0.0, 0.0);
+
+    let m_tot = hub_mp.mass + tooth_mp.mass;
+    let c_hub = hub_mp.local_com;
+    let c_tooth = r_tooth + tooth_mp.local_com;
+    let c_tot = (c_hub * hub_mp.mass + c_tooth * tooth_mp.mass) / m_tot;
+    let steiner = |m: f64, d: nalgebra::Vector3<f64>| {
+        m * (nalgebra::Matrix3::from_diagonal_element(d.norm_squared()) - d * d.transpose())
+    };
+    let i_tot = hub_mp.inertia_tensor
+        + steiner(hub_mp.mass, c_hub - c_tot)
+        + tooth_mp.inertia_tensor
+        + steiner(tooth_mp.mass, c_tooth - c_tot);
+    let mat_to_arr = |m: nalgebra::Matrix3<f64>| {
+        [
+            [m[(0, 0)], m[(0, 1)], m[(0, 2)]],
+            [m[(1, 0)], m[(1, 1)], m[(1, 2)]],
+            [m[(2, 0)], m[(2, 1)], m[(2, 2)]],
+        ]
+    };
+
+    let h0 = world_fr
+        .add_part_with_options(&hub_part, true, ColliderType::ConvexHull, Some([0.0, 0.0, 0.0]), None)
+        .unwrap();
+    world_fr
+        .update_fractured_parent_geometry(
+            "p5_t8_brass_gear",
+            hub_part.mesh().clone(),
+            rho_brass,
+            m_tot,
+            [c_tot.x, c_tot.y, c_tot.z],
+            mat_to_arr(i_tot),
+            ColliderType::ConvexHull,
+        )
+        .unwrap();
+    world_fr
+        .add_joint(
+            "j_p5_t8_shaft",
+            "ground",
+            "p5_t8_brass_gear",
+            CadJointType::Revolute {
+                anchor_a: [0.0, 0.0, 0.0],
+                anchor_b: [0.0, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                limits: None,
+            },
+            Some(MotorConfig::new(20.0, 50.0)),
+        )
+        .unwrap();
+
+    let omega = nalgebra::Vector3::new(0.0, 0.0, -20.0);
+    let v_tot = omega.cross(&c_tot);
+    world_fr.set_part_velocity("p5_t8_brass_gear", [v_tot.x, v_tot.y, v_tot.z]).unwrap();
+    world_fr.set_part_angular_velocity("p5_t8_brass_gear", [omega.x, omega.y, omega.z]).unwrap();
+
+    let mom_fr_before = world_fr.total_system_momentum();
+
+    let v_hub = omega.cross(&c_hub);
+    let v_tooth = omega.cross(&c_tooth);
+    let h1 = world_fr
+        .update_fractured_parent_geometry(
+            "p5_t8_brass_gear",
+            hub_part.mesh().clone(),
+            rho_brass,
+            hub_mp.mass,
+            [c_hub.x, c_hub.y, c_hub.z],
+            mat_to_arr(hub_mp.inertia_tensor),
+            ColliderType::ConvexHull,
+        )
+        .unwrap();
+    assert_eq!(h0, h1);
+    world_fr.set_part_velocity("p5_t8_brass_gear", [v_hub.x, v_hub.y, v_hub.z]).unwrap();
+    world_fr
+        .spawn_detached_fragment(&FragmentSpawnSpec {
+            fragment_id: "p5_t8_tooth_frag_0".to_string(),
+            mesh_local: tooth_part.mesh().clone(),
+            density_kg_m3: rho_brass,
+            mass_kg: tooth_mp.mass,
+            local_com: [0.0, 0.0, 0.0],
+            inertia_tensor_com: mat_to_arr(tooth_mp.inertia_tensor),
+            position: [c_tooth.x, c_tooth.y, c_tooth.z],
+            orientation_quat: [0.0, 0.0, 0.0, 1.0],
+            linear_velocity: [v_tooth.x, v_tooth.y, v_tooth.z],
+            angular_velocity: [omega.x, omega.y, omega.z],
+            collider_type: ColliderType::ConvexHull,
+            friction: 0.3,
+            restitution: 0.4,
+        })
+        .unwrap();
+
+    let mom_fr_after = world_fr.total_system_momentum();
+    let m_err = (mom_fr_before.total_mass_kg - mom_fr_after.total_mass_kg).abs()
+        / mom_fr_before.total_mass_kg;
+    let p_err = (nalgebra::Vector3::from(mom_fr_before.linear_momentum)
+        - nalgebra::Vector3::from(mom_fr_after.linear_momentum))
+    .norm()
+        / nalgebra::Vector3::from(mom_fr_before.linear_momentum).norm().max(1e-12);
+    let l_err = (nalgebra::Vector3::from(mom_fr_before.angular_momentum_origin)
+        - nalgebra::Vector3::from(mom_fr_after.angular_momentum_origin))
+    .norm()
+        / nalgebra::Vector3::from(mom_fr_before.angular_momentum_origin).norm().max(1e-12);
+
+    assert!(m_err < 1e-12 && p_err < 1e-12 && l_err < 1e-12);
+
+    let sim_fr = world_fr.simulate(0.15, 0.002);
+    assert!(sim_fr.success);
+    let hit_stand = sim_fr.collisions.iter().any(|c| {
+        (c.body_a == "p5_t8_tooth_frag_0" && c.body_b == "p5_t8_stand")
+            || (c.body_b == "p5_t8_tooth_frag_0" && c.body_a == "p5_t8_stand")
+    });
+    assert!(hit_stand, "Detached tooth must collide with static stand");
+    let tooth_pos = world_fr.part_position("p5_t8_tooth_frag_0").unwrap();
+    assert!(tooth_pos[1] > -0.052, "Detached tooth tunneled through stand: y={:.4}", tooth_pos[1]);
+    let gear_pos = world_fr.part_position("p5_t8_brass_gear").unwrap();
+    let gear_drift = (gear_pos[0].powi(2) + gear_pos[1].powi(2) + gear_pos[2].powi(2)).sqrt();
+    let gear_w = world_fr.part_angular_velocity("p5_t8_brass_gear").unwrap();
+    assert!(gear_drift < 1e-4, "Surviving gear drifted {:.3e} m", gear_drift);
+    assert!(gear_w[2].abs() > 1.0, "Surviving gear stopped rotating: omega_z={:.3}", gear_w[2]);
+
+    println!(
+        "[P5-T8 Physics 3-Regime Benchmark] elastic p_err={:.2e} (v_b={:.3} m/s) | \
+         inelastic p_err={:.2e} (KE_ratio={:.3}) | fracture cons=(m:{:.2e}, p:{:.2e}, L:{:.2e}) | \
+         gear_drift={:.2e} m, omega_z={:.2} rad/s, stand_hit={} | time={:.1} ms",
+        p_el_err,
+        vb_after[0],
+        p_pl_err,
+        ke_ratio_pl,
+        m_err,
+        p_err,
+        l_err,
+        gear_drift,
+        gear_w[2],
+        hit_stand,
+        t0.elapsed().as_secs_f64() * 1e3
+    );
+}
+
+
+
+
 
 

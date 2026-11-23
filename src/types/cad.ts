@@ -45,6 +45,8 @@ export interface DagNode {
   children?: string[];
 }
 
+export type MaterialFailureMode = 'ductile' | 'brittle';
+
 export interface MaterialSpec {
   id: string;
   name: string;
@@ -53,6 +55,18 @@ export interface MaterialSpec {
   youngsModulus: number; // Pa
   poissonsRatio: number;
   yieldStrength: number; // Pa
+  /** Ultimate tensile strength σ_u in Pascals (Pa, σ_u >= σ_y > 0) */
+  ultimateStrengthPa: number;
+  /** Isotropic linear hardening modulus H in Pascals (Pa, H >= 0) */
+  hardeningModulusPa: number;
+  /** Critical equivalent plastic strain to fracture ε_f (dimensionless, ε_f > 0) */
+  fractureStrain: number;
+  /** Specific fracture energy G_f in J/m^2 (G_f > 0) */
+  fractureEnergyJM2: number;
+  /** Dry Coulomb friction coefficient μ (dimensionless, μ >= 0) */
+  frictionCoeff: number;
+  /** Constitutive failure mode ('ductile' | 'brittle') */
+  failureMode: MaterialFailureMode;
   colorHex: string;
   roughness: number;
   metalness: number;
@@ -284,3 +298,199 @@ export interface McpToolExecution {
   durationMs: number;
   status: 'success' | 'error';
 }
+
+export type SimulationSubMode = 'kinematics' | 'destruction';
+
+export type DestructionScenarioMode =
+  | 'counter_clash'
+  | 'torque_overload'
+  | 'impact_crush';
+
+export type DestructionFieldMode =
+  | 'shaded'
+  | 'von_mises'
+  | 'plastic_strain'
+  | 'damage';
+
+export type DeformationScalePreset = 1 | 5 | 20;
+
+export type SimulationSolverBackend = 'rust_fem_f64' | 'web_local_preview';
+
+export interface EnergyBalanceSnapshot {
+  kineticJ: number;
+  elasticJ: number;
+  plasticJ: number;
+  fractureJ: number;
+  totalJ: number;
+}
+
+export interface DestructionSimConfig {
+  scenarioMode: DestructionScenarioMode;
+  durationSec: number; // e.g., 2.5
+  fps: number; // e.g., 60
+  motorRpmLeft: number; // signed RPM (+ = CCW, - = CW)
+  motorRpmRight: number; // signed RPM (+ = CCW -> head-on clash with left +RPM!)
+  impactTorqueNm: number; // driving torque / impact load in N*m
+  brittleness: number; // 0.2 (ductile steel) .. 1.0 (brittle cast iron / glass)
+  shardCountPerPart: number; // target shards per destructible part (12..48)
+  gravityY: number; // m/s^2, e.g. -9.81 or 0
+  restitution: number; // bounce factor 0.1..0.75
+  seed: number; // deterministic PRNG seed
+}
+
+export interface FractureShardGeometry {
+  id: string;
+  parentPartId: string;
+  materialId: string;
+  colorHex: string;
+  roughness: number;
+  metalness: number;
+  /** Local center of mass in parent part's local space */
+  localCom: [number, number, number];
+  boundingRadius: number;
+  mass: number;
+  /** Distance from shard centroid to primary contact/impact point (in meters) */
+  distToContact: number;
+  /** Outer machined CAD surface triangles (centered at localCom) */
+  vertices: Float32Array;
+  normals: Float32Array;
+  indices: Uint32Array;
+  /** Newly exposed inner crystalline fracture faces (centered at localCom) */
+  innerVertices: Float32Array;
+  innerNormals: Float32Array;
+  innerIndices: Uint32Array;
+}
+
+export interface DestructionTimelineEvent {
+  frameIndex: number;
+  timeSec: number;
+  type:
+    | 'contact'
+    | 'yield_onset'
+    | 'tooth_shear'
+    | 'fragment_detachment'
+    | 'body_fracture'
+    | 'floor_bounce';
+  label: string;
+  partId?: string;
+  stressMPa?: number;
+}
+
+export interface DestructionFrameMetrics {
+  peakStressMPa: number;
+  yieldLimitMPa: number;
+  contactForceN: number;
+  kineticEnergyJ: number;
+  elasticEnergyJ: number;
+  plasticEnergyJ: number;
+  fractureEnergyJ: number;
+  maxPlasticStrainPct: number;
+  maxDamage: number;
+  maxDisplacementMm: number;
+  activeShardsCount: number;
+  totalShardsCount: number;
+  fracturedPartsCount: number;
+  intactPartsCount: number;
+  statusLabel: string;
+}
+
+/**
+ * Active exterior triangle surface mesh of a deformable FEM body for a single simulation frame
+ * (`P5-T15`), transmitted directly from Rust `query_simulation_frame` (`surface_positions_m`,
+ * `surface_reference_positions_m`, `surface_indices`, `surface_node_indices`).
+ * Coordinates are in world meters and already reflect eroded/detached element cavities.
+ */
+export interface CachedFemSurfaceMesh {
+  /** Reference undeformed surface vertex positions in world meters [x, y, z, ...] */
+  referenceVertices: Float32Array;
+  /** Deformed surface vertex positions x(t) = X + u(t) in world meters [x, y, z, ...] */
+  deformedVertices: Float32Array;
+  /** Surface vertex displacement vectors u(t) = x(t) - X in meters [dx, dy, dz, ...] */
+  displacements: Float32Array;
+  /** Outward CCW triangle index buffer referencing compacted surface vertices */
+  indices: Uint32Array;
+  vertexCount: number;
+  triangleCount: number;
+  /** Per-surface-vertex von Mises stress σ_vM in MPa */
+  nodalStressMPa?: Float32Array;
+  /** Per-surface-vertex equivalent plastic strain ε_p (dimensionless) */
+  nodalPlasticStrain?: Float32Array;
+  /** Per-surface-vertex continuum damage D in [0, 1] */
+  nodalDamage?: Float32Array;
+}
+
+export interface CachedPartFrameState {
+  position: [number, number, number];
+  rotation: [number, number, number];
+  /** 0..1+ normalized stress ratio against material yieldStrength */
+  stressRatio: number;
+  /** True while the whole intact parent mesh should be displayed */
+  intact: boolean;
+  /** True when only contact-zone shards have broken off, rest is still spinning */
+  partiallyFractured: boolean;
+  /** Per-vertex local displacement vectors [dx, dy, dz, ...] in meters (scaled by 1x/5x/20x in viewport) */
+  deformedDisplacements?: Float32Array;
+  /** Per-vertex von Mises stress σ_vM in MPa */
+  nodalStressMPa?: Float32Array;
+  /** Per-vertex equivalent plastic strain ε_p (dimensionless, e.g. 0.02 = 2%) */
+  nodalPlasticStrain?: Float32Array;
+  /** Per-vertex continuum damage scalar D in [0, 1] */
+  nodalDamage?: Float32Array;
+  /** Active exterior FEM triangle surface mesh in world meters (P5-T15) */
+  femSurfaceMesh?: CachedFemSurfaceMesh;
+  /** Peak displacement magnitude on this part at this frame (mm) */
+  maxDisplacementMm?: number;
+  /** Peak equivalent plastic strain on this part at this frame (%) */
+  maxPlasticStrainPct?: number;
+  /** Peak damage scalar on this part at this frame [0..1] */
+  maxDamage?: number;
+}
+
+export interface DestructionCacheFrame {
+  frameIndex: number;
+  timeSec: number;
+  partStates: Record<string, CachedPartFrameState>;
+  /** Packed [x, y, z] per shard (length = shards.length * 3) */
+  shardPos: Float32Array;
+  /** Packed [qx, qy, qz, qw] per shard (length = shards.length * 4) */
+  shardQuat: Float32Array;
+  /** 0 = attached to intact parent, 1 = detached & simulating */
+  shardActive: Uint8Array;
+  /** 0..1 hot fracture glow intensity per shard */
+  shardStress: Float32Array;
+  /** Per-shard von Mises stress in MPa for field colormap rendering */
+  shardStressMPa?: Float32Array;
+  /** Per-shard equivalent plastic strain (dimensionless) for ε_p colormap rendering */
+  shardPlasticStrain?: Float32Array;
+  /** Per-shard continuum damage D in [0, 1] for damage colormap rendering */
+  shardDamage?: Float32Array;
+  /** Packed spark segments: [x, y, z, vx, vy, vz, life01] per spark */
+  sparks: Float32Array;
+  metrics: DestructionFrameMetrics;
+}
+
+export interface DestructionCache {
+  id: string;
+  createdAt: string;
+  solverBackend: SimulationSolverBackend;
+  solverLabel: string;
+  rustSimulationId?: string;
+  config: DestructionSimConfig;
+  fps: number;
+  totalFrames: number;
+  durationSec: number;
+  floorY: number;
+  contactPoint: [number, number, number];
+  bakeTimeMs: number;
+  cacheBytes: number;
+  shards: FractureShardGeometry[];
+  frames: DestructionCacheFrame[];
+  events: DestructionTimelineEvent[];
+  maxStressOverallMPa: number;
+  yieldStrengthRefMPa: number;
+  maxPlasticStrainOverallPct: number;
+  maxDamageOverall: number;
+  maxEnergyOverallJ: number;
+}
+
+

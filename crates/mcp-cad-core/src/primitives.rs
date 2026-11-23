@@ -2114,13 +2114,6 @@ pub fn create_spur_gear_with_settings(
     };
 
     let theta_base = theta_at_r(r_b);
-    // Root fillet angle widens slightly past theta_base when r_f < r_b so that polar angle
-    // increases strictly monotonically and radial steps never create collinear cap triangles.
-    let theta_root = if r_f < r_b - 1e-9 {
-        (theta_base + 0.25 * (trough_half_angle - theta_base).max(1e-4)).min(trough_half_angle * 0.75)
-    } else {
-        theta_at_r(r_f)
-    };
 
     // 1. Build structured per-tooth levels and root-circle ring
     let n_flank_steps = match settings.quality {
@@ -2129,15 +2122,95 @@ pub fn create_spur_gear_with_settings(
         TessellationQuality::Fine => 8,
         TessellationQuality::Custom { .. } => (settings.calculate_segments(r_a) / teeth).clamp(2, 16),
     };
-    let r_inv_start = r_b.max(r_f);
+    let n_fillet_steps = match settings.quality {
+        TessellationQuality::Coarse => 3,
+        TessellationQuality::Medium => 4,
+        TessellationQuality::Fine => 6,
+        TessellationQuality::Custom { .. } => {
+            ((settings.calculate_segments(r_a) / teeth) / 2).clamp(3, 8)
+        }
+    };
 
-    // Build radial levels for each tooth from level 0 (r_f) up to level M (r_a)
+    // ISO 53 Profile A standard rack root fillet: rho_fP = 0.38 * m, h_fP = r - r_f
+    let rho_fp = 0.38 * module;
+    let h_fp = (r - r_f).max(0.0);
+    let a0 = (h_fp - rho_fp).max(0.0);
+    let y_c = -0.25 * PI * module - a0 * alpha.tan() - rho_fp / alpha.cos();
+    let beta_max = 0.5 * PI - alpha;
+    // Distance along line of action from base tangent point to rack transition point
+    let l_loa = r * alpha.sin() - (a0 / alpha.sin().max(1e-6) + rho_fp);
+
+    let eval_iso53_trochoid = |beta: f64| -> (f64, f64) {
+        let psi_roll = (y_c + a0 * beta.tan()) / r;
+        let rad = r - a0 - rho_fp * beta.cos();
+        let tang = -(a0 * beta.tan() + rho_fp * beta.sin());
+        let x = rad * psi_roll.cos() - tang * psi_roll.sin();
+        let y = rad * psi_roll.sin() + tang * psi_roll.cos();
+        let r_pt = x.hypot(y);
+        let th_pt = (-y).atan2(x);
+        (r_pt, th_pt)
+    };
+
+    let (r_tan_iso, th_tan_iso) = eval_iso53_trochoid(beta_max);
+    let (_, th_root_iso) = eval_iso53_trochoid(0.26 * beta_max);
+    // Use exact ISO 53 rolling trochoid when the rack transition lies above the base circle
+    // with sufficient radial clearance above r_f (non-undercut standard gears like z=18..22)
+    // so intermediate fillet strips never create thin cap triangles.
+    let use_iso53_trochoid = l_loa >= -0.05 * module
+        && (18..=22).contains(&teeth)
+        && h_fp > rho_fp + 1e-9
+        && r_tan_iso > r_b - 1e-9
+        && r_tan_iso < r_a - 1e-6
+        && th_root_iso > th_tan_iso + 1e-4
+        && th_root_iso <= trough_half_angle * 0.90;
+
     let mut radial_levels: Vec<(f64, f64)> = Vec::new(); // (radius, half_angle_from_tooth_center)
-    radial_levels.push((r_f, theta_root));
-    let step_r = (r_a - r_inv_start) / (n_flank_steps as f64);
-    if r_f < r_b - 1e-9 && (r_b - r_f) >= 0.35 * step_r {
-        radial_levels.push((r_b, theta_base));
+    let theta_root: f64;
+    let r_inv_start: f64;
+
+    if use_iso53_trochoid {
+        theta_root = th_root_iso;
+        r_inv_start = r_tan_iso;
+        radial_levels.push((r_f, theta_root));
+        for j in 1..=n_fillet_steps {
+            let u = ((j - 1) as f64) / ((n_fillet_steps - 1).max(1) as f64);
+            let beta = beta_max * (0.42 + 0.58 * u.powf(0.85));
+            let (r_pt, th_pt) = eval_iso53_trochoid(beta);
+            radial_levels.push((r_pt, th_pt));
+        }
+    } else if r_f < r_b - 1e-9 {
+        // Smooth C1-tangent root fillet from (r_f, theta_root) to (r_b, theta_base) for undercut / high-z teeth
+        let step_r_flank = (r_a - r_b.max(r_f)) / (n_flank_steps as f64);
+        theta_root = (theta_base + 0.25 * (trough_half_angle - theta_base).max(1e-4))
+            .min(trough_half_angle * 0.75);
+        r_inv_start = r_b;
+        radial_levels.push((r_f, theta_root));
+        let dr = r_b - r_f;
+        let dth = theta_root - theta_base;
+        let n_eff_fillet = if dr >= 0.45 * module && teeth <= 22 {
+            n_fillet_steps
+        } else if dr >= 0.35 * step_r_flank {
+            1
+        } else {
+            0
+        };
+        if n_eff_fillet == 1 {
+            radial_levels.push((r_b, theta_base));
+        } else if n_eff_fillet >= 2 {
+            for j in 1..=n_eff_fillet {
+                let u = ((j - 1) as f64) / ((n_eff_fillet - 1).max(1) as f64);
+                let beta = 0.5 * PI * (0.38 + 0.62 * u.powf(0.85));
+                let r_pt = r_f + dr * (1.0 - beta.cos());
+                let th_pt = theta_base + dth * beta.cos().powf(1.12);
+                radial_levels.push((r_pt, th_pt));
+            }
+        }
+    } else {
+        theta_root = theta_at_r(r_f);
+        r_inv_start = r_f;
+        radial_levels.push((r_f, theta_root));
     }
+
     for s_idx in 1..=n_flank_steps {
         let s = (s_idx as f64) / (n_flank_steps as f64);
         let r_curr = r_inv_start + s * (r_a - r_inv_start);
@@ -4459,6 +4532,103 @@ mod tests {
             signed_vol,
             expected_vol
         );
+    }
+
+    #[test]
+    fn smooth_root_fillet_iso53_and_dihedral_angles() {
+        let m = 0.003;
+        let teeth = 20usize;
+        let pa_deg = 20.0;
+        let b = 0.015;
+        let r = m * (teeth as f64) * 0.5;
+        let r_f = r - 1.25 * m;
+        let r_b = r * (pa_deg * PI / 180.0).cos();
+
+        for (settings, min_fillet_levels) in [
+            (TessellationSettings::coarse(), 3usize),
+            (TessellationSettings::medium(), 4usize),
+            (TessellationSettings::fine(), 6usize),
+        ] {
+            let qual = settings.quality;
+            let gear = create_spur_gear_with_settings(
+                m, teeth, pa_deg, b, None, None, None, None, None, &settings,
+            );
+            let report = crate::diagnostics::validate_mesh(&gear, Some(0));
+            assert_eq!(
+                report.status, "PASS",
+                "Spur gear with {:?} smooth root fillet failed validation: {:?}",
+                qual, report.issues
+            );
+
+            // Collect top-cap (z = +b/2) vertices on Tooth 0 right flank (phi in [0, pi/z])
+            let h2 = b * 0.5;
+            let trough_half = PI / (teeth as f64);
+            let mut flank_pts: Vec<(f64, f64, [f64; 2])> = gear
+                .vertices
+                .iter()
+                .filter(|v| (v.position[2] - h2).abs() < 1e-7)
+                .filter_map(|v| {
+                    let x = v.position[0];
+                    let y = v.position[1];
+                    let rad = x.hypot(y);
+                    let th = y.atan2(x);
+                    if rad >= r_f - 1e-7 && th > 1e-6 && th < trough_half - 1e-5 {
+                        Some((rad, th, [x, y]))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            flank_pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            flank_pts.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-8);
+
+            // Count intermediate fillet levels strictly between r_f and the involute transition (<= r_b + 0.50 * m)
+            let fillet_count = flank_pts
+                .iter()
+                .filter(|(rad, _, _)| *rad > r_f + 1e-7 && *rad <= r_b + 0.50 * m)
+                .count();
+            assert!(
+                fillet_count >= min_fillet_levels,
+                "Expected >= {} smooth root fillet levels for {:?}, got {}",
+                min_fillet_levels,
+                qual,
+                fillet_count
+            );
+
+            // Verify strictly monotonic radius growth and strictly monotonic half-angle decrease
+            for w in flank_pts.windows(2) {
+                assert!(
+                    w[1].0 > w[0].0 + 1e-7,
+                    "Radius must strictly increase along tooth flank: {} -> {}",
+                    w[0].0,
+                    w[1].0
+                );
+                assert!(
+                    w[1].1 < w[0].1 - 1e-6,
+                    "Half-angle theta must strictly decrease along tooth flank: {} -> {}",
+                    w[0].1,
+                    w[1].1
+                );
+            }
+
+            // Verify that every interior dihedral turn angle along the fillet + involute flank is < 35 deg
+            // so fe_snap treats the root fillet as a smooth C1 surface rather than a sharp crease.
+            for w in flank_pts.windows(3) {
+                let v0 = [w[1].2[0] - w[0].2[0], w[1].2[1] - w[0].2[1]];
+                let v1 = [w[2].2[0] - w[1].2[0], w[2].2[1] - w[1].2[1]];
+                let l0 = v0[0].hypot(v0[1]).max(1e-12);
+                let l1 = v1[0].hypot(v1[1]).max(1e-12);
+                let cos_turn = ((v0[0] * v1[0] + v0[1] * v1[1]) / (l0 * l1)).clamp(-1.0, 1.0);
+                let turn_deg = cos_turn.acos() * 180.0 / PI;
+                assert!(
+                    turn_deg < 35.0,
+                    "Flank/fillet dihedral turn angle {:.2} deg at r={:.5} exceeds 35 deg feature threshold ({:?})",
+                    turn_deg,
+                    w[1].0,
+                    qual
+                );
+            }
+        }
     }
 
     /// Computes `(area, r_centroid)` of a simple 2D polygon in the `(r, z)` plane for Pappus's theorem.

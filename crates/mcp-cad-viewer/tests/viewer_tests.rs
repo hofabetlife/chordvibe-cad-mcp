@@ -110,13 +110,8 @@ fn test_offscreen_render_mesh_png() {
     assert!(!cube.vertices.is_empty());
     assert!(!cube.indices.is_empty());
 
-    let renderer = match OffscreenRenderer::new() {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Skipping offscreen test due to unavailable GPU adapter in environment: {e}");
-            return;
-        }
-    };
+    let renderer = OffscreenRenderer::new()
+        .expect("OffscreenRenderer initialization must succeed via GPU or CPU fallback");
 
     let width = 640;
     let height = 480;
@@ -159,13 +154,8 @@ fn test_offscreen_fea_heatmap_png() {
         .map(|i| (i as f32) / ((vert_count - 1).max(1) as f32))
         .collect();
 
-    let renderer = match OffscreenRenderer::new() {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Skipping FEA heatmap test due to unavailable GPU adapter in environment: {e}");
-            return;
-        }
-    };
+    let renderer = OffscreenRenderer::new()
+        .expect("OffscreenRenderer initialization must succeed via GPU or CPU fallback");
 
     let width = 800;
     let height = 600;
@@ -253,13 +243,8 @@ fn test_offscreen_render_part_adaptive() {
     use mcp_cad_core::part::Part;
     use mcp_cad_viewer::{TessellationQuality, TessellationSettings};
 
-    let renderer = match OffscreenRenderer::new() {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Skipping test due to unavailable GPU: {e}");
-            return;
-        }
-    };
+    let renderer = OffscreenRenderer::new()
+        .expect("OffscreenRenderer initialization must succeed via GPU or CPU fallback");
 
     let material = Material::new(
         "steel",
@@ -386,4 +371,43 @@ fn test_debug_render_modes() {
         );
         assert_eq!(&png[0..8], &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
     }
+}
+
+#[test]
+fn test_p5_t9_cpu_fallback_and_shared_renderer_without_gpu() {
+    let cpu = OffscreenRenderer::new_software_cpu();
+    assert!(cpu.is_software_cpu());
+    assert_eq!(cpu.backend_name(), "software_cpu");
+
+    let cube = create_box(1.2, 0.8, 0.6);
+    for preset in [
+        CameraPreset::Isometric,
+        CameraPreset::Front,
+        CameraPreset::Top,
+        CameraPreset::Right,
+    ] {
+        let png = cpu
+            .render_mesh_png(&cube, preset, 320, 240)
+            .unwrap_or_else(|e| panic!("CPU fallback failed for preset {:?}: {e}", preset));
+        assert_eq!(&png[0..8], &PNG_MAGIC);
+        let img = image::load_from_memory(&png)
+            .expect("CPU fallback PNG must decode")
+            .to_rgba8();
+        assert_eq!(img.dimensions(), (320, 240));
+        let bg = [38u8, 43, 51, 255];
+        let fg = img.pixels().filter(|p| p.0 != bg).count();
+        assert!(
+            fg > 3_000,
+            "Preset {:?} must render visible shaded geometry (fg={fg})",
+            preset
+        );
+    }
+
+    // Verify process-wide shared renderer also initializes cleanly in headless environments
+    let shared = OffscreenRenderer::shared()
+        .expect("OffscreenRenderer::shared() must succeed via GPU or CPU fallback");
+    let b64 = shared
+        .render_mesh_base64(&cube, CameraPreset::Isometric, 240, 180)
+        .expect("Shared renderer Base64 output must succeed");
+    assert!(b64.starts_with("iVBORw0KGgo"));
 }

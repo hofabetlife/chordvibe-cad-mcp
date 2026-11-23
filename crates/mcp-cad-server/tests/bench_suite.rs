@@ -103,7 +103,8 @@ async fn rpc_call(state: &mcp_cad_server::SharedState, id: u64, tool: &str, args
 
 fn map_ts_material_to_rust(ts_mat: Option<&str>) -> &'static str {
     match ts_mat.unwrap_or("steel_1045") {
-        "steel_1045" | "steel_structural_aisi1020" => "steel_structural_aisi1020",
+        "steel_1045" | "steel_carbon_aisi1045" => "steel_carbon_aisi1045",
+        "steel_1020" | "steel_structural_aisi1020" => "steel_structural_aisi1020",
         "steel_4140" | "steel_high_strength_4140" => "steel_high_strength_4140",
         "alu_6061" | "aluminum_6061_t6" => "aluminum_6061_t6",
         "ti_6al_4v" | "titanium_grade5_ti6al4v" => "titanium_grade5_ti6al4v",
@@ -111,6 +112,7 @@ fn map_ts_material_to_rust(ts_mat: Option<&str>) -> &'static str {
         "nylon_pa12" => "nylon_pa12",
         "pla_3d" | "pla_filament_3dprint" => "pla_filament_3dprint",
         "petg_3d" | "petg_filament_3dprint" => "petg_filament_3dprint",
+        "borosilicate_glass" | "pyrex" | "glass" => "borosilicate_glass",
         _ => "steel_structural_aisi1020",
     }
 }

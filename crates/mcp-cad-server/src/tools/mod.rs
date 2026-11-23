@@ -1,6 +1,7 @@
 //! MCP tool registry, JSON schemas, and execution dispatcher.
 
 pub mod cad;
+pub mod coupled_sim;
 pub mod fea;
 pub mod metrics;
 pub mod physics;
@@ -15,14 +16,14 @@ use crate::error::ServerError;
 use crate::protocol::{ToolCallResult, ToolDefinition};
 use crate::state::EngineState;
 
-/// Returns the complete registry of all 41 MCP engineering tools with strict input schemas,
+/// Returns the complete registry of all 43 MCP engineering tools with strict input schemas,
 /// explicit unit contracts, usage examples, common errors, and recommended next steps.
 pub fn list_tools() -> Vec<ToolDefinition> {
     vec![
         // 1. create_part
         ToolDefinition {
             name: "create_part".to_string(),
-            description: "Creates a new CAD part assigned with an engineering material (e.g. aluminum_6061_t6 / alu_6061 / Al6061-T6, steel_structural_aisi1020 / steel_1045, steel_high_strength_4140 / steel_4140, titanium_grade5_ti6al4v / ti_6al_4v / Ti-6Al-4V, brass_c360, pla_filament_3dprint / pla_3d, petg_filament_3dprint / petg_3d, nylon_pa12 / nylon_pa6). Units: subsequent linear feature dimensions use active length_unit ('mm' by default, or 'm'); material density is in kg/m^3, yield strength in MPa, Young's modulus in GPa. Example: {\"name\": \"Support Bracket\", \"material\": \"aluminum_6061_t6\", \"part_id\": \"bracket_1\", \"is_fixed\": false}. Common errors: UNKNOWN_MATERIAL (material not in registry), PART_ALREADY_EXISTS (duplicate part_id), INVALID_ARGUMENT (empty name). Next step: call 'set_requirements' to declare design constraints or 'add_feature_primitive' to add 3D geometry.".to_string(),
+            description: "Creates a new CAD part assigned with an engineering material (e.g. aluminum_6061_t6 / alu_6061 / Al6061-T6, steel_structural_aisi1020 / steel_1020, steel_carbon_aisi1045 / steel_1045, steel_high_strength_4140 / steel_4140, titanium_grade5_ti6al4v / ti_6al_4v / Ti-6Al-4V, brass_c360, pla_filament_3dprint / pla_3d, petg_filament_3dprint / petg_3d, nylon_pa12 / nylon_pa6, borosilicate_glass / pyrex / glass). Units: subsequent linear feature dimensions use active length_unit ('mm' by default, or 'm'); material density is in kg/m^3, yield strength in MPa, Young's modulus in GPa. Example: {\"name\": \"Support Bracket\", \"material\": \"aluminum_6061_t6\", \"part_id\": \"bracket_1\", \"is_fixed\": false}. Common errors: UNKNOWN_MATERIAL (material not in registry), PART_ALREADY_EXISTS (duplicate part_id), INVALID_ARGUMENT (empty name). Next step: call 'set_requirements' to declare design constraints or 'add_feature_primitive' to add 3D geometry.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -32,7 +33,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     },
                     "material": {
                         "type": "string",
-                        "description": "Identifier of material from registry or common alias (e.g. aluminum_6061_t6, alu_6061, Al6061-T6, steel_structural_aisi1020, steel_1045, steel_high_strength_4140, steel_4140, titanium_grade5_ti6al4v, ti_6al_4v, brass_c360, pla_filament_3dprint, petg_filament_3dprint, nylon_pa12)"
+                        "description": "Identifier of material from registry or common alias (e.g. aluminum_6061_t6, alu_6061, Al6061-T6, steel_structural_aisi1020, steel_1020, steel_carbon_aisi1045, steel_1045, steel_high_strength_4140, steel_4140, titanium_grade5_ti6al4v, ti_6al_4v, brass_c360, pla_filament_3dprint, petg_filament_3dprint, nylon_pa12, borosilicate_glass, pyrex, glass)"
                     },
                     "part_id": {
                         "type": "string",
@@ -530,7 +531,12 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     "element_order": {
                         "type": "integer",
                         "enum": [1, 2],
-                        "description": "Finite element polynomial order (dimensionless integer): 1 for linear 4-node tetrahedra (TET4, default) or 2 for quadratic 10-node tetrahedra (TET10, eliminates shear locking in bending)"
+                        "description": "Finite element polynomial order (dimensionless integer): 1 for linear 4-node tetrahedra (TET4, default) or 2 for quadratic 10-node tetrahedra (TET10, eliminates shear locking in bending; automatic default when accuracy_mode='high')"
+                    },
+                    "accuracy_mode": {
+                        "type": "string",
+                        "enum": ["fast", "standard", "high"],
+                        "description": "Meshing and formulation accuracy preset: 'fast' (legacy voxel grid, default when omitted), 'standard' (boundary-conforming snapped mesh), or 'high' (boundary-conforming curved TET10 mesh with local adaptive refinement in holes, fillets, gear roots, and load zones)"
                     },
                     "convergence_study": {
                         "type": "boolean",
@@ -992,6 +998,35 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     "density_kg_m3": {
                         "type": "number",
                         "description": "Mass density in kilograms per cubic meter (kg/m³, must be > 0)"
+                    },
+                    "ultimate_strength_pa": {
+                        "type": "number",
+                        "description": "Optional ultimate tensile strength σ_u in Pascals (Pa, must satisfy σ_u >= σ_y)"
+                    },
+                    "ultimate_strength_mpa": {
+                        "type": "number",
+                        "description": "Optional ultimate tensile strength σ_u in Megapascals (MPa, must satisfy σ_u >= σ_y)"
+                    },
+                    "hardening_modulus_pa": {
+                        "type": "number",
+                        "description": "Optional isotropic linear hardening modulus H in Pascals (Pa, must be >= 0)"
+                    },
+                    "fracture_strain": {
+                        "type": "number",
+                        "description": "Optional critical equivalent plastic strain to fracture ε_f (dimensionless, must be > 0)"
+                    },
+                    "fracture_energy_j_m2": {
+                        "type": "number",
+                        "description": "Optional specific fracture energy G_f in J/m² (must be > 0)"
+                    },
+                    "friction_coeff": {
+                        "type": "number",
+                        "description": "Optional dry Coulomb friction coefficient μ (dimensionless, must be >= 0)"
+                    },
+                    "failure_mode": {
+                        "type": "string",
+                        "enum": ["ductile", "brittle"],
+                        "description": "Optional constitutive failure mode ('ductile' or 'brittle', default 'ductile')"
                     }
                 },
                 "required": [
@@ -1333,6 +1368,11 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                         "type": "integer",
                         "enum": [1, 2],
                         "description": "Finite element polynomial order (dimensionless integer): 1 for linear 4-node tetrahedra (TET4) or 2 for quadratic 10-node tetrahedra (TET10, default: 2)"
+                    },
+                    "accuracy_mode": {
+                        "type": "string",
+                        "enum": ["fast", "standard", "high"],
+                        "description": "Meshing accuracy preset: 'fast' (voxel grid), 'standard' (boundary-conforming snapped mesh), or 'high' (boundary-conforming curved TET10 with local refinement around stress concentrators and joint anchors)"
                     },
                     "convergence_study": {
                         "type": "boolean",
@@ -1722,6 +1762,172 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "required": ["recipe"]
             }),
         },
+        // 42. bake_coupled_simulation
+        ToolDefinition {
+            name: "bake_coupled_simulation".to_string(),
+            description: "Runs, monitors, or cancels a server-side coupled implicit HHT-alpha (f64, unconditionally stable, CFL-free) dynamic FEA + contact + plasticity + fracture simulation bake, caching compact per-frame deformation/stress/damage/fragment/hub_reactions fields on the server and streaming real-time progress over SSE (/api/coupled-sim/events and /sse). Automatically extracts active PhysicsWorld joints and motors (Revolute, Prismatic, Fixed, Gear) into dynamic RBE2 hub couplings so mechanisms and gear trains run without manual initial_velocities. Units: duration_s in seconds (s); dt_ms, dt_min_ms, dt_max_ms in milliseconds (ms); output_fps in frames per second (1/s); hht_alpha in [-0.3, 0.0] (dimensionless); forces in Newtons (N); initial_velocities in m/s; gravity in m/s^2; output stresses in MPa, displacements in mm, energies in J. Example: {\"action\": \"bake\", \"accuracy_level\": \"standard\", \"part_ids\": [\"beam_1\"], \"duration_s\": 0.02, \"dt_ms\": 1.0, \"fixed_faces\": [{\"part_id\": \"beam_1\", \"face\": \"min_x\"}], \"loads\": [{\"part_id\": \"beam_1\", \"face\": \"max_x\", \"force\": [0.0, -500.0, 0.0]}], \"async_mode\": false}. Common errors: PART_NOT_FOUND, INVALID_ARGUMENT (invalid accuracy_level, hht_alpha outside [-0.3, 0.0], non-positive duration_s), JOB_NOT_FOUND (unknown job_id for status/cancel), FEA_ERROR. Next step: call 'query_simulation_frame' to fetch cached deformed coordinates, von Mises stress, plastic strain, damage, contact forces, hub reactions, and detached fragments for any frame or timestamp.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["bake", "status", "cancel"],
+                        "description": "Operation mode: 'bake' starts a new implicit HHT-alpha coupled pre-bake (default), 'status' queries job progress, 'cancel' stops a running bake job"
+                    },
+                    "job_id": {
+                        "type": "string",
+                        "description": "Target bake job ID for action='status' or action='cancel' (defaults to the most recent job)"
+                    },
+                    "accuracy_level": {
+                        "type": "string",
+                        "enum": ["standard", "high", "ultra"],
+                        "description": "Accuracy preset controlling mesh resolution and element order: 'standard' (TET4 coarse), 'high' (boundary-snapped medium), or 'ultra' (curved TET10 high accuracy)"
+                    },
+                    "part_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional list of CAD part IDs to include in the coupled simulation (defaults to all non-empty parts in the scene)"
+                    },
+                    "duration_s": {
+                        "type": "number",
+                        "description": "Total physical duration to simulate in seconds (s, default: 0.02)"
+                    },
+                    "dt_ms": {
+                        "type": "number",
+                        "description": "Initial adaptive HHT-alpha time step in milliseconds (ms, unrestricted by explicit CFL limit)"
+                    },
+                    "dt_min_ms": {
+                        "type": "number",
+                        "description": "Minimum adaptive bisection time step floor in milliseconds (ms)"
+                    },
+                    "dt_max_ms": {
+                        "type": "number",
+                        "description": "Maximum adaptive time step cap in milliseconds (ms)"
+                    },
+                    "output_fps": {
+                        "type": "number",
+                        "description": "Target cached timeline frame rate in frames per second (dimensionless Hz / 1/second)"
+                    },
+                    "max_frames": {
+                        "type": "integer",
+                        "description": "Maximum number of cached timeline frames stored on the server (dimensionless integer, 1..5000)"
+                    },
+                    "hht_alpha": {
+                        "type": "number",
+                        "description": "Hilber-Hughes-Taylor algorithmic damping parameter alpha in [-0.3, 0.0] (dimensionless; 0.0 is exact energy-conserving Newmark, -0.05 is default)"
+                    },
+                    "mass_matrix": {
+                        "type": "string",
+                        "enum": ["consistent", "lumped"],
+                        "description": "Mass matrix formulation: 'consistent' (full integral M) or 'lumped' (strictly positive diagonal / HRZ lumping)"
+                    },
+                    "linear_solver": {
+                        "type": "string",
+                        "enum": ["auto", "ldlt", "ic_pcg", "ssor_pcg", "jacobi_pcg"],
+                        "description": "Sparse linear solver backend: 'auto' (RCM LDL^T direct for small/medium systems, IC(0)-PCG for large), 'ldlt', 'ic_pcg', 'ssor_pcg', or 'jacobi_pcg'"
+                    },
+                    "mesh_density": {
+                        "type": "string",
+                        "enum": ["coarse", "medium", "fine"],
+                        "description": "Optional override for tetrahedral mesh density ('coarse', 'medium', or 'fine')"
+                    },
+                    "enable_plasticity": {
+                        "type": "boolean",
+                        "description": "Enable J2 von Mises elastoplastic radial return mapping (default: true)"
+                    },
+                    "enable_fracture": {
+                        "type": "boolean",
+                        "description": "Enable local continuum damage, element erosion, and detached fragment extraction (default: true)"
+                    },
+                    "enable_contact": {
+                        "type": "boolean",
+                        "description": "Enable pairwise deformable-to-deformable contact with Coulomb friction when multiple parts are simulated (default: true)"
+                    },
+                    "use_physics_joints": {
+                        "type": "boolean",
+                        "description": "Automatically extract active PhysicsWorld joints and motors (Revolute, Prismatic, Fixed, Gear) as dynamic HHT-alpha hub couplings (default: true)"
+                    },
+                    "corotated": {
+                        "type": "boolean",
+                        "description": "Enable Co-Rotated FEM finite-rotation kinematics F = R*U (default: true)"
+                    },
+                    "contact_friction": {
+                        "type": "number",
+                        "description": "Coulomb dry friction coefficient mu >= 0 for deformable contact pairs (dimensionless, default: 0.2)"
+                    },
+                    "gravity": {
+                        "type": "array",
+                        "items": { "type": "number" },
+                        "minItems": 3,
+                        "maxItems": 3,
+                        "description": "Uniform gravitational acceleration vector [gx, gy, gz] in m/s^2 (m/s per second, default: [0, 0, 0])"
+                    },
+                    "fixed_faces": {
+                        "type": "array",
+                        "description": "List of fixed support faces: strings like 'min_x' or objects {\"part_id\": \"...\", \"face\": \"min_x|max_x|min_y|max_y|min_z|max_z\"}"
+                    },
+                    "loads": {
+                        "type": "array",
+                        "description": "List of external force loads: objects {\"part_id\": \"...\", \"face\": \"max_x\", \"force\": [fx, fy, fz]} where force is in Newtons (N)"
+                    },
+                    "initial_velocities": {
+                        "description": "Optional uniform initial velocity per part in m/s as object {\"part_id\": [vx, vy, vz]} or array [{\"part_id\": \"...\", \"velocity\": [vx, vy, vz]}]"
+                    },
+                    "force_curve": {
+                        "type": "object",
+                        "description": "Optional time modulation for external loads: {\"type\": \"constant|ramp|pulse|sine\", \"amplitude\": 1.0, \"duration_s\": ..., \"start_s\": ..., \"end_s\": ..., \"frequency_hz\": ...} (time in seconds (s), amplitude dimensionless)"
+                    },
+                    "async_mode": {
+                        "type": "boolean",
+                        "description": "If true, runs the bake in a background worker thread and returns job_id immediately for SSE streaming and cancellation; if false (default), blocks until bake completes"
+                    },
+                    "length_unit": {
+                        "type": "string",
+                        "enum": ["mm", "m"],
+                        "description": "Optional per-call length unit override ('mm' or 'm'; defaults to session length_unit)"
+                    }
+                }
+            }),
+        },
+        // 43. query_simulation_frame
+        ToolDefinition {
+            name: "query_simulation_frame".to_string(),
+            description: "Queries a compact cached frame from a previously baked coupled dynamic HHT-alpha simulation by frame_index or nearest time_s, returning deformed nodal coordinates x(t) = X + u(t), active exterior FEM surface triangle meshes (surface_positions_m, surface_reference_positions_m, surface_indices, surface_node_indices reflecting eroded/detached cavities), displacements, von Mises stress, equivalent plastic strain, continuum damage D, eroded elements, detached rigid fragments with synchronized poses and local-space FEM triangle geometry, contact forces, and energy balance. Units: time_s and dt_used_s in seconds (s); deformed_positions and fragment positions in active length_unit ('mm' by default, or 'm'); surface_positions_m, surface_reference_positions_m, position_m, and fragment mesh vertices_m in meters (m); displacements in mm; stresses in MPa; plastic strain and damage D dimensionless; forces in Newtons (N); velocities in m/s and rad/s; energies in Joules (dimensionless/J). Example: {\"frame_index\": 10, \"include_mesh_fields\": true, \"include_fragment_meshes\": true}. Common errors: SIMULATION_NOT_FOUND (run bake_coupled_simulation first), FRAME_OUT_OF_RANGE, PART_NOT_FOUND, INVALID_ARGUMENT. Next step: scrub additional frame indices for timeline playback or fetch cached fragment geometry once via GET /api/coupled-sim/fragments/:sim_id.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "simulation_id": {
+                        "type": "string",
+                        "description": "Optional cached simulation ID returned by bake_coupled_simulation (defaults to the most recent cached simulation)"
+                    },
+                    "frame_index": {
+                        "type": "integer",
+                        "description": "Zero-based timeline frame index to retrieve (dimensionless integer; defaults to the last frame if neither frame_index nor time_s is supplied)"
+                    },
+                    "time_s": {
+                        "type": "number",
+                        "description": "Target physical simulation timestamp in seconds (s); selects the nearest cached frame when frame_index is omitted"
+                    },
+                    "part_id": {
+                        "type": "string",
+                        "description": "Optional part ID filter to return field arrays only for a single part"
+                    },
+                    "include_mesh_fields": {
+                        "type": "boolean",
+                        "description": "If true (default), includes per-node deformed_positions, displacements_mm, nodal_von_mises_mpa, nodal_equiv_plastic_strain, nodal_damage, and active exterior FEM surface mesh arrays (surface_positions_m, surface_reference_positions_m, surface_indices, surface_node_indices); set false for lightweight scalar summary"
+                    },
+                    "include_fragment_meshes": {
+                        "type": "boolean",
+                        "description": "If true (defaults to include_mesh_fields), embeds each detached fragment's local-space triangle mesh (vertices_m, normals, indices) inside detached_fragments; set false when the client fetches fragment meshes once via GET /api/coupled-sim/fragments/:sim_id"
+                    },
+                    "length_unit": {
+                        "type": "string",
+                        "enum": ["mm", "m"],
+                        "description": "Optional per-call length unit override for coordinates ('mm' or 'm'; defaults to session length_unit)"
+                    }
+                }
+            }),
+        },
     ]
 }
 
@@ -1896,6 +2102,14 @@ pub fn dispatch_tool(
         }
         "apply_recipe" => {
             let res = recipes::apply_recipe(args, state)?;
+            ToolCallResult::json(&res).map_err(ServerError::Json)
+        }
+        "bake_coupled_simulation" => {
+            let res = coupled_sim::bake_coupled_simulation(args, state)?;
+            ToolCallResult::json(&res).map_err(ServerError::Json)
+        }
+        "query_simulation_frame" => {
+            let res = coupled_sim::query_simulation_frame(args, state)?;
             ToolCallResult::json(&res).map_err(ServerError::Json)
         }
         other => Err(ServerError::ToolNotFound(other.to_string())),

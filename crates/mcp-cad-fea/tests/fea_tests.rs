@@ -1251,6 +1251,198 @@ fn test_p3_t4_tet10_mesh_conversion_eigenvalues_and_multi_element_patch_test() {
     }
 }
 
+#[test]
+fn test_p5_t2_conforming_octree_zero_hanging_nodes_and_local_refinement() {
+    use mcp_cad_core::primitives::{create_box, cut_hole};
+    use mcp_cad_fea::conforming_mesh::{ConformingMeshOptions, LocalRefinementOptions};
+    use std::collections::HashMap;
+
+    // Plate 120x60x10 mm with centered Ø20 mm through-hole
+    let plate = create_box(0.12, 0.06, 0.01);
+    let plate_with_hole = cut_hole(&plate, [0.0, 0.0, 0.0], [0.0, 0.0, 1.0], 0.01, 0.02, None, None);
+
+    let mut opts = ConformingMeshOptions::high_accuracy(MeshDensity::Coarse);
+    opts.refinement = LocalRefinementOptions {
+        enabled: true,
+        max_depth: 1,
+        max_leaf_cells: 1600,
+        ..LocalRefinementOptions::default()
+    };
+
+    let tet10 = TetrahedralMesh::from_mesh_conforming(&plate_with_hole, &opts)
+        .expect("Conforming octree TET10 meshing must succeed");
+    assert!(tet10.is_tet10());
+    assert!(tet10.is_boundary_conforming());
+
+    // 1. Verify zero hanging nodes: exterior surface triangles form a strictly closed 2-manifold
+    //    where every undirected surface edge is shared by exactly 2 exterior triangles.
+    let surf_tris = tet10.extract_surface_triangles();
+    assert!(!surf_tris.is_empty());
+    let mut edge_counts: HashMap<(usize, usize), usize> = HashMap::new();
+    for &[a, b, c] in &surf_tris {
+        for (u, v) in [(a, b), (b, c), (c, a)] {
+            let key = if u < v { (u, v) } else { (v, u) };
+            *edge_counts.entry(key).or_insert(0) += 1;
+        }
+    }
+    let non_manifold_or_open = edge_counts.values().filter(|&&cnt| cnt != 2).count();
+    assert_eq!(
+        non_manifold_or_open, 0,
+        "Conforming octree mesh must have zero hanging nodes / open edges (found {non_manifold_or_open})"
+    );
+
+    // 2. Verify quality invariants & Gauss Jacobians
+    let metrics = tet10.evaluate_quality(&plate_with_hole, None, 0.0);
+    assert_eq!(metrics.inverted_elements, 0);
+    assert!(
+        metrics.min_scaled_jacobian >= 0.06,
+        "Expected min_scaled_jacobian >= 0.06, got {:.4}",
+        metrics.min_scaled_jacobian
+    );
+    assert!(metrics.all_tet10_gauss_jacobians_positive);
+
+    // 3. Verify local refinement near the hole edge vs far-field corners
+    let mut near_hole_edges = Vec::new();
+    let mut far_field_edges = Vec::new();
+    for elem in &tet10.elements {
+        let mut cx = 0.0;
+        let mut cy = 0.0;
+        for &nid in &elem.node_indices {
+            cx += tet10.nodes[nid].position[0];
+            cy += tet10.nodes[nid].position[1];
+        }
+        cx *= 0.25;
+        cy *= 0.25;
+        let r = (cx * cx + cy * cy).sqrt();
+        let p0 = tet10.nodes[elem.node_indices[0]].pos_vec();
+        let p1 = tet10.nodes[elem.node_indices[1]].pos_vec();
+        let p2 = tet10.nodes[elem.node_indices[2]].pos_vec();
+        let p3 = tet10.nodes[elem.node_indices[3]].pos_vec();
+        let mean_edge = ((p1 - p0).norm()
+            + (p2 - p0).norm()
+            + (p3 - p0).norm()
+            + (p2 - p1).norm()
+            + (p3 - p1).norm()
+            + (p3 - p2).norm())
+            / 6.0;
+        if r < 0.018 {
+            near_hole_edges.push(mean_edge);
+        } else if cx.abs() > 0.045 {
+            far_field_edges.push(mean_edge);
+        }
+    }
+    assert!(!near_hole_edges.is_empty() && !far_field_edges.is_empty());
+    let mean_near = near_hole_edges.iter().sum::<f64>() / near_hole_edges.len() as f64;
+    let mean_far = far_field_edges.iter().sum::<f64>() / far_field_edges.len() as f64;
+    assert!(
+        mean_near < mean_far * 0.85,
+        "Local refinement must make near-hole elements smaller than far-field (near={:.4}m vs far={:.4}m)",
+        mean_near,
+        mean_far
+    );
+}
+
+#[test]
+fn test_p5_t2_explicit_refinement_zone_increases_local_density() {
+    use mcp_cad_core::primitives::create_box;
+    use mcp_cad_fea::conforming_mesh::{ConformingMeshOptions, LocalRefinementOptions, RefinementZone};
+
+    let block = create_box(0.10, 0.04, 0.04);
+    let zone_center = [0.03, 0.0, 0.0];
+    let zone_radius = 0.015;
+
+    let mut base_opts = ConformingMeshOptions::high_accuracy(MeshDensity::Coarse);
+    base_opts.refinement = LocalRefinementOptions {
+        enabled: false,
+        max_depth: 0,
+        ..LocalRefinementOptions::default()
+    };
+    let base_mesh = TetrahedralMesh::from_mesh_conforming(&block, &base_opts)
+        .expect("Base conforming mesh must succeed");
+
+    let mut zone_opts = ConformingMeshOptions::high_accuracy(MeshDensity::Coarse);
+    zone_opts.refinement = LocalRefinementOptions {
+        enabled: true,
+        max_depth: 1,
+        max_leaf_cells: 1500,
+        zones: vec![RefinementZone::new(zone_center, zone_radius, 1)],
+        ..LocalRefinementOptions::default()
+    };
+    let refined_mesh = TetrahedralMesh::from_mesh_conforming(&block, &zone_opts)
+        .expect("Refined conforming mesh with zone must succeed");
+
+    let count_in_sphere = |m: &TetrahedralMesh| -> usize {
+        m.nodes
+            .iter()
+            .filter(|n| {
+                let dx = n.position[0] - zone_center[0];
+                let dy = n.position[1] - zone_center[1];
+                let dz = n.position[2] - zone_center[2];
+                (dx * dx + dy * dy + dz * dz).sqrt() <= zone_radius * 1.2
+            })
+            .count()
+    };
+    let base_local = count_in_sphere(&base_mesh);
+    let refined_local = count_in_sphere(&refined_mesh);
+    assert!(
+        refined_local > base_local,
+        "Explicit RefinementZone must increase local node density ({refined_local} <= {base_local})"
+    );
+    let metrics = refined_mesh.evaluate_quality(&block, None, 0.0);
+    assert_eq!(metrics.inverted_elements, 0);
+    assert!(metrics.all_tet10_gauss_jacobians_positive);
+}
+
+#[test]
+fn test_p5_t2_high_accuracy_and_convergence_api() {
+    use mcp_cad_core::primitives::create_box;
+    use mcp_cad_fea::convergence::run_fea_with_convergence_with_accuracy;
+    use mcp_cad_fea::{analyze_surface_mesh_with_accuracy, AccuracyMode, ElementOrder};
+
+    let beam = create_box(0.10, 0.02, 0.02);
+    let material = Material::new("Steel", 205.0, 0.30, 250.0, 7850.0, "Test steel");
+    let mut bc = BoundaryConditions::new();
+    bc.fix_aabb_face(AabbFace::MinX, 1e-4);
+    bc.add_aabb_face_force(AabbFace::MaxX, 1e-4, [0.0, -500.0, 0.0]);
+
+    let (report_high, mesh_high) = analyze_surface_mesh_with_accuracy(
+        "beam_high",
+        &beam,
+        &material,
+        &bc,
+        MeshDensity::Coarse,
+        AccuracyMode::High,
+        None,
+    )
+    .expect("High accuracy analysis must succeed");
+    assert_eq!(report_high.element_order, 2);
+    assert!(mesh_high.is_boundary_conforming());
+    assert!(report_high.max_displacement_m > 0.0);
+    assert!(report_high.max_stress_von_mises_pa > 0.0);
+
+    let (conv_report, conv_mesh, study) = run_fea_with_convergence_with_accuracy(
+        "beam_conv_high",
+        &beam,
+        &material,
+        &[MeshDensity::Coarse, MeshDensity::Medium],
+        AccuracyMode::High,
+        ElementOrder::Quadratic,
+        &[],
+        Some(60.0),
+        None,
+        |_m| Ok(bc.clone()),
+    )
+    .expect("High accuracy convergence study must succeed");
+    assert_eq!(conv_report.element_order, 2);
+    assert!(conv_mesh.is_boundary_conforming());
+    assert!(
+        !study.voxel_staircase_detected,
+        "Boundary-conforming High accuracy mode must not flag voxel_staircase_detected"
+    );
+    assert_eq!(study.steps.len(), 2);
+}
+
+
 
 
 

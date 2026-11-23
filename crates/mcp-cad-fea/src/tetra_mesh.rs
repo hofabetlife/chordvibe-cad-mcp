@@ -8,6 +8,13 @@ use mcp_cad_core::tessellation::{TessellationQuality, TessellationSettings};
 use mcp_cad_core::topology::{BoundingBox, TriangleMesh, Vertex};
 use crate::error::FeaError;
 
+pub use crate::conforming_mesh::{
+    closest_point_on_segment_3d, closest_point_on_triangle_3d, evaluate_mesh_metrics,
+    snap_mesh_to_surface, tet_det_6v, tet_liu_joe_quality, tet_scaled_jacobian,
+    to_tet10_boundary_snapped, AccuracyMode, ConformingMeshOptions, LocalRefinementOptions,
+    MeshQualityMetrics, RefinementZone, SnapOptions, SurfaceSpatialIndex,
+};
+
 /// Density profile for automatic tetrahedral meshing.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub enum MeshDensity {
@@ -153,6 +160,9 @@ pub struct TetrahedralMesh {
     /// Optional 10-node quadratic tetrahedral connectivity (`[n0..n3, n4..n9]` per element) when `is_tet10()` is true.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tet10_elements: Vec<[usize; 10]>,
+    /// True if exterior boundary nodes were snapped onto the CAD surface (`fe_snap` / `P5-T2`).
+    #[serde(default)]
+    pub boundary_conforming: bool,
 }
 
 impl TetrahedralMesh {
@@ -162,6 +172,7 @@ impl TetrahedralMesh {
             nodes,
             elements,
             tet10_elements: Vec::new(),
+            boundary_conforming: false,
         }
     }
 
@@ -175,6 +186,7 @@ impl TetrahedralMesh {
             nodes,
             elements,
             tet10_elements,
+            boundary_conforming: false,
         }
     }
 
@@ -184,7 +196,14 @@ impl TetrahedralMesh {
             nodes: Vec::new(),
             elements: Vec::new(),
             tet10_elements: Vec::new(),
+            boundary_conforming: false,
         }
+    }
+
+    /// Returns `true` if exterior boundary nodes were fitted to the CAD surface (`fe_snap`).
+    #[inline]
+    pub fn is_boundary_conforming(&self) -> bool {
+        self.boundary_conforming
     }
 
     /// Returns `true` if this mesh carries quadratic 10-node (`TET10`) element connectivity.
@@ -251,7 +270,35 @@ impl TetrahedralMesh {
             nodes,
             elements: self.elements.clone(),
             tet10_elements,
+            boundary_conforming: self.boundary_conforming,
         }
+    }
+
+    /// Snaps exterior boundary nodes of this `TET4` mesh onto `cad_surface` using `fe_snap`
+    /// with a strict scaled Jacobian quality barrier ($J_s \ge 0.06$, $\det J > 0$).
+    pub fn snap_to_surface(&self, cad_surface: &TriangleMesh, opts: SnapOptions) -> Self {
+        snap_mesh_to_surface(self, cad_surface, opts)
+    }
+
+    /// Converts this boundary-snapped `TET4` mesh to quadratic `TET10` and projects exterior
+    /// mid-edge nodes onto curved CAD surfaces while maintaining $\det J > 0$ at all 4 Gauss points.
+    pub fn to_tet10_boundary_snapped(
+        &self,
+        cad_surface: &TriangleMesh,
+        opts: SnapOptions,
+    ) -> Self {
+        to_tet10_boundary_snapped(self, cad_surface, opts)
+    }
+
+    /// Evaluates element quality, `TET10` Gauss-point Jacobian positivity, and boundary surface
+    /// deviation against the exact CAD `TriangleMesh`.
+    pub fn evaluate_quality(
+        &self,
+        cad_surface: &TriangleMesh,
+        curved_feature_triangles: Option<&[[[f64; 3]; 3]]>,
+        feature_search_tol: f64,
+    ) -> MeshQualityMetrics {
+        evaluate_mesh_metrics(self, cad_surface, curved_feature_triangles, feature_search_tol)
     }
 
     /// Returns the number of nodes in the mesh.
@@ -754,6 +801,52 @@ impl TetrahedralMesh {
         } else {
             Self::from_mesh(mesh, density)
         }
+    }
+
+    /// Generates a boundary-conforming, optionally locally-refined `TET4` or curved `TET10` mesh
+    /// from a closed surface `TriangleMesh` (`ADR-0002` / `P5-T2`).
+    pub fn from_mesh_conforming(
+        mesh: &TriangleMesh,
+        options: &ConformingMeshOptions,
+    ) -> Result<Self, FeaError> {
+        crate::conforming_mesh::generate_conforming_mesh(mesh, options)
+    }
+
+    /// Generates a high-accuracy (`AccuracyMode::High`) boundary-conforming curved `TET10` mesh
+    /// with automatic local octree refinement in high-curvature and stress-concentration zones.
+    pub fn from_mesh_high_accuracy(
+        mesh: &TriangleMesh,
+        density: MeshDensity,
+    ) -> Result<Self, FeaError> {
+        let opts = ConformingMeshOptions::high_accuracy(density);
+        Self::from_mesh_conforming(mesh, &opts)
+    }
+
+    /// Generates a tetrahedral mesh from a surface `TriangleMesh` using the given `AccuracyMode`.
+    pub fn from_mesh_with_accuracy(
+        mesh: &TriangleMesh,
+        density: MeshDensity,
+        mode: AccuracyMode,
+    ) -> Result<Self, FeaError> {
+        let opts = ConformingMeshOptions::for_accuracy_mode(mode, density);
+        Self::from_mesh_conforming(mesh, &opts)
+    }
+
+    /// Generates a tetrahedral mesh from a CAD `Part` using the given `AccuracyMode`.
+    pub fn from_part_with_accuracy(
+        part: &Part,
+        density: MeshDensity,
+        mode: AccuracyMode,
+    ) -> Result<Self, FeaError> {
+        let mesh = if part.mesh().indices.is_empty() && !part.dag.nodes.is_empty() {
+            let settings = TessellationSettings::default();
+            part.dag
+                .evaluate_with_settings(&settings)
+                .map_err(|e| FeaError::MeshGenerationFailed(e.to_string()))?
+        } else {
+            part.mesh().clone()
+        };
+        Self::from_mesh_with_accuracy(&mesh, density, mode)
     }
 }
 

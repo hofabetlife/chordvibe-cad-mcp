@@ -50,6 +50,8 @@ const PRESET_SCENES = [
   { id: 'qa_hex_chamfer', label: '12. QA Эталон: Шестигранная призма с фаской' },
   { id: 'qa_revolve_180', label: '13. QA Эталон: Тело вращения 180° (BUG-003)' },
   { id: 'qa_csg_two_holes', label: '14. QA Эталон: Блок с 2 отверстиями (g=2)' },
+  { id: 'gears_clash_destruction', label: '15. Разрушение: Встречное столкновение шестерён' },
+  { id: 'gear_overload_burst', label: '16. Разрушение: Разрыв редуктора (Перегрузка)' },
 ];
 
 export const CadTitleBar: React.FC<CadTitleBarProps> = ({

@@ -679,7 +679,8 @@ mod tests {
         assert_eq!(load_res["status"], "loaded");
         assert_eq!(load_res["parts_count"], 2);
         assert_eq!(load_res["joints_count"], 1);
-        assert_eq!(load_res["materials_count"], 9); // 8 builtins + 1 custom
+        let expected_materials_count = mcp_cad_core::MaterialRegistry::new().list().len() + 1;
+        assert_eq!(load_res["materials_count"], expected_materials_count); // 10 builtins + 1 custom
 
         // Verify parts
         assert!(fresh_state.parts.contains_key("part_base"));

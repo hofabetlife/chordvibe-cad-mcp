@@ -15,10 +15,16 @@ import {
   ExternalLink,
   Cpu,
   Gauge,
+  Flame,
 } from 'lucide-react';
 import {
   CadPart,
   DagNode,
+  DeformationScalePreset,
+  DestructionCache,
+  DestructionFieldMode,
+  DestructionScenarioMode,
+  DestructionSimConfig,
   EngineeringWorkbench,
   FeaBoundaryCondition,
   FeaSimulationResult,
@@ -27,12 +33,15 @@ import {
   McpToolExecution,
   QualityPreset,
   RenderMode,
+  SimulationSubMode,
 } from '../types/cad';
 import { MCP_TOOLS_CATALOG } from '../cad/mcp_dispatcher';
 import { getMaterialById } from '../cad/materials';
 import { AiUnoptimizedScenario } from '../cad/query_optimizer';
 import { CadQueryOptimizerPanel } from './CadQueryOptimizerPanel';
+import { CadDestructionPanel } from './CadDestructionPanel';
 import { FEA_QUICK_LOAD_PRESETS } from '../cad/workbenches';
+import type { RustAccuracyLevel } from '../cad/rust_scene_sync';
 
 export type RightInspectorTab =
   | 'geometry'
@@ -59,6 +68,36 @@ interface CadRightSidebarProps {
   onApplyOptimizedDag?: (partId: string, optimizedDag: DagNode[]) => void;
   onLoadUnoptimizedScenario?: (scenario: AiUnoptimizedScenario) => void;
   externalActiveTab?: RightInspectorTab | null;
+  simulationSubMode?: SimulationSubMode;
+  onChangeSimulationSubMode?: (mode: SimulationSubMode) => void;
+  destructionConfig?: DestructionSimConfig;
+  destructionCache?: DestructionCache | null;
+  destructionFrame?: number;
+  isBakingDestruction?: boolean;
+  bakeProgressPct?: number;
+  bakeStageLabel?: string;
+  isDestructionCacheStale?: boolean;
+  destructionFieldMode?: DestructionFieldMode;
+  destructionDeformScale?: DeformationScalePreset;
+  nativeRustConnected?: boolean;
+  rustEndpointUrl?: string;
+  rustDiagnosticMessage?: string;
+  isProbingRust?: boolean;
+  rustAccuracyLevel?: RustAccuracyLevel;
+  nativeBakeError?: string | null;
+  canCancelBake?: boolean;
+  onChangeDestructionFieldMode?: (mode: DestructionFieldMode) => void;
+  onChangeDestructionDeformScale?: (scale: DeformationScalePreset) => void;
+  onChangeDestructionConfig?: (next: DestructionSimConfig) => void;
+  onSelectDestructionScenario?: (mode: DestructionScenarioMode) => void;
+  onBakeDestructionCache?: () => void;
+  onClearDestructionCache?: () => void;
+  onSeekDestructionFrame?: (frame: number) => void;
+  onExportDestructionCacheJson?: () => void;
+  onChangeRustAccuracyLevel?: (level: RustAccuracyLevel) => void;
+  onConnectRustServer?: (endpointUrl: string) => void;
+  onCancelDestructionBake?: () => void;
+  onDismissNativeBakeError?: () => void;
 }
 
 const WINDOWS_WGPU_ARTIFACTS = [
@@ -117,6 +156,36 @@ export const CadRightSidebar: React.FC<CadRightSidebarProps> = ({
   onApplyOptimizedDag,
   onLoadUnoptimizedScenario,
   externalActiveTab,
+  simulationSubMode = 'kinematics',
+  onChangeSimulationSubMode,
+  destructionConfig,
+  destructionCache = null,
+  destructionFrame = 0,
+  isBakingDestruction = false,
+  bakeProgressPct = 0,
+  bakeStageLabel = '',
+  isDestructionCacheStale = false,
+  destructionFieldMode = 'shaded',
+  destructionDeformScale = 5,
+  nativeRustConnected = false,
+  rustEndpointUrl = '',
+  rustDiagnosticMessage,
+  isProbingRust = false,
+  rustAccuracyLevel = 'standard',
+  nativeBakeError = null,
+  canCancelBake = false,
+  onChangeDestructionFieldMode,
+  onChangeDestructionDeformScale,
+  onChangeDestructionConfig,
+  onSelectDestructionScenario,
+  onBakeDestructionCache,
+  onClearDestructionCache,
+  onSeekDestructionFrame,
+  onExportDestructionCacheJson,
+  onChangeRustAccuracyLevel,
+  onConnectRustServer,
+  onCancelDestructionBake,
+  onDismissNativeBakeError,
 }) => {
   const [optimizerSubTab, setOptimizerSubTab] = useState<
     'optimizer' | 'mcp' | 'qa'
@@ -214,12 +283,30 @@ export const CadRightSidebar: React.FC<CadRightSidebarProps> = ({
       )}
 
       {activeWorkbench === 'simulation' && (
-        <div className="px-3 py-2.5 border-b border-[#262b36] bg-[#10131a] flex items-center justify-between">
-          <div className="flex items-center gap-2 text-xs font-semibold text-[#f1f5f9]">
+        <div className="grid grid-cols-2 border-b border-[#262b36] bg-[#10131a]">
+          <button
+            onClick={() => onChangeSimulationSubMode?.('kinematics')}
+            className={`flex items-center justify-center gap-1.5 py-2.5 text-xs font-medium border-b-2 transition-colors cursor-pointer ${
+              simulationSubMode === 'kinematics'
+                ? 'border-[#10b981] text-[#f1f5f9] bg-[#161a24]'
+                : 'border-transparent text-[#94a3b8] hover:text-[#cbd5e1]'
+            }`}
+          >
             <Gauge className="w-3.5 h-3.5 text-[#10b981]" />
-            <span>Телеметрия движения и Сборка</span>
-          </div>
-          <span className="text-[10px] font-mono text-[#10b981]">60 Гц</span>
+            <span>Кинематика</span>
+          </button>
+
+          <button
+            onClick={() => onChangeSimulationSubMode?.('destruction')}
+            className={`flex items-center justify-center gap-1.5 py-2.5 text-xs font-medium border-b-2 transition-colors cursor-pointer ${
+              simulationSubMode === 'destruction'
+                ? 'border-[#f97316] text-[#f1f5f9] bg-[#161a24]'
+                : 'border-transparent text-[#94a3b8] hover:text-[#cbd5e1]'
+            }`}
+          >
+            <Flame className="w-3.5 h-3.5 text-[#f97316]" />
+            <span>Разрушение (Кэш)</span>
+          </button>
         </div>
       )}
 
@@ -745,8 +832,49 @@ export const CadRightSidebar: React.FC<CadRightSidebarProps> = ({
           </div>
         )}
 
-        {/* SECTION 3: KINEMATICS & SIMULATION TELEMETRY */}
-        {activeWorkbench === 'simulation' && (
+        {/* SECTION 3: KINEMATICS & DESTRUCTION SIMULATION */}
+        {activeWorkbench === 'simulation' &&
+          simulationSubMode === 'destruction' &&
+          destructionConfig &&
+          onChangeDestructionConfig &&
+          onSelectDestructionScenario &&
+          onBakeDestructionCache &&
+          onClearDestructionCache &&
+          onSeekDestructionFrame &&
+          onExportDestructionCacheJson && (
+            <CadDestructionPanel
+              config={destructionConfig}
+              cache={destructionCache}
+              currentFrame={destructionFrame}
+              isBaking={isBakingDestruction}
+              bakeProgressPct={bakeProgressPct}
+              bakeStageLabel={bakeStageLabel}
+              isCacheStale={isDestructionCacheStale}
+              fieldMode={destructionFieldMode}
+              deformScale={destructionDeformScale}
+              nativeRustConnected={nativeRustConnected}
+              rustEndpointUrl={rustEndpointUrl}
+              rustDiagnosticMessage={rustDiagnosticMessage}
+              isProbingRust={isProbingRust}
+              rustAccuracyLevel={rustAccuracyLevel}
+              nativeBakeError={nativeBakeError}
+              canCancelBake={canCancelBake}
+              onChangeFieldMode={(m) => onChangeDestructionFieldMode?.(m)}
+              onChangeDeformScale={(s) => onChangeDestructionDeformScale?.(s)}
+              onChangeConfig={onChangeDestructionConfig}
+              onSelectScenario={onSelectDestructionScenario}
+              onBakeCache={onBakeDestructionCache}
+              onClearCache={onClearDestructionCache}
+              onSeekFrame={onSeekDestructionFrame}
+              onExportCacheJson={onExportDestructionCacheJson}
+              onChangeRustAccuracyLevel={onChangeRustAccuracyLevel}
+              onConnectRustServer={onConnectRustServer}
+              onCancelBake={onCancelDestructionBake}
+              onDismissNativeBakeError={onDismissNativeBakeError}
+            />
+          )}
+
+        {activeWorkbench === 'simulation' && simulationSubMode !== 'destruction' && (
           <div className="space-y-3">
             {/* Simulation Transport & Status */}
             <div className="bg-[#181c24] border border-[#282e3d] rounded p-3 space-y-2.5">

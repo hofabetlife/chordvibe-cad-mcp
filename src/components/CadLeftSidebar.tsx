@@ -22,7 +22,7 @@ import {
   KinematicJoint,
   MaterialSpec,
 } from '../types/cad';
-import { getMaterialById } from '../cad/materials';
+import { deriveNonlinearMaterialDefaults, getMaterialById } from '../cad/materials';
 
 interface CadLeftSidebarProps {
   activeWorkbench: EngineeringWorkbench;
@@ -145,14 +145,18 @@ export const CadLeftSidebar: React.FC<CadLeftSidebarProps> = ({
     const id = `custom_${newMatName
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, '_')}_${Date.now().toString().slice(-3)}`;
+    const youngsModulus = Math.max(0.1, Number(newMatE)) * 1e9;
+    const yieldStrength = Math.max(1, Number(newMatYield)) * 1e6;
+    const nonlinear = deriveNonlinearMaterialDefaults(youngsModulus, yieldStrength, 'ductile');
     const spec: MaterialSpec = {
       id,
       name: newMatName || 'Custom Alloy',
       category: 'Custom',
       density: Math.max(100, Number(newMatDensity)),
-      youngsModulus: Math.max(0.1, Number(newMatE)) * 1e9,
+      youngsModulus,
       poissonsRatio: Math.max(0.05, Math.min(0.49, Number(newMatNu))),
-      yieldStrength: Math.max(1, Number(newMatYield)) * 1e6,
+      yieldStrength,
+      ...nonlinear,
       colorHex: newMatColor,
       roughness: 0.3,
       metalness: 0.85,
@@ -494,12 +498,16 @@ export const CadLeftSidebar: React.FC<CadLeftSidebarProps> = ({
         )}
 
         {materials.map((mat) => {
-          const isAssigned = selectedPart.materialId === mat.id;
+          const isAssigned = activeMaterial?.id === mat.id;
           return (
-            <div
+            <button
+              type="button"
               key={mat.id}
               onClick={() => onAssignMaterial(selectedPart.id, mat.id)}
-              className={`p-2.5 rounded border cursor-pointer transition-colors ${
+              aria-pressed={isAssigned}
+              data-material-id={mat.id}
+              data-assigned={isAssigned ? 'true' : 'false'}
+              className={`w-full text-left p-2.5 rounded border cursor-pointer transition-colors ${
                 isAssigned
                   ? 'bg-[#1d2534] border-[#10b981] text-[#f1f5f9]'
                   : 'bg-[#181c24] border-[#262b36] text-[#cbd5e1] hover:bg-[#1c212c]'
@@ -534,7 +542,7 @@ export const CadLeftSidebar: React.FC<CadLeftSidebarProps> = ({
                   {(mat.yieldStrength / 1e6).toFixed(0)} МПа
                 </div>
               </div>
-            </div>
+            </button>
           );
         })}
       </div>

@@ -2429,3 +2429,356 @@ pub fn create_solved_joint_record(
         last_torque_on_b: [0.0; 3],
     }
 }
+
+// ============================================================================
+// Deformable FEM Hub Coupling Bridge (P5-T4)
+// ============================================================================
+
+/// Kinematic joint family exported for coupling a deformable body's hub/bore nodes
+/// to `f64` joints and actuators managed by [`MultiBodySolver`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HubJointKind {
+    /// 1-DOF rotational shaft joint around `axis_world` through `pivot_world`.
+    Revolute,
+    /// 1-DOF translational slide joint along `axis_world`.
+    Prismatic,
+    /// 0-DOF rigid mounting hub constraint.
+    Fixed,
+}
+
+/// Serializable `f64` kinematic hub coupling specification extracted from a [`SolvedJointRecord`],
+/// linking a deformable FEA body's shaft bore / hub surface nodes to an `f64` joint & motor
+/// without artificially locking free regions such as gear teeth.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JointHubCouplingSpec {
+    /// Joint identifier in the physics assembly.
+    pub joint_id: String,
+    /// Identifier of the deformable target part.
+    pub part_id: String,
+    /// Joint kinematic family.
+    pub kind: HubJointKind,
+    /// Joint pivot point in world coordinates ($\text{m}$).
+    pub pivot_world: [f64; 3],
+    /// Unit joint axis in world coordinates (rotation or sliding axis).
+    pub axis_world: [f64; 3],
+    /// Current scalar joint coordinate ($\text{rad}$ for `Revolute`, $\text{m}$ for `Prismatic`).
+    pub current_coordinate: f64,
+    /// Optional travel limits `[min, max]` ($\text{rad}$ or $\text{m}$).
+    pub limits: Option<[f64; 2]>,
+    /// Optional motor target velocity ($\text{rad/s}$ or $\text{m/s}$).
+    pub motor_target_velocity: Option<f64>,
+    /// Optional motor maximum actuation torque ($\text{N}\cdot\text{m}$) or force ($\text{N}$).
+    pub motor_max_effort: Option<f64>,
+    /// Last solved axial reaction torque ($\text{N}\cdot\text{m}$) or force ($\text{N}$) along `axis_world`.
+    pub last_axial_effort: f64,
+}
+
+/// Extracts deformable hub coupling descriptors for all ground-connected or multi-body
+/// `Revolute`, `Prismatic`, and `Fixed` joints acting on dynamic bodies in `bodies`.
+#[must_use]
+pub fn extract_joint_hub_couplings(
+    bodies: &BodyRegistry,
+    joints: &[SolvedJointRecord],
+) -> Vec<JointHubCouplingSpec> {
+    let mut specs = Vec::new();
+    for j in joints {
+        let (Some(ba), Some(bb)) = (bodies.get(j.body_a), bodies.get(j.body_b)) else {
+            continue;
+        };
+
+        let kind = match j.joint_type {
+            CadJointType::Revolute { .. } => HubJointKind::Revolute,
+            CadJointType::Prismatic { .. } => HubJointKind::Prismatic,
+            CadJointType::Fixed { .. } => HubJointKind::Fixed,
+            CadJointType::Spherical { .. } | CadJointType::Gear { .. } => continue,
+        };
+
+        let current_coord = j
+            .joint_type
+            .current_coordinate(
+                ba.position,
+                ba.rotation_matrix(),
+                bb.position,
+                bb.rotation_matrix(),
+            )
+            .unwrap_or(0.0);
+
+        // Emit coupling for the dynamic body (or Body B if both are dynamic).
+        // In MultiBodySolver, relative joint velocity is (v_b - v_a) · axis, so if only Body A
+        // is dynamic we negate coordinate/motor signs so positive velocity always moves `target_part`
+        // along `+axis_world`.
+        let (target_part, pivot_w, axis_w, force_w, torque_w, coord_sign) = if bb.is_dynamic {
+            let pivot = bb.position + bb.orientation * Vector3::from(j.data.anchor_b);
+            let axis_raw = bb.orientation * Vector3::from(j.data.local_axis_b);
+            let axis = if axis_raw.norm() > 1e-12 {
+                axis_raw.normalize()
+            } else {
+                Vector3::z()
+            };
+            (
+                j.part_b.clone(),
+                pivot,
+                axis,
+                Vector3::from(j.last_force_on_b),
+                Vector3::from(j.last_torque_on_b),
+                1.0_f64,
+            )
+        } else if ba.is_dynamic {
+            let pivot = ba.position + ba.orientation * Vector3::from(j.data.anchor_a);
+            let axis_raw = ba.orientation * Vector3::from(j.data.local_axis_a);
+            let axis = if axis_raw.norm() > 1e-12 {
+                axis_raw.normalize()
+            } else {
+                Vector3::z()
+            };
+            (
+                j.part_a.clone(),
+                pivot,
+                axis,
+                Vector3::from(j.last_force_on_a),
+                Vector3::from(j.last_torque_on_a),
+                -1.0_f64,
+            )
+        } else {
+            continue;
+        };
+
+        let last_axial_effort = match kind {
+            HubJointKind::Revolute => torque_w.dot(&axis_w),
+            HubJointKind::Prismatic => force_w.dot(&axis_w),
+            HubJointKind::Fixed => torque_w.norm(),
+        };
+        let limits = j.data.limits.map(|[lo, hi]| {
+            if coord_sign < 0.0 {
+                [-hi, -lo]
+            } else {
+                [lo, hi]
+            }
+        });
+
+        specs.push(JointHubCouplingSpec {
+            joint_id: j.id.clone(),
+            part_id: target_part,
+            kind,
+            pivot_world: [pivot_w.x, pivot_w.y, pivot_w.z],
+            axis_world: [axis_w.x, axis_w.y, axis_w.z],
+            current_coordinate: current_coord * coord_sign,
+            limits,
+            motor_target_velocity: j.motor.map(|m| m.target_velocity * coord_sign),
+            motor_max_effort: j.motor.map(|m| m.max_force),
+            last_axial_effort,
+        });
+    }
+    specs
+}
+
+/// Serializable `f64` gear-mesh descriptor extracted from a [`CadJointType::Gear`] joint
+/// in [`SolvedJointRecord`] (`P5-T14`), used by coupled dynamic FEA to identify meshing gear pairs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GearJointCouplingSpec {
+    /// Joint identifier in the physics assembly.
+    pub joint_id: String,
+    /// First meshing gear part identifier (typically pinion / driver).
+    pub part_a: String,
+    /// Second meshing gear part identifier (typically driven gear).
+    pub part_b: String,
+    /// Kinematic speed ratio $r = Z_a / Z_b$ (for external gears $\omega_b = -r \omega_a$).
+    pub ratio: f64,
+    /// Unit rotation axis of `part_a` in world coordinates.
+    pub axis_a_world: [f64; 3],
+    /// Unit rotation axis of `part_b` in world coordinates.
+    pub axis_b_world: [f64; 3],
+}
+
+/// Extracts all [`CadJointType::Gear`] descriptors from the active solved joint records (`P5-T14`).
+#[must_use]
+pub fn extract_gear_joint_couplings(
+    bodies: &BodyRegistry,
+    joints: &[SolvedJointRecord],
+) -> Vec<GearJointCouplingSpec> {
+    let mut specs = Vec::new();
+    for j in joints {
+        let CadJointType::Gear { ratio, .. } = j.joint_type else {
+            continue;
+        };
+        let (Some(ba), Some(bb)) = (bodies.get(j.body_a), bodies.get(j.body_b)) else {
+            continue;
+        };
+        let ax_a_raw = ba.orientation * Vector3::from(j.data.local_axis_a);
+        let ax_b_raw = bb.orientation * Vector3::from(j.data.local_axis_b);
+        let ax_a = if ax_a_raw.norm() > 1e-12 {
+            ax_a_raw.normalize()
+        } else {
+            Vector3::z()
+        };
+        let ax_b = if ax_b_raw.norm() > 1e-12 {
+            ax_b_raw.normalize()
+        } else {
+            Vector3::z()
+        };
+        specs.push(GearJointCouplingSpec {
+            joint_id: j.id.clone(),
+            part_a: j.part_a.clone(),
+            part_b: j.part_b.clone(),
+            ratio,
+            axis_a_world: [ax_a.x, ax_a.y, ax_a.z],
+            axis_b_world: [ax_b.x, ax_b.y, ax_b.z],
+        });
+    }
+    specs
+}
+
+/// Updates a `TriMesh` collider's local vertices from newly deformed FEM surface coordinates,
+/// rebuilding its local AABB and cached [`crate::collision::TriMeshBvh`] so subsequent collision
+/// queries see the true deformed geometry (`P5-T4`).
+pub fn sync_deformed_trimesh_collider(
+    colliders: &mut ColliderRegistry,
+    handle: crate::rigid_body::ColliderHandle,
+    deformed_local_vertices: Vec<[f64; 3]>,
+) -> bool {
+    let Some(col) = colliders.get_mut(handle) else {
+        return false;
+    };
+    let indices_clone = match &mut col.shape {
+        crate::rigid_body::ColliderShape::TriMesh { vertices, indices } => {
+            *vertices = deformed_local_vertices;
+            indices.clone()
+        }
+        _ => return false,
+    };
+    if let crate::rigid_body::ColliderShape::TriMesh { vertices, .. } = &col.shape {
+        let mut min = [f64::INFINITY; 3];
+        let mut max = [f64::NEG_INFINITY; 3];
+        for v in vertices {
+            for k in 0..3 {
+                min[k] = min[k].min(v[k]);
+                max[k] = max[k].max(v[k]);
+            }
+        }
+        if vertices.is_empty() {
+            min = [0.0; 3];
+            max = [0.0; 3];
+        }
+        col.local_aabb = mcp_cad_core::topology::BoundingBox::new(min, max);
+        col.tri_bvh = Some(crate::collision::TriMeshBvh::build(vertices, &indices_clone));
+        col.world_aabb = col.local_aabb;
+        return true;
+    }
+    false
+}
+
+#[cfg(test)]
+mod p5_t4_coupling_tests {
+    use super::*;
+    use crate::rigid_body::{Collider, ColliderShape, ColliderType, RigidBody};
+    use mcp_cad_core::dag::FeatureOp;
+    use mcp_cad_core::material::MaterialRegistry;
+    use mcp_cad_core::Part;
+
+    fn make_box_part(id: &str) -> Part {
+        let reg = MaterialRegistry::new();
+        let steel = reg.get("steel_structural_aisi1020").unwrap().clone();
+        let mut p = Part::new(id, id, steel);
+        p.dag.add_feature(
+            FeatureOp::AddBox {
+                width: 0.04,
+                height: 0.04,
+                depth: 0.01,
+                position: None,
+                rotation_deg: None,
+            },
+            None,
+        );
+        p.rebuild().unwrap();
+        p
+    }
+
+    #[test]
+    fn test_p5_t4_extract_joint_hub_couplings_and_deformed_trimesh_sync() {
+        let base_part = make_box_part("ground");
+        let rotor_part = make_box_part("rotor");
+
+        let mut bodies = BodyRegistry::new();
+        let h_ground = bodies.insert(RigidBody::new_fixed(
+            "ground",
+            Vector3::zeros(),
+            UnitQuaternion::identity(),
+        ));
+        let mut rb_rotor = RigidBody::from_part(&rotor_part, true, None, None);
+        rb_rotor.set_pose(
+            Vector3::new(0.05, 0.0, 0.0),
+            UnitQuaternion::from_axis_angle(&Vector3::z_axis(), 0.25),
+        );
+        let h_rotor = bodies.insert(rb_rotor);
+
+        let jtype = CadJointType::Revolute {
+            anchor_a: [0.05, 0.0, 0.0],
+            anchor_b: [0.0, 0.0, 0.0],
+            axis: [0.0, 0.0, 1.0],
+            limits: Some([-1.5, 1.5]),
+        };
+        let motor = MotorConfig {
+            target_velocity: 2.0,
+            max_force: 15.0,
+        };
+        let jdata = jtype.build_generic_joint(Some(motor)).unwrap();
+        let rec = SolvedJointRecord {
+            id: "shaft_rev".to_string(),
+            handle: JointHandle(0),
+            part_a: "ground".to_string(),
+            part_b: "rotor".to_string(),
+            body_a: h_ground,
+            body_b: h_rotor,
+            joint_type: jtype,
+            motor: Some(motor),
+            data: jdata,
+            initial_rel_rot: UnitQuaternion::identity(),
+            initial_coord: 0.0,
+            gear_theta_a: 0.0,
+            gear_theta_b: 0.0,
+            motor_accum_coord: 0.25,
+            motor_saturated: false,
+            last_force_on_a: [0.0; 3],
+            last_torque_on_a: [0.0, 0.0, -9.5],
+            last_force_on_b: [0.0; 3],
+            last_torque_on_b: [0.0, 0.0, 9.5],
+        };
+
+        let couplings = extract_joint_hub_couplings(&bodies, &[rec]);
+        assert_eq!(couplings.len(), 1);
+        let c = &couplings[0];
+        assert_eq!(c.joint_id, "shaft_rev");
+        assert_eq!(c.part_id, "rotor");
+        assert_eq!(c.kind, HubJointKind::Revolute);
+        assert!((c.pivot_world[0] - 0.05).abs() < 1e-12);
+        assert!((c.axis_world[2] - 1.0).abs() < 1e-12);
+        assert!((c.current_coordinate - 0.25).abs() < 1e-9);
+        assert_eq!(c.motor_target_velocity, Some(2.0));
+        assert_eq!(c.motor_max_effort, Some(15.0));
+        assert!((c.last_axial_effort - 9.5).abs() < 1e-12);
+
+        // Verify dynamic deformed TriMesh collider update + BVH rebuild
+        let mut colliders = ColliderRegistry::new();
+        let col = Collider::from_part(&base_part, ColliderType::TriMesh).unwrap();
+        let col_handle = colliders.insert_with_parent(col, h_ground, &mut bodies);
+
+        let orig_verts = match &colliders.get(col_handle).unwrap().shape {
+            ColliderShape::TriMesh { vertices, .. } => vertices.clone(),
+            _ => panic!("expected trimesh"),
+        };
+        let deformed_verts: Vec<[f64; 3]> = orig_verts
+            .iter()
+            .map(|&[x, y, z]| [x, y - 0.002, z])
+            .collect();
+        assert!(sync_deformed_trimesh_collider(
+            &mut colliders,
+            col_handle,
+            deformed_verts
+        ));
+        let updated = colliders.get(col_handle).unwrap();
+        assert!((updated.local_aabb.max[1] - 0.018).abs() < 1e-9);
+        assert!(updated.tri_bvh.is_some());
+    }
+}
+
+

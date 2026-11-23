@@ -14,6 +14,7 @@ use crate::shader::{
     CadVertex, FeaVertex, MaterialUniform, WireframeUniform, CAD_SHADER_WGSL,
     FEA_HEATMAP_SHADER_WGSL, WIREFRAME_SHADER_WGSL,
 };
+use crate::software::{render_cad_mesh_png_cpu, render_fea_heatmap_png_cpu};
 use crate::window::extract_wireframe_indices;
 
 /// Default width in pixels for offscreen rendering.
@@ -139,12 +140,12 @@ static WGPU_INIT_LOCK: Mutex<()> = Mutex::new(());
 /// Process-wide shared offscreen renderer reused by [`OffscreenRenderer::shared`].
 static SHARED_RENDERER: Mutex<Option<Arc<OffscreenRenderer>>> = Mutex::new(None);
 
-/// Headless WGPU offscreen renderer for capturing PNG snapshots and Base64 images.
-pub struct OffscreenRenderer {
+/// Internal GPU state when WGPU initialization succeeds.
+struct WgpuOffscreenState {
     /// WGPU Logical Device.
-    pub device: wgpu::Device,
+    device: wgpu::Device,
     /// WGPU Command Queue.
-    pub queue: wgpu::Queue,
+    queue: wgpu::Queue,
     /// Serializes GPU render/readback passes on a shared device.
     render_lock: Mutex<()>,
     /// Render pipeline for standard CAD solid shading.
@@ -161,14 +162,90 @@ pub struct OffscreenRenderer {
     wireframe_bind_group_layout: wgpu::BindGroupLayout,
 }
 
+/// Active rendering backend selected by [`OffscreenRenderer`].
+enum OffscreenBackend {
+    /// Hardware or software WGPU backend (DirectX 12, Vulkan/Lavapipe, Metal, WARP).
+    Wgpu(Box<WgpuOffscreenState>),
+    /// Pure-Rust CPU software rasterizer fallback when no WGPU adapter/device is available (`ADR-003`).
+    SoftwareCpu,
+}
+
+/// Headless offscreen renderer for capturing PNG snapshots and Base64 images.
+///
+/// Uses WGPU when a hardware or software GPU adapter (DirectX 12, Vulkan/Lavapipe, Metal, WARP)
+/// is available, and automatically falls back to a Pure-Rust CPU software rasterizer (`ADR-003`)
+/// in minimal headless containers without GPU or Vulkan ICDs.
+pub struct OffscreenRenderer {
+    backend: OffscreenBackend,
+}
+
 impl OffscreenRenderer {
+    /// Creates an [`OffscreenRenderer`] explicitly using the Pure-Rust software CPU rasterizer.
+    ///
+    /// Useful for deterministic headless testing and environments where GPU probing should be bypassed.
+    pub fn new_software_cpu() -> Self {
+        Self {
+            backend: OffscreenBackend::SoftwareCpu,
+        }
+    }
+
+    /// Returns `true` if this renderer is using the Pure-Rust software CPU fallback backend.
+    pub fn is_software_cpu(&self) -> bool {
+        matches!(self.backend, OffscreenBackend::SoftwareCpu)
+    }
+
+    /// Returns a human-readable identifier of the active rendering backend (`"wgpu"` or `"software_cpu"`).
+    pub fn backend_name(&self) -> &'static str {
+        match self.backend {
+            OffscreenBackend::Wgpu(_) => "wgpu",
+            OffscreenBackend::SoftwareCpu => "software_cpu",
+        }
+    }
+
+    /// Returns a reference to the underlying WGPU logical device, if the WGPU backend is active.
+    pub fn device(&self) -> Option<&wgpu::Device> {
+        match &self.backend {
+            OffscreenBackend::Wgpu(state) => Some(&state.device),
+            OffscreenBackend::SoftwareCpu => None,
+        }
+    }
+
+    /// Returns a reference to the underlying WGPU command queue, if the WGPU backend is active.
+    pub fn queue(&self) -> Option<&wgpu::Queue> {
+        match &self.backend {
+            OffscreenBackend::Wgpu(state) => Some(&state.queue),
+            OffscreenBackend::SoftwareCpu => None,
+        }
+    }
+
     /// Initializes a new headless OffscreenRenderer instance.
     ///
-    /// Discovers an available GPU adapter (DirectX 12, Vulkan, or software WARP rasterizer)
-    /// without requiring an OS display window.
+    /// Discovers an available GPU adapter (DirectX 12, Vulkan/Lavapipe, Metal, or software WARP)
+    /// without requiring an OS display window. If no WGPU adapter or device is available (or if
+    /// `MCP_CAD_FORCE_CPU_RENDERER=1` is set), automatically falls back to the built-in Pure-Rust
+    /// software CPU rasterizer (`ADR-003`).
     pub fn new() -> Result<Self, ViewerError> {
+        let force_cpu = std::env::var("MCP_CAD_FORCE_CPU_RENDERER")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if force_cpu {
+            return Ok(Self::new_software_cpu());
+        }
+
         let _init_guard = WGPU_INIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
+        match Self::try_init_wgpu() {
+            Some(wgpu_state) => Ok(Self {
+                backend: OffscreenBackend::Wgpu(Box::new(wgpu_state)),
+            }),
+            None => Ok(Self {
+                backend: OffscreenBackend::SoftwareCpu,
+            }),
+        }
+    }
+
+    /// Attempts to initialize the WGPU backend; returns `None` when no adapter or device is available.
+    fn try_init_wgpu() -> Option<WgpuOffscreenState> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
@@ -199,7 +276,7 @@ impl OffscreenRenderer {
                 return Some(adapter);
             }
 
-            // Third attempt: Fallback software rasterizer (e.g. WARP on Windows)
+            // Third attempt: Fallback software rasterizer (e.g. WARP on Windows, Lavapipe on Linux)
             instance
                 .request_adapter(&wgpu::RequestAdapterOptions {
                     power_preference: wgpu::PowerPreference::None,
@@ -207,8 +284,7 @@ impl OffscreenRenderer {
                     compatible_surface: None,
                 })
                 .await
-        })
-        .ok_or(ViewerError::NoSuitableAdapter)?;
+        })?;
 
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
@@ -218,7 +294,8 @@ impl OffscreenRenderer {
                 memory_hints: wgpu::MemoryHints::Performance,
             },
             None,
-        ))?;
+        ))
+        .ok()?;
 
         // 1. Build CAD Pipeline
         let cad_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -452,7 +529,7 @@ impl OffscreenRenderer {
             cache: None,
         });
 
-        Ok(Self {
+        Some(WgpuOffscreenState {
             device,
             queue,
             render_lock: Mutex::new(()),
@@ -521,7 +598,6 @@ impl OffscreenRenderer {
         camera.fit_bounding_box(min_f32, max_f32);
         let camera_uniform = camera.build_uniform();
 
-        // GPU Buffers
         let cad_vertices: Vec<CadVertex> = mesh
             .vertices
             .iter()
@@ -531,69 +607,83 @@ impl OffscreenRenderer {
             })
             .collect();
 
-        let flat_indices: Vec<u32> = mesh
-            .indices
-            .iter()
-            .flat_map(|tri| tri.iter().copied())
-            .collect();
+        match &self.backend {
+            OffscreenBackend::SoftwareCpu => render_cad_mesh_png_cpu(
+                &cad_vertices,
+                &mesh.indices,
+                &camera_uniform,
+                material,
+                None,
+                width,
+                height,
+            ),
+            OffscreenBackend::Wgpu(gpu) => {
+                let flat_indices: Vec<u32> = mesh
+                    .indices
+                    .iter()
+                    .flat_map(|tri| tri.iter().copied())
+                    .collect();
 
-        let vertex_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("CAD Vertex Buffer"),
-                contents: bytemuck::cast_slice(&cad_vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
+                let vertex_buffer = gpu
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("CAD Vertex Buffer"),
+                        contents: bytemuck::cast_slice(&cad_vertices),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });
 
-        let index_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("CAD Index Buffer"),
-                contents: bytemuck::cast_slice(&flat_indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
+                let index_buffer = gpu
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("CAD Index Buffer"),
+                        contents: bytemuck::cast_slice(&flat_indices),
+                        usage: wgpu::BufferUsages::INDEX,
+                    });
 
-        let camera_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("CAD Camera Uniform Buffer"),
-                contents: bytemuck::bytes_of(&camera_uniform),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
+                let camera_buffer = gpu
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("CAD Camera Uniform Buffer"),
+                        contents: bytemuck::bytes_of(&camera_uniform),
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    });
 
-        let material_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("CAD Material Uniform Buffer"),
-                contents: bytemuck::bytes_of(&material),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
+                let material_buffer = gpu
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("CAD Material Uniform Buffer"),
+                        contents: bytemuck::bytes_of(&material),
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    });
 
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("CAD Draw Bind Group"),
-            layout: &self.cad_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: camera_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: material_buffer.as_entire_binding(),
-                },
-            ],
-        });
+                let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("CAD Draw Bind Group"),
+                    layout: &gpu.cad_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: camera_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: material_buffer.as_entire_binding(),
+                        },
+                    ],
+                });
 
-        self.execute_render_pass(
-            &self.cad_pipeline,
-            &bind_group,
-            &vertex_buffer,
-            &index_buffer,
-            flat_indices.len() as u32,
-            None,
-            width,
-            height,
-        )
+                Self::execute_render_pass(
+                    gpu,
+                    &gpu.cad_pipeline,
+                    &bind_group,
+                    &vertex_buffer,
+                    &index_buffer,
+                    flat_indices.len() as u32,
+                    None,
+                    width,
+                    height,
+                )
+            }
+        }
     }
 
     /// Renders a triangular solid CAD mesh in a specified debug visualization mode.
@@ -632,36 +722,6 @@ impl OffscreenRenderer {
                 normal: [v.normal[0] as f32, v.normal[1] as f32, v.normal[2] as f32],
             })
             .collect();
-
-        let flat_indices: Vec<u32> = mesh
-            .indices
-            .iter()
-            .flat_map(|tri| tri.iter().copied())
-            .collect();
-
-        let vertex_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("CAD Debug Vertex Buffer"),
-                contents: bytemuck::cast_slice(&cad_vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-
-        let index_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("CAD Debug Index Buffer"),
-                contents: bytemuck::cast_slice(&flat_indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
-
-        let camera_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("CAD Debug Camera Uniform Buffer"),
-                contents: bytemuck::bytes_of(&camera_uniform),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
 
         let (material, line_indices_opt, line_color) = match mode {
             DebugRenderMode::None => (
@@ -732,49 +792,64 @@ impl OffscreenRenderer {
             ),
         };
 
-        let material_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("CAD Debug Material Uniform Buffer"),
-                contents: bytemuck::bytes_of(&material),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
+        match &self.backend {
+            OffscreenBackend::SoftwareCpu => {
+                let line_overlay = line_indices_opt
+                    .as_deref()
+                    .filter(|l| !l.is_empty())
+                    .map(|l| (l, line_color));
+                render_cad_mesh_png_cpu(
+                    &cad_vertices,
+                    &mesh.indices,
+                    &camera_uniform,
+                    material,
+                    line_overlay,
+                    width,
+                    height,
+                )
+            }
+            OffscreenBackend::Wgpu(gpu) => {
+                let flat_indices: Vec<u32> = mesh
+                    .indices
+                    .iter()
+                    .flat_map(|tri| tri.iter().copied())
+                    .collect();
 
-        let cad_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("CAD Debug Draw Bind Group"),
-            layout: &self.cad_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: camera_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: material_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        let line_overlay_data = if let Some(ref lines) = line_indices_opt {
-            if !lines.is_empty() {
-                let line_ib = self
+                let vertex_buffer = gpu
                     .device
                     .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("CAD Debug Line Index Buffer"),
-                        contents: bytemuck::cast_slice(lines),
+                        label: Some("CAD Debug Vertex Buffer"),
+                        contents: bytemuck::cast_slice(&cad_vertices),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });
+
+                let index_buffer = gpu
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("CAD Debug Index Buffer"),
+                        contents: bytemuck::cast_slice(&flat_indices),
                         usage: wgpu::BufferUsages::INDEX,
                     });
-                let wire_uniform = WireframeUniform { color: line_color };
-                let wire_buffer = self
+
+                let camera_buffer = gpu
                     .device
                     .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("CAD Debug Wireframe Uniform Buffer"),
-                        contents: bytemuck::bytes_of(&wire_uniform),
+                        label: Some("CAD Debug Camera Uniform Buffer"),
+                        contents: bytemuck::bytes_of(&camera_uniform),
                         usage: wgpu::BufferUsages::UNIFORM,
                     });
-                let line_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("CAD Debug Line Bind Group"),
-                    layout: &self.wireframe_bind_group_layout,
+
+                let material_buffer = gpu
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("CAD Debug Material Uniform Buffer"),
+                        contents: bytemuck::bytes_of(&material),
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    });
+
+                let cad_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("CAD Debug Draw Bind Group"),
+                    layout: &gpu.cad_bind_group_layout,
                     entries: &[
                         wgpu::BindGroupEntry {
                             binding: 0,
@@ -782,32 +857,67 @@ impl OffscreenRenderer {
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
-                            resource: wire_buffer.as_entire_binding(),
+                            resource: material_buffer.as_entire_binding(),
                         },
                     ],
                 });
-                Some((line_bg, line_ib, lines.len() as u32))
-            } else {
-                None
+
+                let line_overlay_data = if let Some(ref lines) = line_indices_opt {
+                    if !lines.is_empty() {
+                        let line_ib = gpu
+                            .device
+                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: Some("CAD Debug Line Index Buffer"),
+                                contents: bytemuck::cast_slice(lines),
+                                usage: wgpu::BufferUsages::INDEX,
+                            });
+                        let wire_uniform = WireframeUniform { color: line_color };
+                        let wire_buffer = gpu
+                            .device
+                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: Some("CAD Debug Wireframe Uniform Buffer"),
+                                contents: bytemuck::bytes_of(&wire_uniform),
+                                usage: wgpu::BufferUsages::UNIFORM,
+                            });
+                        let line_bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("CAD Debug Line Bind Group"),
+                            layout: &gpu.wireframe_bind_group_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: camera_buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wire_buffer.as_entire_binding(),
+                                },
+                            ],
+                        });
+                        Some((line_bg, line_ib, lines.len() as u32))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let line_param = line_overlay_data
+                    .as_ref()
+                    .map(|(bg, ib, count)| (&gpu.wireframe_pipeline, bg, ib, *count));
+
+                Self::execute_render_pass(
+                    gpu,
+                    &gpu.cad_pipeline,
+                    &cad_bind_group,
+                    &vertex_buffer,
+                    &index_buffer,
+                    flat_indices.len() as u32,
+                    line_param,
+                    width,
+                    height,
+                )
             }
-        } else {
-            None
-        };
-
-        let line_param = line_overlay_data.as_ref().map(|(bg, ib, count)| {
-            (&self.wireframe_pipeline, bg, ib, *count)
-        });
-
-        self.execute_render_pass(
-            &self.cad_pipeline,
-            &cad_bind_group,
-            &vertex_buffer,
-            &index_buffer,
-            flat_indices.len() as u32,
-            line_param,
-            width,
-            height,
-        )
+        }
     }
 
     /// Helper to render CAD mesh in debug mode directly to a Base64 encoded PNG string.
@@ -951,7 +1061,6 @@ impl OffscreenRenderer {
         camera.fit_bounding_box(min_f32, max_f32);
         let camera_uniform = camera.build_uniform();
 
-        // GPU Buffers
         let fea_vertices: Vec<FeaVertex> = mesh
             .vertices
             .iter()
@@ -963,61 +1072,73 @@ impl OffscreenRenderer {
             })
             .collect();
 
-        let flat_indices: Vec<u32> = mesh
-            .indices
-            .iter()
-            .flat_map(|tri| tri.iter().copied())
-            .collect();
+        match &self.backend {
+            OffscreenBackend::SoftwareCpu => render_fea_heatmap_png_cpu(
+                &fea_vertices,
+                &mesh.indices,
+                &camera_uniform,
+                width,
+                height,
+            ),
+            OffscreenBackend::Wgpu(gpu) => {
+                let flat_indices: Vec<u32> = mesh
+                    .indices
+                    .iter()
+                    .flat_map(|tri| tri.iter().copied())
+                    .collect();
 
-        let vertex_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("FEA Vertex Buffer"),
-                contents: bytemuck::cast_slice(&fea_vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
+                let vertex_buffer = gpu
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("FEA Vertex Buffer"),
+                        contents: bytemuck::cast_slice(&fea_vertices),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });
 
-        let index_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("FEA Index Buffer"),
-                contents: bytemuck::cast_slice(&flat_indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
+                let index_buffer = gpu
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("FEA Index Buffer"),
+                        contents: bytemuck::cast_slice(&flat_indices),
+                        usage: wgpu::BufferUsages::INDEX,
+                    });
 
-        let camera_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("FEA Camera Uniform Buffer"),
-                contents: bytemuck::bytes_of(&camera_uniform),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
+                let camera_buffer = gpu
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("FEA Camera Uniform Buffer"),
+                        contents: bytemuck::bytes_of(&camera_uniform),
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    });
 
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("FEA Draw Bind Group"),
-            layout: &self.fea_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
-        });
+                let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("FEA Draw Bind Group"),
+                    layout: &gpu.fea_bind_group_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: camera_buffer.as_entire_binding(),
+                    }],
+                });
 
-        self.execute_render_pass(
-            &self.fea_pipeline,
-            &bind_group,
-            &vertex_buffer,
-            &index_buffer,
-            flat_indices.len() as u32,
-            None,
-            width,
-            height,
-        )
+                Self::execute_render_pass(
+                    gpu,
+                    &gpu.fea_pipeline,
+                    &bind_group,
+                    &vertex_buffer,
+                    &index_buffer,
+                    flat_indices.len() as u32,
+                    None,
+                    width,
+                    height,
+                )
+            }
+        }
     }
 
     /// Internal execution of the render pass and GPU-to-CPU texture readback.
     #[allow(clippy::too_many_arguments)]
     fn execute_render_pass(
-        &self,
+        gpu: &WgpuOffscreenState,
         pipeline: &wgpu::RenderPipeline,
         bind_group: &wgpu::BindGroup,
         vertex_buffer: &wgpu::Buffer,
@@ -1027,7 +1148,7 @@ impl OffscreenRenderer {
         width: u32,
         height: u32,
     ) -> Result<Vec<u8>, ViewerError> {
-        let _render_guard = self.render_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _render_guard = gpu.render_lock.lock().unwrap_or_else(|e| e.into_inner());
 
         let texture_desc = wgpu::TextureDescriptor {
             label: Some("Offscreen Color Texture"),
@@ -1043,7 +1164,7 @@ impl OffscreenRenderer {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         };
-        let color_texture = self.device.create_texture(&texture_desc);
+        let color_texture = gpu.device.create_texture(&texture_desc);
         let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let depth_desc = wgpu::TextureDescriptor {
@@ -1060,7 +1181,7 @@ impl OffscreenRenderer {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         };
-        let depth_texture = self.device.create_texture(&depth_desc);
+        let depth_texture = gpu.device.create_texture(&depth_desc);
         let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let unpadded_bytes_per_row = width * 4;
@@ -1068,14 +1189,14 @@ impl OffscreenRenderer {
         let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
         let buffer_size = (padded_bytes_per_row * height) as u64;
 
-        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+        let output_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Offscreen Readback Buffer"),
             size: buffer_size,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
 
-        let mut encoder = self
+        let mut encoder = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Offscreen Render Encoder"),
@@ -1149,7 +1270,7 @@ impl OffscreenRenderer {
             },
         );
 
-        self.queue.submit(std::iter::once(encoder.finish()));
+        gpu.queue.submit(std::iter::once(encoder.finish()));
 
         // Map buffer to CPU memory
         let buffer_slice = output_buffer.slice(..);
@@ -1158,7 +1279,7 @@ impl OffscreenRenderer {
             let _ = sender.send(result);
         });
 
-        self.device.poll(wgpu::Maintain::Wait);
+        gpu.device.poll(wgpu::Maintain::Wait);
 
         receiver
             .recv()
@@ -1217,5 +1338,112 @@ impl OffscreenRenderer {
     ) -> Result<String, ViewerError> {
         let png = self.render_fea_heatmap_png(mesh, stress_scalars, camera_preset, width, height)?;
         self.render_to_base64(&png)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mcp_cad_core::primitives::create_box;
+
+    const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+
+    #[test]
+    fn test_p5_t9_software_cpu_fallback_renders_valid_non_uniform_pngs_and_heatmap() {
+        let renderer = OffscreenRenderer::new_software_cpu();
+        assert!(renderer.is_software_cpu());
+        assert_eq!(renderer.backend_name(), "software_cpu");
+        assert!(renderer.device().is_none());
+        assert!(renderer.queue().is_none());
+
+        let mut cube = create_box(1.0, 1.0, 1.0);
+        // 1. Standard CAD shaded render produces valid PNG with geometry distinct from background
+        let shaded_png = renderer
+            .render_mesh_png(&cube, CameraPreset::Isometric, 320, 240)
+            .expect("CPU fallback shaded render must succeed");
+        assert!(shaded_png.len() > 200);
+        assert_eq!(&shaded_png[0..8], &PNG_MAGIC);
+
+        let shaded_img = image::load_from_memory(&shaded_png)
+            .expect("Shaded PNG must decode cleanly")
+            .to_rgba8();
+        assert_eq!(shaded_img.dimensions(), (320, 240));
+        let bg = [38u8, 43, 51, 255];
+        let fg_pixels = shaded_img.pixels().filter(|p| p.0 != bg).count();
+        assert!(
+            fg_pixels > 5_000,
+            "Expected substantial rasterized geometry pixels, got {fg_pixels}"
+        );
+
+        // 2. All debug modes render valid distinct PNGs (including wireframe & boundary edges)
+        cube.indices.remove(0); // introduce open boundary edges & exposed interior backface
+        let wireframe_png = renderer
+            .render_mesh_png_debug(&cube, CameraPreset::Isometric, DebugRenderMode::Wireframe, 240, 180)
+            .expect("CPU fallback wireframe render must succeed");
+        let normals_png = renderer
+            .render_mesh_png_debug(&cube, CameraPreset::Isometric, DebugRenderMode::Normals, 240, 180)
+            .expect("CPU fallback normals render must succeed");
+        let backfaces_png = renderer
+            .render_mesh_png_debug(&cube, CameraPreset::Isometric, DebugRenderMode::Backfaces, 240, 180)
+            .expect("CPU fallback backfaces render must succeed");
+        let boundary_png = renderer
+            .render_mesh_png_debug(&cube, CameraPreset::Isometric, DebugRenderMode::BoundaryEdges, 240, 180)
+            .expect("CPU fallback boundary edges render must succeed");
+        let flat_png = renderer
+            .render_mesh_png_debug(&cube, CameraPreset::Isometric, DebugRenderMode::FlatShading, 240, 180)
+            .expect("CPU fallback flat shading render must succeed");
+
+        for bytes in [&wireframe_png, &normals_png, &backfaces_png, &boundary_png, &flat_png] {
+            assert_eq!(&bytes[0..8], &PNG_MAGIC);
+            assert!(bytes.len() > 150);
+        }
+        assert_ne!(wireframe_png, normals_png);
+        assert_ne!(boundary_png, flat_png);
+
+        // BoundaryEdges mode must actually draw bright amber boundary pixels (R > 200, G > 170, B < 60)
+        let boundary_img = image::load_from_memory(&boundary_png).unwrap().to_rgba8();
+        let amber_pixels = boundary_img
+            .pixels()
+            .filter(|p| p.0[0] > 200 && p.0[1] > 170 && p.0[2] < 60)
+            .count();
+        assert!(
+            amber_pixels > 20,
+            "BoundaryEdges overlay should highlight open edges in amber, got {amber_pixels} px"
+        );
+
+        // 3. FEA heatmap renders gradient from blue (low stress) to red (high stress)
+        let beam = create_box(2.0, 0.4, 0.4);
+        let scalars: Vec<f32> = beam
+            .vertices
+            .iter()
+            .map(|v| ((v.position[0] + 1.0) * 0.5) as f32)
+            .collect();
+        let fea_png = renderer
+            .render_fea_heatmap_png(&beam, &scalars, CameraPreset::Front, 320, 240)
+            .expect("CPU fallback FEA heatmap render must succeed");
+        assert_eq!(&fea_png[0..8], &PNG_MAGIC);
+        let fea_img = image::load_from_memory(&fea_png).unwrap().to_rgba8();
+        let blue_px = fea_img
+            .pixels()
+            .filter(|p| p.0 != bg && p.0[2] > 150 && p.0[0] < 60)
+            .count();
+        let red_px = fea_img
+            .pixels()
+            .filter(|p| p.0 != bg && p.0[0] > 150 && p.0[2] < 60)
+            .count();
+        assert!(
+            blue_px > 200 && red_px > 200,
+            "FEA heatmap should contain both blue ({blue_px}) and red ({red_px}) gradient zones"
+        );
+
+        // 4. Error handling parity (invalid dimensions, empty mesh, scalar mismatch)
+        assert!(matches!(
+            renderer.render_mesh_png(&beam, CameraPreset::Isometric, 0, 200),
+            Err(ViewerError::InvalidDimensions { width: 0, height: 200 })
+        ));
+        assert!(matches!(
+            renderer.render_fea_heatmap_png(&beam, &[0.5], CameraPreset::Front, 160, 120),
+            Err(ViewerError::StressScalarMismatch { .. })
+        ));
     }
 }

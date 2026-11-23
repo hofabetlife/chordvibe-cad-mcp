@@ -168,6 +168,8 @@ async function startServer() {
       healthy,
       rustPort: RUST_MCP_PORT,
       binaryExists: fs.existsSync(resolveRustBinaryPath()),
+      cargoAvailable: fs.existsSync(CARGO_BIN),
+      coupledSimProxy: true,
       logs: rustLogs.slice(-40),
     });
   });
@@ -191,13 +193,207 @@ async function startServer() {
         body: JSON.stringify(req.body),
       });
       const json = await upstream.json();
-      res.json(json);
+      res.status(upstream.status).json(json);
     } catch (err) {
       res.status(500).json({
         jsonrpc: '2.0',
         id: req.body?.id ?? null,
         error: { code: -32603, message: String(err) },
       });
+    }
+  });
+
+  // 2b. Coupled Implicit HHT-α Dynamic FEM Simulation Proxy (/api/coupled-sim/*)
+  // All upstream requests strictly target the local hardcoded Rust daemon on 127.0.0.1:8080.
+  const RUST_COUPLED_BASE = `http://127.0.0.1:${RUST_MCP_PORT}/api/coupled-sim`;
+  const SAFE_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
+  const isSafeId = (val: string): boolean => SAFE_ID_RE.test(val) && !val.includes('..');
+  const SAFE_FRAME_RE = /^\d{1,6}$/;
+  const ALLOWED_UNITS = new Set(['m', 'mm']);
+
+  const buildAllowlistedFrameQuery = (query: Record<string, unknown>): string => {
+    const sp = new URLSearchParams();
+    if (typeof query.part_id === 'string' && isSafeId(query.part_id)) {
+      sp.set('part_id', query.part_id);
+    }
+    if (query.include_mesh_fields === 'true' || query.include_mesh_fields === 'false') {
+      sp.set('include_mesh_fields', query.include_mesh_fields);
+    }
+    if (
+      query.include_fragment_meshes === 'true' ||
+      query.include_fragment_meshes === 'false'
+    ) {
+      sp.set('include_fragment_meshes', query.include_fragment_meshes);
+    }
+    if (typeof query.length_unit === 'string' && ALLOWED_UNITS.has(query.length_unit)) {
+      sp.set('length_unit', query.length_unit);
+    }
+    const qs = sp.toString();
+    return qs ? `?${qs}` : '';
+  };
+
+  const forwardCoupledJson = async (
+    upstreamPath: string,
+    method: 'GET' | 'POST',
+    body: unknown,
+    res: express.Response
+  ) => {
+    try {
+      const healthy = await ensureRustMcpServer();
+      if (!healthy) {
+        res.status(503).json({
+          error: 'Rust mcp-cad-server is unavailable on port 8080',
+        });
+        return;
+      }
+      const upstream = await fetch(`${RUST_COUPLED_BASE}${upstreamPath}`, {
+        method,
+        headers: method === 'POST' ? { 'Content-Type': 'application/json' } : undefined,
+        body: method === 'POST' ? JSON.stringify(body ?? {}) : undefined,
+      });
+      const text = await upstream.text();
+      res.status(upstream.status);
+      res.setHeader(
+        'Content-Type',
+        upstream.headers.get('content-type') || 'application/json'
+      );
+      res.send(text);
+    } catch (err) {
+      res.status(502).json({ error: `Rust coupled-sim proxy error: ${String(err)}` });
+    }
+  };
+
+  app.post('/api/coupled-sim/bake', async (req, res) => {
+    await forwardCoupledJson('/bake', 'POST', req.body, res);
+  });
+
+  app.get('/api/coupled-sim/status', async (_req, res) => {
+    await forwardCoupledJson('/status', 'GET', undefined, res);
+  });
+
+  app.get('/api/coupled-sim/status/:jobId', async (req, res) => {
+    const { jobId } = req.params;
+    if (!isSafeId(jobId)) {
+      res.status(400).json({ error: 'Invalid job_id format' });
+      return;
+    }
+    await forwardCoupledJson(`/status/${encodeURIComponent(jobId)}`, 'GET', undefined, res);
+  });
+
+  app.post('/api/coupled-sim/cancel/:jobId', async (req, res) => {
+    const { jobId } = req.params;
+    if (!isSafeId(jobId)) {
+      res.status(400).json({ error: 'Invalid job_id format' });
+      return;
+    }
+    await forwardCoupledJson(`/cancel/${encodeURIComponent(jobId)}`, 'POST', {}, res);
+  });
+
+  app.get('/api/coupled-sim/fragments', async (req, res) => {
+    const unit =
+      typeof req.query.length_unit === 'string' && ALLOWED_UNITS.has(req.query.length_unit)
+        ? `?length_unit=${req.query.length_unit}`
+        : '';
+    await forwardCoupledJson(`/fragments${unit}`, 'GET', undefined, res);
+  });
+
+  app.get('/api/coupled-sim/fragments/:simId', async (req, res) => {
+    const { simId } = req.params;
+    if (!isSafeId(simId)) {
+      res.status(400).json({ error: 'Invalid sim_id format' });
+      return;
+    }
+    const unit =
+      typeof req.query.length_unit === 'string' && ALLOWED_UNITS.has(req.query.length_unit)
+        ? `?length_unit=${req.query.length_unit}`
+        : '';
+    await forwardCoupledJson(
+      `/fragments/${encodeURIComponent(simId)}${unit}`,
+      'GET',
+      undefined,
+      res
+    );
+  });
+
+  app.get('/api/coupled-sim/frames/:frameIndex', async (req, res) => {
+    const { frameIndex } = req.params;
+    if (!SAFE_FRAME_RE.test(frameIndex)) {
+      res.status(400).json({ error: 'Invalid frame_index format' });
+      return;
+    }
+    const qs = buildAllowlistedFrameQuery(req.query as Record<string, unknown>);
+    await forwardCoupledJson(`/frames/${frameIndex}${qs}`, 'GET', undefined, res);
+  });
+
+  app.get('/api/coupled-sim/frames/:simId/:frameIndex', async (req, res) => {
+    const { simId, frameIndex } = req.params;
+    if (!isSafeId(simId) || !SAFE_FRAME_RE.test(frameIndex)) {
+      res.status(400).json({ error: 'Invalid sim_id or frame_index format' });
+      return;
+    }
+    const qs = buildAllowlistedFrameQuery(req.query as Record<string, unknown>);
+    await forwardCoupledJson(
+      `/frames/${encodeURIComponent(simId)}/${frameIndex}${qs}`,
+      'GET',
+      undefined,
+      res
+    );
+  });
+
+  app.get('/api/coupled-sim/events', async (req, res) => {
+    const healthy = await ensureRustMcpServer();
+    if (!healthy) {
+      res.status(503).json({
+        error: 'Rust mcp-cad-server is unavailable on port 8080',
+      });
+      return;
+    }
+
+    const abortController = new AbortController();
+    req.on('close', () => {
+      abortController.abort();
+    });
+
+    try {
+      const upstream = await fetch(`${RUST_COUPLED_BASE}/events`, {
+        method: 'GET',
+        headers: { Accept: 'text/event-stream' },
+        signal: abortController.signal,
+      });
+
+      if (!upstream.ok || !upstream.body) {
+        res.status(upstream.status || 502).json({
+          error: `Upstream SSE error: HTTP ${upstream.status}`,
+        });
+        return;
+      }
+
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders?.();
+
+      const reader = upstream.body.getReader();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value && value.byteLength > 0) {
+            res.write(Buffer.from(value));
+          }
+        }
+      } finally {
+        reader.releaseLock();
+        if (!res.writableEnded) {
+          res.end();
+        }
+      }
+    } catch (err) {
+      if (!abortController.signal.aborted && !res.headersSent) {
+        res.status(502).json({ error: `SSE proxy error: ${String(err)}` });
+      } else if (!res.writableEnded) {
+        res.end();
+      }
     }
   });
 

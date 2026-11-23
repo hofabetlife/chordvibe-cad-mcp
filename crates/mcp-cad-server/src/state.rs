@@ -15,8 +15,12 @@ use mcp_cad_physics::simulator::PhysicsWorld;
 use mcp_cad_physics::telemetry::SimulationSummary;
 use mcp_cad_viewer::offscreen::OffscreenRenderer;
 use mcp_cad_viewer::window::{GuiEvent, GuiProxy};
+use tokio::sync::broadcast;
 
 use crate::error::ServerError;
+use crate::tools::coupled_sim::{
+    CoupledSimSseEvent, CoupledSimulationManager, SharedCoupledSimManager,
+};
 
 /// Active linear dimension unit for the MCP boundary contract (`[DECISION-UNITS-1]`).
 /// Internal CAD/FEA/Physics kernels strictly operate in SI (`m`, `Pa`, `N`, `kg`, `s`).
@@ -131,6 +135,10 @@ pub struct EngineState {
     pub offscreen_renderer: Arc<OffscreenRenderer>,
     /// Optional Winit event loop proxy for sending mesh and FEA updates to the interactive GUI window.
     pub gui_proxy: Option<GuiProxy>,
+    /// Server-side coupled implicit HHT-α simulation manager, active job cancel flags, and frame cache (`P5-T6`).
+    pub coupled_sim: SharedCoupledSimManager,
+    /// Broadcast channel streaming real-time coupled simulation progress and lifecycle SSE events (`P5-T6`).
+    pub coupled_sim_events_tx: broadcast::Sender<CoupledSimSseEvent>,
 }
 
 /// Thread-safe shared handle to the engine state.
@@ -158,6 +166,8 @@ impl EngineState {
             requirements: crate::tools::requirements::RequirementsState::default(),
             offscreen_renderer: renderer,
             gui_proxy: None,
+            coupled_sim: Arc::new(RwLock::new(CoupledSimulationManager::new())),
+            coupled_sim_events_tx: broadcast::channel(256).0,
         }
     }
 

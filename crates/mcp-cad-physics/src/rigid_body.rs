@@ -448,6 +448,131 @@ impl RigidBody {
         self.sleeping = false;
     }
 
+    /// Constructs a dynamic [`RigidBody`] directly from exact FEA-integrated mass, center of mass,
+    /// $3\times 3$ inertia tensor about COM, world pose, and initial linear/angular velocities (`P5-T5`).
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn from_exact_mass_properties(
+        part_id: impl Into<String>,
+        mass_kg: f64,
+        local_com: [f64; 3],
+        inertia_tensor_com: [[f64; 3]; 3],
+        position: [f64; 3],
+        orientation_quat: [f64; 4],
+        linear_velocity: [f64; 3],
+        angular_velocity: [f64; 3],
+    ) -> Self {
+        let mass = mass_kg.max(0.0);
+        let is_dynamic = mass > 1e-15;
+        let inv_mass = if is_dynamic { 1.0 / mass } else { 0.0 };
+        let com_v = Vector3::new(local_com[0], local_com[1], local_com[2]);
+        let mut inertia = Matrix3::new(
+            inertia_tensor_com[0][0], inertia_tensor_com[0][1], inertia_tensor_com[0][2],
+            inertia_tensor_com[1][0], inertia_tensor_com[1][1], inertia_tensor_com[1][2],
+            inertia_tensor_com[2][0], inertia_tensor_com[2][1], inertia_tensor_com[2][2],
+        );
+        for r in 0..3 {
+            inertia[(r, r)] = inertia[(r, r)].max(0.0);
+            for c in (r + 1)..3 {
+                let sym = 0.5 * (inertia[(r, c)] + inertia[(c, r)]);
+                inertia[(r, c)] = sym;
+                inertia[(c, r)] = sym;
+            }
+        }
+        let inv_inertia = if is_dynamic {
+            inertia.try_inverse().unwrap_or_else(Matrix3::zeros)
+        } else {
+            Matrix3::zeros()
+        };
+        let com_norm_sq = com_v.norm_squared();
+        let steiner_shift =
+            mass * (Matrix3::from_diagonal_element(com_norm_sq) - com_v * com_v.transpose());
+        let inertia_origin = inertia + steiner_shift;
+
+        let q = Quaternion::new(
+            orientation_quat[3],
+            orientation_quat[0],
+            orientation_quat[1],
+            orientation_quat[2],
+        );
+        let orientation = if q.norm() > 1e-12 {
+            UnitQuaternion::from_quaternion(q)
+        } else {
+            UnitQuaternion::identity()
+        };
+
+        Self {
+            handle: BodyHandle(0),
+            part_id: part_id.into(),
+            is_dynamic,
+            is_fixed: !is_dynamic,
+            mass,
+            inv_mass,
+            local_com: com_v,
+            local_inertia: inertia,
+            local_inv_inertia: inv_inertia,
+            local_inertia_origin: inertia_origin,
+            position: Vector3::new(position[0], position[1], position[2]),
+            orientation,
+            linear_velocity: if is_dynamic {
+                Vector3::new(linear_velocity[0], linear_velocity[1], linear_velocity[2])
+            } else {
+                Vector3::zeros()
+            },
+            angular_velocity: if is_dynamic {
+                Vector3::new(angular_velocity[0], angular_velocity[1], angular_velocity[2])
+            } else {
+                Vector3::zeros()
+            },
+            external_force: Vector3::zeros(),
+            external_torque: Vector3::zeros(),
+            sleeping: false,
+            colliders: Vec::new(),
+        }
+    }
+
+    /// Updates exact mass, local COM, and $3\times 3$ inertia tensor about COM in place while
+    /// preserving `BodyHandle`, world pose, velocities, and attached joints (`P5-T5`).
+    pub fn update_exact_mass_properties(
+        &mut self,
+        mass_kg: f64,
+        local_com: [f64; 3],
+        inertia_tensor_com: [[f64; 3]; 3],
+    ) {
+        let mass = mass_kg.max(0.0);
+        let effective_dynamic = self.is_dynamic && mass > 1e-15;
+        let com_v = Vector3::new(local_com[0], local_com[1], local_com[2]);
+        let mut inertia = Matrix3::new(
+            inertia_tensor_com[0][0], inertia_tensor_com[0][1], inertia_tensor_com[0][2],
+            inertia_tensor_com[1][0], inertia_tensor_com[1][1], inertia_tensor_com[1][2],
+            inertia_tensor_com[2][0], inertia_tensor_com[2][1], inertia_tensor_com[2][2],
+        );
+        for r in 0..3 {
+            inertia[(r, r)] = inertia[(r, r)].max(0.0);
+            for c in (r + 1)..3 {
+                let sym = 0.5 * (inertia[(r, c)] + inertia[(c, r)]);
+                inertia[(r, c)] = sym;
+                inertia[(c, r)] = sym;
+            }
+        }
+        let inv_inertia = if effective_dynamic {
+            inertia.try_inverse().unwrap_or_else(Matrix3::zeros)
+        } else {
+            Matrix3::zeros()
+        };
+        let com_norm_sq = com_v.norm_squared();
+        let steiner_shift =
+            mass * (Matrix3::from_diagonal_element(com_norm_sq) - com_v * com_v.transpose());
+
+        self.mass = mass;
+        self.inv_mass = if effective_dynamic { 1.0 / mass } else { 0.0 };
+        self.local_com = com_v;
+        self.local_inertia = inertia;
+        self.local_inv_inertia = inv_inertia;
+        self.local_inertia_origin = inertia + steiner_shift;
+        self.sleeping = false;
+    }
+
     /// Returns `true` if the rigid body is dynamic (movable).
     #[inline]
     #[must_use]
@@ -979,9 +1104,30 @@ pub struct Collider {
 impl Collider {
     /// Builds a [`Collider`] in `f64` from a CAD [`Part`] and [`ColliderType`].
     pub fn from_part(part: &Part, collider_type: ColliderType) -> Result<Self, PhysicsError> {
-        if part.mesh.vertices.is_empty() {
+        Self::from_mesh(
+            &part.id,
+            &part.mesh,
+            part.material.density_kg_m3,
+            collider_type,
+            0.5,
+            0.0,
+        )
+    }
+
+    /// Builds a [`Collider`] in `f64` directly from a closed [`TriangleMesh`], density,
+    /// [`ColliderType`], and contact properties (used for CAD parts and detached FEA fragments).
+    pub fn from_mesh(
+        part_id: impl Into<String>,
+        mesh: &TriangleMesh,
+        density_kg_m3: f64,
+        collider_type: ColliderType,
+        friction: f64,
+        restitution: f64,
+    ) -> Result<Self, PhysicsError> {
+        let part_id = part_id.into();
+        if mesh.vertices.is_empty() {
             return Err(PhysicsError::InvalidGeometry(
-                part.id.clone(),
+                part_id,
                 "Part mesh is empty. Rebuild the part DAG first.".into(),
             ));
         }
@@ -991,17 +1137,17 @@ impl Collider {
 
         let shape = match collider_type {
             ColliderType::ConvexHull => {
-                if part.mesh.vertices.len() < 4 {
+                if mesh.vertices.len() < 4 {
                     return Err(PhysicsError::ColliderCreationFailed(
-                        part.id.clone(),
+                        part_id,
                         "At least 4 vertices required for convex hull collider".into(),
                     ));
                 }
                 let raw_points: Vec<[f64; 3]> =
-                    part.mesh.vertices.iter().map(|v| v.position).collect();
+                    mesh.vertices.iter().map(|v| v.position).collect();
                 let (points, faces) = compute_convex_hull_f64(&raw_points).ok_or_else(|| {
                     PhysicsError::ColliderCreationFailed(
-                        part.id.clone(),
+                        part_id.clone(),
                         "Convex hull computation failed: points may be coplanar or collinear"
                             .into(),
                     )
@@ -1009,34 +1155,33 @@ impl Collider {
                 ColliderShape::ConvexHull { points, faces }
             }
             ColliderType::TriMesh => {
-                if part.mesh.indices.is_empty() {
+                if mesh.indices.is_empty() {
                     return Err(PhysicsError::ColliderCreationFailed(
-                        part.id.clone(),
+                        part_id,
                         "TriMesh collider requires at least one triangle index face".into(),
                     ));
                 }
-                let vertices: Vec<[f64; 3]> =
-                    part.mesh.vertices.iter().map(|v| v.position).collect();
-                let indices = part.mesh.indices.clone();
+                let vertices: Vec<[f64; 3]> = mesh.vertices.iter().map(|v| v.position).collect();
+                let indices = mesh.indices.clone();
                 ColliderShape::TriMesh { vertices, indices }
             }
             ColliderType::Compound => {
-                if part.mesh.vertices.len() < 4 || part.mesh.indices.is_empty() {
+                if mesh.vertices.len() < 4 || mesh.indices.is_empty() {
                     return Err(PhysicsError::ColliderCreationFailed(
-                        part.id.clone(),
+                        part_id,
                         "Compound decomposition requires vertices and faces".into(),
                     ));
                 }
-                let parts = compute_compound_convex_parts_f64(&part.mesh).ok_or_else(|| {
+                let parts = compute_compound_convex_parts_f64(mesh).ok_or_else(|| {
                     PhysicsError::ColliderCreationFailed(
-                        part.id.clone(),
+                        part_id.clone(),
                         "Compound convex decomposition failed: mesh may be degenerate".into(),
                     )
                 })?;
                 ColliderShape::Compound { parts }
             }
             ColliderType::Cube => {
-                let aabb = part.mesh.bounding_box();
+                let aabb = mesh.bounding_box();
                 let dims = aabb.dimensions();
                 let hx = (dims[0] * 0.5).max(1e-4);
                 let hy = (dims[1] * 0.5).max(1e-4);
@@ -1048,7 +1193,7 @@ impl Collider {
                 }
             }
             ColliderType::Sphere => {
-                let aabb = part.mesh.bounding_box();
+                let aabb = mesh.bounding_box();
                 let dims = aabb.dimensions();
                 let radius = (dims[0].max(dims[1]).max(dims[2]) * 0.5).max(1e-4);
                 let center = aabb.center();
@@ -1056,13 +1201,12 @@ impl Collider {
                 ColliderShape::Sphere { radius }
             }
             ColliderType::Cylinder => {
-                let aabb = part.mesh.bounding_box();
+                let aabb = mesh.bounding_box();
                 let dims = aabb.dimensions();
                 let center = aabb.center();
                 local_translation = Vector3::new(center[0], center[1], center[2]);
 
                 if dims[2] > dims[0] && dims[2] > dims[1] {
-                    // Aligned along Z-axis (default for mcp-cad-core cylinders)
                     let radius = (dims[0].max(dims[1]) * 0.5).max(1e-4);
                     let half_height = (dims[2] * 0.5).max(1e-4);
                     let rot = Rotation3::from_axis_angle(
@@ -1076,7 +1220,6 @@ impl Collider {
                         axis: [0.0, 0.0, 1.0],
                     }
                 } else if dims[0] > dims[1] && dims[0] > dims[2] {
-                    // Aligned along X-axis
                     let radius = (dims[1].max(dims[2]) * 0.5).max(1e-4);
                     let half_height = (dims[0] * 0.5).max(1e-4);
                     let rot = Rotation3::from_axis_angle(
@@ -1090,7 +1233,6 @@ impl Collider {
                         axis: [1.0, 0.0, 0.0],
                     }
                 } else {
-                    // Aligned along Y-axis
                     let radius = (dims[0].max(dims[2]) * 0.5).max(1e-4);
                     let half_height = (dims[1] * 0.5).max(1e-4);
                     ColliderShape::Cylinder {
@@ -1102,8 +1244,8 @@ impl Collider {
             }
         };
 
-        let mass_properties = MassProperties::from_part(part);
-        let density = part.material.density_kg_m3.max(0.0);
+        let density = density_kg_m3.max(0.0);
+        let mass_properties = MassProperties::from_mesh_and_density(mesh, density);
         let mass = mass_properties.mass;
 
         let world_translation = local_translation;
@@ -1124,7 +1266,7 @@ impl Collider {
         Ok(Self {
             handle: ColliderHandle(0),
             parent: None,
-            part_id: part.id.clone(),
+            part_id,
             collider_type,
             shape,
             local_translation,
@@ -1134,8 +1276,8 @@ impl Collider {
             density,
             mass,
             mass_properties,
-            friction: 0.5,
-            restitution: 0.0,
+            friction: friction.max(0.0),
+            restitution: restitution.clamp(0.0, 1.0),
             local_aabb,
             world_aabb,
             tri_bvh,

@@ -2,6 +2,11 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   CadPart,
   DagNodeType,
+  DeformationScalePreset,
+  DestructionCache,
+  DestructionFieldMode,
+  DestructionScenarioMode,
+  DestructionSimConfig,
   EngineeringWorkbench,
   FeaBoundaryCondition,
   FeaSimulationResult,
@@ -12,6 +17,7 @@ import {
   ProjectionMode,
   QualityPreset,
   RenderMode,
+  SimulationSubMode,
   ViewportLayout,
 } from './types/cad';
 import { DEFAULT_MATERIALS, getMaterialById } from './cad/materials';
@@ -43,10 +49,23 @@ import {
 } from './components/CadRightSidebar';
 import { CadStatusBar } from './components/CadStatusBar';
 import {
+  CadDestructionTimeline,
+  PlaybackSpeed,
+} from './components/CadDestructionTimeline';
+import {
+  bakeDestructionCacheAsync,
+  DEFAULT_DESTRUCTION_CONFIG,
+  exportDestructionCacheSummaryJson,
+  formatCacheBytes,
+  getPresetDestructionConfig,
+} from './cad/destruction_engine';
+import {
   AI_UNOPTIMIZED_SCENARIOS,
   AiUnoptimizedScenario,
 } from './cad/query_optimizer';
 import {
+  bakeNativeCoupledSimulation,
+  cancelNativeCoupledSimulation,
   DEFAULT_BRIDGE_STATUS,
   executeRemoteWindowsMcpTool,
   getWindowsWgpuArtifactUrl,
@@ -54,7 +73,9 @@ import {
   loadCachedRustStlMesh,
   NativeBridgeStatus,
   probeWindowsMcpServer,
+  RustBakeCancelledError,
 } from './cad/native_bridge';
+import type { RustAccuracyLevel } from './cad/rust_scene_sync';
 import {
   Scissors,
   Sparkles,
@@ -74,6 +95,7 @@ import {
   HelpCircle,
   Compass,
   Activity,
+  Flame,
 } from 'lucide-react';
 
 const NATIVE_STL_PRESET_MAP: Record<
@@ -154,6 +176,40 @@ export function App() {
     useState<boolean>(false);
   const [feaResult, setFeaResult] = useState<FeaSimulationResult | null>(null);
   const [fps, setFps] = useState<number>(60);
+
+  // Cached Destruction Simulation & Timeline State
+  const [simulationSubMode, setSimulationSubMode] =
+    useState<SimulationSubMode>('kinematics');
+  const [destructionConfig, setDestructionConfig] =
+    useState<DestructionSimConfig>(DEFAULT_DESTRUCTION_CONFIG);
+  const [destructionCache, setDestructionCache] =
+    useState<DestructionCache | null>(null);
+  const [destructionFrame, setDestructionFrame] = useState<number>(0);
+  const [isPlayingDestruction, setIsPlayingDestruction] =
+    useState<boolean>(false);
+  const [playbackSpeed, setPlaybackSpeed] = useState<PlaybackSpeed>(0.5);
+  const [loopDestruction, setLoopDestruction] = useState<boolean>(true);
+  const [showDestructionStressGlow, setShowDestructionStressGlow] =
+    useState<boolean>(true);
+  const [showDestructionSparks, setShowDestructionSparks] =
+    useState<boolean>(true);
+  const [isBakingDestruction, setIsBakingDestruction] =
+    useState<boolean>(false);
+  const [bakeProgressPct, setBakeProgressPct] = useState<number>(0);
+  const [bakeStageLabel, setBakeStageLabel] = useState<string>('');
+  const [isDestructionCacheStale, setIsDestructionCacheStale] =
+    useState<boolean>(false);
+  const [destructionFieldMode, setDestructionFieldMode] =
+    useState<DestructionFieldMode>('shaded');
+  const [destructionDeformScale, setDestructionDeformScale] =
+    useState<DeformationScalePreset>(5);
+  const [rustAccuracyLevel, setRustAccuracyLevel] =
+    useState<RustAccuracyLevel>('standard');
+  const [isProbingRust, setIsProbingRust] = useState<boolean>(false);
+  const [nativeBakeError, setNativeBakeError] = useState<string | null>(null);
+  const [canCancelBake, setCanCancelBake] = useState<boolean>(false);
+  const activeRustJobIdRef = useRef<string | null>(null);
+  const activeRustAbortRef = useRef<AbortController | null>(null);
 
   // Modals for Cut Hole + Keyway and Cut Helical Groove / ISO Thread
   const [isHoleModalOpen, setIsHoleModalOpen] = useState<boolean>(false);
@@ -258,6 +314,10 @@ export function App() {
       setActivePreset(presetId);
       setIsSimulatingPhysics(false);
       setFeaResult(null);
+      setDestructionCache(null);
+      setDestructionFrame(0);
+      setIsPlayingDestruction(false);
+      setIsDestructionCacheStale(false);
       if (keepRenderMode) {
         setRenderMode(keepRenderMode);
       } else if (renderMode === 'fea_heatmap') {
@@ -987,6 +1047,240 @@ export function App() {
         setParts([csgPart]);
         setSelectedPartId(csgPart.id);
         setJoints([]);
+      } else if (presetId === 'gears_clash_destruction') {
+        // Opposing-gears destructive clash rig: Z1=18 (m=2.2, R1=19.8mm) & Z2=22 (m=2.2, R2=24.2mm), center distance a=44mm
+        const leftGearDag = [
+          {
+            id: 'node_gcl_1',
+            name: 'Ведущая шестерня Z=18 (m=2.2)',
+            type: 'spur_gear' as const,
+            params: {
+              teeth: 18,
+              module: 2.2,
+              pressure_angle_deg: 20,
+              face_width: 0.016,
+              bore_diameter: 0.012,
+              hub_diameter: 0.024,
+              hub_length: 0.006,
+              keyway_width: 0.004,
+              keyway_depth: 0.0018,
+            },
+            enabled: true,
+          },
+        ];
+        const rightGearDag = [
+          {
+            id: 'node_gcr_1',
+            name: 'Встречная шестерня Z=22 (m=2.2)',
+            type: 'spur_gear' as const,
+            params: {
+              teeth: 22,
+              module: 2.2,
+              pressure_angle_deg: 20,
+              face_width: 0.016,
+              bore_diameter: 0.014,
+              hub_diameter: 0.028,
+              hub_length: 0.006,
+              keyway_width: 0.004,
+              keyway_depth: 0.0018,
+            },
+            enabled: true,
+          },
+        ];
+        const benchDag = [
+          {
+            id: 'node_bench',
+            name: 'Испытательная плита стенда 200×12×90мм',
+            type: 'box' as const,
+            params: { width: 0.2, height: 0.012, depth: 0.09 },
+            enabled: true,
+          },
+        ];
+
+        const leftGear: CadPart = {
+          id: 'gear_clash_left',
+          name: 'Шестерня A (Сталь 4140, Z=18)',
+          materialId: 'steel_4140',
+          dag: leftGearDag,
+          mesh: evaluateFeatureTree(leftGearDag, q, 7850),
+          visible: true,
+          position: [-0.0254, 0, 0],
+          rotation: [0, 0, 0],
+          scale: [1, 1, 1],
+        };
+        const rightGear: CadPart = {
+          id: 'gear_clash_right',
+          name: 'Шестерня B (Латунь C360, Z=22)',
+          materialId: 'brass_c360',
+          dag: rightGearDag,
+          mesh: evaluateFeatureTree(rightGearDag, q, 8500),
+          visible: true,
+          position: [0.0254, 0, 0],
+          rotation: [0, 0, Math.PI / 22],
+          scale: [1, 1, 1],
+        };
+        const benchPart: CadPart = {
+          id: 'test_rig_bench',
+          name: 'Плита испытательного стенда',
+          materialId: 'steel_4140',
+          dag: benchDag,
+          mesh: evaluateFeatureTree(benchDag, q, 7850),
+          visible: true,
+          position: [0, -0.048, 0],
+          rotation: [0, 0, 0],
+          scale: [1, 1, 1],
+          isFixed: true,
+        };
+
+        setParts([leftGear, rightGear, benchPart]);
+        setSelectedPartId(leftGear.id);
+        setJoints([
+          {
+            id: 'joint_drive_left',
+            name: 'Привод левой шестерни (+ω₁)',
+            type: 'revolute',
+            partA: 'test_rig_bench',
+            partB: 'gear_clash_left',
+            anchor: [-0.0254, 0, 0],
+            axis: [0, 0, 1],
+            motorSpeedRpm: 120,
+            motorTorqueNm: 185,
+            motorEnabled: true,
+            currentAngleRad: 0,
+          },
+          {
+            id: 'joint_drive_right',
+            name: 'Встречный привод правой (+ω₂)',
+            type: 'revolute',
+            partA: 'test_rig_bench',
+            partB: 'gear_clash_right',
+            anchor: [0.0254, 0, 0],
+            axis: [0, 0, 1],
+            motorSpeedRpm: 120,
+            motorTorqueNm: 185,
+            motorEnabled: true,
+            currentAngleRad: 0,
+          },
+        ]);
+        setDestructionConfig(getPresetDestructionConfig('counter_clash'));
+        setSimulationSubMode('destruction');
+      } else if (presetId === 'gear_overload_burst') {
+        // High-torque overload destruction rig: Steel Z1=20 + Aluminum Z2=30, m=2.0mm, a=50mm
+        const pinionDag = [
+          {
+            id: 'node_ov_p1',
+            name: 'Ведущая шестерня Z=20 (Сталь 4140)',
+            type: 'spur_gear' as const,
+            params: {
+              teeth: 20,
+              module: 2.0,
+              pressure_angle_deg: 20,
+              face_width: 0.015,
+              bore_diameter: 0.01,
+              hub_diameter: 0.022,
+              hub_length: 0.005,
+              keyway_width: 0.003,
+              keyway_depth: 0.0015,
+            },
+            enabled: true,
+          },
+        ];
+        const drivenDag = [
+          {
+            id: 'node_ov_g2',
+            name: 'Ведомая шестерня Z=30 (Al 6061)',
+            type: 'spur_gear' as const,
+            params: {
+              teeth: 30,
+              module: 2.0,
+              pressure_angle_deg: 20,
+              face_width: 0.015,
+              bore_diameter: 0.014,
+              hub_diameter: 0.028,
+              hub_length: 0.005,
+              keyway_width: 0.004,
+              keyway_depth: 0.002,
+            },
+            enabled: true,
+          },
+        ];
+        const benchDag = [
+          {
+            id: 'node_ov_bench',
+            name: 'Плита нагрузочного стенда 220×12×90мм',
+            type: 'box' as const,
+            params: { width: 0.22, height: 0.012, depth: 0.09 },
+            enabled: true,
+          },
+        ];
+
+        const pinionPart: CadPart = {
+          id: 'gear_overload_pinion',
+          name: 'Шестерня-привод Z=20 (Сталь)',
+          materialId: 'steel_4140',
+          dag: pinionDag,
+          mesh: evaluateFeatureTree(pinionDag, q, 7850),
+          visible: true,
+          position: [-0.025, 0, 0],
+          rotation: [0, 0, 0],
+          scale: [1, 1, 1],
+        };
+        const drivenPart: CadPart = {
+          id: 'gear_overload_driven',
+          name: 'Ведомое колесо Z=30 (Al 6061)',
+          materialId: 'alu_6061',
+          dag: drivenDag,
+          mesh: evaluateFeatureTree(drivenDag, q, 2700),
+          visible: true,
+          position: [0.025, 0, 0],
+          rotation: [0, 0, Math.PI / 30],
+          scale: [1, 1, 1],
+        };
+        const benchPart: CadPart = {
+          id: 'test_rig_bench',
+          name: 'Плита испытательного стенда',
+          materialId: 'steel_1045',
+          dag: benchDag,
+          mesh: evaluateFeatureTree(benchDag, q, 7850),
+          visible: true,
+          position: [0, -0.052, 0],
+          rotation: [0, 0, 0],
+          scale: [1, 1, 1],
+          isFixed: true,
+        };
+
+        setParts([pinionPart, drivenPart, benchPart]);
+        setSelectedPartId(pinionPart.id);
+        setJoints([
+          {
+            id: 'joint_ov_left',
+            name: 'Привод редуктора (+180 RPM)',
+            type: 'revolute',
+            partA: 'test_rig_bench',
+            partB: 'gear_overload_pinion',
+            anchor: [-0.025, 0, 0],
+            axis: [0, 0, 1],
+            motorSpeedRpm: 180,
+            motorTorqueNm: 260,
+            motorEnabled: true,
+            currentAngleRad: 0,
+          },
+          {
+            id: 'joint_ov_right',
+            name: 'Нагрузочный тормоз (-120 RPM)',
+            type: 'revolute',
+            partA: 'test_rig_bench',
+            partB: 'gear_overload_driven',
+            anchor: [0.025, 0, 0],
+            axis: [0, 0, 1],
+            motorSpeedRpm: -120,
+            motorTorqueNm: 260,
+            motorEnabled: true,
+            currentAngleRad: 0,
+          },
+        ]);
+        setDestructionConfig(getPresetDestructionConfig('torque_overload'));
+        setSimulationSubMode('destruction');
       } else {
         const aiScen = AI_UNOPTIMIZED_SCENARIOS.find((s) => s.id === presetId);
         if (aiScen) {
@@ -1068,7 +1362,21 @@ export function App() {
         cycleQualityPreset();
       } else if (e.code === 'KeyP') {
         e.preventDefault();
-        setIsSimulatingPhysics((prev) => !prev);
+        if (destructionCache) {
+          setIsPlayingDestruction((prev) => !prev);
+        } else {
+          setIsSimulatingPhysics((prev) => !prev);
+        }
+      } else if (e.code === 'ArrowLeft' && destructionCache) {
+        e.preventDefault();
+        setIsPlayingDestruction(false);
+        setDestructionFrame((prev) => Math.max(0, prev - 1));
+      } else if (e.code === 'ArrowRight' && destructionCache) {
+        e.preventDefault();
+        setIsPlayingDestruction(false);
+        setDestructionFrame((prev) =>
+          Math.min(destructionCache.totalFrames, prev + 1)
+        );
       } else if (e.code === 'KeyO') {
         e.preventDefault();
         setProjectionMode((prev) =>
@@ -1106,11 +1414,11 @@ export function App() {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [cycleQualityPreset]);
+  }, [cycleQualityPreset, destructionCache]);
 
-  // 60Hz Kinematics Loop
+  // 60Hz Live Kinematics Loop (automatically paused when destruction cache is active)
   useEffect(() => {
-    if (!isSimulatingPhysics) return;
+    if (!isSimulatingPhysics || destructionCache) return;
     const interval = setInterval(() => {
       setParts((prevParts) => {
         const res = stepKinematicsAssembly(prevParts, joints, 1 / 60);
@@ -1119,7 +1427,285 @@ export function App() {
       });
     }, 16);
     return () => clearInterval(interval);
-  }, [isSimulatingPhysics, joints]);
+  }, [isSimulatingPhysics, joints, destructionCache]);
+
+  // Frame-rate independent Cached Destruction Timeline Playback Loop
+  useEffect(() => {
+    if (!isPlayingDestruction || !destructionCache) return;
+    let rafId = 0;
+    let lastTs = performance.now();
+    let frameAccumulator = destructionFrame;
+
+    const tick = (now: number) => {
+      const dtSec = Math.min(0.1, (now - lastTs) / 1000);
+      lastTs = now;
+      frameAccumulator += dtSec * destructionCache.fps * playbackSpeed;
+
+      if (frameAccumulator >= destructionCache.totalFrames) {
+        if (loopDestruction) {
+          frameAccumulator = frameAccumulator % (destructionCache.totalFrames + 1);
+        } else {
+          setDestructionFrame(destructionCache.totalFrames);
+          setIsPlayingDestruction(false);
+          return;
+        }
+      }
+
+      const nextFrameIdx = Math.min(
+        destructionCache.totalFrames,
+        Math.max(0, Math.floor(frameAccumulator))
+      );
+      setDestructionFrame(nextFrameIdx);
+      rafId = requestAnimationFrame(tick);
+    };
+
+    rafId = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafId);
+  }, [isPlayingDestruction, destructionCache, playbackSpeed, loopDestruction]);
+
+  const handleChangeDestructionConfig = useCallback(
+    (next: DestructionSimConfig) => {
+      setDestructionConfig(next);
+      if (destructionCache) {
+        setIsDestructionCacheStale(true);
+      }
+    },
+    [destructionCache]
+  );
+
+  const handleConnectRustServer = useCallback(
+    async (customEndpoint: string) => {
+      if (isProbingRust) return;
+      setIsProbingRust(true);
+      try {
+        const status = await probeWindowsMcpServer(customEndpoint, true);
+        setBridgeStatus(status);
+        if (status.connectedToWindowsExe) {
+          setNativeBakeError(null);
+          showToast(
+            `Rust FEM f64 подключён (${status.isSameOriginProxy ? '/api прокси' : status.endpointUrl}, ${status.latencyMs} мс)`
+          );
+        } else {
+          showToast(
+            status.diagnosticMessage || 'Rust mcp-cad-server недоступен',
+            'error'
+          );
+        }
+      } finally {
+        setIsProbingRust(false);
+      }
+    },
+    [isProbingRust, showToast]
+  );
+
+  const handleCancelDestructionBake = useCallback(() => {
+    const controller = activeRustAbortRef.current;
+    const jobId = activeRustJobIdRef.current;
+    if (controller && !controller.signal.aborted) {
+      controller.abort();
+    }
+    if (jobId) {
+      void cancelNativeCoupledSimulation(bridgeStatus.endpointUrl, jobId);
+    }
+  }, [bridgeStatus.endpointUrl]);
+
+  const handleBakeDestructionCache = useCallback(async () => {
+    if (isBakingDestruction || parts.length === 0) return;
+    setIsSimulatingPhysics(false);
+    setIsPlayingDestruction(false);
+    setIsBakingDestruction(true);
+    setNativeBakeError(null);
+    setBakeProgressPct(4);
+    setBakeStageLabel(
+      bridgeStatus.connectedToWindowsExe
+        ? `Rust FEM f64 (${rustAccuracyLevel}): синхронизация сцены и запуск HHT-α...`
+        : 'Web Local Preview: подготовка сетки и полей деформаций...'
+    );
+
+    const abortController = new AbortController();
+    activeRustAbortRef.current = abortController;
+    activeRustJobIdRef.current = null;
+
+    try {
+      let cache: DestructionCache | null = null;
+
+      if (bridgeStatus.connectedToWindowsExe) {
+        setCanCancelBake(true);
+        try {
+          cache = await bakeNativeCoupledSimulation(
+            bridgeStatus.endpointUrl,
+            parts,
+            materials,
+            destructionConfig,
+            (pct, label) => {
+              setBakeProgressPct(pct);
+              setBakeStageLabel(label);
+            },
+            {
+              joints,
+              accuracyLevel: rustAccuracyLevel,
+              onJobId: (jobId) => {
+                activeRustJobIdRef.current = jobId;
+              },
+              signal: abortController.signal,
+            }
+          );
+        } catch (nativeErr: any) {
+          if (
+            nativeErr instanceof RustBakeCancelledError ||
+            nativeErr?.name === 'AbortError' ||
+            abortController.signal.aborted
+          ) {
+            showToast('Расчёт Rust FEM отменён');
+            return;
+          }
+          const msg =
+            nativeErr?.message ||
+            'Неизвестная ошибка при расчёте на Rust FEM сервере';
+          setNativeBakeError(msg);
+          setCanCancelBake(false);
+          setBakeStageLabel(
+            'Сбой Rust FEM — переключение на Web Local Preview...'
+          );
+        }
+      }
+
+      if (!cache) {
+        setCanCancelBake(false);
+        cache = await bakeDestructionCacheAsync(
+          parts,
+          joints,
+          materials,
+          destructionConfig,
+          (pct, label) => {
+            setBakeProgressPct(pct);
+            setBakeStageLabel(label);
+          }
+        );
+      }
+
+      setDestructionCache(cache);
+      setDestructionFrame(0);
+      setIsDestructionCacheStale(false);
+      setBakeProgressPct(100);
+      setIsPlayingDestruction(true);
+      showToast(
+        `Кэш запечён (${cache.solverLabel}): ${cache.totalFrames + 1} кадров, σ_max=${cache.maxStressOverallMPa.toFixed(0)} МПа (${formatCacheBytes(cache.cacheBytes)}, ${cache.bakeTimeMs.toFixed(0)} мс)`
+      );
+    } catch (err: any) {
+      showToast(
+        err?.message || 'Ошибка при расчёте кэша разрушения',
+        'error'
+      );
+    } finally {
+      activeRustAbortRef.current = null;
+      activeRustJobIdRef.current = null;
+      setCanCancelBake(false);
+      setIsBakingDestruction(false);
+    }
+  }, [
+    isBakingDestruction,
+    parts,
+    joints,
+    materials,
+    destructionConfig,
+    rustAccuracyLevel,
+    bridgeStatus.connectedToWindowsExe,
+    bridgeStatus.endpointUrl,
+    showToast,
+  ]);
+
+  const handleClearDestructionCache = useCallback(() => {
+    setIsPlayingDestruction(false);
+    setDestructionCache(null);
+    setDestructionFrame(0);
+    setIsDestructionCacheStale(false);
+    showToast('Кэш разрушения очищен — возвращена исходная геометрия');
+  }, [showToast]);
+
+  const handleTogglePlayDestruction = useCallback(() => {
+    if (!destructionCache) return;
+    setIsPlayingDestruction((prev) => {
+      if (!prev && destructionFrame >= destructionCache.totalFrames) {
+        setDestructionFrame(0);
+      }
+      return !prev;
+    });
+  }, [destructionCache, destructionFrame]);
+
+  const handleSeekDestructionFrame = useCallback(
+    (frame: number) => {
+      if (!destructionCache) return;
+      const clamped = Math.max(
+        0,
+        Math.min(destructionCache.totalFrames, Math.round(frame))
+      );
+      setIsPlayingDestruction(false);
+      setDestructionFrame(clamped);
+    },
+    [destructionCache]
+  );
+
+  const handleStepDestructionFrame = useCallback(
+    (delta: number) => {
+      if (!destructionCache) return;
+      setIsPlayingDestruction(false);
+      setDestructionFrame((prev) =>
+        Math.max(0, Math.min(destructionCache.totalFrames, prev + delta))
+      );
+    },
+    [destructionCache]
+  );
+
+  const handleSelectDestructionScenario = useCallback(
+    (mode: DestructionScenarioMode) => {
+      const nextCfg = getPresetDestructionConfig(mode);
+      setDestructionConfig(nextCfg);
+      if (mode === 'counter_clash') {
+        loadScenePreset('gears_clash_destruction', quality);
+      } else if (mode === 'torque_overload') {
+        loadScenePreset('gear_overload_burst', quality);
+      } else {
+        // Impact crush works on the currently loaded CAD part!
+        setDestructionCache(null);
+        setDestructionFrame(0);
+        setIsPlayingDestruction(false);
+        setIsDestructionCacheStale(false);
+        setSimulationSubMode('destruction');
+        showToast(
+          'Режим ударного краш-теста готов для текущей CAD-детали — нажмите «Запечь кэш»'
+        );
+      }
+    },
+    [loadScenePreset, quality, showToast]
+  );
+
+  const handleOpenDestructionMode = useCallback(() => {
+    setUiMode('studio_ide');
+    setActiveWorkbench('simulation');
+    setSimulationSubMode('destruction');
+    if (
+      activePreset !== 'gears_clash_destruction' &&
+      activePreset !== 'gear_overload_burst'
+    ) {
+      loadScenePreset('gears_clash_destruction', quality);
+    }
+  }, [activePreset, loadScenePreset, quality]);
+
+  const handleExportDestructionCacheJson = useCallback(() => {
+    if (!destructionCache) return;
+    const json = exportDestructionCacheSummaryJson(destructionCache);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `destruction_cache_${destructionCache.config.scenarioMode}_${destructionCache.totalFrames}f.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    showToast('Сводка кэша разрушения сохранена в JSON');
+  }, [destructionCache, showToast]);
 
   const handleChangeQuality = (q: QualityPreset) => {
     setQuality(q);
@@ -1787,8 +2373,9 @@ export function App() {
             <span
               title={
                 bridgeStatus.mode === 'windows_exe_connected'
-                  ? `Прямое соединение с Windows демоном ${bridgeStatus.endpointUrl} (${bridgeStatus.latencyMs}ms)`
-                  : 'Единое ядро Z-Axis WGPU + бинарные сетки /output/*.stl (100% паритет с Windows EXE)'
+                  ? `Нативный Rust FEM сервер ${bridgeStatus.isSameOriginProxy ? '(/api -> 127.0.0.1:8080)' : bridgeStatus.endpointUrl} (${bridgeStatus.latencyMs}ms)`
+                  : bridgeStatus.diagnosticMessage ||
+                    'Единое ядро Z-Axis WGPU + локальный TS превью (подключите Rust mcp-cad-server для HHT-α FEM)'
               }
               className={`hidden 2xl:inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono border shrink-0 ${
                 bridgeStatus.mode === 'windows_exe_connected'
@@ -1798,7 +2385,9 @@ export function App() {
             >
               <span>
                 {bridgeStatus.mode === 'windows_exe_connected'
-                  ? 'Win EXE :8080 LIVE'
+                  ? bridgeStatus.isSameOriginProxy
+                    ? 'Rust FEM /api LIVE'
+                    : 'Rust FEM :8080 LIVE'
                   : 'Win ↔ Web 1:1 Sync'}
               </span>
             </span>
@@ -1862,6 +2451,14 @@ export function App() {
                   </option>
                   <option value="qa_csg_two_holes">
                     csg_chain_two_holes (Блок с 2 отв., g=2)
+                  </option>
+                </optgroup>
+                <optgroup label="Симуляция разрушения (Кэш + Таймлайн)">
+                  <option value="gears_clash_destruction">
+                    Столкновение шестерён Z1=18 / Z2=22 (Разрушение)
+                  </option>
+                  <option value="gear_overload_burst">
+                    Разрыв редуктора Z1=20 / Z2=30 (Перегрузка)
                   </option>
                 </optgroup>
                 <optgroup label="Сборки и Инженерный анализ (FEA / Кинематика)">
@@ -2043,6 +2640,15 @@ export function App() {
             </div>
 
             <button
+              onClick={handleOpenDestructionMode}
+              title="Открыть симуляцию разрушения деталей (кэш + таймлайн: встречное вращение шестерён)"
+              className="px-2.5 py-1 rounded bg-[#f97316]/15 hover:bg-[#f97316]/25 border border-[#f97316]/60 text-[11px] font-semibold text-[#fb923c] flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+            >
+              <Flame className="w-3.5 h-3.5 shrink-0" />
+              <span>Разрушение</span>
+            </button>
+
+            <button
               onClick={() => setUiMode('studio_ide')}
               title="Открыть инженерную студию с разделением на Моделирование, Нагрузки, Симуляцию и Оптимизатор"
               className="px-2.5 py-1 rounded bg-[#1e293b] hover:bg-[#334155] border border-[#38bdf8]/40 text-[11px] font-mono text-[#38bdf8] flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
@@ -2089,9 +2695,58 @@ export function App() {
             minimalistWindow={true}
             showReferenceGrid={false}
             windowsWgpuArtifactUrl={activeWindowsArtifactUrl}
+            destructionCache={destructionCache}
+            destructionFrameIndex={destructionFrame}
+            destructionFieldMode={destructionFieldMode}
+            destructionDeformScale={destructionDeformScale}
+            onChangeDestructionFieldMode={setDestructionFieldMode}
+            onChangeDestructionDeformScale={setDestructionDeformScale}
+            showDestructionStressGlow={showDestructionStressGlow}
+            showDestructionSparks={showDestructionSparks}
+            hideAssemblyBar={
+              destructionCache !== null ||
+              activePreset === 'gears_clash_destruction' ||
+              activePreset === 'gear_overload_burst'
+            }
           />
 
-          {/* Subtle Bottom WGPU Status & Controls Overlay */}
+          {(destructionCache ||
+            activePreset === 'gears_clash_destruction' ||
+            activePreset === 'gear_overload_burst') && (
+            <CadDestructionTimeline
+              cache={destructionCache}
+              isBaking={isBakingDestruction}
+              bakeProgressPct={bakeProgressPct}
+              bakeStageLabel={bakeStageLabel}
+              isCacheStale={isDestructionCacheStale}
+              currentFrame={destructionFrame}
+              isPlaying={isPlayingDestruction}
+              playbackSpeed={playbackSpeed}
+              loopEnabled={loopDestruction}
+              showStressGlow={showDestructionStressGlow}
+              showSparks={showDestructionSparks}
+              fieldMode={destructionFieldMode}
+              deformScale={destructionDeformScale}
+              onChangeFieldMode={setDestructionFieldMode}
+              onChangeDeformScale={setDestructionDeformScale}
+              onSeekFrame={handleSeekDestructionFrame}
+              onTogglePlay={handleTogglePlayDestruction}
+              onStepFrame={handleStepDestructionFrame}
+              onChangeSpeed={setPlaybackSpeed}
+              onToggleLoop={() => setLoopDestruction((v) => !v)}
+              onToggleStressGlow={() =>
+                setShowDestructionStressGlow((v) => !v)
+              }
+              onToggleSparks={() => setShowDestructionSparks((v) => !v)}
+              onBakeCache={handleBakeDestructionCache}
+              onClearCache={handleClearDestructionCache}
+            />
+          )}
+
+          {/* Subtle Bottom WGPU Status & Controls Overlay (hidden when destruction timeline dock is shown) */}
+          {!destructionCache &&
+            activePreset !== 'gears_clash_destruction' &&
+            activePreset !== 'gear_overload_burst' && (
           <div className="absolute bottom-2.5 inset-x-3 pointer-events-none flex items-center justify-between gap-2 text-[11px] font-mono text-[#94a3b8] whitespace-nowrap">
             <div className="px-2.5 py-1 rounded bg-[#14171ee0] border border-[#282e3b] flex items-center gap-3">
               <span className="text-[#e2e8f0] font-semibold">
@@ -2151,6 +2806,7 @@ export function App() {
               </button>
             </div>
           </div>
+          )}
 
           {/* Non-Intrusive Toast Notification */}
           {toastBanner && (
@@ -2227,6 +2883,7 @@ export function App() {
       {/* 2. Contextual Engineering Ribbon Toolbar (Adapts to Modeling / FEA / Simulation / Optimizer) */}
       <CadRibbonToolbar
         activeWorkbench={activeWorkbench}
+        activePreset={activePreset}
         renderMode={renderMode}
         onChangeRenderMode={setRenderMode}
         showCadEdges={showCadEdges}
@@ -2248,6 +2905,24 @@ export function App() {
         onTogglePhysics={() => setIsSimulatingPhysics((prev) => !prev)}
         onResetPhysics={() => loadScenePreset(activePreset, quality, renderMode)}
         onStepPhysics={handleStepPhysics}
+        simulationSubMode={simulationSubMode}
+        onChangeSimulationSubMode={(mode) => {
+          setSimulationSubMode(mode);
+          if (
+            mode === 'destruction' &&
+            activePreset !== 'gears_clash_destruction' &&
+            activePreset !== 'gear_overload_burst' &&
+            parts.length <= 1
+          ) {
+            loadScenePreset('gears_clash_destruction', quality);
+          }
+        }}
+        destructionCache={destructionCache}
+        isBakingDestruction={isBakingDestruction}
+        isPlayingDestruction={isPlayingDestruction}
+        onTogglePlayDestruction={handleTogglePlayDestruction}
+        onBakeDestructionCache={handleBakeDestructionCache}
+        onClearDestructionCache={handleClearDestructionCache}
         onRunQuickFea={(conds, label) => {
           handleRunFea(
             conds || [
@@ -2365,32 +3040,80 @@ export function App() {
           />
         )}
 
-        <CadViewport3D
-          parts={parts}
-          joints={joints}
-          selectedPartId={selectedPartId}
-          onSelectPart={setSelectedPartId}
-          renderMode={renderMode}
-          showCadEdges={showCadEdges}
-          projectionMode={projectionMode}
-          viewportLayout={viewportLayout}
-          onChangeViewportLayout={setViewportLayout}
-          onToggleViewportLayout={() =>
-            setViewportLayout((v) => (v === 'single' ? 'quad' : 'single'))
-          }
-          materials={materials}
-          feaResult={feaResult}
-          deformScale={deformScale}
-          onChangeDeformScale={setDeformScale}
-          fitTrigger={fitTrigger}
-          onFpsUpdate={setFps}
-          onRegisterCapture={(fn) => {
-            captureFnRef.current = fn;
-          }}
-          minimalistWindow={false}
-          showReferenceGrid={showReferenceGrid}
-          windowsWgpuArtifactUrl={activeWindowsArtifactUrl}
-        />
+        <div className="flex-1 relative min-w-0 h-full flex">
+          <CadViewport3D
+            parts={parts}
+            joints={joints}
+            selectedPartId={selectedPartId}
+            onSelectPart={setSelectedPartId}
+            renderMode={renderMode}
+            showCadEdges={showCadEdges}
+            projectionMode={projectionMode}
+            viewportLayout={viewportLayout}
+            onChangeViewportLayout={setViewportLayout}
+            onToggleViewportLayout={() =>
+              setViewportLayout((v) => (v === 'single' ? 'quad' : 'single'))
+            }
+            materials={materials}
+            feaResult={feaResult}
+            deformScale={deformScale}
+            onChangeDeformScale={setDeformScale}
+            fitTrigger={fitTrigger}
+            onFpsUpdate={setFps}
+            onRegisterCapture={(fn) => {
+              captureFnRef.current = fn;
+            }}
+            minimalistWindow={false}
+            showReferenceGrid={showReferenceGrid}
+            windowsWgpuArtifactUrl={activeWindowsArtifactUrl}
+            destructionCache={destructionCache}
+            destructionFrameIndex={destructionFrame}
+            destructionFieldMode={destructionFieldMode}
+            destructionDeformScale={destructionDeformScale}
+            onChangeDestructionFieldMode={setDestructionFieldMode}
+            onChangeDestructionDeformScale={setDestructionDeformScale}
+            showDestructionStressGlow={showDestructionStressGlow}
+            showDestructionSparks={showDestructionSparks}
+            hideAssemblyBar={
+              destructionCache !== null ||
+              (activeWorkbench === 'simulation' &&
+                simulationSubMode === 'destruction')
+            }
+          />
+
+          {(destructionCache !== null ||
+            (activeWorkbench === 'simulation' &&
+              simulationSubMode === 'destruction')) && (
+            <CadDestructionTimeline
+              cache={destructionCache}
+              isBaking={isBakingDestruction}
+              bakeProgressPct={bakeProgressPct}
+              bakeStageLabel={bakeStageLabel}
+              isCacheStale={isDestructionCacheStale}
+              currentFrame={destructionFrame}
+              isPlaying={isPlayingDestruction}
+              playbackSpeed={playbackSpeed}
+              loopEnabled={loopDestruction}
+              showStressGlow={showDestructionStressGlow}
+              showSparks={showDestructionSparks}
+              fieldMode={destructionFieldMode}
+              deformScale={destructionDeformScale}
+              onChangeFieldMode={setDestructionFieldMode}
+              onChangeDeformScale={setDestructionDeformScale}
+              onSeekFrame={handleSeekDestructionFrame}
+              onTogglePlay={handleTogglePlayDestruction}
+              onStepFrame={handleStepDestructionFrame}
+              onChangeSpeed={setPlaybackSpeed}
+              onToggleLoop={() => setLoopDestruction((v) => !v)}
+              onToggleStressGlow={() =>
+                setShowDestructionStressGlow((v) => !v)
+              }
+              onToggleSparks={() => setShowDestructionSparks((v) => !v)}
+              onBakeCache={handleBakeDestructionCache}
+              onClearCache={handleClearDestructionCache}
+            />
+          )}
+        </div>
 
         {showRightPanel && (
           <CadRightSidebar
@@ -2408,6 +3131,46 @@ export function App() {
             mcpHistory={mcpHistory}
             onExecuteMcpTool={handleExecuteMcpTool}
             externalActiveTab={externalInspectorTab}
+            simulationSubMode={simulationSubMode}
+            onChangeSimulationSubMode={(mode) => {
+              setSimulationSubMode(mode);
+              if (
+                mode === 'destruction' &&
+                activePreset !== 'gears_clash_destruction' &&
+                activePreset !== 'gear_overload_burst' &&
+                parts.length <= 1
+              ) {
+                loadScenePreset('gears_clash_destruction', quality);
+              }
+            }}
+            destructionConfig={destructionConfig}
+            destructionCache={destructionCache}
+            destructionFrame={destructionFrame}
+            isBakingDestruction={isBakingDestruction}
+            bakeProgressPct={bakeProgressPct}
+            bakeStageLabel={bakeStageLabel}
+            isDestructionCacheStale={isDestructionCacheStale}
+            destructionFieldMode={destructionFieldMode}
+            destructionDeformScale={destructionDeformScale}
+            nativeRustConnected={bridgeStatus.connectedToWindowsExe}
+            rustEndpointUrl={bridgeStatus.endpointUrl}
+            rustDiagnosticMessage={bridgeStatus.diagnosticMessage}
+            isProbingRust={isProbingRust}
+            rustAccuracyLevel={rustAccuracyLevel}
+            nativeBakeError={nativeBakeError}
+            canCancelBake={canCancelBake}
+            onChangeDestructionFieldMode={setDestructionFieldMode}
+            onChangeDestructionDeformScale={setDestructionDeformScale}
+            onChangeDestructionConfig={handleChangeDestructionConfig}
+            onSelectDestructionScenario={handleSelectDestructionScenario}
+            onBakeDestructionCache={handleBakeDestructionCache}
+            onClearDestructionCache={handleClearDestructionCache}
+            onSeekDestructionFrame={handleSeekDestructionFrame}
+            onExportDestructionCacheJson={handleExportDestructionCacheJson}
+            onChangeRustAccuracyLevel={setRustAccuracyLevel}
+            onConnectRustServer={handleConnectRustServer}
+            onCancelDestructionBake={handleCancelDestructionBake}
+            onDismissNativeBakeError={() => setNativeBakeError(null)}
             onApplyOptimizedDag={(partId) => {
               handleExecuteMcpTool('optimize_feature_tree', {
                 part_id: partId,
@@ -2433,18 +3196,18 @@ export function App() {
         {/* Non-Intrusive Toast Notification */}
         {toastBanner && (
           <div
-            className={`absolute bottom-4 left-1/2 -translate-x-1/2 z-40 px-3.5 py-2 rounded border shadow-lg flex items-center gap-2 text-xs font-mono ${
+            className={`absolute top-12 left-1/2 -translate-x-1/2 z-40 max-w-[460px] px-3 py-1.5 rounded border shadow-lg flex items-center gap-2 text-[11px] font-mono ${
               toastBanner.type === 'error'
                 ? 'bg-[#1f1215] border-[#ef4444] text-[#fca5a5]'
                 : 'bg-[#121922] border-[#38bdf8] text-[#e2e8f0]'
             }`}
           >
             {toastBanner.type === 'error' ? (
-              <AlertTriangle className="w-4 h-4 text-[#ef4444]" />
+              <AlertTriangle className="w-3.5 h-3.5 shrink-0 text-[#ef4444]" />
             ) : (
-              <CheckCircle2 className="w-4 h-4 text-[#10b981]" />
+              <CheckCircle2 className="w-3.5 h-3.5 shrink-0 text-[#10b981]" />
             )}
-            <span>{toastBanner.text}</span>
+            <span className="truncate">{toastBanner.text}</span>
           </div>
         )}
       </div>

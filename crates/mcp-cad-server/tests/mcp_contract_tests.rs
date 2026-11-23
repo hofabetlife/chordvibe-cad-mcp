@@ -141,8 +141,8 @@ async fn test_mcp_tools_list() {
         .as_array()
         .expect("tools must be an array");
 
-    // Must declare all 41 tools
-    assert_eq!(tools.len(), 41, "Server must expose exactly 41 MCP tools");
+    // Must declare all 43 tools
+    assert_eq!(tools.len(), 43, "Server must expose exactly 43 MCP tools");
 
     let expected_tools = [
         "create_part",
@@ -186,6 +186,8 @@ async fn test_mcp_tools_list() {
         "check_interference",
         "sweep_joint",
         "apply_recipe",
+        "bake_coupled_simulation",
+        "query_simulation_frame",
     ];
 
     let mut found_names = HashSet::new();
@@ -2231,6 +2233,56 @@ async fn test_mcp_define_material() {
         }
     })).await;
     assert_tool_error(&resp);
+
+    // 5. P5-T1: Custom brittle material with explicit Phase 5 parameters
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 844,
+        "method": "tools/call",
+        "params": {
+            "name": "define_material",
+            "arguments": {
+                "id": "grey_cast_iron_en_gjl_250",
+                "name": "Grey Cast Iron EN-GJL-250",
+                "young_modulus_gpa": 105.0,
+                "poisson_ratio": 0.26,
+                "yield_strength_mpa": 220.0,
+                "ultimate_strength_pa": 250e6,
+                "hardening_modulus_pa": 0.0,
+                "fracture_strain": 0.005,
+                "fracture_energy_j_m2": 320.0,
+                "friction_coeff": 0.19,
+                "failure_mode": "brittle",
+                "density_kg_m3": 7200.0
+            }
+        }
+    })).await;
+    assert_eq!(resp["id"], 844);
+    assert!(resp["error"].is_null());
+    let cast_data: Value = serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(cast_data["status"], "material_registered");
+    assert_eq!(cast_data["properties"]["failure_mode"], "brittle");
+    assert!((cast_data["properties"]["ultimate_strength_pa"].as_f64().unwrap() - 250e6).abs() < 1.0);
+    assert!((cast_data["properties"]["fracture_energy_j_m2"].as_f64().unwrap() - 320.0).abs() < 1e-6);
+
+    // 6. P5-T1: Validation rejects σ_u < σ_y
+    let resp = rpc_call(&state, json!({
+        "jsonrpc": "2.0",
+        "id": 845,
+        "method": "tools/call",
+        "params": {
+            "name": "define_material",
+            "arguments": {
+                "id": "bad_uts",
+                "young_modulus_gpa": 200.0,
+                "poisson_ratio": 0.30,
+                "yield_strength_mpa": 400.0,
+                "ultimate_strength_pa": 300e6,
+                "density_kg_m3": 7850.0
+            }
+        }
+    })).await;
+    assert_tool_error(&resp);
 }
 
 #[tokio::test]
@@ -2563,7 +2615,7 @@ async fn test_bug015_create_joint_and_create_part_schema_contract() {
     })).await;
 
     let tools = list_resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 41, "tools/list must expose all 41 MCP tools");
+    assert_eq!(tools.len(), 43, "tools/list must expose all 43 MCP tools");
 
     let create_part_tool = tools.iter().find(|t| t["name"] == "create_part").unwrap();
     assert!(
@@ -4551,6 +4603,7 @@ fn assert_numeric_schema_fields_have_units(tool_name: &str, path: &str, schema: 
         "degree",
         "MPa",
         "GPa",
+        "pascal",
         "N*m",
         "N·m",
         "Newton",
@@ -4565,6 +4618,8 @@ fn assert_numeric_schema_fields_have_units(tool_name: &str, path: &str, schema: 
         "watt",
         "kw",
         "rpm",
+        "j/m²",
+        "j/m^2",
         "dimensionless",
     ];
 
@@ -4721,7 +4776,7 @@ async fn test_mcp_p2_t10_initialize_instructions_and_tool_descriptions_contract(
     let tools = list_resp["result"]["tools"]
         .as_array()
         .expect("tools must be an array");
-    assert_eq!(tools.len(), 41);
+    assert_eq!(tools.len(), 43);
 
     for tool in tools {
         let name = tool["name"].as_str().unwrap();
@@ -4763,6 +4818,28 @@ async fn test_mcp_p2_t10_initialize_instructions_and_tool_descriptions_contract(
             assert!(
                 desc.contains("strict_slivers"),
                 "Tool '{name}' description must mention 'strict_slivers'"
+            );
+        } else if name == "create_part" {
+            let mat_desc = tool["inputSchema"]["properties"]["material"]["description"]
+                .as_str()
+                .expect("create_part.material must have description");
+            let reg = mcp_cad_core::MaterialRegistry::new();
+            assert_eq!(reg.len(), 10);
+            for mat in reg.list() {
+                assert!(
+                    desc.contains(&mat.name),
+                    "create_part description must list canonical material '{}': '{desc}'",
+                    mat.name
+                );
+                assert!(
+                    mat_desc.contains(&mat.name),
+                    "create_part material schema description must list canonical material '{}': '{mat_desc}'",
+                    mat.name
+                );
+            }
+            assert!(
+                !desc.contains("steel_structural_aisi1020 / steel_1045"),
+                "create_part description must not treat steel_1045 as an alias of steel_structural_aisi1020"
             );
         }
     }
@@ -10248,6 +10325,68 @@ async fn test_mcp_p3_t8_check_gear_strength_contract() {
     .await;
     assert_eq!(err_resp["result"]["isError"], json!(true));
     assert_eq!(parse_error_envelope(&err_resp).error.code, "INVALID_ARGUMENT");
+
+    // 5. Test UNKNOWN_MATERIAL for unknown `material` and `mating_material`
+    let unknown_mat_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3905,
+            "method": "tools/call",
+            "params": {
+                "name": "check_gear_strength",
+                "arguments": {
+                    "module": 3.0,
+                    "teeth": 20,
+                    "face_width": 30.0,
+                    "torque": 100.0,
+                    "material": "vibranium"
+                }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(unknown_mat_resp["result"]["isError"], json!(true));
+    let unknown_mat_env = parse_error_envelope(&unknown_mat_resp);
+    assert_eq!(unknown_mat_env.error.code, "UNKNOWN_MATERIAL");
+    assert_eq!(unknown_mat_env.error.param.as_deref(), Some("material"));
+    assert!(
+        unknown_mat_env.error.details["builtin_materials"]
+            .as_array()
+            .is_some_and(|arr| !arr.is_empty()),
+        "UNKNOWN_MATERIAL must include builtin_materials list"
+    );
+
+    let unknown_mating_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3906,
+            "method": "tools/call",
+            "params": {
+                "name": "check_gear_strength",
+                "arguments": {
+                    "module": 3.0,
+                    "teeth": 20,
+                    "face_width": 30.0,
+                    "torque": 100.0,
+                    "material": "steel_structural_aisi1020",
+                    "mating_material": "unobtanium"
+                }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(unknown_mating_resp["result"]["isError"], json!(true));
+    let unknown_mating_env = parse_error_envelope(&unknown_mating_resp);
+    assert_eq!(unknown_mating_env.error.code, "UNKNOWN_MATERIAL");
+    assert_eq!(unknown_mating_env.error.param.as_deref(), Some("material"));
+    assert!(
+        unknown_mating_env.error.details["builtin_materials"]
+            .as_array()
+            .is_some_and(|arr| !arr.is_empty()),
+        "UNKNOWN_MATERIAL for mating_material must include builtin_materials list"
+    );
 }
 
 #[tokio::test]
@@ -11403,7 +11542,218 @@ async fn test_mcp_p4_t7_f64_dae_end_to_end_mechanisms_friction_and_fea_coupling(
     );
 }
 
+#[tokio::test]
+async fn test_p5_t6_mcp_bake_coupled_simulation_and_query_simulation_frame() {
+    let state = EngineState::new()
+        .expect("EngineState initialization failed")
+        .into_shared();
 
+    let _ = parse_content(
+        &rpc_call(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 7001,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_part",
+                    "arguments": {
+                        "part_id": "p5t6_beam",
+                        "name": "Dynamic Beam",
+                        "material": "steel_structural_aisi1020"
+                    }
+                }
+            }),
+        )
+        .await,
+    );
 
+    let _ = parse_content(
+        &rpc_call(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 7002,
+                "method": "tools/call",
+                "params": {
+                    "name": "add_feature_primitive",
+                    "arguments": {
+                        "part_id": "p5t6_beam",
+                        "primitive_type": "box",
+                        "params": { "width": 100.0, "height": 20.0, "depth": 20.0 }
+                    }
+                }
+            }),
+        )
+        .await,
+    );
 
+    let bake = parse_content(
+        &rpc_call(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 7003,
+                "method": "tools/call",
+                "params": {
+                    "name": "bake_coupled_simulation",
+                    "arguments": {
+                        "action": "bake",
+                        "accuracy_level": "standard",
+                        "part_ids": ["p5t6_beam"],
+                        "duration_s": 0.008,
+                        "dt_ms": 1.0,
+                        "hht_alpha": -0.05,
+                        "enable_fracture": false,
+                        "fixed_faces": [{"part_id": "p5t6_beam", "face": "min_x"}],
+                        "loads": [{"part_id": "p5t6_beam", "face": "max_x", "force": [0.0, -500.0, 0.0]}]
+                    }
+                }
+            }),
+        )
+        .await,
+    );
+    assert_eq!(bake["status"], "completed");
+    let sim_id = bake["simulation_id"].as_str().expect("simulation_id");
+    let frame_count = bake["frame_count"].as_u64().expect("frame_count") as usize;
+    assert!(frame_count >= 5);
 
+    let frame = parse_content(
+        &rpc_call(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 7004,
+                "method": "tools/call",
+                "params": {
+                    "name": "query_simulation_frame",
+                    "arguments": {
+                        "simulation_id": sim_id,
+                        "frame_index": frame_count - 1,
+                        "include_mesh_fields": true
+                    }
+                }
+            }),
+        )
+        .await,
+    );
+    assert_eq!(frame["simulation_id"], sim_id);
+    assert_eq!(frame["parts"][0]["part_id"], "p5t6_beam");
+    assert!(frame["parts"][0]["max_von_mises_mpa"].as_f64().unwrap() > 0.0);
+}
+
+#[tokio::test]
+async fn test_mcp_p5_t19_create_part_material_schema_sync() {
+    let state = EngineState::new()
+        .expect("EngineState initialization failed")
+        .into_shared();
+
+    let list_resp = rpc_call(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 7010,
+            "method": "tools/list"
+        }),
+    )
+    .await;
+    let tools = list_resp["result"]["tools"]
+        .as_array()
+        .expect("tools must be an array");
+    let create_part_tool = tools
+        .iter()
+        .find(|t| t["name"] == "create_part")
+        .expect("create_part tool must be registered");
+
+    let desc = create_part_tool["description"]
+        .as_str()
+        .expect("create_part description");
+    let mat_desc = create_part_tool["inputSchema"]["properties"]["material"]["description"]
+        .as_str()
+        .expect("create_part.material description");
+
+    let reg = mcp_cad_core::MaterialRegistry::new();
+    assert_eq!(reg.len(), 10);
+    for mat in reg.list() {
+        assert!(
+            desc.contains(&mat.name),
+            "create_part description missing '{}'",
+            mat.name
+        );
+        assert!(
+            mat_desc.contains(&mat.name),
+            "create_part material schema missing '{}'",
+            mat.name
+        );
+    }
+    for alias in ["steel_1020", "steel_1045", "pyrex", "glass"] {
+        assert!(desc.contains(alias), "create_part description missing alias '{alias}'");
+        assert!(
+            mat_desc.contains(alias),
+            "create_part material schema missing alias '{alias}'"
+        );
+    }
+    assert!(
+        !desc.contains("steel_structural_aisi1020 / steel_1045"),
+        "create_part description must not group steel_1045 under steel_structural_aisi1020"
+    );
+
+    // Verify docs/MCP_API_REFERENCE.md create_part section is also synchronized
+    let api_ref_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("docs/MCP_API_REFERENCE.md");
+    let api_ref = std::fs::read_to_string(&api_ref_path)
+        .expect("docs/MCP_API_REFERENCE.md must exist");
+    let create_part_section = api_ref
+        .split("### 1. `create_part`")
+        .nth(1)
+        .and_then(|s| s.split("### 2. `list_parts`").next())
+        .expect("create_part section in docs/MCP_API_REFERENCE.md");
+    for mat in reg.list() {
+        assert!(
+            create_part_section.contains(&mat.name),
+            "docs/MCP_API_REFERENCE.md create_part section missing '{}'",
+            mat.name
+        );
+    }
+    assert!(
+        !create_part_section.contains("`steel_structural_aisi1020` (алиасы: `steel_1045`"),
+        "docs/MCP_API_REFERENCE.md must not list steel_1045 as alias of steel_structural_aisi1020"
+    );
+
+    // Verify create_part works with newly documented materials and aliases
+    for (idx, (part_id, mat_arg)) in [
+        ("p5t19_1045", "steel_carbon_aisi1045"),
+        ("p5t19_1045_alias", "steel_1045"),
+        ("p5t19_glass", "borosilicate_glass"),
+        ("p5t19_pyrex", "pyrex"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let resp = rpc_call(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 7020 + idx as i64,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_part",
+                    "arguments": {
+                        "part_id": part_id,
+                        "name": format!("Part {part_id}"),
+                        "material": mat_arg
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_ne!(
+            resp["result"]["isError"], true,
+            "create_part failed for material '{mat_arg}': {resp:?}"
+        );
+    }
+}

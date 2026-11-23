@@ -30,7 +30,7 @@ C:\Users\<username>\Documents\chordvibe-cad-mcp\
 ├── README.md                     # Главная страница документации
 ├── docs/                         # Техническая документация
 │   ├── ARCHITECTURE.md           # Архитектурный обзор (данный документ)
-│   ├── MCP_API_REFERENCE.md      # Полный справочник 41 инструмента MCP
+│   ├── MCP_API_REFERENCE.md      # Полный справочник 43 инструментов MCP
 │   └── CLAUDE_DESKTOP_SETUP.md   # Руководство по интеграции с Claude Desktop
 ├── examples/                     # Готовые инженерные сценарии
 │   ├── bracket_design.json       # Проект кронштейна с расчетом прочности
@@ -124,15 +124,17 @@ pub struct EngineState {
 - **Пересчет геометрии (`rebuild`)**: При вызове `modify_feature` ядро заново выполняет последовательность операций DAG, гарантируя транзакционный откат при некорректных параметрах и консистентность геометрии без потери топологической информации.
 - **Стоимостной оптимизатор дерева операций (`CadQueryOptimizer` / `optimize_feature_tree`)**: По аналогии с оптимизатором запросов SQL (`EXPLAIN ANALYZE`), транслирует *Логический план* ИИ-агента в оптимальный *Физический план* исполнения DAG с применением правил свертки матриц $SE(3)$ (`R1`), отсечения «мертвых» операций вне AABB (`R2`), пакетной группировки компланарных вырезов по Де Моргану (`R3`), понижения размерности 3D CSG до 2D профиля вращения `revolve` (`R4`) и слияния призмы с резьбой (`R5`).
 - **Расчет масс-инерционных характеристик**: Автоматическое интегрирование объема по теореме Остроградского-Гаусса по замкнутой полигональной сетке `TriangleMesh` с вычислением центра масс, массы $m = \rho \cdot V$ и тензора инерции $I_{xx}, I_{yy}, I_{zz}$.
-- **Инженерная база материалов (`MaterialRegistry`)**: Предустановленные константы для сплавов и полимеров:
+- **Инженерная база материалов (`MaterialRegistry`)**: Предустановленные константы для сплавов, полимеров и хрупких материалов (10 пресетов, полная кросс-языковая синхронизация Rust↔TS `P5-T11`):
   - `aluminum_6061_t6` ($E=68.9$ GPa, $\nu=0.33$, $\sigma_y=276$ MPa, $\rho=2700$ kg/m³)
   - `steel_structural_aisi1020` ($E=205.0$ GPa, $\nu=0.29$, $\sigma_y=250$ MPa, $\rho=7850$ kg/m³)
+  - `steel_carbon_aisi1045` (`steel_1045`, $E=205.0$ GPa, $\nu=0.29$, $\sigma_y=350$ MPa, $\rho=7850$ kg/m³)
   - `steel_high_strength_4140` ($E=210.0$ GPa, $\nu=0.30$, $\sigma_y=655$ MPa, $\rho=7850$ kg/m³)
   - `titanium_grade5_ti6al4v` ($E=114.0$ GPa, $\nu=0.34$, $\sigma_y=880$ MPa, $\rho=4430$ kg/m³)
   - `brass_c360` ($E=100.0$ GPa, $\nu=0.34$, $\sigma_y=310$ MPa, $\rho=8500$ kg/m³)
   - `pla_filament_3dprint` ($E=3.5$ GPa, $\nu=0.36$, $\sigma_y=60$ MPa, $\rho=1240$ kg/m³)
   - `petg_filament_3dprint` ($E=2.1$ GPa, $\nu=0.38$, $\sigma_y=50$ MPa, $\rho=1270$ kg/m³)
   - `nylon_pa12` ($E=1.8$ GPa, $\nu=0.40$, $\sigma_y=45$ MPa, $\rho=1010$ kg/m³)
+  - `borosilicate_glass` ($E=64.0$ GPa, $\nu=0.20$, $\sigma_y=120$ MPa, $\rho=2500$ kg/m³)
 
 ---
 
@@ -185,11 +187,11 @@ pub struct EngineState {
   - `initialize`: согласование версии протокола и манифеста возможностей сервера (`capabilities.tools`).
   - `notifications/initialized`: подтверждение готовности клиента.
   - `ping`: проверка доступности.
-  - `tools/list`: отдача массива из 41 строгого JSON-Schema определения инструментов.
+  - `tools/list`: отдача массива из 43 строгих JSON-Schema определений инструментов.
   - `tools/call`: исполнение указанного инструмента с аргументами.
 - **Поддерживаемые транспорты**:
   - **Stdio Loop**: Чтение строк JSON-RPC из `stdin` и немедленный сброс (`flush`) ответов в `stdout`.
-  - **HTTP/SSE Server**: Построен на базе **Axum** и **Tower-HTTP**. Поддерживает конечные точки `GET /sse` (подключение потока Server-Sent Events) и `POST /message` (отправка JSON-RPC команд).
+  - **HTTP/SSE Server**: Построен на базе **Axum** и **Tower-HTTP**. Поддерживает конечные точки `GET /sse` (поток JSON-RPC + прогресса `coupled_sim`), `POST /message` и REST/SSE API сопряжённого запекания `HHT-α`: `POST /api/coupled-sim/bake`, `GET /api/coupled-sim/events`, `GET /api/coupled-sim/status[/:job_id]`, `POST /api/coupled-sim/cancel/:job_id`, `GET /api/coupled-sim/frames/[:sim_id/]:frame_index`.
 
 ---
 

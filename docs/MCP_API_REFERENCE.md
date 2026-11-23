@@ -266,15 +266,17 @@
 | `material` | `string` | Да | Идентификатор материала из базы пресетов |
 | `is_fixed` | `boolean` | Нет | Закрепить деталь неподвижно в мировом пространстве (статическое тело с бесконечной массой для физических расчетов и кинематики, например станина или корпус редуктора). По умолчанию `false` |
 
-**Доступные пресеты материалов (и поддерживаемые канонические алиасы P2-T13)**:
+**Доступные пресеты материалов (10 пресетов и поддерживаемые канонические алиасы)**:
 - `aluminum_6061_t6` (алиасы: `alu_6061`, `Al6061-T6`, `Al-6061-T6`, `aluminum_6061`): Авиационный алюминиевый сплав ($E=68.9$ GPa, $\sigma_y=276$ MPa, $\rho=2700$ kg/m³).
-- `steel_structural_aisi1020` (алиасы: `steel_1045`, `steel_1020`, `AISI 1020`, `steel`): Конструкционная углеродистая сталь ($E=205.0$ GPa, $\sigma_y=250$ MPa, $\rho=7850$ kg/m³).
-- `steel_high_strength_4140` (алиасы: `steel_4140`, `AISI 4140`): Высокопрочная легированная сталь ($E=210.0$ GPa, $\sigma_y=655$ MPa, $\rho=7850$ kg/m³).
+- `steel_structural_aisi1020` (алиасы: `steel_1020`, `AISI 1020`, `steel`, `structural_steel`): Конструкционная углеродистая сталь AISI 1020 ($E=205.0$ GPa, $\sigma_y=250$ MPa, $\rho=7850$ kg/m³).
+- `steel_carbon_aisi1045` (алиасы: `steel_1045`, `AISI 1045`, `1045`, `carbon_steel_1045`): Среднеуглеродистая конструкционная сталь AISI 1045 ($E=205.0$ GPa, $\sigma_y=350$ MPa, $\rho=7850$ kg/m³).
+- `steel_high_strength_4140` (алиасы: `steel_4140`, `AISI 4140`, `4140`): Высокопрочная легированная сталь ($E=210.0$ GPa, $\sigma_y=655$ MPa, $\rho=7850$ kg/m³).
 - `titanium_grade5_ti6al4v` (алиасы: `ti_6al_4v`, `Ti-6Al-4V`, `Ti6Al4V`, `titanium_ti6al4v`): Титановый сплав Grade 5 ($E=114.0$ GPa, $\sigma_y=880$ MPa, $\rho=4430$ kg/m³).
 - `brass_c360` (алиасы: `brass_c36000`, `brass`): Автоматная свинцовая латунь ($E=100.0$ GPa, $\sigma_y=310$ MPa, $\rho=8500$ kg/m³).
 - `pla_filament_3dprint` (алиасы: `pla_3d`, `pla_plastic`, `pla`): Пластик PLA для 3D-печати ($E=3.5$ GPa, $\sigma_y=60$ MPa, $\rho=1240$ kg/m³).
 - `petg_filament_3dprint` (алиасы: `petg_3d`, `petg_plastic`, `petg`): Пластик PETG для 3D-печати ($E=2.1$ GPa, $\sigma_y=50$ MPa, $\rho=1270$ kg/m³).
 - `nylon_pa12` (алиасы: `nylon_pa6`, `nylon`): Инженерный полиамид PA12 ($E=1.8$ GPa, $\sigma_y=45$ MPa, $\rho=1010$ kg/m³).
+- `borosilicate_glass` (алиасы: `pyrex`, `glass`, `borosilicate`): Боросиликатное техническое стекло ($E=64.0$ GPa, $\sigma_y=120$ MPa, $\rho=2500$ kg/m³, `failure_mode: brittle`).
 
 #### Пример запроса
 ```json
@@ -2258,4 +2260,91 @@
   }
 }
 ```
+
+---
+
+### 42. `bake_coupled_simulation`
+
+Запускает, опрашивает статус или отменяет серверное предзапекание сопряжённой неявной динамической симуляции **`HHT-α`** (`f64`, безусловно устойчивый интегратор без ограничения шага по условию Куранта CFL, многопоточная `rayon`-сборка, разреженный решатель `RCM LDL^T` / `IC(0)-PCG` / `SSOR-PCG`, $J_2$-пластичность, деформируемый контакт с трением Кулона, локальное разрушение и синхронизация отделившихся фрагментов в `PhysicsWorld`) с потоковой передачей прогресса по SSE (`/api/coupled-sim/events` и `/sse`) и покадровым кэшированием результатов на сервере (`P5-T6`).
+
+#### Входные параметры
+| Параметр | Тип | Обязательный | Описание |
+|---|---|:---:|---|
+| `action` | `"bake" \| "status" \| "cancel"` | Нет | Режим работы: `"bake"` (по умолчанию), `"status"` или `"cancel"` |
+| `job_id` | `string` | Нет | Идентификатор задачи для `action="status"` / `"cancel"` (по умолчанию последняя задача) |
+| `accuracy_level` | `"standard" \| "high" \| "ultra"` | Нет | Профиль точности (`standard`: `TET4` coarse, `high`: boundary-snapped medium, `ultra`: криволинейная `TET10` High) |
+| `part_ids` | `string[]` | Нет | Список ID деталей для расчёта (по умолчанию все непустые детали сцены) |
+| `duration_s` | `number` | Нет | Длительность физического расчёта в секундах (по умолчанию `0.02`) |
+| `dt_ms`, `dt_min_ms`, `dt_max_ms` | `number` | Нет | Начальный, минимальный и максимальный адаптивный шаг $\Delta t$ в миллисекундах (не ограничен CFL) |
+| `hht_alpha` | `number` | Нет | Параметр численного демпфирования $\alpha \in [-0.3, 0.0]$ (по умолчанию `-0.05`; `0.0` — консервативный Newmark) |
+| `mass_matrix` | `"consistent" \| "lumped"` | Нет | Тип матрицы масс (согласованная или строго положительная диагональная / HRZ для `TET10`) |
+| `linear_solver` | `"auto" \| "ldlt" \| "ic_pcg" \| "ssor_pcg" \| "jacobi_pcg"` | Нет | Разреженный линейный решатель |
+| `fixed_faces`, `loads`, `initial_velocities`, `gravity`, `force_curve` | `array \| object` | Нет | Граничные условия, силы (Н), начальные скорости (м/с), гравитация ($\text{м/с}^2$) и временной профиль нагрузки |
+| `use_physics_joints` | `boolean` | Нет | `true` (по умолчанию) — автоматически извлекает активные шарниры и моторы (`Revolute`, `Prismatic`, `Fixed`, `Gear`) из `PhysicsWorld` в динамические ступицы `HHT-α` (`P5-T14`) |
+| `async_mode` | `boolean` | Нет | `true` — запуск в фоновом потоке с немедленным возвратом `job_id` и SSE-стримингом; `false` (по умолчанию) — синхронное ожидание завершения |
+
+#### HTTP/SSE маршруты (в режиме `--mode sse`)
+- `POST /api/coupled-sim/bake` — запуск предрасчёта (`standard` / `high` / `ultra`, синхронно или `async_mode: true`)
+- `GET /api/coupled-sim/events` — поток SSE-событий (`started`, `progress`, `completed`, `cancelled`, `failed`)
+- `GET /api/coupled-sim/status` / `GET /api/coupled-sim/status/:job_id` — статус активной/завершённой задачи
+- `POST /api/coupled-sim/cancel/:job_id` — отмена активного расчёта
+- `GET /api/coupled-sim/frames/:frame_index` / `GET /api/coupled-sim/frames/:sim_id/:frame_index` — загрузка компактного кэшированного кадра (поддерживает query-параметры `part_id`, `include_mesh_fields`, `include_fragment_meshes`, `length_unit`)
+- `GET /api/coupled-sim/fragments` / `GET /api/coupled-sim/fragments/:sim_id` — однократная загрузка кэшированных локальных треугольных сеток (`vertices_m`, `normals`, `indices`, `bounding_radius_m`) всех отделившихся 3D-фрагментов симуляции (`P5-T15`)
+
+#### Пример запроса
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 42,
+  "method": "tools/call",
+  "params": {
+    "name": "bake_coupled_simulation",
+    "arguments": {
+      "action": "bake",
+      "accuracy_level": "standard",
+      "part_ids": ["beam_1"],
+      "duration_s": 0.02,
+      "dt_ms": 1.0,
+      "hht_alpha": -0.05,
+      "fixed_faces": [{ "part_id": "beam_1", "face": "min_x" }],
+      "loads": [{ "part_id": "beam_1", "face": "max_x", "force": [0.0, -500.0, 0.0] }]
+    }
+  }
+}
+```
+
+---
+
+### 43. `query_simulation_frame`
+
+Возвращает компактный кэшированный кадр ранее запечённой сопряжённой динамической симуляции `HHT-α` по номеру кадра `frame_index` или ближайшему времени `time_s`: деформированные координаты узлов $\mathbf{x}(t) = \mathbf{X} + \mathbf{u}(t)$, внешнюю поверхностную треугольную сетку активных (неэродированных и неотделившихся) элементов МКЭ (`surface_positions_m`, `surface_reference_positions_m`, `surface_indices`, `surface_node_indices`), перемещения (мм), поля $\sigma_{vM}$ (МПа), $\bar{\varepsilon}_p$, повреждаемости $D$, список эродированных элементов, синхронизированные траектории и локальные треугольные сетки отделившихся фрагментов, контактные силы, реакции и кинематику динамических ступиц (`hub_reactions`) и баланс энергий ($E_k, E_e, E_p, E_f, W_{\text{ext}}$) (`P5-T6`, `P5-T14`, `P5-T15`).
+
+#### Входные параметры
+| Параметр | Тип | Обязательный | Описание |
+|---|---|:---:|---|
+| `simulation_id` | `string` | Нет | ID кэшированной симуляции (по умолчанию последняя запечённая) |
+| `frame_index` | `integer` | Нет | Индекс кадра (`0..total_frames-1`) |
+| `time_s` | `number` | Нет | Целевое время в секундах (выбирается ближайший кадр, если не задан `frame_index`) |
+| `part_id` | `string` | Нет | Фильтр для выдачи полей только одной детали |
+| `include_mesh_fields` | `boolean` | Нет | Включать ли поузловые массивы полей и активную поверхностную сетку (`surface_positions_m`, `surface_reference_positions_m`, `surface_indices`, `surface_node_indices`) (по умолчанию `true`) |
+| `include_fragment_meshes` | `boolean` | Нет | Включать ли локальную треугольную сетку `mesh` (`vertices_m`, `normals`, `indices`, `bounding_radius_m`) в каждый элемент `detached_fragments[]` (по умолчанию `true` при `include_mesh_fields=true`) (`P5-T15`) |
+| `length_unit` | `"mm" \| "m"` | Нет | Единица длины для выходных координат |
+
+#### Пример запроса
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 43,
+  "method": "tools/call",
+  "params": {
+    "name": "query_simulation_frame",
+    "arguments": {
+      "frame_index": 10,
+      "include_mesh_fields": true,
+      "include_fragment_meshes": true
+    }
+  }
+}
+```
+
 

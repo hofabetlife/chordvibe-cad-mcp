@@ -75,9 +75,10 @@ flowchart LR
    - Процедурные тепловые карты напряжений Мизеса (градиент Синий $\to$ Циан $\to$ Зеленый $\to$ Желтый $\to$ Красный) для мультимодального анализа агентом.
 
 6. **Инженерная библиотека и кастомные материалы**:
-   - Стали: `steel_structural_aisi1020`, `steel_high_strength_4140`.
+   - Стали: `steel_structural_aisi1020`, `steel_carbon_aisi1045` (`steel_1045`), `steel_high_strength_4140`.
    - Легкие сплавы: авиационный алюминий `aluminum_6061_t6`, титан `titanium_grade5_ti6al4v`, латунь `brass_c360`.
    - Полимеры для 3D-печати: `pla_filament_3dprint`, `petg_filament_3dprint`, инженерный нейлон `nylon_pa12`.
+   - Хрупкие материалы: боросиликатное стекло `borosilicate_glass`.
    - **Динамическое создание материалов (`define_material`)**: регистрация пользовательских сплавов, полимеров и композитов с индивидуальными $E$, $\nu$, $\sigma_y$ и $\rho$.
 
 7. **Производственный экспорт и телеметрия**:
@@ -167,7 +168,7 @@ docker run --rm -p 8080:8080 mcp-cad-server
    - **Name**: `cad-engine`
    - **Type**: `command`
    - **Command**: `C:\Users\<username>\Documents\chordvibe-cad-mcp\target\release\mcp-cad-server.exe --mode stdio`
-4. Нажмите **Save**. Зеленый индикатор подтвердит доступность всех 41 инструментов (полный Rust MCP).
+4. Нажмите **Save**. Зеленый индикатор подтвердит доступность всех 43 инструментов (полный Rust MCP).
 
 ---
 
@@ -206,7 +207,7 @@ MCP-CAD Engine спроектирован специально для преод
 
 ---
 
-## 🛠️ Сводная таблица инструментов MCP (41 Tools)
+## 🛠️ Сводная таблица инструментов MCP (43 Tools)
 
 | № | Имя инструмента | Входные параметры | Выходные данные | Назначение |
 |:---:|---|---|---|---|
@@ -251,9 +252,11 @@ MCP-CAD Engine спроектирован специально для преод
 | **39** | `check_interference` | `part_ids?: [str]`, `ignore_adjacent?: bool`, `pairs?: [[str, str]]`, `length_unit?: str` | `{ has_interference: bool, interfering_pairs_count: int, min_clearance: num, pairs: [...] }` | Попарная проверка геометрической интерференции и зазоров (`AABB` + `csg_intersection`) |
 | **40** | `sweep_joint` | `joint_id: str`, `from: num`, `to: num`, `steps: int`, `ignore_adjacent?: bool`, `angle_unit?: str`, `length_unit?: str` | `{ status: "PASS"\|"FAIL", collision_detected: bool, safe_travel_range: obj, min_clearance: num, lockup_detected: bool, ... }` | Пошаговое сканирование хода шарнира (включая замкнутые контуры) с детекцией коллизий и заклинивания |
 | **41** | `apply_recipe` | `recipe: "flanged_bushing"\|"stepped_shaft"\|"gear_transmission"`, `params?: obj`, `length_unit?: "mm"\|"m"` | `{ status: "recipe_applied", recipe: str, created_parts: [str], created_joints: [str], details: obj, ... }` | Атомарно построить типовой узел/сборку из параметрического рецепта с проверкой `validate_mesh` |
+| **42** | `bake_coupled_simulation` | `action?: "bake"\|"status"\|"cancel"`, `accuracy_level?: "standard"\|"high"\|"ultra"`, `part_ids?: [str]`, `duration_s?: num`, `dt_ms?: num`, `hht_alpha?: num`, `async_mode?: bool` | `{ status: str, job_id: str, simulation_id: str, frame_count: int, cfl_ratio_max: num, max_energy_drift_pct: num, ... }` | Запустить, проверить статус или отменить серверное запекание сопряжённой неявной динамики `HHT-α` с прогрессом по SSE |
+| **43** | `query_simulation_frame` | `simulation_id?: str`, `frame_index?: int`, `time_s?: num`, `part_id?: str`, `include_mesh_fields?: bool` | `{ simulation_id: str, frame_index: int, time_s: num, parts: [...], detached_fragments: [...], contact_forces: [...], energy_balance: obj }` | Получить компактный кэшированный кадр сопряжённой симуляции ($\mathbf{x}(t)$, $\sigma_{vM}$, $\bar{\varepsilon}_p$, $D$, осколки, баланс энергий) |
 
 > [!TIP]
-> Полная документация с примерами JSON-RPC запросов и ответов для всех 41 инструментов представлена в документе [Справочник API инструментов MCP](docs/MCP_API_REFERENCE.md).
+> Полная документация с примерами JSON-RPC запросов и ответов для всех 43 инструментов представлена в документе [Справочник API инструментов MCP](docs/MCP_API_REFERENCE.md).
 
 ---
 
@@ -315,7 +318,7 @@ graph TD
 - **Инварианты примитивов и CSG (`mcp-cad-core`)**: Проверка водонепроницаемости (`validate_mesh`), внешней ориентации нормалей, характеристики Эйлера ($\chi = 2 - 2g$), отсутствия вырожденных углов (`Sliver Gate`) и аналитических тождеств объёма.
 - **Аналитическая верификация МКЭ (`mcp-cad-fea`)**: Проверка решения 3D-задач теории упругости на тетраэдрах `TET4` и квадратичных элементах `TET10` (ошибка прогиба консоли `0.25%`) методом сопряжённых градиентов (PCG).
 - **Верификация кинематики и динамики (`mcp-cad-physics`)**: Проверка собственного `f64` DAE/KKT решателя на свободном падении (`< 1e-12`), асимметричном свободном волчке Эйлера (сохранение $T_{\text{rot}}$ и $\|\mathbf{L}\|$ до `< 1e-13`), 10-оборотной зубчатой передаче с передачей момента (`< 1e-7 Н·м`), замкнутых механизмах, коллизиях с трением Кулона (`< 1e-4` на наклоне $30^\circ$) и передаче реакций в МКЭ.
-- **Контрактное и сквозное E2E тестирование MCP (`mcp-cad-server`)**: Проверка обработки всех 41 инструментов и соответствия схеме MCP 2024-11-05 (`mcp_contract_tests`, `qa_wide_scan`, `gear_kinematic_test`, `bench_suite`).
+- **Контрактное и сквозное E2E тестирование MCP (`mcp-cad-server`)**: Проверка обработки всех 43 инструментов и соответствия схеме MCP 2024-11-05 (`mcp_contract_tests`, `qa_wide_scan`, `gear_kinematic_test`, `bench_suite`).
 
 > [!IMPORTANT]
 > **Требуемая версия Rust и фактическое состояние тестов:**

@@ -2,7 +2,26 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::sync::OnceLock;
 use thiserror::Error;
+
+/// Returns the deterministically sorted canonical IDs of all built-in materials
+/// registered in `mcp_cad_core::MaterialRegistry`.
+fn builtin_material_ids() -> &'static [String] {
+    static BUILTIN_MATERIALS: OnceLock<Vec<String>> = OnceLock::new();
+    BUILTIN_MATERIALS
+        .get_or_init(|| {
+            let registry = mcp_cad_core::MaterialRegistry::new();
+            let mut ids: Vec<String> = registry
+                .list()
+                .into_iter()
+                .map(|m| m.name.clone())
+                .collect();
+            ids.sort();
+            ids
+        })
+        .as_slice()
+}
 
 /// MCP tool execution error envelope containing the structured error payload.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -246,23 +265,19 @@ fn map_invalid_argument_error(full_message: String, msg: &str) -> ErrorBody {
     }
 
     // 2. Unknown material
-    if msg.contains("Unknown material") {
+    if msg.contains("Unknown material")
+        || ((msg.contains("Material '") || msg.contains("material '"))
+            && msg.contains("not found in registry"))
+    {
+        let builtin_materials = builtin_material_ids();
         return ErrorBody::new("UNKNOWN_MATERIAL", full_message)
             .with_param("material")
-            .with_hint("Use a builtin material (e.g. steel_structural_aisi1020, aluminum_6061_t6, titanium_ti6al4v, copper_c10100, pla_plastic, abs_plastic) or define a custom material with 'define_material'.")
+            .with_hint(format!(
+                "Use a builtin material ({}) or define a custom material with 'define_material'.",
+                builtin_materials.join(", ")
+            ))
             .with_details(json!({
-                "builtin_materials": [
-                    "steel_structural_aisi1020",
-                    "steel_stainless_304",
-                    "aluminum_6061_t6",
-                    "titanium_ti6al4v",
-                    "copper_c10100",
-                    "brass_c36000",
-                    "pla_plastic",
-                    "abs_plastic",
-                    "polycarbonate",
-                    "nylon_pa6"
-                ]
+                "builtin_materials": builtin_materials
             }));
     }
 
@@ -496,10 +511,17 @@ fn map_cad_error(full_message: String, err: &mcp_cad_core::CadError) -> ErrorBod
                 .with_details(json!({ "feature_id": uuid.to_string() }))
         }
         mcp_cad_core::CadError::MaterialNotFound(mat) => {
+            let builtin_materials = builtin_material_ids();
             ErrorBody::new("MATERIAL_NOT_FOUND", full_message)
                 .with_param("material")
-                .with_hint("Material not found. Use a standard builtin material or define one with 'define_material'.")
-                .with_details(json!({ "material": mat }))
+                .with_hint(format!(
+                    "Material not found. Use a standard builtin material ({}) or define one with 'define_material'.",
+                    builtin_materials.join(", ")
+                ))
+                .with_details(json!({
+                    "material": mat,
+                    "builtin_materials": builtin_materials
+                }))
         }
         mcp_cad_core::CadError::CsgError(csg_msg) => {
             ErrorBody::new("CSG_BOOLEAN_ERROR", full_message)
@@ -855,6 +877,119 @@ mod tests {
         assert_eq!(body.code, "UNKNOWN_MATERIAL");
         assert_eq!(body.param.as_deref(), Some("material"));
         assert!(body.details["builtin_materials"].is_array());
+    }
+
+    #[test]
+    fn test_p5_t10_unknown_material_builtin_materials_match_registry() {
+        let registry = mcp_cad_core::MaterialRegistry::new();
+        let mut expected_canonical: Vec<String> = registry
+            .list()
+            .into_iter()
+            .map(|m| m.name.clone())
+            .collect();
+        expected_canonical.sort();
+
+        let unknown_messages = [
+            "Unknown material 'vibranium'",
+            "Material 'vibranium' not found in registry. Available presets: aluminum_6061_t6",
+            "Part 'p1' references material 'vibranium' which was not found in registry",
+        ];
+
+        for msg in unknown_messages {
+            let err = ServerError::InvalidArgument(msg.to_string());
+            let body = err.to_error_body();
+            assert_eq!(body.code, "UNKNOWN_MATERIAL", "Failed for message: {msg}");
+            assert_eq!(body.param.as_deref(), Some("material"));
+
+            let listed: Vec<String> = body.details["builtin_materials"]
+                .as_array()
+                .expect("details.builtin_materials must be an array")
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .expect("builtin_materials entries must be strings")
+                        .to_string()
+                })
+                .collect();
+
+            assert_eq!(listed, expected_canonical);
+            for id in &listed {
+                assert!(
+                    registry.contains(id),
+                    "Builtin material '{id}' listed in UNKNOWN_MATERIAL must exist in MaterialRegistry"
+                );
+                assert_eq!(
+                    registry.get(id).expect("Canonical material must resolve").name,
+                    *id,
+                    "Builtin material '{id}' must be a canonical preset ID"
+                );
+            }
+
+            let hint = body.hint.as_deref().expect("Hint must be present");
+            for id in &expected_canonical {
+                assert!(
+                    hint.contains(id),
+                    "Hint '{hint}' must include canonical builtin material '{id}'"
+                );
+            }
+            for stale in [
+                "steel_stainless_304",
+                "copper_c10100",
+                "abs_plastic",
+                "polycarbonate",
+            ] {
+                assert!(
+                    !listed.iter().any(|id| id == stale) && !hint.contains(stale),
+                    "Stale non-existent material '{stale}' must not appear in UNKNOWN_MATERIAL"
+                );
+            }
+        }
+
+        // Also verify CadError::MaterialNotFound exposes the same synchronized builtin_materials list
+        let cad_err = ServerError::Cad(mcp_cad_core::CadError::MaterialNotFound(
+            "vibranium".to_string(),
+        ));
+        let cad_body = cad_err.to_error_body();
+        assert_eq!(cad_body.code, "MATERIAL_NOT_FOUND");
+        assert_eq!(cad_body.param.as_deref(), Some("material"));
+        let cad_listed: Vec<String> = cad_body.details["builtin_materials"]
+            .as_array()
+            .expect("MATERIAL_NOT_FOUND details.builtin_materials must be an array")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(cad_listed, expected_canonical);
+    }
+
+    #[test]
+    fn test_p5_t10_create_part_unknown_material_returns_synchronized_envelope() {
+        let mut state = crate::state::EngineState::new()
+            .expect("EngineState::new must succeed (WGPU or SoftwareCpu fallback)");
+        let err = crate::tools::cad::create_part(
+            &json!({
+                "name": "TestBracket",
+                "material": "vibranium"
+            }),
+            &mut state,
+        )
+        .expect_err("create_part must fail for unknown material");
+
+        let body = err.to_error_body();
+        assert_eq!(body.code, "UNKNOWN_MATERIAL");
+        assert_eq!(body.param.as_deref(), Some("material"));
+
+        let registry = mcp_cad_core::MaterialRegistry::new();
+        let listed = body.details["builtin_materials"]
+            .as_array()
+            .expect("details.builtin_materials must be an array");
+        assert_eq!(listed.len(), registry.len());
+        for entry in listed {
+            let id = entry.as_str().expect("material id must be string");
+            assert!(
+                registry.contains(id),
+                "Material '{id}' suggested by create_part error must resolve in MaterialRegistry"
+            );
+        }
     }
 
     #[test]

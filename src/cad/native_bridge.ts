@@ -1,8 +1,27 @@
-import { MeshGeometryData, RenderMode } from '../types/cad';
+import {
+  CadPart,
+  DestructionCache,
+  DestructionSimConfig,
+  KinematicJoint,
+  MaterialSpec,
+  MeshGeometryData,
+  RenderMode,
+} from '../types/cad';
 import { parseStlBuffer } from './primitives';
 import { MCP_TOOLS_CATALOG } from './mcp_dispatcher';
+import {
+  convertRustCoupledSimToDestructionCache,
+  type RustCoupledSimBakeSummaryJson,
+  type RustCoupledSimFrameJson,
+} from './field_colormaps';
+import {
+  buildRustSceneSyncPlan,
+  resolveRustEndpoint,
+  type RustAccuracyLevel,
+  type RustSceneSyncPlan,
+} from './rust_scene_sync';
 
-export const RUST_MCP_TOOLS_COUNT = 41;
+export const RUST_MCP_TOOLS_COUNT = 43;
 export const TS_MCP_TOOLS_COUNT = MCP_TOOLS_CATALOG.length;
 
 export type EngineRuntimeMode =
@@ -13,6 +32,10 @@ export interface WindowsBridgeStatus {
   mode: EngineRuntimeMode;
   endpointUrl: string;
   connectedToWindowsExe: boolean;
+  isSameOriginProxy?: boolean;
+  cargoAvailable?: boolean;
+  binaryExists?: boolean;
+  diagnosticMessage?: string;
   serverVersion: string;
   activeToolsCount: number;
   lastSyncTimestamp: string;
@@ -24,14 +47,22 @@ export type NativeBridgeStatus = WindowsBridgeStatus;
 
 export const DEFAULT_BRIDGE_STATUS: WindowsBridgeStatus = {
   mode: 'unified_hybrid_kernel',
-  endpointUrl: 'http://127.0.0.1:8080',
+  endpointUrl: '',
   connectedToWindowsExe: false,
+  isSameOriginProxy: true,
   serverVersion: '0.1.0-hybrid-wgpu-sync',
   activeToolsCount: TS_MCP_TOOLS_COUNT,
   lastSyncTimestamp: '00:00:00',
   latencyMs: 0.4,
   rustStlCacheCount: 5,
 };
+
+export class RustBakeCancelledError extends Error {
+  constructor(message: string = 'Расчёт Rust FEM отменён пользователем') {
+    super(message);
+    this.name = 'RustBakeCancelledError';
+  }
+}
 
 export interface GoldenArtifactMapping {
   presetId: string;
@@ -180,29 +211,46 @@ export function getWindowsWgpuArtifactUrl(
 }
 
 /**
- * Probes whether the native Windows `mcp-cad-server.exe` HTTP/SSE daemon is reachable
- * on the given endpoint (default `http://127.0.0.1:8080`).
- * Only performs a live network fetch when `?bridge=live` is present in the URL or `forceProbe` is true,
- * preventing unnecessary localhost network requests in cloud preview environments.
+ * Probes whether the native Rust `mcp-cad-server` HTTP/SSE daemon is reachable.
+ *
+ * - Default (`endpointUrl = ""` / `"auto"`): probes same-origin Express proxy `GET /api/rust/status`
+ *   (safe in every environment, zero cross-origin localhost noise).
+ * - If `?bridge=live` is present in the browser URL and same-origin proxy reports unhealthy, also
+ *   probes direct `http://127.0.0.1:8080`.
+ * - Explicit `http(s)://...` URL (when user connects manually or passes `forceProbe = true`):
+ *   probes `${base}/message` via JSON-RPC `initialize`.
  */
 export async function probeWindowsMcpServer(
-  endpointUrl: string = 'http://127.0.0.1:8080',
+  endpointUrl: string = '',
   forceProbe: boolean = false
 ): Promise<WindowsBridgeStatus> {
   const t0 = performance.now();
-  const base = endpointUrl.replace(/\/+$/, '');
+  const resolved = resolveRustEndpoint(endpointUrl);
 
-  const shouldProbeNetwork =
-    forceProbe ||
-    (typeof window !== 'undefined' &&
-      window.location.search.includes('bridge=live'));
+  if (!resolved.ok) {
+    return {
+      mode: 'unified_hybrid_kernel',
+      endpointUrl,
+      connectedToWindowsExe: false,
+      isSameOriginProxy: false,
+      diagnosticMessage: resolved.error,
+      serverVersion: '0.1.0-hybrid-wgpu-sync',
+      activeToolsCount: TS_MCP_TOOLS_COUNT,
+      lastSyncTimestamp: new Date().toTimeString().slice(0, 8),
+      latencyMs: 0,
+      rustStlCacheCount: stlMeshCache.size,
+    };
+  }
 
-  if (shouldProbeNetwork && typeof fetch === 'function') {
+  let cargoAvailable: boolean | undefined;
+  let binaryExists: boolean | undefined;
+  let diagnosticMessage: string | undefined;
+
+  const probeDirectMcp = async (mcpUrl: string, displayEndpoint: string, isProxy: boolean) => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1500);
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 650);
-
-      const res = await fetch(`${base}/message`, {
+      const res = await fetch(mcpUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -218,74 +266,572 @@ export async function probeWindowsMcpServer(
         signal: controller.signal,
       });
       clearTimeout(timeout);
-
       if (res.ok) {
         const data = await res.json();
-        const latencyMs = Number((performance.now() - t0).toFixed(1));
-        return {
-          mode: 'windows_exe_connected',
-          endpointUrl: base,
-          connectedToWindowsExe: true,
-          serverVersion:
-            data?.result?.serverInfo?.version || '0.1.0-windows-x64',
-          activeToolsCount: RUST_MCP_TOOLS_COUNT,
-          lastSyncTimestamp: new Date().toTimeString().slice(0, 8),
-          latencyMs,
-          rustStlCacheCount: stlMeshCache.size,
-        };
+        if (!data?.error) {
+          const latencyMs = Number((performance.now() - t0).toFixed(1));
+          return {
+            mode: 'windows_exe_connected' as const,
+            endpointUrl: displayEndpoint,
+            connectedToWindowsExe: true,
+            isSameOriginProxy: isProxy,
+            cargoAvailable,
+            binaryExists,
+            diagnosticMessage: isProxy
+              ? 'Подключено через локальный прокси /api -> Rust mcp-cad-server (:8080)'
+              : `Прямое подключение к ${displayEndpoint}`,
+            serverVersion:
+              data?.result?.serverInfo?.version || '0.1.0-rust-fem-f64',
+            activeToolsCount: RUST_MCP_TOOLS_COUNT,
+            lastSyncTimestamp: new Date().toTimeString().slice(0, 8),
+            latencyMs,
+            rustStlCacheCount: stlMeshCache.size,
+          };
+        }
       }
     } catch {
-      // Localhost 8080 server not active; use unified hybrid kernel
+      clearTimeout(timeout);
+    }
+    return null;
+  };
+
+  if (typeof fetch === 'function') {
+    if (resolved.isSameOriginProxy) {
+      // 1. Check same-origin Express proxy health (/api/rust/status)
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 1800);
+        const statusRes = await fetch(resolved.statusUrl, {
+          method: 'GET',
+          signal: controller.signal,
+        });
+        clearTimeout(timeout);
+
+        if (statusRes.ok) {
+          const st = await statusRes.json();
+          cargoAvailable = Boolean(st?.cargoAvailable);
+          binaryExists = Boolean(st?.binaryExists);
+          if (st?.healthy) {
+            const initHit = await probeDirectMcp(resolved.mcpUrl, '', true);
+            if (initHit) return initHit;
+            return {
+              mode: 'windows_exe_connected',
+              endpointUrl: '',
+              connectedToWindowsExe: true,
+              isSameOriginProxy: true,
+              cargoAvailable,
+              binaryExists,
+              diagnosticMessage:
+                'Подключено через прокси /api -> Rust mcp-cad-server (:8080)',
+              serverVersion: '0.1.0-rust-fem-f64',
+              activeToolsCount: RUST_MCP_TOOLS_COUNT,
+              lastSyncTimestamp: new Date().toTimeString().slice(0, 8),
+              latencyMs: Number((performance.now() - t0).toFixed(1)),
+              rustStlCacheCount: stlMeshCache.size,
+            };
+          } else {
+            diagnosticMessage = !binaryExists && !cargoAvailable
+              ? 'На сервере не установлен Rust/Cargo. Запустите mcp-cad-server локально на :8080 и укажите его URL.'
+              : 'Локальный mcp-cad-server (:8080) не запущен. Запустите ./run_server.sh или cargo run --release --bin mcp-cad-server -- --mode sse --port 8080.';
+          }
+        }
+      } catch {
+        diagnosticMessage =
+          'Прокси /api/rust/status недоступен. Укажите прямой URL Rust-сервера (например http://127.0.0.1:8080).';
+      }
+
+      // 2. Optional direct localhost probe when explicitly enabled via `?bridge=live`
+      const allowLiveLocalhost =
+        typeof window !== 'undefined' &&
+        window.location.search.includes('bridge=live');
+      if (allowLiveLocalhost) {
+        const direct = await probeDirectMcp(
+          'http://127.0.0.1:8080/message',
+          'http://127.0.0.1:8080',
+          false
+        );
+        if (direct) return direct;
+      }
+    } else if (
+      forceProbe ||
+      (typeof window !== 'undefined' &&
+        window.location.search.includes('bridge=live'))
+    ) {
+      const direct = await probeDirectMcp(
+        resolved.mcpUrl,
+        resolved.endpointUrl,
+        false
+      );
+      if (direct) return direct;
+      diagnosticMessage = `Не удалось подключиться к ${resolved.endpointUrl}. Убедитесь, что mcp-cad-server запущен с флагом --mode sse.`;
     }
   }
 
   return {
     mode: 'unified_hybrid_kernel',
-    endpointUrl: base,
+    endpointUrl: resolved.endpointUrl,
     connectedToWindowsExe: false,
+    isSameOriginProxy: resolved.isSameOriginProxy,
+    cargoAvailable,
+    binaryExists,
+    diagnosticMessage,
     serverVersion: '0.1.0-hybrid-wgpu-sync',
     activeToolsCount: TS_MCP_TOOLS_COUNT,
     lastSyncTimestamp: new Date().toTimeString().slice(0, 8),
-    latencyMs: 0.4,
+    latencyMs: Number((performance.now() - t0).toFixed(1)),
     rustStlCacheCount: stlMeshCache.size,
   };
 }
 
 /**
- * Executes an MCP tool call over JSON-RPC 2.0 against a live Windows `mcp-cad-server.exe` instance.
+ * Executes an MCP tool call over JSON-RPC 2.0 against either the same-origin Express proxy (`/api/mcp`)
+ * or a direct Rust `mcp-cad-server` HTTP/SSE instance (`${base}/message`).
  */
 export async function executeRemoteWindowsMcpTool(
   endpointUrl: string,
   toolName: string,
-  args: Record<string, any>
-): Promise<{ ok: boolean; payload: any }> {
-  const base = endpointUrl.replace(/\/+$/, '');
-  const res = await fetch(`${base}/message`, {
+  args: Record<string, unknown>,
+  signal?: AbortSignal
+): Promise<{ ok: boolean; payload: any; errorMessage?: string }> {
+  const resolved = resolveRustEndpoint(endpointUrl);
+  if (!resolved.ok) {
+    throw new Error(resolved.error);
+  }
+
+  const res = await fetch(resolved.mcpUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       jsonrpc: '2.0',
-      id: Date.now(),
+      id: Date.now() + Math.floor(Math.random() * 1000),
       method: 'tools/call',
       params: {
         name: toolName,
         arguments: args,
       },
     }),
+    signal,
   });
+
   if (!res.ok) {
-    throw new Error(`Windows MCP Server HTTP ${res.status}`);
+    let errDetail = `HTTP ${res.status}`;
+    try {
+      const errJson = await res.json();
+      errDetail = errJson?.error?.message || errJson?.error || errDetail;
+    } catch {
+      // Keep status text
+    }
+    throw new Error(`Rust MCP (${toolName}): ${errDetail}`);
   }
+
   const rpc = await res.json();
   if (rpc.error) {
-    throw new Error(rpc.error.message || 'MCP JSON-RPC Error');
+    throw new Error(rpc.error.message || `MCP JSON-RPC Error (${toolName})`);
   }
+
   const textContent = rpc.result?.content?.find(
     (c: any) => c.type === 'text'
   )?.text;
-  const parsed = textContent ? JSON.parse(textContent) : rpc.result;
+  let parsed: any = rpc.result;
+  if (typeof textContent === 'string') {
+    try {
+      parsed = JSON.parse(textContent);
+    } catch {
+      parsed = { rawText: textContent };
+    }
+  }
+
+  const isErr = Boolean(rpc.result?.isError);
+  const errorMessage = isErr
+    ? parsed?.error?.message ||
+      parsed?.message ||
+      (typeof parsed?.error === 'string' ? parsed.error : undefined) ||
+      textContent ||
+      `MCP tool ${toolName} returned error`
+    : undefined;
+
   return {
-    ok: !rpc.result?.isError,
+    ok: !isErr,
     payload: parsed,
+    errorMessage,
   };
 }
+
+/**
+ * Synchronizes the active Web Studio scene (`parts`, `joints`, `materials`, `config`)
+ * into the native Rust `mcp-cad-server` `EngineState` and `PhysicsWorld` before baking.
+ */
+export async function syncSceneToRustServer(
+  endpointUrl: string,
+  parts: readonly CadPart[],
+  joints: readonly KinematicJoint[],
+  materials: readonly MaterialSpec[],
+  config: DestructionSimConfig,
+  accuracyLevel: RustAccuracyLevel = 'standard',
+  onProgress?: (pct: number, stageLabel: string) => void,
+  signal?: AbortSignal
+): Promise<RustSceneSyncPlan> {
+  const plan = buildRustSceneSyncPlan(
+    parts,
+    joints,
+    materials,
+    config,
+    accuracyLevel
+  );
+
+  if (plan.activePartIds.length === 0) {
+    throw new Error('В сцене нет видимых деталей для синхронизации с Rust FEM.');
+  }
+
+  onProgress?.(4, 'Rust FEM f64: очистка предыдущей сцены сервера...');
+
+  // 1. Clear stale parts from previous Web Studio presets / runs
+  const listRes = await executeRemoteWindowsMcpTool(
+    endpointUrl,
+    'list_parts',
+    { length_unit: 'm' },
+    signal
+  );
+  if (listRes.ok && Array.isArray(listRes.payload?.parts)) {
+    for (const existing of listRes.payload.parts) {
+      const existingId = existing?.id ?? existing?.part_id;
+      if (typeof existingId === 'string' && existingId.length > 0) {
+        if (signal?.aborted) throw new RustBakeCancelledError();
+        await executeRemoteWindowsMcpTool(
+          endpointUrl,
+          'delete_part',
+          { part_id: existingId },
+          signal
+        );
+      }
+    }
+  }
+
+  // 2. Replay ordered scene-sync operations (units -> custom materials -> parts -> DAG -> transforms -> joints -> motors)
+  const totalOps = Math.max(1, plan.operations.length);
+  for (let i = 0; i < plan.operations.length; i++) {
+    if (signal?.aborted) throw new RustBakeCancelledError();
+    const op = plan.operations[i];
+    const pct = 5 + Math.round(((i + 1) / totalOps) * 13); // 5% .. 18%
+    onProgress?.(
+      pct,
+      `Rust FEM f64: синхронизация (${op.tool}, ${i + 1}/${totalOps})...`
+    );
+
+    const res = await executeRemoteWindowsMcpTool(
+      endpointUrl,
+      op.tool,
+      op.args,
+      signal
+    );
+    if (!res.ok) {
+      throw new Error(
+        `Сбой синхронизации сцены с Rust (${op.tool}): ${res.errorMessage || 'неизвестная ошибка'}`
+      );
+    }
+  }
+
+  return plan;
+}
+
+/**
+ * Cancels an active background Rust FEM coupled simulation bake job via `POST /api/coupled-sim/cancel/:job_id`.
+ */
+export async function cancelNativeCoupledSimulation(
+  endpointUrl: string,
+  jobId: string
+): Promise<boolean> {
+  const resolved = resolveRustEndpoint(endpointUrl);
+  if (!resolved.ok) return false;
+  try {
+    const res = await fetch(
+      `${resolved.coupledSimBaseUrl}/cancel/${encodeURIComponent(jobId)}`,
+      { method: 'POST' }
+    );
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export interface NativeCoupledBakeOptions {
+  joints?: readonly KinematicJoint[];
+  accuracyLevel?: RustAccuracyLevel;
+  onJobId?: (jobId: string) => void;
+  signal?: AbortSignal;
+  /** Internal test flag to bypass MCP scene sync when parts already live on server. */
+  skipSceneSync?: boolean;
+}
+
+/**
+ * Synchronizes the active Web Studio scene into the native Rust `mcp-cad-server`,
+ * bakes a real f64 coupled implicit HHT-α dynamic FEM simulation (`/api/coupled-sim/*`),
+ * streams SSE progress (with polling fallback & cancellation), and adapts all frames
+ * into a `DestructionCache` tagged with `solverBackend: 'rust_fem_f64'` (`Rust FEM f64`).
+ */
+export async function bakeNativeCoupledSimulation(
+  endpointUrl: string,
+  parts: readonly CadPart[],
+  materials: readonly MaterialSpec[],
+  config: DestructionSimConfig,
+  onProgress?: (pct: number, stageLabel: string) => void,
+  accuracyOrOptions: RustAccuracyLevel | NativeCoupledBakeOptions = 'standard'
+): Promise<DestructionCache> {
+  const opts: NativeCoupledBakeOptions =
+    typeof accuracyOrOptions === 'string'
+      ? { accuracyLevel: accuracyOrOptions }
+      : accuracyOrOptions;
+
+  const accuracyLevel: RustAccuracyLevel = opts.accuracyLevel ?? 'standard';
+  const joints: readonly KinematicJoint[] = opts.joints ?? [];
+  const signal = opts.signal;
+
+  const resolved = resolveRustEndpoint(endpointUrl);
+  if (!resolved.ok) {
+    throw new Error(resolved.error);
+  }
+  const coupledBase = resolved.coupledSimBaseUrl;
+
+  if (signal?.aborted) {
+    throw new RustBakeCancelledError();
+  }
+
+  let bakePayload: Record<string, unknown>;
+  if (opts.skipSceneSync) {
+    bakePayload = buildRustSceneSyncPlan(
+      parts,
+      joints,
+      materials,
+      config,
+      accuracyLevel
+    ).bakePayload;
+  } else {
+    const plan = await syncSceneToRustServer(
+      endpointUrl,
+      parts,
+      joints,
+      materials,
+      config,
+      accuracyLevel,
+      onProgress,
+      signal
+    );
+    bakePayload = plan.bakePayload;
+  }
+
+  if (signal?.aborted) {
+    throw new RustBakeCancelledError();
+  }
+
+  onProgress?.(20, `Rust FEM f64 (${accuracyLevel}): запуск HHT-α расчёта...`);
+
+  const bakeRes = await fetch(`${coupledBase}/bake`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(bakePayload),
+    signal,
+  });
+
+  if (!bakeRes.ok) {
+    let errText = `HTTP ${bakeRes.status}`;
+    try {
+      const errJson = await bakeRes.json();
+      errText = errJson?.error || errText;
+    } catch {
+      // Ignore parse failure
+    }
+    throw new Error(`Rust FEM bake отклонён: ${errText}`);
+  }
+
+  const bakeAck = await bakeRes.json();
+  const jobId: string | undefined = bakeAck?.job_id;
+  if (jobId) {
+    opts.onJobId?.(jobId);
+  }
+
+  let simulationId: string | undefined = bakeAck?.simulation_id;
+  let totalFrames: number = bakeAck?.frame_count ?? bakeAck?.total_frames ?? 0;
+  let bakeSummary: RustCoupledSimBakeSummaryJson = {
+    simulation_id: simulationId || 'latest',
+    accuracy_level: accuracyLevel,
+    duration_s: bakeAck?.duration_s ?? Number(bakePayload.duration_s ?? config.durationSec),
+    total_frames: totalFrames,
+    frame_count: totalFrames,
+    bake_time_ms: bakeAck?.elapsed_ms ?? bakeAck?.bake_time_ms,
+    elapsed_ms: bakeAck?.elapsed_ms ?? bakeAck?.bake_time_ms,
+    events: bakeAck?.events,
+  };
+
+  if (jobId && bakeAck?.status !== 'completed') {
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let es: EventSource | null = null;
+      let pollTimer: ReturnType<typeof setInterval> | null = null;
+
+      const onAbort = () => {
+        void cancelNativeCoupledSimulation(endpointUrl, jobId);
+        finish(new RustBakeCancelledError());
+      };
+
+      const finish = (err?: Error) => {
+        if (settled) return;
+        settled = true;
+        if (es) es.close();
+        if (pollTimer) clearInterval(pollTimer);
+        signal?.removeEventListener('abort', onAbort);
+        if (err) reject(err);
+        else resolve();
+      };
+
+      if (signal) {
+        if (signal.aborted) {
+          onAbort();
+          return;
+        }
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+
+      if (typeof EventSource === 'function') {
+        try {
+          es = new EventSource(`${coupledBase}/events`);
+          es.addEventListener('coupled_sim', (evt) => {
+            try {
+              const data = JSON.parse((evt as MessageEvent).data);
+              if (data.job_id && data.job_id !== jobId) return;
+              if (data.event === 'progress') {
+                const rawPct = Number(data.progress_pct || 0);
+                const pct = Math.min(84, Math.max(22, 20 + Math.round(rawPct * 0.64)));
+                onProgress?.(
+                  pct,
+                  `Rust FEM f64 (HHT-α): шаг ${data.step_count ?? 0}, t=${Number(data.time_s ?? 0).toFixed(4)}с, σ_max=${Number(data.max_von_mises_mpa ?? 0).toFixed(0)} МПа`
+                );
+              } else if (data.event === 'completed') {
+                simulationId = data.simulation_id || simulationId;
+                totalFrames = data.frame_count ?? data.total_frames ?? totalFrames;
+                bakeSummary = {
+                  ...bakeSummary,
+                  simulation_id: simulationId || 'latest',
+                  total_frames: totalFrames,
+                  frame_count: totalFrames,
+                  bake_time_ms: data.elapsed_ms ?? data.bake_time_ms,
+                  elapsed_ms: data.elapsed_ms ?? data.bake_time_ms,
+                  events: data.events ?? bakeSummary.events,
+                };
+                finish();
+              } else if (data.event === 'cancelled') {
+                finish(new RustBakeCancelledError());
+              } else if (data.event === 'failed') {
+                finish(new Error(data.error || 'Rust FEM job failed'));
+              }
+            } catch {
+              // Ignore malformed SSE keepalive payloads
+            }
+          });
+        } catch {
+          // Fall back to HTTP status polling below
+        }
+      }
+
+      // Polling safety net in case SSE drops or isn't supported (e.g. Node unit tests)
+      pollTimer = setInterval(async () => {
+        try {
+          const stRes = await fetch(
+            `${coupledBase}/status/${encodeURIComponent(jobId)}`
+          );
+          if (!stRes.ok) return;
+          const st = await stRes.json();
+          const job = st?.job ?? st;
+          const jobState = job?.state ?? job?.status;
+          if (jobState === 'completed') {
+            simulationId = job.simulation_id || simulationId;
+            totalFrames = job.frame_count ?? job.total_frames ?? totalFrames;
+            bakeSummary = {
+              ...bakeSummary,
+              simulation_id: simulationId || 'latest',
+              total_frames: totalFrames,
+              frame_count: totalFrames,
+              bake_time_ms: job.elapsed_ms ?? job.bake_time_ms,
+              elapsed_ms: job.elapsed_ms ?? job.bake_time_ms,
+              events: job.events ?? st.events ?? bakeSummary.events,
+            };
+            finish();
+          } else if (jobState === 'cancelled') {
+            finish(new RustBakeCancelledError());
+          } else if (jobState === 'failed') {
+            finish(new Error(job.error || 'Rust FEM job failed'));
+          } else if (typeof job?.progress_pct === 'number') {
+            const pct = Math.min(84, Math.max(22, 20 + Math.round(job.progress_pct * 0.64)));
+            onProgress?.(
+              pct,
+              `Rust FEM f64: расчёт (${Math.round(job.progress_pct)}%)...`
+            );
+          }
+        } catch {
+          // Retry next poll tick
+        }
+      }, 250);
+    });
+  }
+
+  if (signal?.aborted) {
+    throw new RustBakeCancelledError();
+  }
+
+  const simKey = simulationId || 'latest';
+
+  // P5-T15: Fetch local-space detached fragment triangle meshes once per simulation
+  let fetchedFragmentMeshesOnce = false;
+  try {
+    onProgress?.(85, 'Rust FEM f64: загрузка сеток фрагментов...');
+    const fragsRes = await fetch(
+      `${coupledBase}/fragments/${encodeURIComponent(simKey)}?length_unit=m`,
+      { signal }
+    );
+    if (fragsRes.ok) {
+      const fragsJson = await fragsRes.json();
+      if (Array.isArray(fragsJson?.fragments)) {
+        bakeSummary = {
+          ...bakeSummary,
+          fragment_meshes: fragsJson.fragments,
+        };
+        fetchedFragmentMeshesOnce = true;
+      }
+    }
+  } catch (err) {
+    if (signal?.aborted) throw new RustBakeCancelledError();
+    // Fallback to inline fragment meshes per frame when endpoint is unavailable
+    void err;
+  }
+
+  const frameCount = Math.max(1, totalFrames);
+  const rustFrames: RustCoupledSimFrameJson[] = [];
+  const fragInlineParam = fetchedFragmentMeshesOnce ? 'false' : 'true';
+
+  for (let i = 0; i < frameCount; i++) {
+    if (signal?.aborted) throw new RustBakeCancelledError();
+    onProgress?.(
+      86 + Math.round((i / frameCount) * 13),
+      `Rust FEM f64: загрузка поверхностных сеток и полей кадра ${i + 1}/${frameCount}...`
+    );
+    const fRes = await fetch(
+      `${coupledBase}/frames/${encodeURIComponent(simKey)}/${i}?include_mesh_fields=true&include_fragment_meshes=${fragInlineParam}&length_unit=m`,
+      { signal }
+    );
+    if (!fRes.ok) {
+      throw new Error(`Failed loading Rust FEM frame ${i}: HTTP ${fRes.status}`);
+    }
+    const fJson: RustCoupledSimFrameJson = await fRes.json();
+    rustFrames.push(fJson);
+  }
+
+  onProgress?.(100, 'Rust FEM f64 кэш готов');
+  return convertRustCoupledSimToDestructionCache(
+    bakeSummary,
+    rustFrames,
+    parts,
+    materials,
+    config
+  );
+}
+
+

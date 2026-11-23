@@ -1,6 +1,7 @@
 //! Linear 4-node (TET4) and quadratic 10-node (TET10) tetrahedral finite element formulations.
 
-use nalgebra::{Matrix3, Matrix4, Matrix6, SMatrix, SVector};
+use nalgebra::{Matrix3, Matrix4, Matrix6, SMatrix, SVector, Vector3};
+use crate::elasticity::{radial_return_j2, GaussPointState, J2MaterialParams, ReturnMappingResult};
 use crate::error::FeaError;
 
 /// Type alias for the 6x12 strain-displacement matrix B (TET4).
@@ -155,6 +156,170 @@ impl Tet4Element {
         let shear = 6.0 * (txy.powi(2) + tyz.powi(2) + tzx.powi(2));
 
         (0.5 * (s1 + s2 + s3 + shear)).sqrt()
+    }
+
+    /// Returns the 4 physical shape function gradients $\nabla_X N_i = [\partial N_i/\partial x, \partial N_i/\partial y, \partial N_i/\partial z]$
+    /// extracted directly from the precomputed $B$-matrix.
+    #[inline]
+    pub fn shape_gradients(&self) -> [[f64; 3]; 4] {
+        let mut grads = [[0.0; 3]; 4];
+        for (i, grad) in grads.iter_mut().enumerate() {
+            let col = 3 * i;
+            grad[0] = self.b_matrix[(0, col)];
+            grad[1] = self.b_matrix[(1, col + 1)];
+            grad[2] = self.b_matrix[(2, col + 2)];
+        }
+        grads
+    }
+
+    /// Computes the $3 \times 3$ displacement gradient $\mathbf{H} = \nabla_X \mathbf{u} = \sum_{i=0}^3 \mathbf{u}_i \otimes \nabla_X N_i$.
+    #[inline]
+    pub fn displacement_gradient(&self, u_elem: &Vector12<f64>) -> Matrix3<f64> {
+        let grads = self.shape_gradients();
+        let mut h = Matrix3::<f64>::zeros();
+        for (i, &[gx, gy, gz]) in grads.iter().enumerate() {
+            let ux = u_elem[3 * i];
+            let uy = u_elem[3 * i + 1];
+            let uz = u_elem[3 * i + 2];
+            h[(0, 0)] += ux * gx;
+            h[(0, 1)] += ux * gy;
+            h[(0, 2)] += ux * gz;
+            h[(1, 0)] += uy * gx;
+            h[(1, 1)] += uy * gy;
+            h[(1, 2)] += uy * gz;
+            h[(2, 0)] += uz * gx;
+            h[(2, 1)] += uz * gy;
+            h[(2, 2)] += uz * gz;
+        }
+        h
+    }
+
+    /// Evaluates nonlinear internal forces $\mathbf{f}_{\text{int}}$ ($12 \times 1$),
+    /// symmetric tangent stiffness $\mathbf{K}_e$ ($12 \times 12$), updated $J_2$ Gauss-point state,
+    /// and element rotation $\mathbf{R} \in SO(3)$ using Co-Rotated FEM (when `corotated = true`)
+    /// and Radial Return Mapping.
+    pub fn evaluate_nonlinear(
+        &self,
+        u_elem: &Vector12<f64>,
+        prev_state: &GaussPointState,
+        params: &J2MaterialParams,
+        corotated: bool,
+        include_geometric_stiffness: bool,
+    ) -> (Vector12<f64>, Matrix12<f64>, ReturnMappingResult, Matrix3<f64>) {
+        let grads = self.shape_gradients();
+        let h_grad = self.displacement_gradient(u_elem);
+        let (r_mat, u_stretch, eps_loc) = if corotated {
+            corotated_biot_strain_voigt(&h_grad)
+        } else {
+            (
+                Matrix3::identity(),
+                Matrix3::identity(),
+                linear_strain_from_grad_u(&h_grad),
+            )
+        };
+
+        let rm = radial_return_j2(&eps_loc, prev_state, params);
+        let sigma_mat = voigt_stress_to_matrix3(&rm.stress);
+        let pk1 = r_mat * sigma_mat;
+
+        let mut f_int = Vector12::<f64>::zeros();
+        for (k, &g) in grads.iter().enumerate() {
+            let fk = pk1 * Vector3::new(g[0], g[1], g[2]) * self.volume;
+            f_int[3 * k] = fk.x;
+            f_int[3 * k + 1] = fk.y;
+            f_int[3 * k + 2] = fk.z;
+        }
+
+        let mut ke = Matrix12::<f64>::zeros();
+        let r_t = r_mat.transpose();
+        let mut b_rot = [SMatrix::<f64, 6, 3>::zeros(); 4];
+        let mut cb_rot = [SMatrix::<f64, 6, 3>::zeros(); 4];
+        for (k, &g) in grads.iter().enumerate() {
+            let br = node_b_matrix(g) * r_t;
+            cb_rot[k] = rm.tangent * br;
+            b_rot[k] = br;
+        }
+
+        let use_geo = corotated && include_geometric_stiffness && rm.stress.norm() > 1e-12;
+        let su_inv = if use_geo {
+            let su = Matrix3::identity() * u_stretch.trace() - u_stretch;
+            su.try_inverse()
+        } else {
+            None
+        };
+
+        let mut geo_a = [Matrix3::<f64>::zeros(); 4];
+        let mut geo_m = [Matrix3::<f64>::zeros(); 4];
+        if let Some(su_inv_mat) = su_inv {
+            for (k, &g) in grads.iter().enumerate() {
+                let gv = Vector3::new(g[0], g[1], g[2]);
+                let tk = sigma_mat * gv;
+                geo_a[k] = r_mat * skew_matrix(&tk);
+                geo_m[k] = su_inv_mat * skew_matrix(&gv) * r_t;
+            }
+        }
+
+        for a in 0..4 {
+            let row = 3 * a;
+            for b in a..4 {
+                let col = 3 * b;
+                let mut block = (b_rot[a].transpose() * cb_rot[b]) * self.volume;
+                if su_inv.is_some() {
+                    let g_ab = -(geo_a[a] * geo_m[b]) * self.volume;
+                    let g_ba = -(geo_a[b] * geo_m[a]) * self.volume;
+                    block += (g_ab + g_ba.transpose()) * 0.5;
+                }
+
+                for r in 0..3 {
+                    for c in 0..3 {
+                        ke[(row + r, col + c)] = block[(r, c)];
+                    }
+                }
+                if b > a {
+                    for r in 0..3 {
+                        for c in 0..3 {
+                            ke[(col + c, row + r)] = block[(r, c)];
+                        }
+                    }
+                }
+            }
+        }
+
+        (f_int, ke, rm, r_mat)
+    }
+
+    /// Evaluates nonlinear internal forces $\mathbf{f}_{\text{int}}$ ($12 \times 1$) and $J_2$
+    /// Gauss-point state without assembling the tangent stiffness (fast path for line search).
+    pub fn evaluate_nonlinear_forces_only(
+        &self,
+        u_elem: &Vector12<f64>,
+        prev_state: &GaussPointState,
+        params: &J2MaterialParams,
+        corotated: bool,
+    ) -> (Vector12<f64>, ReturnMappingResult, Matrix3<f64>) {
+        let grads = self.shape_gradients();
+        let h_grad = self.displacement_gradient(u_elem);
+        let (r_mat, _u_stretch, eps_loc) = if corotated {
+            corotated_biot_strain_voigt(&h_grad)
+        } else {
+            (
+                Matrix3::identity(),
+                Matrix3::identity(),
+                linear_strain_from_grad_u(&h_grad),
+            )
+        };
+
+        let rm = radial_return_j2(&eps_loc, prev_state, params);
+        let pk1 = r_mat * voigt_stress_to_matrix3(&rm.stress);
+
+        let mut f_int = Vector12::<f64>::zeros();
+        for (k, &g) in grads.iter().enumerate() {
+            let fk = pk1 * Vector3::new(g[0], g[1], g[2]) * self.volume;
+            f_int[3 * k] = fk.x;
+            f_int[3 * k + 1] = fk.y;
+            f_int[3 * k + 2] = fk.z;
+        }
+        (f_int, rm, r_mat)
     }
 }
 
@@ -450,6 +615,472 @@ impl Tet10Element {
 
         f_int
     }
+
+    /// Computes the $3 \times 3$ displacement gradient $\mathbf{H}^{(q)} = \nabla_X \mathbf{u}(\mathbf{L}^{(q)})$
+    /// at Gauss point `gp` ($0..4$).
+    #[inline]
+    pub fn displacement_gradient_at_gp(&self, gp: usize, u_elem: &Vector30<f64>) -> Matrix3<f64> {
+        let grads = &self.gauss_gradients[gp];
+        let mut h = Matrix3::<f64>::zeros();
+        for (k, &[gx, gy, gz]) in grads.iter().enumerate() {
+            let ux = u_elem[3 * k];
+            let uy = u_elem[3 * k + 1];
+            let uz = u_elem[3 * k + 2];
+            h[(0, 0)] += ux * gx;
+            h[(0, 1)] += ux * gy;
+            h[(0, 2)] += ux * gz;
+            h[(1, 0)] += uy * gx;
+            h[(1, 1)] += uy * gy;
+            h[(1, 2)] += uy * gz;
+            h[(2, 0)] += uz * gx;
+            h[(2, 1)] += uz * gy;
+            h[(2, 2)] += uz * gz;
+        }
+        h
+    }
+
+    /// Evaluates nonlinear internal forces $\mathbf{f}_{\text{int}}$ ($30 \times 1$),
+    /// symmetric tangent stiffness $\mathbf{K}_e$ ($30 \times 30$), updated 4-point $J_2$
+    /// Gauss-point states, and per-GP rotations $\mathbf{R}^{(q)} \in SO(3)$ using
+    /// Co-Rotated FEM (when `corotated = true`) and Radial Return Mapping.
+    pub fn evaluate_nonlinear(
+        &self,
+        u_elem: &Vector30<f64>,
+        prev_states: &[GaussPointState; 4],
+        params: &J2MaterialParams,
+        corotated: bool,
+        include_geometric_stiffness: bool,
+    ) -> (
+        Vector30<f64>,
+        Matrix30<f64>,
+        [ReturnMappingResult; 4],
+        [Matrix3<f64>; 4],
+    ) {
+        let mut f_int = Vector30::<f64>::zeros();
+        let mut ke = Matrix30::<f64>::zeros();
+        let mut results: [Option<ReturnMappingResult>; 4] = [None, None, None, None];
+        let mut rotations = [Matrix3::<f64>::identity(); 4];
+
+        for q in 0..4 {
+            let w = self.gauss_weights[q];
+            let grads = &self.gauss_gradients[q];
+            let h_grad = self.displacement_gradient_at_gp(q, u_elem);
+
+            let (r_mat, u_stretch, eps_loc) = if corotated {
+                corotated_biot_strain_voigt(&h_grad)
+            } else {
+                (
+                    Matrix3::identity(),
+                    Matrix3::identity(),
+                    linear_strain_from_grad_u(&h_grad),
+                )
+            };
+
+            let rm = radial_return_j2(&eps_loc, &prev_states[q], params);
+            let sigma_mat = voigt_stress_to_matrix3(&rm.stress);
+            let pk1 = r_mat * sigma_mat;
+
+            for (k, &g) in grads.iter().enumerate() {
+                let fk = pk1 * Vector3::new(g[0], g[1], g[2]) * w;
+                f_int[3 * k] += fk.x;
+                f_int[3 * k + 1] += fk.y;
+                f_int[3 * k + 2] += fk.z;
+            }
+
+            let r_t = r_mat.transpose();
+            let mut b_rot = [SMatrix::<f64, 6, 3>::zeros(); 10];
+            let mut cb_rot = [SMatrix::<f64, 6, 3>::zeros(); 10];
+            for (k, &g) in grads.iter().enumerate() {
+                let br = node_b_matrix(g) * r_t;
+                cb_rot[k] = rm.tangent * br;
+                b_rot[k] = br;
+            }
+
+            let use_geo = corotated && include_geometric_stiffness && rm.stress.norm() > 1e-12;
+            let su_inv = if use_geo {
+                let su = Matrix3::identity() * u_stretch.trace() - u_stretch;
+                su.try_inverse()
+            } else {
+                None
+            };
+
+            let mut geo_a = [Matrix3::<f64>::zeros(); 10];
+            let mut geo_m = [Matrix3::<f64>::zeros(); 10];
+            if let Some(su_inv_mat) = su_inv {
+                for (k, &g) in grads.iter().enumerate() {
+                    let gv = Vector3::new(g[0], g[1], g[2]);
+                    let tk = sigma_mat * gv;
+                    geo_a[k] = r_mat * skew_matrix(&tk);
+                    geo_m[k] = su_inv_mat * skew_matrix(&gv) * r_t;
+                }
+            }
+
+            for a in 0..10 {
+                let row = 3 * a;
+                for b in a..10 {
+                    let col = 3 * b;
+                    let mut block = (b_rot[a].transpose() * cb_rot[b]) * w;
+                    if su_inv.is_some() {
+                        let g_ab = -(geo_a[a] * geo_m[b]) * w;
+                        let g_ba = -(geo_a[b] * geo_m[a]) * w;
+                        block += (g_ab + g_ba.transpose()) * 0.5;
+                    }
+
+                    for r in 0..3 {
+                        for c in 0..3 {
+                            ke[(row + r, col + c)] += block[(r, c)];
+                        }
+                    }
+                    if b > a {
+                        for r in 0..3 {
+                            for c in 0..3 {
+                                ke[(col + c, row + r)] += block[(r, c)];
+                            }
+                        }
+                    }
+                }
+            }
+
+            rotations[q] = r_mat;
+            results[q] = Some(rm);
+        }
+
+        let rm_arr = [
+            results[0].unwrap(),
+            results[1].unwrap(),
+            results[2].unwrap(),
+            results[3].unwrap(),
+        ];
+        (f_int, ke, rm_arr, rotations)
+    }
+
+    /// Evaluates nonlinear internal forces $\mathbf{f}_{\text{int}}$ ($30 \times 1$) and 4-point
+    /// $J_2$ Gauss-point states without assembling the tangent stiffness (fast path for line search).
+    pub fn evaluate_nonlinear_forces_only(
+        &self,
+        u_elem: &Vector30<f64>,
+        prev_states: &[GaussPointState; 4],
+        params: &J2MaterialParams,
+        corotated: bool,
+    ) -> (Vector30<f64>, [ReturnMappingResult; 4], [Matrix3<f64>; 4]) {
+        let mut f_int = Vector30::<f64>::zeros();
+        let mut results: [Option<ReturnMappingResult>; 4] = [None, None, None, None];
+        let mut rotations = [Matrix3::<f64>::identity(); 4];
+
+        for q in 0..4 {
+            let w = self.gauss_weights[q];
+            let grads = &self.gauss_gradients[q];
+            let h_grad = self.displacement_gradient_at_gp(q, u_elem);
+
+            let (r_mat, _u_stretch, eps_loc) = if corotated {
+                corotated_biot_strain_voigt(&h_grad)
+            } else {
+                (
+                    Matrix3::identity(),
+                    Matrix3::identity(),
+                    linear_strain_from_grad_u(&h_grad),
+                )
+            };
+
+            let rm = radial_return_j2(&eps_loc, &prev_states[q], params);
+            let pk1 = r_mat * voigt_stress_to_matrix3(&rm.stress);
+
+            for (k, &g) in grads.iter().enumerate() {
+                let fk = pk1 * Vector3::new(g[0], g[1], g[2]) * w;
+                f_int[3 * k] += fk.x;
+                f_int[3 * k + 1] += fk.y;
+                f_int[3 * k + 2] += fk.z;
+            }
+
+            rotations[q] = r_mat;
+            results[q] = Some(rm);
+        }
+
+        let rm_arr = [
+            results[0].unwrap(),
+            results[1].unwrap(),
+            results[2].unwrap(),
+            results[3].unwrap(),
+        ];
+        (f_int, rm_arr, rotations)
+    }
+
+    /// Extrapolates arbitrary 4-Gauss-point Voigt 6-vectors (e.g., world-frame Cauchy stresses
+    /// or plastic strains) to all 10 element nodes via the exact linear barycentric inverse mapping.
+    #[inline]
+    pub fn extrapolate_gauss_vectors_to_nodes(gp: &[Vector6<f64>; 4]) -> [Vector6<f64>; 10] {
+        const ALPHA: f64 = 1.9270509831248424; // (1 + 3*sqrt(5)) / 4
+        const BETA: f64 = -0.30901699437494745; // (1 - sqrt(5)) / 4
+
+        let gp_sum = gp[0] + gp[1] + gp[2] + gp[3];
+        let mut nodal = [Vector6::zeros(); 10];
+        for i in 0..4 {
+            nodal[i] = gp[i] * (ALPHA - BETA) + gp_sum * BETA;
+        }
+        for (e, &(a, b)) in TET10_EDGE_PAIRS.iter().enumerate() {
+            nodal[4 + e] = (nodal[a] + nodal[b]) * 0.5;
+        }
+        nodal
+    }
+}
+
+// =========================================================================
+// Co-Rotated FEM Kinematics & Polar Decomposition Utilities (P5-T3)
+// =========================================================================
+
+#[inline]
+fn node_b_matrix(grad: [f64; 3]) -> SMatrix<f64, 6, 3> {
+    let [gx, gy, gz] = grad;
+    let mut b = SMatrix::<f64, 6, 3>::zeros();
+    b[(0, 0)] = gx;
+    b[(1, 1)] = gy;
+    b[(2, 2)] = gz;
+    b[(3, 0)] = gy;
+    b[(3, 1)] = gx;
+    b[(4, 1)] = gz;
+    b[(4, 2)] = gy;
+    b[(5, 0)] = gz;
+    b[(5, 2)] = gx;
+    b
+}
+
+#[inline]
+fn skew_matrix(v: &Vector3<f64>) -> Matrix3<f64> {
+    Matrix3::new(
+        0.0, -v.z, v.y,
+        v.z, 0.0, -v.x,
+        -v.y, v.x, 0.0,
+    )
+}
+
+#[inline]
+fn linear_strain_from_grad_u(h: &Matrix3<f64>) -> Vector6<f64> {
+    Vector6::new(
+        h[(0, 0)],
+        h[(1, 1)],
+        h[(2, 2)],
+        h[(0, 1)] + h[(1, 0)],
+        h[(1, 2)] + h[(2, 1)],
+        h[(0, 2)] + h[(2, 0)],
+    )
+}
+
+/// Converts a symmetric Voigt Cauchy stress vector $[\sigma_{xx}, \sigma_{yy}, \sigma_{zz}, \tau_{xy}, \tau_{yz}, \tau_{zx}]$
+/// into a symmetric $3 \times 3$ matrix.
+#[inline]
+pub fn voigt_stress_to_matrix3(s: &Vector6<f64>) -> Matrix3<f64> {
+    Matrix3::new(
+        s[0], s[3], s[5],
+        s[3], s[1], s[4],
+        s[5], s[4], s[2],
+    )
+}
+
+/// Converts a symmetric $3 \times 3$ stress tensor into a Voigt 6-vector
+/// $[\sigma_{xx}, \sigma_{yy}, \sigma_{zz}, \tau_{xy}, \tau_{yz}, \tau_{zx}]$.
+#[inline]
+pub fn matrix3_to_voigt_stress(m: &Matrix3<f64>) -> Vector6<f64> {
+    Vector6::new(
+        m[(0, 0)],
+        m[(1, 1)],
+        m[(2, 2)],
+        0.5 * (m[(0, 1)] + m[(1, 0)]),
+        0.5 * (m[(1, 2)] + m[(2, 1)]),
+        0.5 * (m[(0, 2)] + m[(2, 0)]),
+    )
+}
+
+/// Rotates a Voigt Cauchy stress vector from the co-rotated material frame into the world frame:
+/// $\boldsymbol{\sigma}_{\text{world}} = \mathbf{R} \boldsymbol{\sigma}_{\text{loc}} \mathbf{R}^T$.
+#[inline]
+pub fn rotate_voigt_stress(r: &Matrix3<f64>, s_loc: &Vector6<f64>) -> Vector6<f64> {
+    let m = voigt_stress_to_matrix3(s_loc);
+    let world = r * m * r.transpose();
+    matrix3_to_voigt_stress(&world)
+}
+
+/// Rotates an engineering Voigt strain vector $[\varepsilon_{xx}, \varepsilon_{yy}, \varepsilon_{zz}, \gamma_{xy}, \gamma_{yz}, \gamma_{zx}]$
+/// from the co-rotated material frame into the world frame:
+/// $\boldsymbol{\varepsilon}_{\text{world}} = \mathbf{R} \boldsymbol{\varepsilon}_{\text{loc}} \mathbf{R}^T$.
+#[inline]
+pub fn rotate_voigt_strain(r: &Matrix3<f64>, e_loc: &Vector6<f64>) -> Vector6<f64> {
+    let m = Matrix3::new(
+        e_loc[0],
+        0.5 * e_loc[3],
+        0.5 * e_loc[5],
+        0.5 * e_loc[3],
+        e_loc[1],
+        0.5 * e_loc[4],
+        0.5 * e_loc[5],
+        0.5 * e_loc[4],
+        e_loc[2],
+    );
+    let world = r * m * r.transpose();
+    Vector6::new(
+        world[(0, 0)],
+        world[(1, 1)],
+        world[(2, 2)],
+        world[(0, 1)] + world[(1, 0)],
+        world[(1, 2)] + world[(2, 1)],
+        world[(0, 2)] + world[(2, 0)],
+    )
+}
+
+/// Computes the exact polar decomposition $\mathbf{F} = \mathbf{R}\mathbf{U}$ with
+/// proper rotation $\mathbf{R} \in SO(3)$ ($\det \mathbf{R} = +1$) and symmetric stretch
+/// tensor $\mathbf{U} = \mathbf{R}^T \mathbf{F}$ via SVD with reflection safeguard and
+/// Newton-Schulz orthogonal polishing.
+pub fn polar_decomposition_so3(f: &Matrix3<f64>) -> (Matrix3<f64>, Matrix3<f64>) {
+    let svd = f.svd(true, true);
+    let (mut u_mat, v_t) = match (svd.u, svd.v_t) {
+        (Some(u), Some(vt)) => (u, vt),
+        _ => return (Matrix3::identity(), *f),
+    };
+
+    let mut r = u_mat * v_t;
+    if r.determinant() < 0.0 {
+        // Flip the singular vector corresponding to the smallest singular value to enforce det(R) = +1
+        let s = svd.singular_values;
+        let min_idx = if s[0] <= s[1] && s[0] <= s[2] {
+            0
+        } else if s[1] <= s[2] {
+            1
+        } else {
+            2
+        };
+        for row in 0..3 {
+            u_mat[(row, min_idx)] = -u_mat[(row, min_idx)];
+        }
+        r = u_mat * v_t;
+    }
+
+    // One Newton-Schulz orthogonal refinement if needed to guarantee R^T R = I to machine precision
+    let ortho_err = (r.transpose() * r - Matrix3::identity()).norm();
+    if ortho_err > 1e-15 && ortho_err < 0.5 {
+        r = r * 1.5 - (r * r.transpose() * r) * 0.5;
+    }
+
+    let rt_f = r.transpose() * f;
+    let u_stretch = (rt_f + rt_f.transpose()) * 0.5;
+    (r, u_stretch)
+}
+
+/// Computes the Co-Rotated Biot strain tensor $\mathbf{E} = \mathbf{U} - \mathbf{I}$
+/// in engineering Voigt notation from the displacement gradient $\mathbf{H} = \nabla_X \mathbf{u}$
+/// (where $\mathbf{F} = \mathbf{I} + \mathbf{H}$), returning `(R, U, E_voigt)`.
+///
+/// Uses the cancellation-free identity
+/// $\mathbf{E} = \frac{1}{2}(\mathbf{R}^T \mathbf{H} + \mathbf{H}^T \mathbf{R}) - \frac{1}{2}(\mathbf{R} - \mathbf{I})^T (\mathbf{R} - \mathbf{I})$
+/// so both tiny elastic strains ($\sim 10^{-12}$) and finite rotations ($90^\circ, 180^\circ, 360^\circ$)
+/// achieve full `f64` precision.
+pub fn corotated_biot_strain_voigt(
+    h_grad: &Matrix3<f64>,
+) -> (Matrix3<f64>, Matrix3<f64>, Vector6<f64>) {
+    let f = Matrix3::identity() + h_grad;
+    let (r, mut u_stretch) = polar_decomposition_so3(&f);
+
+    let dr = r - Matrix3::identity();
+    let rt_h = r.transpose() * h_grad;
+    let mut e_mat = (rt_h + rt_h.transpose()) * 0.5 - (dr.transpose() * dr) * 0.5;
+
+    // Suppress pure floating-point cancellation noise under finite rigid rotations:
+    // threshold scales strictly with ||R - I||_F (identically 0 when R = I, ~1e-14 at 180 deg).
+    let rot_mag = dr.norm();
+    let fp_noise_floor = 64.0 * f64::EPSILON * rot_mag;
+    if rot_mag > 0.0 && e_mat.norm() <= fp_noise_floor {
+        e_mat = Matrix3::zeros();
+        u_stretch = Matrix3::identity();
+    }
+
+    let e_voigt = Vector6::new(
+        e_mat[(0, 0)],
+        e_mat[(1, 1)],
+        e_mat[(2, 2)],
+        2.0 * e_mat[(0, 1)],
+        2.0 * e_mat[(1, 2)],
+        2.0 * e_mat[(2, 0)],
+    );
+    (r, u_stretch, e_voigt)
+}
+
+/// Validates that a quadratic `TET10` element has strictly positive corner volume and
+/// strictly positive Jacobian determinants $\det J(\mathbf{L}^{(q)}) > 0$ at all 4 Gauss points.
+/// Returns the minimum Gauss-point Jacobian determinant on success.
+pub fn check_tet10_gauss_jacobians(positions: &[[f64; 3]; 10]) -> Result<f64, FeaError> {
+    let c = Matrix4::new(
+        1.0, positions[0][0], positions[0][1], positions[0][2],
+        1.0, positions[1][0], positions[1][1], positions[1][2],
+        1.0, positions[2][0], positions[2][1], positions[2][2],
+        1.0, positions[3][0], positions[3][1], positions[3][2],
+    );
+    let corner_vol = c.determinant() / 6.0;
+    if !corner_vol.is_finite() || corner_vol <= 1e-15 {
+        return Err(FeaError::DegenerateElement {
+            id: 0,
+            volume: corner_vol,
+        });
+    }
+
+    let mut min_det_j = f64::INFINITY;
+    for &l in &TET10_GAUSS_POINTS {
+        let (det_j, _) = compute_tet10_jacobian_and_gradients(0, positions, l)?;
+        if det_j < min_det_j {
+            min_det_j = det_j;
+        }
+    }
+    Ok(min_det_j)
+}
+
+/// Computes the minimum ratio $\min_{q \in 0..4} \frac{\det J(\mathbf{L}^{(q)})}{\det J_{\text{corner}}}$
+/// for a quadratic `TET10` element.
+///
+/// For a straight-edged tetrahedron this ratio is identically `1.0`. For curved boundary-snapped
+/// elements, keeping this ratio above a positive threshold (e.g. `>= 0.15`) guarantees that all
+/// 4 Gauss points remain strictly positive and well-conditioned. Returns a non-positive value if
+/// the corner tetrahedron or any Gauss point is degenerate or inverted.
+pub fn tet10_min_gauss_jacobian_ratio(positions: &[[f64; 3]; 10]) -> f64 {
+    let c = Matrix4::new(
+        1.0, positions[0][0], positions[0][1], positions[0][2],
+        1.0, positions[1][0], positions[1][1], positions[1][2],
+        1.0, positions[2][0], positions[2][1], positions[2][2],
+        1.0, positions[3][0], positions[3][1], positions[3][2],
+    );
+    let corner_det = c.determinant();
+    if !corner_det.is_finite() || corner_det <= 1e-15 {
+        return 0.0;
+    }
+
+    let mut min_det = f64::INFINITY;
+    for &l in &TET10_GAUSS_POINTS {
+        let dn_dl = tet10_barycentric_derivatives(l);
+        let mut j_mat = Matrix3::<f64>::zeros();
+        for k in 0..10 {
+            let d0 = dn_dl[k][0];
+            let dxi0 = dn_dl[k][1] - d0;
+            let dxi1 = dn_dl[k][2] - d0;
+            let dxi2 = dn_dl[k][3] - d0;
+            let px = positions[k][0];
+            let py = positions[k][1];
+            let pz = positions[k][2];
+            j_mat[(0, 0)] += px * dxi0;
+            j_mat[(0, 1)] += px * dxi1;
+            j_mat[(0, 2)] += px * dxi2;
+            j_mat[(1, 0)] += py * dxi0;
+            j_mat[(1, 1)] += py * dxi1;
+            j_mat[(1, 2)] += py * dxi2;
+            j_mat[(2, 0)] += pz * dxi0;
+            j_mat[(2, 1)] += pz * dxi1;
+            j_mat[(2, 2)] += pz * dxi2;
+        }
+        let det_j = j_mat.determinant();
+        if !det_j.is_finite() || det_j <= 1e-15 {
+            return det_j / corner_det;
+        }
+        if det_j < min_det {
+            min_det = det_j;
+        }
+    }
+    min_det / corner_det
 }
 
 /// Computes the isoparametric Jacobian determinant $\det J(\mathbf{L})$ and physical Cartesian
@@ -852,5 +1483,181 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_tet10_gauss_jacobian_checks_straight_curved_and_inverted() {
+        let corners = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        // 1. Straight-sided TET10 has uniform Gauss Jacobian equal to corner det6 = 1.0
+        let straight = make_straight_tet10(corners);
+        let det_min = check_tet10_gauss_jacobians(&straight).expect("straight TET10 must pass");
+        assert!((det_min - 1.0).abs() < 1e-12);
+        let ratio = tet10_min_gauss_jacobian_ratio(&straight);
+        assert!((ratio - 1.0).abs() < 1e-12);
+
+        // 2. Mildly curved edge: outward bow expands Jacobian (>= 1.0), inward bow reduces it (0.5 < r < 1.0)
+        let mut curved_out = straight;
+        curved_out[4][1] = -0.05;
+        let curved_out_det =
+            check_tet10_gauss_jacobians(&curved_out).expect("outward curved TET10 must pass");
+        assert!(curved_out_det > 1.0);
+        assert!(tet10_min_gauss_jacobian_ratio(&curved_out) > 1.0);
+
+        let mut curved_in = straight;
+        curved_in[4][1] = 0.05;
+        let curved_in_det =
+            check_tet10_gauss_jacobians(&curved_in).expect("inward curved TET10 must pass");
+        assert!(curved_in_det > 0.5);
+        let curved_in_ratio = tet10_min_gauss_jacobian_ratio(&curved_in);
+        assert!(curved_in_ratio > 0.5 && curved_in_ratio < 1.0);
+
+        // 3. Severely inverted mid-edge node pulled past the opposite face fails Jacobian check
+        let mut inverted = straight;
+        inverted[4] = [0.5, 0.8, 0.8];
+        assert!(
+            check_tet10_gauss_jacobians(&inverted).is_err(),
+            "severely bowed TET10 must be rejected"
+        );
+        assert!(tet10_min_gauss_jacobian_ratio(&inverted) <= 0.0);
+    }
+
+    #[test]
+    fn test_polar_decomposition_and_corotated_rigid_rotations_zero_stress() {
+        let corners = [
+            [0.01, -0.02, 0.005],
+            [0.11, 0.01, -0.01],
+            [0.02, 0.09, 0.015],
+            [0.03, 0.01, 0.12],
+        ];
+        let tet4 = Tet4Element::new(0, [0, 1, 2, 3], corners).unwrap();
+        let pos10 = make_straight_tet10(corners);
+        let tet10 = Tet10Element::new(0, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], pos10).unwrap();
+
+        let mat = mcp_cad_core::material::Material::new(
+            "steel", 205.0, 0.29, 250.0, 7850.0, "steel",
+        );
+        let params = J2MaterialParams::from_material(&mat).unwrap();
+        let state0 = GaussPointState::default();
+
+        // Test exact 90 deg, 180 deg, 270 deg around Z and an arbitrary 3D axis-angle rotation (137 deg)
+        let axis_arbitrary = nalgebra::Unit::new_normalize(Vector3::new(0.4, -0.7, 0.59));
+        let rotations = [
+            nalgebra::Rotation3::from_axis_angle(&Vector3::z_axis(), std::f64::consts::FRAC_PI_2),
+            nalgebra::Rotation3::from_axis_angle(&Vector3::z_axis(), std::f64::consts::PI),
+            nalgebra::Rotation3::from_axis_angle(&Vector3::z_axis(), 1.5 * std::f64::consts::PI),
+            nalgebra::Rotation3::from_axis_angle(&axis_arbitrary, 137.0_f64.to_radians()),
+        ];
+
+        for rot in rotations {
+            let r_exact = *rot.matrix();
+            let translation = Vector3::new(0.25, -0.4, 0.15);
+
+            // TET4 rigid rotation
+            let mut u4 = Vector12::<f64>::zeros();
+            for k in 0..4 {
+                let x0 = Vector3::from(corners[k]);
+                let x1 = r_exact * x0 + translation;
+                let du = x1 - x0;
+                u4[3 * k] = du.x;
+                u4[3 * k + 1] = du.y;
+                u4[3 * k + 2] = du.z;
+            }
+            let (f4, _k4, rm4, r4) = tet4.evaluate_nonlinear(&u4, &state0, &params, true, true);
+            assert!((r4 - r_exact).norm() < 1e-13, "TET4 rotation mismatch");
+            assert!(
+                Tet4Element::von_mises_stress(&rm4.stress) < 1e-9,
+                "TET4 rigid rotation stress must be < 1e-9 Pa, got {}",
+                Tet4Element::von_mises_stress(&rm4.stress)
+            );
+            assert!(f4.norm() < 1e-9, "TET4 rigid rotation internal force must vanish");
+
+            // TET10 rigid rotation
+            let mut u10 = Vector30::<f64>::zeros();
+            for k in 0..10 {
+                let x0 = Vector3::from(pos10[k]);
+                let x1 = r_exact * x0 + translation;
+                let du = x1 - x0;
+                u10[3 * k] = du.x;
+                u10[3 * k + 1] = du.y;
+                u10[3 * k + 2] = du.z;
+            }
+            let (f10, _k10, rm10, r10) =
+                tet10.evaluate_nonlinear(&u10, &[state0; 4], &params, true, true);
+            for q in 0..4 {
+                assert!((r10[q] - r_exact).norm() < 1e-13, "TET10 GP {q} rotation mismatch");
+                let vm = Tet4Element::von_mises_stress(&rm10[q].stress);
+                assert!(
+                    vm < 1e-9,
+                    "TET10 GP {q} rigid rotation stress must be < 1e-9 Pa, got {vm}"
+                );
+            }
+            assert!(f10.norm() < 1e-9, "TET10 rigid rotation internal force must vanish");
+        }
+    }
+
+    #[test]
+    fn test_corotated_elastoplastic_tangent_matches_finite_differences() {
+        let corners = [
+            [0.0, 0.0, 0.0],
+            [0.10, 0.01, -0.005],
+            [0.01, 0.09, 0.01],
+            [0.02, -0.01, 0.08],
+        ];
+        let tet4 = Tet4Element::new(0, [0, 1, 2, 3], corners).unwrap();
+        let mat = mcp_cad_core::material::Material::new(
+            "steel", 205.0, 0.29, 250.0, 7850.0, "steel",
+        );
+        let params = J2MaterialParams::from_material(&mat).unwrap();
+        let state0 = GaussPointState::default();
+
+        // Combine a finite 35-degree rotation with a small elastoplastic stretch (> yield)
+        let rot = nalgebra::Rotation3::from_axis_angle(&Vector3::z_axis(), 35.0_f64.to_radians());
+        let r_exact = *rot.matrix();
+        let mut u4 = Vector12::<f64>::zeros();
+        for k in 0..4 {
+            let x0 = Vector3::from(corners[k]);
+            let stretched = Vector3::new(x0.x * 1.004, x0.y * 0.9985, x0.z * 0.9985);
+            let x1 = r_exact * stretched;
+            let du = x1 - x0;
+            u4[3 * k] = du.x;
+            u4[3 * k + 1] = du.y;
+            u4[3 * k + 2] = du.z;
+        }
+
+        let (_f0, ke, rm, _r) = tet4.evaluate_nonlinear(&u4, &state0, &params, true, true);
+        assert!(rm.plastic_step, "Element must be in plastic regime");
+
+        // Verify symmetry of Ke
+        let ke_norm = ke.norm();
+        assert!((ke - ke.transpose()).norm() / ke_norm < 1e-13);
+
+        // Compare against symmetrized finite-difference Jacobian of f_int(u)
+        let h_fd = 1e-8;
+        let mut k_fd = Matrix12::<f64>::zeros();
+        for j in 0..12 {
+            let mut up = u4;
+            let mut um = u4;
+            up[j] += h_fd;
+            um[j] -= h_fd;
+            let (fp, _, _) = tet4.evaluate_nonlinear_forces_only(&up, &state0, &params, true);
+            let (fm, _, _) = tet4.evaluate_nonlinear_forces_only(&um, &state0, &params, true);
+            let col = (fp - fm) / (2.0 * h_fd);
+            for i in 0..12 {
+                k_fd[(i, j)] = col[i];
+            }
+        }
+        let k_fd_sym = (k_fd + k_fd.transpose()) * 0.5;
+        let rel_err = (ke - k_fd_sym).norm() / k_fd_sym.norm();
+        assert!(
+            rel_err < 1e-3,
+            "Co-rotated elastoplastic tangent mismatch vs FD: rel_err = {rel_err:.3e}"
+        );
+    }
 }
+
+
 

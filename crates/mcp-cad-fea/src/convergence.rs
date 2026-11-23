@@ -752,6 +752,146 @@ where
     Ok((final_report, final_mesh, study_report))
 }
 
+/// Runs a multi-level FEA convergence study on a surface `TriangleMesh` with explicit
+/// `AccuracyMode` and `ElementOrder`.
+///
+/// When `accuracy_mode` is `AccuracyMode::High` (or `Standard` with boundary snapping), each
+/// convergence level is meshed with boundary-conforming `fe_snap` (and local octree refinement
+/// in `High` mode), so curved boundaries do not trigger the unsnapped voxel-staircase flag.
+#[allow(clippy::too_many_arguments)]
+pub fn run_fea_with_convergence_with_accuracy<F>(
+    part_id: impl Into<String>,
+    surface_mesh: &TriangleMesh,
+    material: &Material,
+    densities: &[MeshDensity],
+    accuracy_mode: crate::tetra_mesh::AccuracyMode,
+    element_order: crate::tetra_mesh::ElementOrder,
+    refinement_zones: &[crate::tetra_mesh::RefinementZone],
+    max_seconds: Option<f64>,
+    options: Option<SolverOptions>,
+    build_boundary_for_mesh: F,
+) -> Result<(FeaReport, TetrahedralMesh, MeshConvergenceStudyReport), FeaError>
+where
+    F: Fn(&TetrahedralMesh) -> Result<BoundaryConditions, FeaError>,
+{
+    if accuracy_mode == crate::tetra_mesh::AccuracyMode::Fast {
+        return run_fea_with_convergence_with_order(
+            part_id,
+            surface_mesh,
+            material,
+            densities,
+            element_order,
+            max_seconds,
+            options,
+            build_boundary_for_mesh,
+        );
+    }
+
+    let part_id_str = part_id.into();
+    let default_levels = [MeshDensity::Coarse, MeshDensity::Medium, MeshDensity::Fine];
+    let levels = if densities.is_empty() {
+        &default_levels[..]
+    } else {
+        densities
+    };
+
+    let study_start = Instant::now();
+    let aabb = surface_mesh.bounding_box();
+    // Boundary-conforming snapped meshes eliminate Cartesian staircase artifacts
+    let has_non_axial_staircase = false;
+
+    let mut steps = Vec::with_capacity(levels.len());
+    let mut prev_stress = 0.0_f64;
+    let mut prev_disp = 0.0_f64;
+    let mut last_report: Option<FeaReport> = None;
+    let mut last_mesh: Option<TetrahedralMesh> = None;
+    let mut partial_result = false;
+
+    for (idx, &density) in levels.iter().enumerate() {
+        if idx > 0 {
+            if let Some(limit_s) = max_seconds {
+                if study_start.elapsed().as_secs_f64() >= limit_s {
+                    partial_result = true;
+                    break;
+                }
+            }
+        }
+
+        let step_start = Instant::now();
+        let mut mesh_opts =
+            crate::tetra_mesh::ConformingMeshOptions::for_accuracy_mode(accuracy_mode, density);
+        mesh_opts.element_order = element_order;
+        mesh_opts.refinement.zones.extend_from_slice(refinement_zones);
+        let tet_mesh = TetrahedralMesh::from_mesh_conforming(surface_mesh, &mesh_opts)?;
+        let boundary = build_boundary_for_mesh(&tet_mesh)?;
+        let report = crate::analyze_mesh(&part_id_str, &tet_mesh, material, &boundary, options)?;
+        let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
+
+        let h = density.target_element_size(&aabb);
+        let stress_change = if idx > 0 && prev_stress > 1e-6 {
+            ((report.max_stress_von_mises_pa - prev_stress) / prev_stress) * 100.0
+        } else {
+            0.0
+        };
+        let disp_change = if idx > 0 && prev_disp > 1e-9 {
+            ((report.max_displacement_m - prev_disp) / prev_disp) * 100.0
+        } else {
+            0.0
+        };
+
+        steps.push(MeshConvergenceStep {
+            step_index: idx,
+            density: density_key_str(density),
+            density_label: density_label_str(density),
+            max_edge_length: h,
+            node_count: report.node_count,
+            element_count: report.element_count,
+            max_displacement_m: report.max_displacement_m,
+            max_displacement_mm: report.max_displacement_m * 1000.0,
+            max_stress_von_mises_pa: report.max_stress_von_mises_pa,
+            max_von_mises_mpa: report.max_stress_von_mises_pa / 1.0e6,
+            stress_change_pct: stress_change,
+            displacement_change_pct: disp_change,
+            computation_time_ms: step_ms,
+        });
+
+        prev_stress = report.max_stress_von_mises_pa;
+        prev_disp = report.max_displacement_m;
+        last_report = Some(report);
+        last_mesh = Some(tet_mesh);
+
+        if idx + 1 < levels.len() {
+            if let Some(limit_s) = max_seconds {
+                if study_start.elapsed().as_secs_f64() >= limit_s {
+                    partial_result = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    let total_study_time_ms = study_start.elapsed().as_secs_f64() * 1000.0;
+    let study_report = finalize_convergence_report(
+        part_id_str,
+        steps,
+        CONVERGENCE_DISP_TOLERANCE_PCT,
+        CONVERGENCE_STRESS_TOLERANCE_PCT,
+        has_non_axial_staircase,
+        last_report.as_ref(),
+        partial_result,
+        max_seconds,
+        total_study_time_ms,
+    );
+
+    let accuracy = study_report.to_fea_accuracy();
+    let final_report = last_report
+        .ok_or(FeaError::EmptyMesh)?
+        .with_accuracy(accuracy);
+    let final_mesh = last_mesh.ok_or(FeaError::EmptyMesh)?;
+
+    Ok((final_report, final_mesh, study_report))
+}
+
 /// Runs a mesh convergence study on a CAD `Part` across multiple mesh densities.
 pub fn run_mesh_convergence_study_part(
     title: impl Into<String>,

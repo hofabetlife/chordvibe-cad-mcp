@@ -3347,7 +3347,7 @@ pub fn define_material(args: &Value, state: &mut EngineState) -> Result<Value, S
     let name = args.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
     let desc = name.clone().unwrap_or_else(|| id.to_string());
 
-    let material = Material::new(
+    let mut material = Material::new(
         id,
         young_modulus_gpa,
         poisson_ratio,
@@ -3356,18 +3356,56 @@ pub fn define_material(args: &Value, state: &mut EngineState) -> Result<Value, S
         &desc,
     );
 
-    state.materials.register(material);
+    if let Some(mode_str) = args.get("failure_mode").and_then(|v| v.as_str()) {
+        let parsed_mode = mcp_cad_core::FailureMode::parse(mode_str)
+            .map_err(|e| ServerError::InvalidArgument(e.to_string()))?;
+        material.failure_mode = parsed_mode;
+        if parsed_mode == mcp_cad_core::FailureMode::Brittle {
+            material.ultimate_strength_pa = yield_strength_mpa * 1.0e6;
+            material.hardening_modulus_pa = 0.0;
+            material.fracture_strain = 0.002;
+            material.fracture_energy_j_m2 = 50.0;
+            material.friction_coeff = 0.20;
+        }
+    }
+
+    if let Some(uts_pa) = args.get("ultimate_strength_pa").and_then(|v| v.as_f64()) {
+        material.ultimate_strength_pa = uts_pa;
+    } else if let Some(uts_mpa) = args.get("ultimate_strength_mpa").and_then(|v| v.as_f64()) {
+        material.ultimate_strength_pa = uts_mpa * 1.0e6;
+    }
+
+    if let Some(h_pa) = args.get("hardening_modulus_pa").and_then(|v| v.as_f64()) {
+        material.hardening_modulus_pa = h_pa;
+    }
+    if let Some(ef) = args.get("fracture_strain").and_then(|v| v.as_f64()) {
+        material.fracture_strain = ef;
+    }
+    if let Some(gf) = args.get("fracture_energy_j_m2").and_then(|v| v.as_f64()) {
+        material.fracture_energy_j_m2 = gf;
+    }
+    if let Some(mu) = args.get("friction_coeff").and_then(|v| v.as_f64()) {
+        material.friction_coeff = mu;
+    }
+
+    material
+        .validate()
+        .map_err(|e| ServerError::InvalidArgument(e.to_string()))?;
+
+    let ultimate_strength_pa = material.ultimate_strength_pa;
+    let hardening_modulus_pa = material.hardening_modulus_pa;
+    let fracture_strain = material.fracture_strain;
+    let fracture_energy_j_m2 = material.fracture_energy_j_m2;
+    let friction_coeff = material.friction_coeff;
+    let failure_mode = material.failure_mode;
+
+    state.materials.register(material.clone());
 
     if let Some(ref custom_name) = name {
         if custom_name != id {
-            let alias_mat = Material::new(
-                custom_name.clone(),
-                young_modulus_gpa,
-                poisson_ratio,
-                yield_strength_mpa,
-                density_kg_m3,
-                format!("Alias for {}", id),
-            );
+            let mut alias_mat = material;
+            alias_mat.name = custom_name.clone();
+            alias_mat.description = format!("Alias for {}", id);
             state.materials.register(alias_mat);
         }
     }
@@ -3384,6 +3422,13 @@ pub fn define_material(args: &Value, state: &mut EngineState) -> Result<Value, S
             "poisson_ratio": poisson_ratio,
             "yield_strength_mpa": yield_strength_mpa,
             "yield_strength_pa": yield_strength_mpa * 1.0e6,
+            "ultimate_strength_pa": ultimate_strength_pa,
+            "ultimate_strength_mpa": ultimate_strength_pa / 1.0e6,
+            "hardening_modulus_pa": hardening_modulus_pa,
+            "fracture_strain": fracture_strain,
+            "fracture_energy_j_m2": fracture_energy_j_m2,
+            "friction_coeff": friction_coeff,
+            "failure_mode": failure_mode.as_str(),
             "density_kg_m3": density_kg_m3,
         },
         "units": unit.units_metadata(),
@@ -3585,14 +3630,14 @@ pub fn check_gear_strength(args: &Value, state: &mut EngineState) -> Result<Valu
     let mut part_teeth = None;
     let mut part_face_width_m = None;
     let mut part_pa_deg = None;
-    let mut part_mat_name = None;
+    let mut part_material: Option<Material> = None;
 
     if let Some(pid) = part_id {
         let part = state
             .parts
             .get(pid)
             .ok_or_else(|| ServerError::PartNotFound(pid.to_string()))?;
-        part_mat_name = Some(part.material.name.clone());
+        part_material = Some(part.material.clone());
 
         for node in &part.dag.nodes {
             if let mcp_cad_core::dag::FeatureOp::AddSpurGear {
@@ -3732,42 +3777,97 @@ pub fn check_gear_strength(args: &Value, state: &mut EngineState) -> Result<Valu
     };
 
     // 5. Resolve material properties
-    let mat_id = args
-        .get("material")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or(part_mat_name)
-        .unwrap_or_else(|| "steel_structural_aisi1020".to_string());
-
-    let canonical_mat = mcp_cad_core::material::MaterialRegistry::resolve_alias(&mat_id);
-    let resolved_mat = state.materials.get(canonical_mat).cloned();
-
-    let default_sy_mpa = resolved_mat.as_ref().map(|m| m.yield_strength_mpa).unwrap_or(250.0);
-    let default_e_pa = resolved_mat.as_ref().map(|m| m.youngs_modulus_pa()).unwrap_or(205.0e9);
-    let default_nu = resolved_mat.as_ref().map(|m| m.poissons_ratio).unwrap_or(0.29);
+    let explicit_material = match args.get("material") {
+        Some(v) if !v.is_null() => Some(v.as_str().ok_or_else(|| {
+            ServerError::InvalidArgument(
+                "Parameter 'material' must be a string material identifier or alias".to_string(),
+            )
+        })?),
+        _ => None,
+    };
 
     let allowable_bending_mpa = args
         .get("allowable_bending_stress_mpa")
         .or_else(|| args.get("allowable_bending_mpa"))
         .and_then(|v| v.as_f64());
 
-    let yield_strength_mpa = args
-        .get("yield_strength_mpa")
-        .and_then(|v| v.as_f64())
-        .or(Some(default_sy_mpa));
+    let yield_strength_override = args.get("yield_strength_mpa").and_then(|v| v.as_f64());
 
-    let youngs_modulus_pa = args
+    let youngs_modulus_override_gpa = args
         .get("youngs_modulus_gpa")
         .or_else(|| args.get("young_modulus_gpa"))
-        .and_then(|v| v.as_f64())
-        .map(|g| g * 1.0e9)
-        .unwrap_or(default_e_pa);
+        .and_then(|v| v.as_f64());
 
-    let poissons_ratio = args
+    let poissons_ratio_override = args
         .get("poissons_ratio")
         .or_else(|| args.get("poisson_ratio"))
-        .and_then(|v| v.as_f64())
-        .unwrap_or(default_nu);
+        .and_then(|v| v.as_f64());
+
+    if let Some(sy) = yield_strength_override {
+        if !sy.is_finite() || sy <= 0.0 {
+            return Err(ServerError::InvalidArgument(
+                "Parameter 'yield_strength_mpa' must be positive".to_string(),
+            ));
+        }
+    }
+    if let Some(e_gpa) = youngs_modulus_override_gpa {
+        if !e_gpa.is_finite() || e_gpa <= 0.0 {
+            return Err(ServerError::InvalidArgument(
+                "Parameter 'youngs_modulus_gpa' must be positive".to_string(),
+            ));
+        }
+    }
+    if let Some(nu) = poissons_ratio_override {
+        if !nu.is_finite() || nu <= -1.0 || nu >= 0.5 {
+            return Err(ServerError::InvalidArgument(
+                "Parameter 'poissons_ratio' must be in (-1.0, 0.5)".to_string(),
+            ));
+        }
+    }
+
+    let has_full_primary_overrides = (yield_strength_override.is_some()
+        || allowable_bending_mpa.is_some())
+        && youngs_modulus_override_gpa.is_some()
+        && poissons_ratio_override.is_some();
+
+    let (canonical_mat, resolved_mat) = if let Some(req_mat) = explicit_material {
+        if let Some(mat) = state.materials.get(req_mat).cloned() {
+            (mat.name.clone(), Some(mat))
+        } else if has_full_primary_overrides {
+            (req_mat.to_string(), None)
+        } else {
+            let mut available: Vec<_> = state
+                .materials
+                .list()
+                .into_iter()
+                .map(|m| m.name.as_str())
+                .collect();
+            available.sort_unstable();
+            return Err(ServerError::InvalidArgument(format!(
+                "Material '{}' not found in registry. Available presets: {}",
+                req_mat,
+                available.join(", ")
+            )));
+        }
+    } else if let Some(p_mat) = part_material {
+        (p_mat.name.clone(), Some(p_mat))
+    } else {
+        let default_id = "steel_structural_aisi1020";
+        let default_mat = state.materials.get(default_id).cloned();
+        (default_id.to_string(), default_mat)
+    };
+
+    let yield_strength_mpa = yield_strength_override
+        .or_else(|| resolved_mat.as_ref().map(|m| m.yield_strength_mpa));
+
+    let youngs_modulus_pa = youngs_modulus_override_gpa
+        .map(|g| g * 1.0e9)
+        .or_else(|| resolved_mat.as_ref().map(|m| m.youngs_modulus_pa()))
+        .unwrap_or(205.0e9);
+
+    let poissons_ratio = poissons_ratio_override
+        .or_else(|| resolved_mat.as_ref().map(|m| m.poissons_ratio))
+        .unwrap_or(0.29);
 
     // 6. Mating gear parameters for Hertz contact stress
     let mating_teeth = args
@@ -3778,12 +3878,32 @@ pub fn check_gear_strength(args: &Value, state: &mut EngineState) -> Result<Valu
         .and_then(|v| v.as_u64())
         .map(|z| z as usize);
 
-    let (mating_e_pa, mating_nu) = if let Some(m_mat_id) = args.get("mating_material").and_then(|v| v.as_str()) {
-        let m_can = mcp_cad_core::material::MaterialRegistry::resolve_alias(m_mat_id);
-        if let Some(m_mat) = state.materials.get(m_can) {
+    let explicit_mating_material = match args.get("mating_material") {
+        Some(v) if !v.is_null() => Some(v.as_str().ok_or_else(|| {
+            ServerError::InvalidArgument(
+                "Parameter 'mating_material' must be a string material identifier or alias"
+                    .to_string(),
+            )
+        })?),
+        _ => None,
+    };
+
+    let (mating_e_pa, mating_nu) = if let Some(m_mat_id) = explicit_mating_material {
+        if let Some(m_mat) = state.materials.get(m_mat_id) {
             (Some(m_mat.youngs_modulus_pa()), Some(m_mat.poissons_ratio))
         } else {
-            (Some(youngs_modulus_pa), Some(poissons_ratio))
+            let mut available: Vec<_> = state
+                .materials
+                .list()
+                .into_iter()
+                .map(|m| m.name.as_str())
+                .collect();
+            available.sort_unstable();
+            return Err(ServerError::InvalidArgument(format!(
+                "Mating material '{}' not found in registry. Available presets: {}",
+                m_mat_id,
+                available.join(", ")
+            )));
         }
     } else {
         (Some(youngs_modulus_pa), Some(poissons_ratio))
@@ -6067,6 +6187,120 @@ mod tests {
         assert!((resp["module"].as_f64().unwrap() - 0.003).abs() < 1e-6);
         assert!((resp["face_width"].as_f64().unwrap() - 0.030).abs() < 1e-6);
         assert!((resp["bending_stress_mpa"].as_f64().unwrap() - 115.02).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_p5_t18_check_gear_strength_unknown_material_and_overrides() {
+        let mut state = EngineState::new().unwrap();
+        let expected_builtins: Vec<String> = {
+            let mut ids: Vec<String> = mcp_cad_core::MaterialRegistry::new()
+                .list()
+                .into_iter()
+                .map(|m| m.name.clone())
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
+
+        // 1. Unknown primary material without overrides -> UNKNOWN_MATERIAL
+        let err_primary = check_gear_strength(
+            &json!({
+                "module": 3.0,
+                "teeth": 20,
+                "face_width": 30.0,
+                "torque": 100.0,
+                "material": "vibranium"
+            }),
+            &mut state,
+        )
+        .expect_err("unknown primary material must fail");
+        let body_primary = err_primary.to_error_body();
+        assert_eq!(body_primary.code, "UNKNOWN_MATERIAL");
+        assert_eq!(body_primary.param.as_deref(), Some("material"));
+        let listed_primary: Vec<String> = body_primary.details["builtin_materials"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(listed_primary, expected_builtins);
+
+        // 2. Unknown primary material with only partial override (missing E and nu) -> still UNKNOWN_MATERIAL
+        let err_partial = check_gear_strength(
+            &json!({
+                "module": 3.0,
+                "teeth": 20,
+                "face_width": 30.0,
+                "torque": 100.0,
+                "material": "vibranium",
+                "yield_strength_mpa": 500.0
+            }),
+            &mut state,
+        )
+        .expect_err("partial override must not silently fall back to AISI 1020 E/nu");
+        assert_eq!(err_partial.to_error_body().code, "UNKNOWN_MATERIAL");
+
+        // 3. Unknown mating_material -> UNKNOWN_MATERIAL
+        let err_mating = check_gear_strength(
+            &json!({
+                "module": 3.0,
+                "teeth": 20,
+                "face_width": 30.0,
+                "torque": 100.0,
+                "material": "steel_structural_aisi1020",
+                "mating_material": "unobtanium"
+            }),
+            &mut state,
+        )
+        .expect_err("unknown mating_material must fail");
+        let body_mating = err_mating.to_error_body();
+        assert_eq!(body_mating.code, "UNKNOWN_MATERIAL");
+        assert_eq!(body_mating.param.as_deref(), Some("material"));
+        let listed_mating: Vec<String> = body_mating.details["builtin_materials"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(listed_mating, expected_builtins);
+
+        // 4. Unknown primary material WITH full mechanical overrides -> succeeds using overrides
+        let override_resp = check_gear_strength(
+            &json!({
+                "module": 3.0,
+                "teeth": 20,
+                "face_width": 30.0,
+                "torque": 100.0,
+                "material": "custom_gear_alloy",
+                "yield_strength_mpa": 500.0,
+                "youngs_modulus_gpa": 100.0,
+                "poissons_ratio": 0.30,
+                "manufacturing_method": "static"
+            }),
+            &mut state,
+        )
+        .expect("full mechanical property overrides must succeed");
+        assert_eq!(override_resp["material"], "custom_gear_alloy");
+        assert!((override_resp["bending_safety_factor"].as_f64().unwrap() - (500.0 / 115.02)).abs() < 0.05);
+        // Cp for E=100 GPa, nu=0.30 is much smaller than for E=205 GPa (~188.74 -> ~132.4 MPa^0.5)
+        assert!(override_resp["elastic_coefficient_cp_mpa_half"].as_f64().unwrap() < 140.0);
+
+        // 5. Valid alias in material and mating_material (and custom material via define_material) -> succeeds
+        let alias_resp = check_gear_strength(
+            &json!({
+                "module": 3.0,
+                "teeth": 20,
+                "face_width": 30.0,
+                "torque": 100.0,
+                "material": "steel_1045",
+                "mating_material": "brass",
+                "manufacturing_method": "static"
+            }),
+            &mut state,
+        )
+        .expect("known material aliases must resolve");
+        assert_eq!(alias_resp["material"], "steel_carbon_aisi1045");
+        assert!(alias_resp["elastic_coefficient_cp_mpa_half"].as_f64().unwrap() < 188.0);
     }
 
     #[test]

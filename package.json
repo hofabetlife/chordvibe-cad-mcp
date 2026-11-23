@@ -4,19 +4,23 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite --port 3000 --host 0.0.0.0",
+    "dev": "tsx server.ts",
+    "start": "node server.ts",
     "build": "vite build",
     "preview": "vite preview --port 3000",
     "lint": "tsc --noEmit",
-    "test": "npx --yes tsx --test src/cad/cad_engine.test.ts src/cad/__tests__/analyze_mechanism.test.ts"
+    "test": "tsx --test src/cad/cad_engine.test.ts src/cad/__tests__/analyze_mechanism.test.ts src/cad/__tests__/destruction_engine.test.ts src/cad/__tests__/ortho_views.test.ts src/cad/__tests__/field_colormaps.test.ts src/cad/__tests__/rust_scene_sync.test.ts"
   },
   "dependencies": {
+    "@types/express": "^5.0.6",
     "clsx": "^2.1.1",
+    "express": "^5.3.0",
     "lucide-react": "^0.460.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "tailwind-merge": "^2.5.2",
-    "three": "^0.170.0"
+    "three": "^0.170.0",
+    "tsx": "^4.23.15"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.0.0",

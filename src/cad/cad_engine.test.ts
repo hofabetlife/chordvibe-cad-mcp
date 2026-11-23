@@ -19,7 +19,14 @@ import {
 } from './primitives';
 import { runLinearFeaSolver } from './fea_solver';
 import { stepKinematicsAssembly } from './kinematics';
-import { DEFAULT_MATERIALS } from './materials';
+import {
+  DEFAULT_MATERIALS,
+  MATERIALS_LIBRARY,
+  getMaterialById,
+  normalizeMaterialSpec,
+  resolveMaterialAlias,
+  validateMaterialSpec,
+} from './materials';
 import {
   EngineStateSnapshot,
   MCP_TOOLS_CATALOG,
@@ -1083,13 +1090,13 @@ describe('MCP-CAD Core Geometry & Topological Verification Suite', () => {
     assert.ok(emptyMesh.volume < 1e-7 || emptyMesh.triangleCount === 0);
   });
 
-  it('verifies BUG-021: 41 Rust / 31 TS MCP tools documentation & contract parity across README, setup guides, architecture, PROJECT_CONTEXT, and API reference', () => {
+  it('verifies BUG-021: 43 Rust / 31 TS MCP tools documentation & contract parity across README, setup guides, architecture, PROJECT_CONTEXT, and API reference', () => {
     // 1. Verify exactly 31 tools in TS catalog with unique names (28 baseline + 3 P3-T9/T10 kinematics tools)
     assert.equal(MCP_TOOLS_CATALOG.length, 31, 'Catalog must contain exactly 31 TS tools');
     const catalogNames = new Set(MCP_TOOLS_CATALOG.map((t) => t.name));
     assert.equal(catalogNames.size, 31, 'All 31 tool names must be unique');
     assert.equal(TS_MCP_TOOLS_COUNT, 31, 'TS_MCP_TOOLS_COUNT must equal 31');
-    assert.equal(RUST_MCP_TOOLS_COUNT, 41, 'RUST_MCP_TOOLS_COUNT must equal 41');
+    assert.equal(RUST_MCP_TOOLS_COUNT, 43, 'RUST_MCP_TOOLS_COUNT must equal 43');
     assert.equal(DEFAULT_BRIDGE_STATUS.activeToolsCount, 31, 'DEFAULT_BRIDGE_STATUS must report 31 TS tools in hybrid mode');
 
     // Expected 28 baseline tools + 3 kinematics tools in TS catalog
@@ -1129,7 +1136,7 @@ describe('MCP-CAD Core Geometry & Topological Verification Suite', () => {
       'check_interference',
       'sweep_joint',
     ];
-    const EXPECTED_41_RUST_TOOLS = [
+    const EXPECTED_43_RUST_TOOLS = [
       ...EXPECTED_31_TS_TOOLS,
       'set_units',
       'save_project',
@@ -1141,17 +1148,19 @@ describe('MCP-CAD Core Geometry & Topological Verification Suite', () => {
       'run_fea_from_simulation',
       'check_gear_strength',
       'apply_recipe',
+      'bake_coupled_simulation',
+      'query_simulation_frame',
     ];
 
     for (const tool of EXPECTED_31_TS_TOOLS) {
       assert.ok(catalogNames.has(tool), `Missing tool '${tool}' in MCP catalog`);
     }
 
-    // 2. Automated Contract check against README.md (all 41 Rust MCP tools)
+    // 2. Automated Contract check against README.md (all 43 Rust MCP tools)
     const readmeContent = fs.readFileSync(path.resolve(process.cwd(), 'README.md'), 'utf-8');
-    assert.ok(readmeContent.includes('41 Tools'), 'README.md must state 41 Tools');
-    assert.ok(readmeContent.includes('41 инструмент'), 'README.md must state 41 инструмент');
-    for (const tool of EXPECTED_41_RUST_TOOLS) {
+    assert.ok(readmeContent.includes('43 Tools'), 'README.md must state 43 Tools');
+    assert.ok(readmeContent.includes('43 инструмент'), 'README.md must state 43 инструмент');
+    for (const tool of EXPECTED_43_RUST_TOOLS) {
       assert.ok(
         readmeContent.includes(`\`${tool}\``),
         `README.md missing documented entry for tool '${tool}'`
@@ -1161,10 +1170,10 @@ describe('MCP-CAD Core Geometry & Topological Verification Suite', () => {
     assert.ok(readmeContent.includes('gear'), 'README must document gear joint');
     assert.ok(readmeContent.includes('debug_mode'), 'README must document debug_mode parameter');
 
-    // 3. Automated Contract check against docs/CLAUDE_DESKTOP_SETUP.md (all 41 Rust MCP tools)
+    // 3. Automated Contract check against docs/CLAUDE_DESKTOP_SETUP.md (all 43 Rust MCP tools)
     const claudeContent = fs.readFileSync(path.resolve(process.cwd(), 'docs/CLAUDE_DESKTOP_SETUP.md'), 'utf-8');
-    assert.ok(claudeContent.includes('41 инженерный инструмент'), 'Claude setup must state 41 tools');
-    for (const tool of EXPECTED_41_RUST_TOOLS) {
+    assert.ok(claudeContent.includes('43 инженерных инструмента'), 'Claude setup must state 43 tools');
+    for (const tool of EXPECTED_43_RUST_TOOLS) {
       assert.ok(
         claudeContent.includes(`\`${tool}\``),
         `docs/CLAUDE_DESKTOP_SETUP.md missing tool '${tool}'`
@@ -1174,23 +1183,23 @@ describe('MCP-CAD Core Geometry & Topological Verification Suite', () => {
     // 4. Automated Contract check against docs/ANTIGRAVITY_SETUP.md
     const antigravityContent = fs.readFileSync(path.resolve(process.cwd(), 'docs/ANTIGRAVITY_SETUP.md'), 'utf-8');
     assert.ok(
-      antigravityContent.includes('41 инженерного инструмента') || antigravityContent.includes('41 инженерных инструментов'),
-      'Antigravity setup must state 41 tools'
+      antigravityContent.includes('43 инженерного инструмента') || antigravityContent.includes('43 инженерных инструментов') || antigravityContent.includes('43 инженерных инструмента'),
+      'Antigravity setup must state 43 tools'
     );
 
     // 5. Automated Contract check against docs/ARCHITECTURE.md
     const archContent = fs.readFileSync(path.resolve(process.cwd(), 'docs/ARCHITECTURE.md'), 'utf-8');
-    assert.ok(archContent.includes('41 инструмента MCP') || archContent.includes('41 инструментов MCP'), 'ARCHITECTURE.md must state 41 MCP tools');
-    assert.ok(archContent.includes('41 строгого JSON-Schema') || archContent.includes('41 строгих JSON-Schema'), 'ARCHITECTURE.md must state 41 JSON-Schema tool definitions');
+    assert.ok(archContent.includes('43 инструмента MCP') || archContent.includes('43 инструментов MCP'), 'ARCHITECTURE.md must state 43 MCP tools');
+    assert.ok(archContent.includes('43 строгого JSON-Schema') || archContent.includes('43 строгих JSON-Schema'), 'ARCHITECTURE.md must state 43 JSON-Schema tool definitions');
     assert.ok(archContent.includes('Gear'), 'ARCHITECTURE.md must document Gear joint');
     assert.ok(archContent.includes('WheelRim'), 'ARCHITECTURE.md must document WheelRim primitive');
     assert.ok(archContent.includes('SpurGear'), 'ARCHITECTURE.md must document SpurGear primitive');
     assert.ok(archContent.includes('src/cad'), 'ARCHITECTURE.md must document TypeScript CAD layer');
 
-    // 6. Automated Contract check against docs/MCP_API_REFERENCE.md and PROJECT_CONTEXT.md (all 41 Rust tools)
+    // 6. Automated Contract check against docs/MCP_API_REFERENCE.md and PROJECT_CONTEXT.md (all 43 Rust tools)
     const apiRefContent = fs.readFileSync(path.resolve(process.cwd(), 'docs/MCP_API_REFERENCE.md'), 'utf-8');
     const projectCtxContent = fs.readFileSync(path.resolve(process.cwd(), 'PROJECT_CONTEXT.md'), 'utf-8');
-    for (const tool of EXPECTED_41_RUST_TOOLS) {
+    for (const tool of EXPECTED_43_RUST_TOOLS) {
       assert.ok(
         apiRefContent.includes(`\`${tool}\``),
         `docs/MCP_API_REFERENCE.md missing tool '${tool}'`
@@ -2232,5 +2241,402 @@ describe('MCP-CAD Core Geometry & Topological Verification Suite', () => {
       );
     }
   });
-});
 
+  it('verifies P5-T1: all 10 standard materials carry valid J2 plasticity, fracture, and friction constants', () => {
+    const requiredIds = [
+      'steel_1045',
+      'steel_structural_aisi1020',
+      'steel_4140',
+      'alu_6061',
+      'ti_6al_4v',
+      'brass_c360',
+      'pla_3d',
+      'petg_3d',
+      'nylon_pa12',
+      'borosilicate_glass',
+    ];
+    assert.equal(MATERIALS_LIBRARY.length, 10);
+
+    for (const id of requiredIds) {
+      const mat = getMaterialById(id);
+      assert.equal(mat.id, id, `Expected material '${id}' in MATERIALS_LIBRARY`);
+      const check = validateMaterialSpec(mat);
+      assert.equal(
+        check.valid,
+        true,
+        `Material '${id}' failed physical invariant validation: ${check.errors.join('; ')}`
+      );
+      assert.ok(mat.ultimateStrengthPa >= mat.yieldStrength);
+      assert.ok(mat.hardeningModulusPa >= 0);
+      assert.ok(mat.fractureStrain > 0);
+      assert.ok(mat.fractureEnergyJM2 > 0);
+      assert.ok(mat.frictionCoeff >= 0);
+      assert.ok(mat.poissonsRatio > 0 && mat.poissonsRatio < 0.5);
+    }
+
+    // Physical class ordering checks
+    const steel1020 = getMaterialById('steel_structural_aisi1020');
+    const steel1045 = getMaterialById('steel_1045');
+    const steel4140 = getMaterialById('steel_4140');
+    const glass = getMaterialById('borosilicate_glass');
+    assert.ok(steel4140.yieldStrength > steel1045.yieldStrength);
+    assert.ok(steel1045.yieldStrength > steel1020.yieldStrength);
+    assert.equal(steel4140.failureMode, 'ductile');
+    assert.equal(glass.failureMode, 'brittle');
+    assert.equal(glass.hardeningModulusPa, 0);
+    assert.ok(steel4140.fractureEnergyJM2 > 1000 * glass.fractureEnergyJM2);
+    assert.equal(getMaterialById('pyrex').id, 'borosilicate_glass');
+    assert.equal(getMaterialById('glass').id, 'borosilicate_glass');
+  });
+
+  it('verifies P5-T11: steel_1045 and steel_structural_aisi1020 are distinct and all 10 presets match Rust MaterialRegistry exactly', () => {
+    const steel1045 = getMaterialById('steel_1045');
+    const steel1020 = getMaterialById('steel_structural_aisi1020');
+    assert.equal(steel1045.id, 'steel_1045');
+    assert.equal(steel1020.id, 'steel_structural_aisi1020');
+    assert.equal(steel1045.yieldStrength, 350e6);
+    assert.equal(steel1045.ultimateStrengthPa, 585e6);
+    assert.equal(steel1045.hardeningModulusPa, 1.8e9);
+    assert.equal(steel1045.fractureStrain, 0.16);
+    assert.equal(steel1020.yieldStrength, 250e6);
+    assert.equal(steel1020.ultimateStrengthPa, 420e6);
+    assert.equal(steel1020.hardeningModulusPa, 1.2e9);
+    assert.equal(steel1020.fractureStrain, 0.22);
+
+    assert.equal(resolveMaterialAlias('steel_carbon_aisi1045'), 'steel_1045');
+    assert.equal(resolveMaterialAlias('AISI 1045'), 'steel_1045');
+    assert.equal(resolveMaterialAlias('steel_1020'), 'steel_structural_aisi1020');
+    assert.equal(resolveMaterialAlias('AISI 1020'), 'steel_structural_aisi1020');
+    assert.equal(resolveMaterialAlias('steel'), 'steel_structural_aisi1020');
+
+    // Cross-check all standard presets and aliases directly against Rust crates/mcp-cad-core/src/material.rs
+    const rustMaterialPath = path.resolve(
+      process.cwd(),
+      'crates/mcp-cad-core/src/material.rs'
+    );
+    const rustSrc = fs.readFileSync(rustMaterialPath, 'utf8');
+
+    const regStart = rustSrc.indexOf('fn register_presets(&mut self)');
+    const regEnd = rustSrc.indexOf('pub fn resolve_alias', regStart);
+    assert.ok(regStart >= 0 && regEnd > regStart, 'Could not locate register_presets in material.rs');
+    const regBody = rustSrc.slice(regStart, regEnd);
+
+    const parseRustFloat = (s: string): number => Number(s.replace(/_/g, '').trim());
+    const presetRegex =
+      /Material::new\(\s*"([^"]+)",\s*([\d._eE+-]+),\s*([\d._eE+-]+),\s*([\d._eE+-]+),\s*([\d._eE+-]+),\s*"[^"]*",?\s*\)\s*\.with_nonlinear_properties\(\s*([\d._eE+-]+),\s*([\d._eE+-]+),\s*([\d._eE+-]+),\s*([\d._eE+-]+),\s*([\d._eE+-]+),\s*FailureMode::(Ductile|Brittle),?\s*\)/g;
+
+    interface RustMatParsed {
+      name: string;
+      youngsModulusPa: number;
+      poissonsRatio: number;
+      yieldStrengthPa: number;
+      densityKgM3: number;
+      ultimateStrengthPa: number;
+      hardeningModulusPa: number;
+      fractureStrain: number;
+      fractureEnergyJM2: number;
+      frictionCoeff: number;
+      failureMode: 'ductile' | 'brittle';
+    }
+
+    const rustPresets = new Map<string, RustMatParsed>();
+    for (const match of regBody.matchAll(presetRegex)) {
+      const parsed: RustMatParsed = {
+        name: match[1],
+        youngsModulusPa: parseRustFloat(match[2]) * 1e9,
+        poissonsRatio: parseRustFloat(match[3]),
+        yieldStrengthPa: parseRustFloat(match[4]) * 1e6,
+        densityKgM3: parseRustFloat(match[5]),
+        ultimateStrengthPa: parseRustFloat(match[6]),
+        hardeningModulusPa: parseRustFloat(match[7]),
+        fractureStrain: parseRustFloat(match[8]),
+        fractureEnergyJM2: parseRustFloat(match[9]),
+        frictionCoeff: parseRustFloat(match[10]),
+        failureMode: match[11].toLowerCase() as 'ductile' | 'brittle',
+      };
+      rustPresets.set(parsed.name, parsed);
+    }
+
+    assert.equal(
+      rustPresets.size,
+      MATERIALS_LIBRARY.length,
+      `Rust preset count (${rustPresets.size}) must equal TS MATERIALS_LIBRARY length (${MATERIALS_LIBRARY.length})`
+    );
+
+    const assertClose = (label: string, a: number, b: number) => {
+      const scale = Math.max(Math.abs(a), Math.abs(b), 1);
+      assert.ok(
+        Math.abs(a - b) <= 1e-9 * scale,
+        `Rust/TS mismatch on ${label}: Rust=${a} vs TS=${b}`
+      );
+    };
+
+    const matchedTsIds = new Set<string>();
+    for (const [rustId, rustMat] of rustPresets.entries()) {
+      const tsMat = getMaterialById(rustId);
+      assert.ok(
+        !matchedTsIds.has(tsMat.id),
+        `Rust preset '${rustId}' collided with already-mapped TS preset '${tsMat.id}'`
+      );
+      matchedTsIds.add(tsMat.id);
+
+      assertClose(`${rustId}.density`, rustMat.densityKgM3, tsMat.density);
+      assertClose(`${rustId}.youngsModulus`, rustMat.youngsModulusPa, tsMat.youngsModulus);
+      assertClose(`${rustId}.poissonsRatio`, rustMat.poissonsRatio, tsMat.poissonsRatio);
+      assertClose(`${rustId}.yieldStrength`, rustMat.yieldStrengthPa, tsMat.yieldStrength);
+      assertClose(`${rustId}.ultimateStrengthPa`, rustMat.ultimateStrengthPa, tsMat.ultimateStrengthPa);
+      assertClose(`${rustId}.hardeningModulusPa`, rustMat.hardeningModulusPa, tsMat.hardeningModulusPa);
+      assertClose(`${rustId}.fractureStrain`, rustMat.fractureStrain, tsMat.fractureStrain);
+      assertClose(`${rustId}.fractureEnergyJM2`, rustMat.fractureEnergyJM2, tsMat.fractureEnergyJM2);
+      assertClose(`${rustId}.frictionCoeff`, rustMat.frictionCoeff, tsMat.frictionCoeff);
+      assert.equal(
+        rustMat.failureMode,
+        tsMat.failureMode,
+        `Rust/TS failureMode mismatch for ${rustId}`
+      );
+    }
+
+    // Verify every alias defined in Rust resolve_alias resolves to the physically identical preset in TS
+    const aliasEnd = rustSrc.indexOf('pub fn register(', regEnd);
+    assert.ok(aliasEnd > regEnd, 'Could not locate end of resolve_alias in material.rs');
+    const aliasBody = rustSrc.slice(regEnd, aliasEnd);
+    const armRegex = /((?:"[^"]+"\s*\|\s*)*"[^"]+")\s*=>\s*(?:\{\s*)?"([^"]+)"/g;
+    let checkedRustAliases = 0;
+    for (const arm of aliasBody.matchAll(armRegex)) {
+      const targetRustId = arm[2];
+      const rustMat = rustPresets.get(targetRustId);
+      assert.ok(rustMat, `Rust alias target '${targetRustId}' not found in register_presets`);
+      for (const aliasMatch of arm[1].matchAll(/"([^"]+)"/g)) {
+        const alias = aliasMatch[1];
+        const tsMat = getMaterialById(alias);
+        assertClose(`alias(${alias}).yieldStrength`, rustMat.yieldStrengthPa, tsMat.yieldStrength);
+        assertClose(`alias(${alias}).ultimateStrengthPa`, rustMat.ultimateStrengthPa, tsMat.ultimateStrengthPa);
+        assertClose(`alias(${alias}).hardeningModulusPa`, rustMat.hardeningModulusPa, tsMat.hardeningModulusPa);
+        assertClose(`alias(${alias}).fractureStrain`, rustMat.fractureStrain, tsMat.fractureStrain);
+        checkedRustAliases++;
+      }
+    }
+    assert.ok(
+      checkedRustAliases >= 50,
+      `Expected full Rust resolve_alias coverage, checked only ${checkedRustAliases} aliases`
+    );
+  });
+
+  it('verifies P5-T1: validateMaterialSpec rejects invariant violations and normalizeMaterialSpec supports legacy payloads', () => {
+    const base = getMaterialById('steel_1045');
+    assert.equal(validateMaterialSpec(base).valid, true);
+
+    assert.equal(
+      validateMaterialSpec({ ...base, ultimateStrengthPa: base.yieldStrength * 0.8 }).valid,
+      false
+    );
+    assert.equal(validateMaterialSpec({ ...base, hardeningModulusPa: -1 }).valid, false);
+    assert.equal(validateMaterialSpec({ ...base, fractureStrain: 0 }).valid, false);
+    assert.equal(validateMaterialSpec({ ...base, fractureEnergyJM2: -5 }).valid, false);
+    assert.equal(validateMaterialSpec({ ...base, poissonsRatio: 0.5 }).valid, false);
+    assert.equal(validateMaterialSpec({ ...base, poissonsRatio: 0 }).valid, false);
+    assert.equal(validateMaterialSpec({ ...base, frictionCoeff: -0.05 }).valid, false);
+
+    // Legacy 6-field material (high yield titanium without Phase 5 fields)
+    const legacy = normalizeMaterialSpec({
+      id: 'legacy_ti',
+      name: 'Legacy Titanium',
+      category: 'Metal',
+      density: 4430,
+      youngsModulus: 114e9,
+      poissonsRatio: 0.34,
+      yieldStrength: 880e6,
+    });
+    assert.equal(validateMaterialSpec(legacy).valid, true);
+    assert.ok(legacy.ultimateStrengthPa >= 880e6);
+    assert.equal(legacy.failureMode, 'ductile');
+
+    // Rust snake_case JSON payload compatibility
+    const fromRust = normalizeMaterialSpec({
+      name: 'borosilicate_glass',
+      density_kg_m3: 2500,
+      youngs_modulus_gpa: 64,
+      poissons_ratio: 0.2,
+      yield_strength_mpa: 120,
+      ultimate_strength_pa: 120e6,
+      hardening_modulus_pa: 0,
+      fracture_strain: 0.002,
+      fracture_energy_j_m2: 8.5,
+      friction_coeff: 0.18,
+      failure_mode: 'brittle',
+    });
+    assert.equal(validateMaterialSpec(fromRust).valid, true);
+    assert.equal(fromRust.failureMode, 'brittle');
+    assert.equal(fromRust.fractureEnergyJM2, 8.5);
+  });
+
+  it('verifies P5-T20: alias and Rust canonical material IDs resolve to matching library cards for UI highlighting', () => {
+    const cases: Array<[string, string]> = [
+      ['al_6061', 'alu_6061'],
+      ['aluminum_6061_t6', 'alu_6061'],
+      ['steel_carbon_aisi1045', 'steel_1045'],
+      ['AISI 1045', 'steel_1045'],
+      ['steel_1020', 'steel_structural_aisi1020'],
+      ['steel_high_strength_4140', 'steel_4140'],
+      ['pyrex', 'borosilicate_glass'],
+      ['glass', 'borosilicate_glass'],
+      ['titanium_grade5_ti6al4v', 'ti_6al_4v'],
+      ['brass', 'brass_c360'],
+    ];
+
+    for (const [partMaterialId, expectedCardId] of cases) {
+      const activeMaterial = getMaterialById(partMaterialId, MATERIALS_LIBRARY);
+      const matchedCards = MATERIALS_LIBRARY.filter(
+        (mat) => activeMaterial.id === mat.id
+      );
+      assert.equal(
+        matchedCards.length,
+        1,
+        `Expected exactly 1 highlighted card for '${partMaterialId}', got ${matchedCards.length}`
+      );
+      assert.equal(matchedCards[0].id, expectedCardId);
+    }
+
+    // Verify CadLeftSidebar uses activeMaterial.id === mat.id rather than raw selectedPart.materialId === mat.id
+    const sidebarPath = path.resolve(
+      process.cwd(),
+      'src/components/CadLeftSidebar.tsx'
+    );
+    const sidebarSrc = fs.readFileSync(sidebarPath, 'utf8');
+    assert.ok(
+      sidebarSrc.includes('activeMaterial?.id === mat.id') ||
+        sidebarSrc.includes('activeMaterial.id === mat.id'),
+      'CadLeftSidebar must compare activeMaterial.id === mat.id to highlight alias-assigned materials'
+    );
+    assert.equal(
+      sidebarSrc.includes('selectedPart.materialId === mat.id'),
+      false,
+      'CadLeftSidebar must not use direct selectedPart.materialId === mat.id comparison'
+    );
+  });
+
+  it('verifies P5-T28: run_fea_analysis, get_fea_heatmap_image, and CadViewport3D FEM surface meshes resolve material aliases via getMaterialById', () => {
+    const baseState: EngineStateSnapshot = {
+      parts: [],
+      selectedPartId: '',
+      joints: [],
+      materials: [...DEFAULT_MATERIALS],
+      feaResult: null,
+      physicsFrames: [],
+      quality: 'standard',
+      renderMode: 'shaded',
+    };
+
+    // Create two identical cantilevers: one with canonical 'steel_1045' (E=205 GPa, sy=350 MPa)
+    // and one with alias 'pyrex' -> 'borosilicate_glass' (E=64 GPa, sy=120 MPa)
+    const { nextState: s1 } = executeMcpToolOnEngineState(baseState, 'create_part', {
+      part_id: 'beam_steel',
+      name: 'Beam Steel',
+      material: 'steel_1045',
+    });
+    const { nextState: s2 } = executeMcpToolOnEngineState(s1, 'create_part', {
+      part_id: 'beam_pyrex',
+      name: 'Beam Pyrex',
+      material: 'pyrex',
+    });
+    const { nextState: s3 } = executeMcpToolOnEngineState(s2, 'create_part', {
+      part_id: 'beam_al_rust',
+      name: 'Beam Al Rust ID',
+      material: 'aluminum_6061_t6',
+    });
+
+    const feaSteel = executeMcpToolOnEngineState(s3, 'run_fea_analysis', {
+      part_id: 'beam_steel',
+      fixed_region: 'min_x',
+      loads: [{ region: 'max_x', force_vector: [0, -1200, 0] }],
+    }).response;
+
+    const feaPyrex = executeMcpToolOnEngineState(s3, 'run_fea_analysis', {
+      part_id: 'beam_pyrex',
+      fixed_region: 'min_x',
+      loads: [{ region: 'max_x', force_vector: [0, -1200, 0] }],
+    }).response;
+
+    const feaAl = executeMcpToolOnEngineState(s3, 'run_fea_analysis', {
+      part_id: 'beam_al_rust',
+      fixed_region: 'min_x',
+      loads: [{ region: 'max_x', force_vector: [0, -1200, 0] }],
+    }).response;
+
+    // Pyrex has E = 64 GPa vs Steel 1045 E = 205 GPa (~3.2x larger displacement) and sy = 120 MPa vs 350 MPa
+    assert.equal(feaSteel.yieldStrengthMPa, 350);
+    assert.equal(feaPyrex.yieldStrengthMPa, 120);
+    assert.equal(feaAl.yieldStrengthMPa, 276);
+    assert.ok(
+      feaPyrex.maxDisplacementMm > feaSteel.maxDisplacementMm * 2.5,
+      `Expected pyrex (E=64 GPa) displacement (${feaPyrex.maxDisplacementMm} mm) to be >2.5x steel_1045 (${feaSteel.maxDisplacementMm} mm)`
+    );
+    assert.ok(
+      feaAl.maxDisplacementMm > feaSteel.maxDisplacementMm * 2.5,
+      `Expected aluminum_6061_t6 (E=68.9 GPa) displacement (${feaAl.maxDisplacementMm} mm) to be >2.5x steel_1045 (${feaSteel.maxDisplacementMm} mm)`
+    );
+    assert.ok(
+      feaPyrex.safetyFactor < feaSteel.safetyFactor * 0.5,
+      `Expected pyrex (sy=120 MPa) safety factor (${feaPyrex.safetyFactor}) to be <0.5x steel_1045 (${feaSteel.safetyFactor})`
+    );
+
+    // Verify get_fea_heatmap_image on a part without cached feaStressMPa also resolves alias 'pyrex'
+    const heatmapPyrex = executeMcpToolOnEngineState(
+      s3,
+      'get_fea_heatmap_image',
+      { part_id: 'beam_pyrex' }
+    ).response;
+    const heatmapSteel = executeMcpToolOnEngineState(
+      s3,
+      'get_fea_heatmap_image',
+      { part_id: 'beam_steel' }
+    ).response;
+    assert.ok(
+      heatmapPyrex.safety_factor < heatmapSteel.safety_factor * 0.5,
+      `Expected get_fea_heatmap_image for 'pyrex' (${heatmapPyrex.safety_factor}) to use sy=120 MPa instead of falling back to steel_1045 (${heatmapSteel.safety_factor})`
+    );
+
+    // Verify custom material defined via define_material still resolves cleanly
+    const { nextState: sCustom } = executeMcpToolOnEngineState(
+      s3,
+      'define_material',
+      {
+        material_id: 'custom_soft_rubber',
+        density_kg_m3: 1100,
+        youngs_modulus_gpa: 1.0,
+        poissons_ratio: 0.45,
+        yield_strength_mpa: 25,
+        part_id: 'beam_steel',
+      }
+    );
+    const feaCustom = executeMcpToolOnEngineState(sCustom, 'run_fea_analysis', {
+      part_id: 'beam_steel',
+    }).response;
+    assert.equal(feaCustom.yieldStrengthMPa, 25);
+    assert.ok(
+      feaCustom.maxDisplacementMm > feaSteel.maxDisplacementMm * 50,
+      `Expected custom 1 GPa material displacement (${feaCustom.maxDisplacementMm} mm) to scale with custom E`
+    );
+
+    // Verify CadViewport3D resolves FEM surface material properties via getMaterialById
+    const viewportPath = path.resolve(
+      process.cwd(),
+      'src/components/CadViewport3D.tsx'
+    );
+    const viewportSrc = fs.readFileSync(viewportPath, 'utf8');
+    assert.ok(
+      viewportSrc.includes('getMaterialById(partObj.materialId, materials)'),
+      'CadViewport3D must resolve FEM surface material aliases via getMaterialById(partObj.materialId, materials)'
+    );
+    assert.equal(
+      viewportSrc.includes('materials.find((m) => m.id === partObj?.materialId)'),
+      false,
+      'CadViewport3D must not use raw materials.find((m) => m.id === partObj?.materialId)'
+    );
+    assert.equal(getMaterialById('pyrex', MATERIALS_LIBRARY).colorHex, '#dbeafe');
+    assert.equal(
+      getMaterialById('aluminum_6061_t6', MATERIALS_LIBRARY).colorHex,
+      '#c4cdd6'
+    );
+  });
+});

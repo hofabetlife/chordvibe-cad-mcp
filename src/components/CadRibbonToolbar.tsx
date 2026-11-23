@@ -20,14 +20,18 @@ import {
   FastForward,
   Grid,
   X,
+  Flame,
+  Zap,
 } from 'lucide-react';
 import {
   DagNodeType,
+  DestructionCache,
   EngineeringWorkbench,
   FeaBoundaryCondition,
   ProjectionMode,
   QualityPreset,
   RenderMode,
+  SimulationSubMode,
   ViewportLayout,
 } from '../types/cad';
 
@@ -67,6 +71,14 @@ interface CadRibbonToolbarProps {
   hasCompiledStlMapping?: boolean;
   useCompiledRustStl?: boolean;
   onToggleRustStlSource?: () => void;
+  simulationSubMode?: SimulationSubMode;
+  onChangeSimulationSubMode?: (mode: SimulationSubMode) => void;
+  destructionCache?: DestructionCache | null;
+  isBakingDestruction?: boolean;
+  isPlayingDestruction?: boolean;
+  onTogglePlayDestruction?: () => void;
+  onBakeDestructionCache?: () => void;
+  onClearDestructionCache?: () => void;
 }
 
 const RENDER_MODES: {
@@ -198,6 +210,18 @@ export interface AssemblyPresetItem {
 
 const ASSEMBLY_PRESETS: AssemblyPresetItem[] = [
   {
+    id: 'gears_clash_destruction',
+    label: 'Столкновение шестерён (Кэш)',
+    description: 'Встречное вращение Z1=18 / Z2=22, скол зубьев и осколки',
+    icon: <Flame className="w-4 h-4 text-[#f97316]" />,
+  },
+  {
+    id: 'gear_overload_burst',
+    label: 'Разрыв редуктора (Перегрузка)',
+    description: 'Критический момент > σy, фрагментация шестерён',
+    icon: <Zap className="w-4 h-4 text-[#ef4444]" />,
+  },
+  {
     id: 'gear_transmission',
     label: 'Редуктор Z1=20 / Z2=40',
     description: 'Двухступенчатая зубчатая передача',
@@ -280,6 +304,14 @@ export const CadRibbonToolbar: React.FC<CadRibbonToolbarProps> = ({
   hasCompiledStlMapping,
   useCompiledRustStl,
   onToggleRustStlSource,
+  simulationSubMode = 'kinematics',
+  onChangeSimulationSubMode,
+  destructionCache = null,
+  isBakingDestruction = false,
+  isPlayingDestruction = false,
+  onTogglePlayDestruction,
+  onBakeDestructionCache,
+  onClearDestructionCache,
 }) => {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -622,49 +654,137 @@ export const CadRibbonToolbar: React.FC<CadRibbonToolbarProps> = ({
 
       {activeWorkbench === 'simulation' && (
         <div className="flex items-center gap-2 shrink-0">
-          <div className="flex items-center gap-1 bg-[#10131a] p-0.5 rounded border border-[#252b38] shrink-0">
-            <button
-              onClick={onTogglePhysics}
-              title="Запуск / Пауза кинематической симуляции f64 DAE (Клавиша P)"
-              className={`flex items-center gap-1.5 px-3 py-1 rounded text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap ${
-                isSimulatingPhysics
-                  ? 'bg-[#10b981] text-[#0c0e12]'
-                  : 'bg-[#1d222e] text-[#10b981] hover:bg-[#262d3d]'
-              }`}
-            >
-              {isSimulatingPhysics ? (
-                <>
-                  <Pause className="w-3.5 h-3.5 fill-current" />
-                  <span>Пауза [P]</span>
-                </>
-              ) : (
-                <>
-                  <Play className="w-3.5 h-3.5 fill-current" />
-                  <span>Старт симуляции [P]</span>
-                </>
-              )}
-            </button>
-
-            {onStepPhysics && (
+          {/* Sub-mode switcher: Live Kinematics vs Cached Destruction */}
+          {onChangeSimulationSubMode && (
+            <div className="flex items-center bg-[#10131a] p-0.5 rounded border border-[#252b38] shrink-0">
               <button
-                onClick={onStepPhysics}
-                title="Выполнить один шаг кинематики (+1/15 сек)"
-                className="flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium text-[#cbd5e1] hover:bg-[#1d222e] transition-colors cursor-pointer whitespace-nowrap"
+                onClick={() => onChangeSimulationSubMode('kinematics')}
+                className={`px-2 py-1 rounded text-[11px] font-semibold transition-colors cursor-pointer whitespace-nowrap ${
+                  simulationSubMode === 'kinematics'
+                    ? 'bg-[#10b981] text-[#0c0e12]'
+                    : 'text-[#94a3b8] hover:text-[#f1f5f9]'
+                }`}
               >
-                <FastForward className="w-3.5 h-3.5 text-[#38bdf8]" />
-                <span>Шаг</span>
+                Кинематика
               </button>
-            )}
+              <button
+                onClick={() => onChangeSimulationSubMode('destruction')}
+                className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-semibold transition-colors cursor-pointer whitespace-nowrap ${
+                  simulationSubMode === 'destruction'
+                    ? 'bg-[#f97316] text-[#0c0e12]'
+                    : 'text-[#94a3b8] hover:text-[#f1f5f9]'
+                }`}
+              >
+                <Flame className="w-3 h-3" />
+                <span>Разрушение (Кэш)</span>
+              </button>
+            </div>
+          )}
 
-            <button
-              onClick={onResetPhysics}
-              title="Сбросить углы поворота и исходные положения звеньев"
-              className="flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium text-[#94a3b8] hover:text-[#f1f5f9] hover:bg-[#1d222e] transition-colors cursor-pointer whitespace-nowrap"
-            >
-              <RotateCcw className="w-3.5 h-3.5" />
-              <span>Сброс</span>
-            </button>
-          </div>
+          {simulationSubMode === 'destruction' ? (
+            <div className="flex items-center gap-1 bg-[#10131a] p-0.5 rounded border border-[#252b38] shrink-0">
+              {onBakeDestructionCache && (
+                <button
+                  onClick={onBakeDestructionCache}
+                  disabled={isBakingDestruction}
+                  title="Запечь физику разрушения в кэш кадров"
+                  className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap ${
+                    isBakingDestruction
+                      ? 'bg-[#252b38] text-[#94a3b8] cursor-wait'
+                      : 'bg-[#f97316] hover:bg-[#ea580c] text-[#0b0e14]'
+                  }`}
+                >
+                  <Zap className="w-3.5 h-3.5" />
+                  <span>
+                    {isBakingDestruction
+                      ? 'Расчёт кэша...'
+                      : destructionCache
+                        ? 'Перезапечь кэш'
+                        : 'Запечь кэш'}
+                  </span>
+                </button>
+              )}
+
+              {destructionCache && onTogglePlayDestruction && (
+                <button
+                  onClick={onTogglePlayDestruction}
+                  title="Воспроизвести / Пауза кэша разрушения (Клавиша P)"
+                  className={`flex items-center gap-1 px-2.5 py-1 rounded text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap ${
+                    isPlayingDestruction
+                      ? 'bg-[#10b981] text-[#0c0e12]'
+                      : 'bg-[#1d222e] text-[#f1f5f9] hover:bg-[#262d3d]'
+                  }`}
+                >
+                  {isPlayingDestruction ? (
+                    <>
+                      <Pause className="w-3.5 h-3.5 fill-current" />
+                      <span>Пауза</span>
+                    </>
+                  ) : (
+                    <>
+                      <Play className="w-3.5 h-3.5 fill-current" />
+                      <span>Пуск</span>
+                    </>
+                  )}
+                </button>
+              )}
+
+              {destructionCache && onClearDestructionCache && (
+                <button
+                  onClick={onClearDestructionCache}
+                  title="Очистить кэш разрушения"
+                  className="flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium text-[#94a3b8] hover:text-[#f1f5f9] hover:bg-[#1d222e] transition-colors cursor-pointer whitespace-nowrap"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Сброс</span>
+                </button>
+              )}
+            </div>
+          ) : (
+            <div className="flex items-center gap-1 bg-[#10131a] p-0.5 rounded border border-[#252b38] shrink-0">
+              <button
+                onClick={onTogglePhysics}
+                title="Запуск / Пауза кинематической симуляции f64 DAE (Клавиша P)"
+                className={`flex items-center gap-1.5 px-3 py-1 rounded text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap ${
+                  isSimulatingPhysics
+                    ? 'bg-[#10b981] text-[#0c0e12]'
+                    : 'bg-[#1d222e] text-[#10b981] hover:bg-[#262d3d]'
+                }`}
+              >
+                {isSimulatingPhysics ? (
+                  <>
+                    <Pause className="w-3.5 h-3.5 fill-current" />
+                    <span>Пауза [P]</span>
+                  </>
+                ) : (
+                  <>
+                    <Play className="w-3.5 h-3.5 fill-current" />
+                    <span>Старт симуляции [P]</span>
+                  </>
+                )}
+              </button>
+
+              {onStepPhysics && (
+                <button
+                  onClick={onStepPhysics}
+                  title="Выполнить один шаг кинематики (+1/15 сек)"
+                  className="flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium text-[#cbd5e1] hover:bg-[#1d222e] transition-colors cursor-pointer whitespace-nowrap"
+                >
+                  <FastForward className="w-3.5 h-3.5 text-[#38bdf8]" />
+                  <span>Шаг</span>
+                </button>
+              )}
+
+              <button
+                onClick={onResetPhysics}
+                title="Сбросить углы поворота и исходные положения звеньев"
+                className="flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium text-[#94a3b8] hover:text-[#f1f5f9] hover:bg-[#1d222e] transition-colors cursor-pointer whitespace-nowrap"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                <span>Сброс</span>
+              </button>
+            </div>
+          )}
 
           <div className="h-4 w-[1px] bg-[#262b36] mx-0.5 shrink-0" />
 

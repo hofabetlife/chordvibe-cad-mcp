@@ -2350,6 +2350,432 @@ pub(crate) fn orthonormal_pair(n: &Vector3<f64>) -> (Vector3<f64>, Vector3<f64>)
     (t1, t2)
 }
 
+// ============================================================================
+// Analytical Hertz Contact Mechanics & Dynamic Deformable Surface Index (P5-T4)
+// ============================================================================
+
+/// Exact analytical Hertz line-contact solution for two parallel elastic cylinders (`f64`).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HertzCylinderSolution {
+    /// Effective radius $R^* = (1/R_1 + 1/R_2)^{-1}$ ($\text{m}$).
+    pub effective_radius_m: f64,
+    /// Effective plane-strain modulus $E^* = \left(\frac{1-\nu_1^2}{E_1} + \frac{1-\nu_2^2}{E_2}\right)^{-1}$ ($\text{Pa}$).
+    pub effective_modulus_pa: f64,
+    /// Half-width of the elliptical contact strip $a = \sqrt{\frac{4 F' R^*}{\pi E^*}}$ ($\text{m}$).
+    pub half_width_m: f64,
+    /// Peak Hertzian normal contact pressure $p_0 = \sqrt{\frac{F' E^*}{\pi R^*}} = \frac{2 F'}{\pi a}$ ($\text{Pa}$).
+    pub max_pressure_pa: f64,
+    /// Applied normal load per unit cylinder length $F' = F / L$ ($\text{N/m}$).
+    pub force_per_length_n_m: f64,
+}
+
+impl HertzCylinderSolution {
+    /// Evaluates the exact analytical Hertzian pressure profile $p(x) = p_0 \sqrt{1 - (x/a)^2}$ ($\text{Pa}$)
+    /// at transverse offset `x_m` ($\text{m}$) from the contact centerline.
+    #[must_use]
+    pub fn pressure_at(&self, x_m: f64) -> f64 {
+        if self.half_width_m <= 1e-18 {
+            return 0.0;
+        }
+        let ratio = x_m.abs() / self.half_width_m;
+        if ratio >= 1.0 {
+            0.0
+        } else {
+            self.max_pressure_pa * (1.0 - ratio * ratio).sqrt()
+        }
+    }
+}
+
+/// Computes the exact analytical Hertz contact parameters for two parallel elastic cylinders
+/// of radii `r1_m`, `r2_m` (use `f64::INFINITY` for a flat half-space), moduli `e1_pa`, `e2_pa`,
+/// Poisson's ratios `nu1`, `nu2`, and normal force per unit axial length `force_per_length_n_m`.
+#[must_use]
+pub fn hertz_cylinder_contact(
+    r1_m: f64,
+    r2_m: f64,
+    e1_pa: f64,
+    nu1: f64,
+    e2_pa: f64,
+    nu2: f64,
+    force_per_length_n_m: f64,
+) -> Option<HertzCylinderSolution> {
+    if r1_m <= 0.0
+        || r2_m <= 0.0
+        || e1_pa <= 0.0
+        || e2_pa <= 0.0
+        || !(0.0..0.5).contains(&nu1)
+        || !(0.0..0.5).contains(&nu2)
+        || force_per_length_n_m < 0.0
+        || !force_per_length_n_m.is_finite()
+    {
+        return None;
+    }
+    let inv_r = (if r1_m.is_infinite() { 0.0 } else { 1.0 / r1_m })
+        + (if r2_m.is_infinite() { 0.0 } else { 1.0 / r2_m });
+    if inv_r <= 0.0 || !inv_r.is_finite() {
+        return None;
+    }
+    let r_star = 1.0 / inv_r;
+    let inv_e = (1.0 - nu1 * nu1) / e1_pa + (1.0 - nu2 * nu2) / e2_pa;
+    if inv_e <= 0.0 || !inv_e.is_finite() {
+        return None;
+    }
+    let e_star = 1.0 / inv_e;
+    let pi = std::f64::consts::PI;
+    let half_width_m = ((4.0 * force_per_length_n_m * r_star) / (pi * e_star)).sqrt();
+    let max_pressure_pa = ((force_per_length_n_m * e_star) / (pi * r_star)).sqrt();
+    Some(HertzCylinderSolution {
+        effective_radius_m: r_star,
+        effective_modulus_pa: e_star,
+        half_width_m,
+        max_pressure_pa,
+        force_per_length_n_m,
+    })
+}
+
+/// Exact analytical Hertz circular point-contact solution for two elastic spheres (`f64`).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HertzSphereSolution {
+    /// Effective radius $R^* = (1/R_1 + 1/R_2)^{-1}$ ($\text{m}$).
+    pub effective_radius_m: f64,
+    /// Effective modulus $E^* = \left(\frac{1-\nu_1^2}{E_1} + \frac{1-\nu_2^2}{E_2}\right)^{-1}$ ($\text{Pa}$).
+    pub effective_modulus_pa: f64,
+    /// Circular contact patch radius $a = \left(\frac{3 F R^*}{4 E^*}\right)^{1/3}$ ($\text{m}$).
+    pub contact_radius_m: f64,
+    /// Peak Hertzian normal contact pressure $p_0 = \frac{3 F}{2 \pi a^2}$ ($\text{Pa}$).
+    pub max_pressure_pa: f64,
+    /// Mutual elastic approach $\delta = a^2 / R^*$ ($\text{m}$).
+    pub approach_m: f64,
+}
+
+/// Computes the exact analytical Hertz contact parameters for two elastic spheres.
+#[must_use]
+pub fn hertz_sphere_contact(
+    r1_m: f64,
+    r2_m: f64,
+    e1_pa: f64,
+    nu1: f64,
+    e2_pa: f64,
+    nu2: f64,
+    normal_force_n: f64,
+) -> Option<HertzSphereSolution> {
+    if r1_m <= 0.0
+        || r2_m <= 0.0
+        || e1_pa <= 0.0
+        || e2_pa <= 0.0
+        || !(0.0..0.5).contains(&nu1)
+        || !(0.0..0.5).contains(&nu2)
+        || normal_force_n < 0.0
+        || !normal_force_n.is_finite()
+    {
+        return None;
+    }
+    let inv_r = (if r1_m.is_infinite() { 0.0 } else { 1.0 / r1_m })
+        + (if r2_m.is_infinite() { 0.0 } else { 1.0 / r2_m });
+    if inv_r <= 0.0 || !inv_r.is_finite() {
+        return None;
+    }
+    let r_star = 1.0 / inv_r;
+    let inv_e = (1.0 - nu1 * nu1) / e1_pa + (1.0 - nu2 * nu2) / e2_pa;
+    if inv_e <= 0.0 || !inv_e.is_finite() {
+        return None;
+    }
+    let e_star = 1.0 / inv_e;
+    let contact_radius_m = ((3.0 * normal_force_n * r_star) / (4.0 * e_star)).cbrt();
+    let max_pressure_pa = if contact_radius_m > 1e-18 {
+        (3.0 * normal_force_n) / (2.0 * std::f64::consts::PI * contact_radius_m * contact_radius_m)
+    } else {
+        0.0
+    };
+    let approach_m = (contact_radius_m * contact_radius_m) / r_star;
+    Some(HertzSphereSolution {
+        effective_radius_m: r_star,
+        effective_modulus_pa: e_star,
+        contact_radius_m,
+        max_pressure_pa,
+        approach_m,
+    })
+}
+
+/// Closest-point signed projection onto a dynamically deformed triangle surface mesh (`P5-T4`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SurfaceProjection {
+    /// Index of the closest surface triangle.
+    pub triangle_index: usize,
+    /// Closest point on the deformed master triangle ($\text{m}$).
+    pub closest_point: Vector3<f64>,
+    /// Barycentric weights `[w0, w1, w2]` ($\sum w_k = 1$, $w_k \ge 0$).
+    pub barycentric: [f64; 3],
+    /// Outward unit contact normal at the projected point.
+    pub normal: Vector3<f64>,
+    /// Signed normal gap $g_n = (\mathbf{p} - \mathbf{q}) \cdot \mathbf{n}_{\text{pseudo}}$ ($\text{m}$);
+    /// negative values indicate penetration ($\delta = -g_n > 0$).
+    pub signed_gap_m: f64,
+}
+
+/// Dynamic deformable surface mesh with cached `f64` [`TriMeshBvh`] and Bærentzen–Aanæs
+/// angle-weighted outward pseudonormals for exact signed-gap Node-to-Surface queries (`P5-T4`).
+#[derive(Debug, Clone)]
+pub struct DeformableSurfaceIndex {
+    /// Current deformed vertex positions ($\text{m}$).
+    pub vertices: Vec<[f64; 3]>,
+    /// Outwardly oriented surface triangle vertex indices.
+    pub indices: Vec<[u32; 3]>,
+    /// Per-triangle outward unit normals.
+    face_normals: Vec<Vector3<f64>>,
+    /// Per-vertex angle-weighted outward unit pseudonormals.
+    vertex_normals: Vec<Vector3<f64>>,
+    /// Per-undirected-edge outward unit pseudonormals `(min_v, max_v) -> unit normal`.
+    edge_normals: HashMap<(u32, u32), Vector3<f64>>,
+    /// Spatial AABB BVH rebuilt whenever vertex coordinates are updated.
+    bvh: TriMeshBvh,
+}
+
+impl DeformableSurfaceIndex {
+    /// Builds a new [`DeformableSurfaceIndex`] from outwardly oriented triangles and vertex positions.
+    #[must_use]
+    pub fn build(vertices: Vec<[f64; 3]>, indices: Vec<[u32; 3]>) -> Self {
+        let mut idx = Self {
+            vertices,
+            indices,
+            face_normals: Vec::new(),
+            vertex_normals: Vec::new(),
+            edge_normals: HashMap::new(),
+            bvh: TriMeshBvh::build(&[], &[]),
+        };
+        idx.rebuild_geometry();
+        idx
+    }
+
+    /// Updates deformed vertex positions in-place and rebuilds outward pseudonormals and BVH.
+    pub fn update_vertices(&mut self, new_vertices: &[[f64; 3]]) {
+        if new_vertices.len() == self.vertices.len() {
+            self.vertices.copy_from_slice(new_vertices);
+        } else {
+            self.vertices = new_vertices.to_vec();
+        }
+        self.rebuild_geometry();
+    }
+
+    fn rebuild_geometry(&mut self) {
+        let nv = self.vertices.len();
+        let nt = self.indices.len();
+        self.face_normals.clear();
+        self.face_normals.reserve(nt);
+        let mut v_accum = vec![Vector3::<f64>::zeros(); nv];
+        let mut e_accum: HashMap<(u32, u32), Vector3<f64>> = HashMap::with_capacity(nt * 2);
+
+        for &[i0, i1, i2] in &self.indices {
+            let p0 = Vector3::from(self.vertices[i0 as usize]);
+            let p1 = Vector3::from(self.vertices[i1 as usize]);
+            let p2 = Vector3::from(self.vertices[i2 as usize]);
+            let e01 = p1 - p0;
+            let e12 = p2 - p1;
+            let e20 = p0 - p2;
+            let cross = e01.cross(&(p2 - p0));
+            let norm = cross.norm();
+            let fn_vec = if norm > 1e-18 {
+                cross / norm
+            } else {
+                Vector3::z()
+            };
+            self.face_normals.push(fn_vec);
+
+            if norm > 1e-18 {
+                let ang0 = angle_between_vectors(e01, -e20);
+                let ang1 = angle_between_vectors(-e01, e12);
+                let ang2 = angle_between_vectors(-e12, e20);
+                v_accum[i0 as usize] += fn_vec * ang0;
+                v_accum[i1 as usize] += fn_vec * ang1;
+                v_accum[i2 as usize] += fn_vec * ang2;
+
+                for (a, b) in [(i0, i1), (i1, i2), (i2, i0)] {
+                    let key = if a < b { (a, b) } else { (b, a) };
+                    *e_accum.entry(key).or_insert_with(Vector3::zeros) += fn_vec;
+                }
+            }
+        }
+
+        self.vertex_normals = v_accum
+            .into_iter()
+            .map(|n| {
+                let len = n.norm();
+                if len > 1e-15 { n / len } else { Vector3::z() }
+            })
+            .collect();
+
+        self.edge_normals = e_accum
+            .into_iter()
+            .map(|(k, n)| {
+                let len = n.norm();
+                let unit = if len > 1e-15 { n / len } else { Vector3::z() };
+                (k, unit)
+            })
+            .collect();
+
+        self.bvh = TriMeshBvh::build(&self.vertices, &self.indices);
+    }
+
+    /// Queries the closest surface point within `max_search_dist` ($\text{m}$) and returns the
+    /// exact signed normal gap using Bærentzen–Aanæs angle-weighted outward pseudonormals.
+    #[must_use]
+    pub fn closest_point_signed(
+        &self,
+        point: Vector3<f64>,
+        max_search_dist: f64,
+    ) -> Option<SurfaceProjection> {
+        if self.bvh.is_empty() || max_search_dist <= 0.0 {
+            return None;
+        }
+        let query = BoundingBox::new(
+            [
+                point.x - max_search_dist,
+                point.y - max_search_dist,
+                point.z - max_search_dist,
+            ],
+            [
+                point.x + max_search_dist,
+                point.y + max_search_dist,
+                point.z + max_search_dist,
+            ],
+        );
+        let mut candidates = Vec::new();
+        self.bvh.query_local_aabb(&query, &mut candidates);
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let mut best_dist_sq = max_search_dist * max_search_dist;
+        let mut best: Option<SurfaceProjection> = None;
+
+        for &t_idx in &candidates {
+            let [i0, i1, i2] = self.indices[t_idx];
+            let a = Vector3::from(self.vertices[i0 as usize]);
+            let b = Vector3::from(self.vertices[i1 as usize]);
+            let c = Vector3::from(self.vertices[i2 as usize]);
+            let (q, bary, feature) = closest_point_barycentric_feature(point, a, b, c);
+            let diff = point - q;
+            let dist_sq = diff.norm_squared();
+            if dist_sq <= best_dist_sq {
+                let pseudo_n = match feature {
+                    TriFeature::Face => self.face_normals[t_idx],
+                    TriFeature::Vertex(0) => self.vertex_normals[i0 as usize],
+                    TriFeature::Vertex(1) => self.vertex_normals[i1 as usize],
+                    TriFeature::Vertex(_) => self.vertex_normals[i2 as usize],
+                    TriFeature::Edge(e) => {
+                        let (u, v) = match e {
+                            0 => (i0, i1),
+                            1 => (i1, i2),
+                            _ => (i2, i0),
+                        };
+                        let key = if u < v { (u, v) } else { (v, u) };
+                        self.edge_normals
+                            .get(&key)
+                            .copied()
+                            .unwrap_or(self.face_normals[t_idx])
+                    }
+                };
+                let smooth_raw = self.vertex_normals[i0 as usize] * bary[0]
+                    + self.vertex_normals[i1 as usize] * bary[1]
+                    + self.vertex_normals[i2 as usize] * bary[2];
+                let normal = if smooth_raw.norm() > 1e-12 {
+                    let s = smooth_raw.normalize();
+                    if s.dot(&pseudo_n) > 0.85 {
+                        s
+                    } else {
+                        pseudo_n
+                    }
+                } else {
+                    pseudo_n
+                };
+                let signed_gap_m = diff.dot(&pseudo_n);
+                best_dist_sq = dist_sq;
+                best = Some(SurfaceProjection {
+                    triangle_index: t_idx,
+                    closest_point: q,
+                    barycentric: bary,
+                    normal,
+                    signed_gap_m,
+                });
+            }
+        }
+
+        best
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriFeature {
+    Face,
+    Edge(u8),
+    Vertex(u8),
+}
+
+#[inline]
+fn angle_between_vectors(u: Vector3<f64>, v: Vector3<f64>) -> f64 {
+    let nu = u.norm();
+    let nv = v.norm();
+    if nu <= 1e-18 || nv <= 1e-18 {
+        return 0.0;
+    }
+    let cos_a = (u.dot(&v) / (nu * nv)).clamp(-1.0, 1.0);
+    cos_a.acos()
+}
+
+fn closest_point_barycentric_feature(
+    p: Vector3<f64>,
+    a: Vector3<f64>,
+    b: Vector3<f64>,
+    c: Vector3<f64>,
+) -> (Vector3<f64>, [f64; 3], TriFeature) {
+    let ab = b - a;
+    let ac = c - a;
+    let ap = p - a;
+    let d1 = ab.dot(&ap);
+    let d2 = ac.dot(&ap);
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return (a, [1.0, 0.0, 0.0], TriFeature::Vertex(0));
+    }
+
+    let bp = p - b;
+    let d3 = ab.dot(&bp);
+    let d4 = ac.dot(&bp);
+    if d3 >= 0.0 && d4 <= d3 {
+        return (b, [0.0, 1.0, 0.0], TriFeature::Vertex(1));
+    }
+
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        let v = d1 / (d1 - d3);
+        return (a + ab * v, [1.0 - v, v, 0.0], TriFeature::Edge(0));
+    }
+
+    let cp = p - c;
+    let d5 = ab.dot(&cp);
+    let d6 = ac.dot(&cp);
+    if d6 >= 0.0 && d5 <= d6 {
+        return (c, [0.0, 0.0, 1.0], TriFeature::Vertex(2));
+    }
+
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        let w = d2 / (d2 - d6);
+        return (a + ac * w, [1.0 - w, 0.0, w], TriFeature::Edge(2));
+    }
+
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return (b + (c - b) * w, [0.0, 1.0 - w, w], TriFeature::Edge(1));
+    }
+
+    let denom = 1.0 / (va + vb + vc);
+    let v = vb * denom;
+    let w = vc * denom;
+    let u = 1.0 - v - w;
+    (a + ab * v + ac * w, [u, v, w], TriFeature::Face)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2453,5 +2879,42 @@ mod tests {
         bvh.query_local_aabb(&BoundingBox::new([-0.2, -0.1, -0.2], [0.2, 0.1, 0.2]), &mut hits);
         assert!(hits.contains(&0) && hits.contains(&1));
         assert!(!hits.contains(&2));
+    }
+
+    #[test]
+    fn test_p5_t4_hertz_analytical_and_deformable_surface_signed_gap() {
+        // 1. Two identical steel cylinders (R = 50mm, E = 205 GPa, nu = 0.29)
+        let hertz = hertz_cylinder_contact(0.050, 0.050, 205e9, 0.29, 205e9, 0.29, 212_280.0)
+            .expect("valid Hertz parameters");
+        assert!((hertz.effective_radius_m - 0.025).abs() < 1e-12);
+        // Integral check: int_{-a}^{a} p(x) dx = (pi/2) * p0 * a == F'
+        let integral_f = 0.5 * std::f64::consts::PI * hertz.max_pressure_pa * hertz.half_width_m;
+        assert!((integral_f - 212_280.0).abs() / 212_280.0 < 1e-12);
+        assert!((hertz.pressure_at(0.0) - hertz.max_pressure_pa).abs() < 1e-6);
+        assert_eq!(hertz.pressure_at(hertz.half_width_m * 1.01), 0.0);
+
+        // 2. Dynamic DeformableSurfaceIndex signed-gap query on an updated box surface
+        let box_mesh = mcp_cad_core::primitives::create_box(0.04, 0.04, 0.04);
+        let verts: Vec<[f64; 3]> = box_mesh.vertices.iter().map(|v| v.position).collect();
+        let mut surf = DeformableSurfaceIndex::build(verts.clone(), box_mesh.indices.clone());
+
+        let outside = surf
+            .closest_point_signed(Vector3::new(0.0, 0.0, 0.023), 0.01)
+            .expect("point above +Z face");
+        assert!((outside.signed_gap_m - 0.003).abs() < 1e-12);
+        assert!((outside.normal - Vector3::z()).norm() < 1e-12);
+
+        let inside = surf
+            .closest_point_signed(Vector3::new(0.0, 0.0, 0.018), 0.01)
+            .expect("point inside +Z face");
+        assert!((inside.signed_gap_m - (-0.002)).abs() < 1e-12);
+
+        // Deform the surface upward by +0.004 m and re-query the previously outside point
+        let shifted: Vec<[f64; 3]> = verts.iter().map(|p| [p[0], p[1], p[2] + 0.004]).collect();
+        surf.update_vertices(&shifted);
+        let now_inside = surf
+            .closest_point_signed(Vector3::new(0.0, 0.0, 0.023), 0.01)
+            .expect("point now inside shifted +Z face");
+        assert!((now_inside.signed_gap_m - (-0.001)).abs() < 1e-12);
     }
 }

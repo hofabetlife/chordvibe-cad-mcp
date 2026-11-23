@@ -16,7 +16,7 @@ pub mod query_optimizer;
 pub mod gear_strength;
 
 pub use error::CadError;
-pub use material::{Material, MaterialRegistry};
+pub use material::{FailureMode, Material, MaterialRegistry, MaterialSpec};
 pub use tessellation::{TessellationQuality, TessellationSettings};
 pub use topology::{BoundingBox, FaceInfo, FaceKind, GeometryInspection, PlanarFaceInfo, TriangleMesh, Vertex};
 pub use diagnostics::{validate_mesh, MeshValidationReport, TopologyMetrics, GeometryMetrics, AngleStatistics};

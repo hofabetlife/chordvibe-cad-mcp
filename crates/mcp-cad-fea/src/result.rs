@@ -2,11 +2,16 @@
 //! safety factor (FoS), equilibrium diagnostics, and report generation.
 
 use std::collections::HashSet;
-use nalgebra::{Matrix6, Vector3, Vector6};
+use nalgebra::{Matrix3, Matrix6, Vector3, Vector6};
 use serde::{Deserialize, Serialize};
 use crate::boundary::ResolvedBoundary;
-use crate::element::{Tet10Element, Tet4Element, Vector12, Vector30};
-use crate::solver::{compute_nodal_reactions, compute_nodal_reactions_tet10};
+use crate::element::{
+    rotate_voigt_strain, rotate_voigt_stress, Tet10Element, Tet4Element, Vector12, Vector30,
+};
+use crate::solver::{
+    compute_nodal_reactions, compute_nodal_reactions_tet10, compute_nonlinear_nodal_reactions_tet4,
+    compute_nonlinear_nodal_reactions_tet10, NonlinearSolveResult, NonlinearState, StepHistoryPoint,
+};
 use crate::tetra_mesh::TetrahedralMesh;
 
 fn default_confidence() -> String {
@@ -147,6 +152,34 @@ pub struct FeaSimulationSource {
     pub joints: Vec<FeaJointLoadSource>,
 }
 
+/// Summary of nonlinear elastoplastic Co-Rotated FEM convergence, plasticity extent,
+/// and energy balance (`P5-T3`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NonlinearFeaSummary {
+    /// True if Co-Rotated polar decomposition $\mathbf{F} = \mathbf{R}\mathbf{U}$ was enabled.
+    pub corotated: bool,
+    /// Maximum accumulated equivalent plastic strain $\bar{\varepsilon}_{p,\max}$ across all Gauss points.
+    pub max_equivalent_plastic_strain: f64,
+    /// Number of Gauss integration points that experienced plastic yielding ($\bar{\varepsilon}_p > 10^{-12}$).
+    pub yielded_gauss_points: usize,
+    /// Total number of Gauss integration points in the mesh.
+    pub total_gauss_points: usize,
+    /// Volume fraction of the part that has yielded (in `[0.0, 1.0]`).
+    pub plastic_volume_fraction: f64,
+    /// Total recoverable elastic strain energy $\int w_e \, dV$ in Joules.
+    pub elastic_strain_energy_j: f64,
+    /// Total irreversible plastic dissipation energy $\int w_p \, dV$ in Joules.
+    pub plastic_dissipation_energy_j: f64,
+    /// Total number of converged incremental load steps.
+    pub converged_steps: usize,
+    /// Total cumulative Newton-Raphson iterations across all converged steps.
+    pub total_newton_iterations: usize,
+    /// Total number of adaptive step bisections triggered.
+    pub total_bisections: usize,
+    /// Maximum relative out-of-balance force residual ratio observed across converged steps.
+    pub max_residual_ratio: f64,
+}
+
 /// Comprehensive FEA analysis report, serializable to JSON for AI agent introspection
 /// and 3D viewer heatmaps.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -182,6 +215,9 @@ pub struct FeaReport {
     /// Optional simulation-to-FEA load case provenance (populated by `run_fea_from_simulation`, P3-T7)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<FeaSimulationSource>,
+    /// Optional nonlinear elastoplastic Co-Rotated FEM summary (populated by nonlinear solver, P5-T3)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nonlinear: Option<NonlinearFeaSummary>,
     /// Node index exhibiting maximum displacement
     pub critical_node_displacement: usize,
     /// Node index exhibiting maximum von Mises stress
@@ -258,6 +294,19 @@ impl FeaReport {
             s.push_str(&format!(
                 "\n- Convergence: {} (Δstress: {:.2}%, Δdisp: {:.2}%)",
                 acc.verdict, acc.stress_change_pct, acc.displacement_change_pct
+            ));
+        }
+        if let Some(ref nl) = self.nonlinear {
+            s.push_str(&format!(
+                "\n- Nonlinear J2 ({}): max eq. plastic strain = {:.5}, yielded GPs = {}/{} ({:.1}% vol), steps = {}, Newton iters = {}, bisections = {}",
+                if nl.corotated { "Co-Rotated" } else { "Small-Strain" },
+                nl.max_equivalent_plastic_strain,
+                nl.yielded_gauss_points,
+                nl.total_gauss_points,
+                nl.plastic_volume_fraction * 100.0,
+                nl.converged_steps,
+                nl.total_newton_iterations,
+                nl.total_bisections,
             ));
         }
         s
@@ -799,6 +848,7 @@ pub fn compute_fea_results_with_boundary(
         diagnostics,
         accuracy: None,
         source: None,
+        nonlinear: None,
         critical_node_displacement: critical_node_disp,
         critical_node_stress,
         nodal_displacements,
@@ -888,10 +938,19 @@ pub fn compute_fea_results_with_boundary_tet10(
         }
 
         let gp_stresses = elem.compute_gauss_stresses(d_matrix, &u_elem);
-        let vm_elem = gp_stresses
-            .iter()
-            .map(Tet4Element::von_mises_stress)
-            .fold(0.0_f64, f64::max);
+        let vm_elem = if mesh.is_boundary_conforming() {
+            // On curved boundary-conforming TET10 meshes, use the element-centroid averaged Cauchy
+            // stress as the element floor so intra-element single-GP oscillations cannot override
+            // the superconvergent extrapolated patch-smoothed nodal stress at the true CAD boundary.
+            let mean_stress =
+                (gp_stresses[0] + gp_stresses[1] + gp_stresses[2] + gp_stresses[3]) * 0.25;
+            Tet4Element::von_mises_stress(&mean_stress)
+        } else {
+            gp_stresses
+                .iter()
+                .map(Tet4Element::von_mises_stress)
+                .fold(0.0_f64, f64::max)
+        };
         elem_vm_stresses.push(vm_elem);
         if vm_elem > max_elem_stress {
             max_elem_stress = vm_elem;
@@ -1175,6 +1234,7 @@ pub fn compute_fea_results_with_boundary_tet10(
         diagnostics,
         accuracy: None,
         source: None,
+        nonlinear: None,
         critical_node_displacement: critical_node_disp,
         critical_node_stress,
         nodal_displacements,
@@ -1184,3 +1244,714 @@ pub fn compute_fea_results_with_boundary_tet10(
     }
 }
 
+// =========================================================================
+// Nonlinear Elastoplastic Co-Rotated FEM Post-Processing (P5-T3)
+// =========================================================================
+
+/// Complete report for a nonlinear elastoplastic Co-Rotated FEM analysis, wrapping the standard
+/// `FeaReport` together with full converged Gauss-point internal state, nodal plastic strain fields,
+/// and incremental load-displacement history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NonlinearFeaReport {
+    /// Standard FEA report (with `report.nonlinear` populated).
+    pub report: FeaReport,
+    /// Converged nonlinear state (displacements, Gauss-point plastic tensors, rotations, energies).
+    pub state: NonlinearState,
+    /// Volume-weighted smoothed nodal equivalent plastic strain $\bar{\varepsilon}_p$.
+    pub nodal_equivalent_plastic_strain: Vec<f64>,
+    /// Volume-weighted smoothed world-frame nodal plastic strain tensors (Voigt 6-vectors).
+    pub nodal_plastic_strains: Vec<[f64; 6]>,
+    /// Step-by-step incremental history across all load/unload stages.
+    pub history: Vec<StepHistoryPoint>,
+}
+
+impl NonlinearFeaReport {
+    /// Serializes the nonlinear FEA report into pretty JSON.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+}
+
+#[inline]
+fn rows_to_matrix3(rows: [[f64; 3]; 3]) -> Matrix3<f64> {
+    Matrix3::new(
+        rows[0][0], rows[0][1], rows[0][2],
+        rows[1][0], rows[1][1], rows[1][2],
+        rows[2][0], rows[2][1], rows[2][2],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_nonlinear_report(
+    part_id: String,
+    element_order: u8,
+    mesh: &TetrahedralMesh,
+    num_elements: usize,
+    corotated: bool,
+    boundary: Option<&ResolvedBoundary>,
+    reactions: Option<&[[f64; 3]]>,
+    constrained_nodes: &HashSet<usize>,
+    constraint_zone_nodes: &HashSet<usize>,
+    elem_vm_stresses: &[f64],
+    elem_node_indices_for_peak: &[usize],
+    elem_all_outside_flags: &[bool],
+    accum_stresses: &[Vector6<f64>],
+    accum_plastic_strains: &[Vector6<f64>],
+    accum_eq_plastic: &[f64],
+    accum_volume: &[f64],
+    min_quality: f64,
+    mean_quality: f64,
+    com: Vector3<f64>,
+    yielded_gps: usize,
+    total_gps: usize,
+    plastic_volume_fraction: f64,
+    max_gp_eq_plastic: f64,
+    max_elem_stress: f64,
+    solve_result: NonlinearSolveResult,
+    yield_strength_pa: f64,
+    computation_time_ms: f64,
+) -> NonlinearFeaReport {
+    let num_nodes = mesh.node_count();
+    let u_full = &solve_result.state.displacements;
+
+    let mut nodal_displacements = Vec::with_capacity(num_nodes);
+    let mut max_disp = 0.0;
+    let mut critical_node_disp = 0;
+    for i in 0..num_nodes {
+        let ux = u_full[3 * i];
+        let uy = u_full[3 * i + 1];
+        let uz = u_full[3 * i + 2];
+        let mag = (ux * ux + uy * uy + uz * uz).sqrt();
+        if mag > max_disp {
+            max_disp = mag;
+            critical_node_disp = i;
+        }
+        nodal_displacements.push([ux, uy, uz]);
+    }
+
+    let mut nodal_von_mises = Vec::with_capacity(num_nodes);
+    let mut nodal_equivalent_plastic_strain = Vec::with_capacity(num_nodes);
+    let mut nodal_plastic_strains = Vec::with_capacity(num_nodes);
+    let mut max_stress = 0.0;
+    let mut critical_node_stress = 0;
+
+    for i in 0..num_nodes {
+        let vol = accum_volume[i];
+        let (smoothed_stress, smoothed_ep_tensor, smoothed_ep) = if vol > 1e-18 {
+            (
+                accum_stresses[i] / vol,
+                accum_plastic_strains[i] / vol,
+                (accum_eq_plastic[i] / vol).max(0.0),
+            )
+        } else {
+            (Vector6::zeros(), Vector6::zeros(), 0.0)
+        };
+
+        let vm = Tet4Element::von_mises_stress(&smoothed_stress);
+        if vm > max_stress {
+            max_stress = vm;
+            critical_node_stress = i;
+        }
+        nodal_von_mises.push(vm);
+        nodal_equivalent_plastic_strain.push(smoothed_ep);
+        nodal_plastic_strains.push([
+            smoothed_ep_tensor[0],
+            smoothed_ep_tensor[1],
+            smoothed_ep_tensor[2],
+            smoothed_ep_tensor[3],
+            smoothed_ep_tensor[4],
+            smoothed_ep_tensor[5],
+        ]);
+    }
+
+    if max_elem_stress > max_stress && !elem_node_indices_for_peak.is_empty() {
+        max_stress = max_elem_stress;
+        critical_node_stress = *elem_node_indices_for_peak
+            .iter()
+            .max_by(|&&a, &&b| {
+                let va = nodal_von_mises[a];
+                let vb = nodal_von_mises[b];
+                va.partial_cmp(&vb)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| constrained_nodes.contains(&a).cmp(&constrained_nodes.contains(&b)))
+            })
+            .unwrap_or(&elem_node_indices_for_peak[0]);
+    }
+
+    let critical_node_near_constraint = constraint_zone_nodes.contains(&critical_node_stress);
+
+    let mut max_stress_excl = 0.0_f64;
+    let mut found_outside_zone = false;
+    for (nid, &vm) in nodal_von_mises.iter().enumerate() {
+        if !constraint_zone_nodes.contains(&nid) {
+            found_outside_zone = true;
+            if vm > max_stress_excl {
+                max_stress_excl = vm;
+            }
+        }
+    }
+    for (elem_idx, &outside) in elem_all_outside_flags.iter().enumerate() {
+        if outside {
+            found_outside_zone = true;
+            if elem_vm_stresses[elem_idx] > max_stress_excl {
+                max_stress_excl = elem_vm_stresses[elem_idx];
+            }
+        }
+    }
+    if !found_outside_zone {
+        for (nid, &vm) in nodal_von_mises.iter().enumerate() {
+            if !constrained_nodes.contains(&nid) && vm > max_stress_excl {
+                max_stress_excl = vm;
+                found_outside_zone = true;
+            }
+        }
+        if !found_outside_zone {
+            max_stress_excl = max_stress;
+        }
+    }
+
+    let mesh_closed = is_tet_mesh_surface_closed(mesh);
+    let dims = mesh.bounding_box().dimensions();
+    let l_char = dims[0].max(dims[1]).max(dims[2]).max(1e-6);
+
+    let (
+        applied_total,
+        reaction_total,
+        applied_moment_total,
+        reaction_moment_total,
+        equilibrium_relative_error,
+        equilibrium_error_pct,
+        moment_equilibrium_error_pct,
+        constrained_rigid_body_modes_ok,
+    ) = if let (Some(bc), Some(rx_slice)) = (boundary, reactions) {
+        let mut f_sum = Vector3::<f64>::zeros();
+        let mut r_sum = Vector3::<f64>::zeros();
+        let mut m_f_sum = Vector3::<f64>::zeros();
+        let mut m_r_sum = Vector3::<f64>::zeros();
+        let mut f_abs_sum = 0.0_f64;
+        let mut r_abs_sum = 0.0_f64;
+
+        for (n, &rn_arr) in rx_slice.iter().enumerate().take(num_nodes) {
+            let fn_vec = Vector3::from(bc.nodal_forces[n]);
+            let rn_vec = Vector3::from(rn_arr);
+            f_sum += fn_vec;
+            r_sum += rn_vec;
+            f_abs_sum += fn_vec.norm();
+            r_abs_sum += rn_vec.norm();
+
+            // Use deformed nodal coordinates for exact finite-rotation moment equilibrium
+            let p_def = mesh.nodes[n].pos_vec()
+                + Vector3::new(u_full[3 * n], u_full[3 * n + 1], u_full[3 * n + 2]);
+            let arm = p_def - com;
+            m_f_sum += arm.cross(&fn_vec);
+            m_r_sum += arm.cross(&rn_vec);
+        }
+
+        let f_ref = f_sum.norm().max(f_abs_sum).max(r_abs_sum).max(1e-12);
+        let force_imb = (r_sum + f_sum).norm();
+        let eq_rel = force_imb / f_ref;
+        let eq_pct = eq_rel * 100.0;
+
+        let m_ref = m_f_sum
+            .norm()
+            .max(m_r_sum.norm())
+            .max(f_ref * l_char)
+            .max(1e-12);
+        let mom_imb = (m_r_sum + m_f_sum).norm();
+        let mom_pct = (mom_imb / m_ref) * 100.0;
+
+        let rbm_ok = check_rigid_body_modes_constrained(mesh, bc, com, l_char);
+
+        (
+            [f_sum.x, f_sum.y, f_sum.z],
+            [r_sum.x, r_sum.y, r_sum.z],
+            [m_f_sum.x, m_f_sum.y, m_f_sum.z],
+            [m_r_sum.x, m_r_sum.y, m_r_sum.z],
+            eq_rel,
+            eq_pct,
+            mom_pct,
+            rbm_ok,
+        )
+    } else {
+        (
+            [0.0; 3],
+            [0.0; 3],
+            [0.0; 3],
+            [0.0; 3],
+            0.0,
+            0.0,
+            0.0,
+            true,
+        )
+    };
+
+    let mut notes = Vec::new();
+    if yielded_gps > 0 {
+        notes.push(format!(
+            "Info [PLASTIC_YIELDING]: Plastic flow detected in {}/{} Gauss points ({:.2}% volume), max equivalent plastic strain = {:.5}.",
+            yielded_gps,
+            total_gps,
+            plastic_volume_fraction * 100.0,
+            max_gp_eq_plastic
+        ));
+    }
+    if critical_node_near_constraint && max_stress > 1e-6 {
+        notes.push(format!(
+            "Warning [CONSTRAINT_SINGULARITY]: Peak von Mises stress ({:.2} MPa at node #{}) occurs within 1 element of constrained support nodes (max_stress_excluding_constraint_zone = {:.2} MPa).",
+            max_stress / 1.0e6,
+            critical_node_stress,
+            max_stress_excl / 1.0e6
+        ));
+    }
+    if equilibrium_error_pct > 1.0 {
+        notes.push(format!(
+            "Warning [EQUILIBRIUM_RESIDUAL]: Nonlinear static force equilibrium error ({:.4}%) exceeds 1.0% threshold.",
+            equilibrium_error_pct
+        ));
+    }
+    if !constrained_rigid_body_modes_ok {
+        notes.push(
+            "Warning [RIGID_BODY_MODES]: Dirichlet boundary conditions do not kinematically constrain all 6 3D rigid-body modes."
+                .to_string(),
+        );
+    }
+    if min_quality < 0.10 {
+        notes.push(format!(
+            "Warning [ELEMENT_QUALITY]: Minimum tetrahedral element quality ({:.3}) is below 0.10; consider refining mesh density.",
+            min_quality
+        ));
+    }
+
+    let confidence = if !mesh_closed
+        || !constrained_rigid_body_modes_ok
+        || equilibrium_error_pct > 1.0
+        || min_quality < 0.05
+    {
+        "low".to_string()
+    } else if equilibrium_error_pct > 0.05 || min_quality < 0.25 || num_elements < 200 {
+        "medium".to_string()
+    } else {
+        "high".to_string()
+    };
+
+    let diagnostics = FeaDiagnostics {
+        mesh_closed,
+        equilibrium_error_pct,
+        equilibrium_relative_error,
+        moment_equilibrium_error_pct,
+        applied_total,
+        reaction_total,
+        applied_moment_total,
+        reaction_moment_total,
+        constrained_rigid_body_modes_ok,
+        critical_node_near_constraint,
+        max_stress_excluding_constraint_zone: max_stress_excl,
+        max_stress_excluding_constraint_zone_mpa: max_stress_excl / 1.0e6,
+        element_quality: ElementQualityStats {
+            min: min_quality,
+            mean: mean_quality,
+        },
+        notes,
+    };
+
+    let factor_of_safety = if max_stress > 1e-6 {
+        yield_strength_pa / max_stress
+    } else {
+        999.0
+    };
+    let verdict = if factor_of_safety >= 1.0 && yielded_gps == 0 {
+        "PASS".to_string()
+    } else {
+        "FAIL".to_string()
+    };
+
+    let normalized_stresses = if max_stress > 1e-6 {
+        nodal_von_mises
+            .iter()
+            .map(|&s| (s / max_stress).clamp(0.0, 1.0) as f32)
+            .collect()
+    } else {
+        vec![0.0f32; num_nodes]
+    };
+
+    let nonlinear_summary = NonlinearFeaSummary {
+        corotated,
+        max_equivalent_plastic_strain: max_gp_eq_plastic,
+        yielded_gauss_points: yielded_gps,
+        total_gauss_points: total_gps,
+        plastic_volume_fraction,
+        elastic_strain_energy_j: solve_result.state.total_elastic_energy_j,
+        plastic_dissipation_energy_j: solve_result.state.total_plastic_energy_j,
+        converged_steps: solve_result.state.converged_steps,
+        total_newton_iterations: solve_result.state.total_newton_iterations,
+        total_bisections: solve_result.state.total_bisections,
+        max_residual_ratio: solve_result.state.max_residual_ratio,
+    };
+
+    let report = FeaReport {
+        part_id,
+        element_order,
+        node_count: num_nodes,
+        element_count: num_elements,
+        max_displacement_m: max_disp,
+        max_stress_von_mises_pa: max_stress,
+        yield_strength_pa,
+        factor_of_safety,
+        verdict,
+        confidence,
+        diagnostics,
+        accuracy: None,
+        source: None,
+        nonlinear: Some(nonlinear_summary),
+        critical_node_displacement: critical_node_disp,
+        critical_node_stress,
+        nodal_displacements,
+        nodal_von_mises_stresses: nodal_von_mises,
+        normalized_stresses,
+        computation_time_ms,
+    };
+
+    NonlinearFeaReport {
+        report,
+        state: solve_result.state,
+        nodal_equivalent_plastic_strain,
+        nodal_plastic_strains,
+        history: solve_result.history,
+    }
+}
+
+/// Post-processes a converged nonlinear elastoplastic Co-Rotated FEM solution for linear `TET4` elements.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_nonlinear_fea_results_tet4(
+    part_id: impl Into<String>,
+    mesh: &TetrahedralMesh,
+    elements: &[Tet4Element],
+    boundary: Option<&ResolvedBoundary>,
+    solve_result: NonlinearSolveResult,
+    yield_strength_pa: f64,
+    corotated: bool,
+    computation_time_ms: f64,
+) -> NonlinearFeaReport {
+    let num_nodes = mesh.node_count();
+
+    let mut constrained_nodes = HashSet::new();
+    if let Some(bc) = boundary {
+        if !is_zero_reaction_321_datum(bc) {
+            for &dof in bc.fixed_dofs.keys() {
+                constrained_nodes.insert(dof / 3);
+            }
+        }
+    }
+    let mut constraint_zone_nodes = constrained_nodes.clone();
+    if !constrained_nodes.is_empty() {
+        for elem in elements {
+            if elem
+                .node_indices
+                .iter()
+                .any(|n| constrained_nodes.contains(n))
+            {
+                for &n in &elem.node_indices {
+                    constraint_zone_nodes.insert(n);
+                }
+            }
+        }
+    }
+
+    let mut accum_stresses = vec![Vector6::zeros(); num_nodes];
+    let mut accum_plastic_strains = vec![Vector6::zeros(); num_nodes];
+    let mut accum_eq_plastic = vec![0.0; num_nodes];
+    let mut accum_volume = vec![0.0; num_nodes];
+    let mut elem_vm_stresses = Vec::with_capacity(elements.len());
+    let mut elem_all_outside = Vec::with_capacity(elements.len());
+
+    let mut max_elem_stress = 0.0;
+    let mut max_elem_idx = 0;
+    let mut min_quality = if elements.is_empty() { 1.0 } else { f64::INFINITY };
+    let mut sum_quality = 0.0;
+    let mut weighted_com = Vector3::<f64>::zeros();
+    let mut total_vol = 0.0;
+    let mut plastic_vol = 0.0;
+    let mut yielded_gps = 0usize;
+    let mut max_gp_eq_plastic = 0.0_f64;
+
+    for (idx, elem) in elements.iter().enumerate() {
+        let gp = &solve_result.state.gauss_states[idx];
+        let r_mat = rows_to_matrix3(solve_result.state.gauss_rotations[idx]);
+        let world_stress = rotate_voigt_stress(&r_mat, &gp.stress_vec());
+        let world_ep_tensor = rotate_voigt_strain(&r_mat, &gp.plastic_strain_vec());
+        let vm_elem = Tet4Element::von_mises_stress(&world_stress);
+
+        elem_vm_stresses.push(vm_elem);
+        elem_all_outside.push(
+            elem.node_indices
+                .iter()
+                .all(|n| !constraint_zone_nodes.contains(n)),
+        );
+        if vm_elem > max_elem_stress {
+            max_elem_stress = vm_elem;
+            max_elem_idx = idx;
+        }
+
+        let vol = elem.volume;
+        if gp.equivalent_plastic_strain > 1e-12 {
+            yielded_gps += 1;
+            plastic_vol += vol;
+        }
+        if gp.equivalent_plastic_strain > max_gp_eq_plastic {
+            max_gp_eq_plastic = gp.equivalent_plastic_strain;
+        }
+
+        let q = compute_tet_element_quality(mesh, elem);
+        if q < min_quality {
+            min_quality = q;
+        }
+        sum_quality += q;
+
+        let c_elem = (mesh.nodes[elem.node_indices[0]].pos_vec()
+            + mesh.nodes[elem.node_indices[1]].pos_vec()
+            + mesh.nodes[elem.node_indices[2]].pos_vec()
+            + mesh.nodes[elem.node_indices[3]].pos_vec())
+            * 0.25;
+        weighted_com += c_elem * vol;
+        total_vol += vol;
+
+        for &n in &elem.node_indices {
+            accum_stresses[n] += world_stress * vol;
+            accum_plastic_strains[n] += world_ep_tensor * vol;
+            accum_eq_plastic[n] += gp.equivalent_plastic_strain * vol;
+            accum_volume[n] += vol;
+        }
+    }
+
+    let mean_quality = if !elements.is_empty() {
+        sum_quality / (elements.len() as f64)
+    } else {
+        1.0
+    };
+    if !min_quality.is_finite() {
+        min_quality = 1.0;
+    }
+    let com = if total_vol > 1e-18 {
+        weighted_com / total_vol
+    } else {
+        Vector3::from(mesh.bounding_box().center())
+    };
+    let plastic_volume_fraction = if total_vol > 1e-18 {
+        (plastic_vol / total_vol).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    let reactions = boundary
+        .map(|bc| compute_nonlinear_nodal_reactions_tet4(mesh, elements, &solve_result.state, bc));
+    let peak_nodes: Vec<usize> = elements
+        .get(max_elem_idx)
+        .map(|e| e.node_indices.to_vec())
+        .unwrap_or_default();
+
+    finalize_nonlinear_report(
+        part_id.into(),
+        1,
+        mesh,
+        elements.len(),
+        corotated,
+        boundary,
+        reactions.as_deref(),
+        &constrained_nodes,
+        &constraint_zone_nodes,
+        &elem_vm_stresses,
+        &peak_nodes,
+        &elem_all_outside,
+        &accum_stresses,
+        &accum_plastic_strains,
+        &accum_eq_plastic,
+        &accum_volume,
+        min_quality,
+        mean_quality,
+        com,
+        yielded_gps,
+        elements.len(),
+        plastic_volume_fraction,
+        max_gp_eq_plastic,
+        max_elem_stress,
+        solve_result,
+        yield_strength_pa,
+        computation_time_ms,
+    )
+}
+
+/// Post-processes a converged nonlinear elastoplastic Co-Rotated FEM solution for quadratic `TET10` elements.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_nonlinear_fea_results_tet10(
+    part_id: impl Into<String>,
+    mesh: &TetrahedralMesh,
+    elements: &[Tet10Element],
+    boundary: Option<&ResolvedBoundary>,
+    solve_result: NonlinearSolveResult,
+    yield_strength_pa: f64,
+    corotated: bool,
+    computation_time_ms: f64,
+) -> NonlinearFeaReport {
+    let num_nodes = mesh.node_count();
+
+    let mut constrained_nodes = HashSet::new();
+    if let Some(bc) = boundary {
+        if !is_zero_reaction_321_datum(bc) {
+            for &dof in bc.fixed_dofs.keys() {
+                constrained_nodes.insert(dof / 3);
+            }
+        }
+    }
+    let mut constraint_zone_nodes = constrained_nodes.clone();
+    if !constrained_nodes.is_empty() {
+        for elem in elements {
+            if elem
+                .node_indices
+                .iter()
+                .any(|n| constrained_nodes.contains(n))
+            {
+                for &n in &elem.node_indices {
+                    constraint_zone_nodes.insert(n);
+                }
+            }
+        }
+    }
+
+    let mut accum_stresses = vec![Vector6::zeros(); num_nodes];
+    let mut accum_plastic_strains = vec![Vector6::zeros(); num_nodes];
+    let mut accum_eq_plastic = vec![0.0; num_nodes];
+    let mut accum_volume = vec![0.0; num_nodes];
+    let mut elem_vm_stresses = Vec::with_capacity(elements.len());
+    let mut elem_all_outside = Vec::with_capacity(elements.len());
+
+    let mut max_elem_stress = 0.0;
+    let mut max_elem_idx = 0;
+    let mut min_quality = if elements.is_empty() { 1.0 } else { f64::INFINITY };
+    let mut sum_quality = 0.0;
+    let mut weighted_com = Vector3::<f64>::zeros();
+    let mut total_vol = 0.0;
+    let mut plastic_vol = 0.0;
+    let mut yielded_gps = 0usize;
+    let mut max_gp_eq_plastic = 0.0_f64;
+
+    for (idx, elem) in elements.iter().enumerate() {
+        let base_gp = idx * 4;
+        let mut gp_world_stresses = [Vector6::zeros(); 4];
+        let mut gp_world_ep = [Vector6::zeros(); 4];
+        let mut gp_eq_ep = [0.0; 4];
+
+        for q in 0..4 {
+            let gp = &solve_result.state.gauss_states[base_gp + q];
+            let r_mat = rows_to_matrix3(solve_result.state.gauss_rotations[base_gp + q]);
+            gp_world_stresses[q] = rotate_voigt_stress(&r_mat, &gp.stress_vec());
+            gp_world_ep[q] = rotate_voigt_strain(&r_mat, &gp.plastic_strain_vec());
+            gp_eq_ep[q] = gp.equivalent_plastic_strain;
+
+            let w = elem.gauss_weights[q];
+            if gp.equivalent_plastic_strain > 1e-12 {
+                yielded_gps += 1;
+                plastic_vol += w;
+            }
+            if gp.equivalent_plastic_strain > max_gp_eq_plastic {
+                max_gp_eq_plastic = gp.equivalent_plastic_strain;
+            }
+        }
+
+        let vm_elem = gp_world_stresses
+            .iter()
+            .map(Tet4Element::von_mises_stress)
+            .fold(0.0_f64, f64::max);
+        elem_vm_stresses.push(vm_elem);
+        elem_all_outside.push(
+            elem.node_indices
+                .iter()
+                .all(|n| !constraint_zone_nodes.contains(n)),
+        );
+        if vm_elem > max_elem_stress {
+            max_elem_stress = vm_elem;
+            max_elem_idx = idx;
+        }
+
+        let vol = elem.volume;
+        let q_shape = compute_tet10_element_quality(mesh, elem);
+        if q_shape < min_quality {
+            min_quality = q_shape;
+        }
+        sum_quality += q_shape;
+
+        let c_elem = (mesh.nodes[elem.node_indices[0]].pos_vec()
+            + mesh.nodes[elem.node_indices[1]].pos_vec()
+            + mesh.nodes[elem.node_indices[2]].pos_vec()
+            + mesh.nodes[elem.node_indices[3]].pos_vec())
+            * 0.25;
+        weighted_com += c_elem * vol;
+        total_vol += vol;
+
+        let nodal_stresses = Tet10Element::extrapolate_gauss_vectors_to_nodes(&gp_world_stresses);
+        let nodal_ep_tensors = Tet10Element::extrapolate_gauss_vectors_to_nodes(&gp_world_ep);
+        let mean_eq_ep = 0.25 * (gp_eq_ep[0] + gp_eq_ep[1] + gp_eq_ep[2] + gp_eq_ep[3]);
+
+        for (local_i, &global_node) in elem.node_indices.iter().enumerate() {
+            accum_stresses[global_node] += nodal_stresses[local_i] * vol;
+            accum_plastic_strains[global_node] += nodal_ep_tensors[local_i] * vol;
+            accum_eq_plastic[global_node] += mean_eq_ep * vol;
+            accum_volume[global_node] += vol;
+        }
+    }
+
+    let mean_quality = if !elements.is_empty() {
+        sum_quality / (elements.len() as f64)
+    } else {
+        1.0
+    };
+    if !min_quality.is_finite() {
+        min_quality = 1.0;
+    }
+    let com = if total_vol > 1e-18 {
+        weighted_com / total_vol
+    } else {
+        Vector3::from(mesh.bounding_box().center())
+    };
+    let plastic_volume_fraction = if total_vol > 1e-18 {
+        (plastic_vol / total_vol).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    let reactions = boundary
+        .map(|bc| compute_nonlinear_nodal_reactions_tet10(mesh, elements, &solve_result.state, bc));
+    let peak_nodes: Vec<usize> = elements
+        .get(max_elem_idx)
+        .map(|e| e.node_indices.to_vec())
+        .unwrap_or_default();
+
+    finalize_nonlinear_report(
+        part_id.into(),
+        2,
+        mesh,
+        elements.len(),
+        corotated,
+        boundary,
+        reactions.as_deref(),
+        &constrained_nodes,
+        &constraint_zone_nodes,
+        &elem_vm_stresses,
+        &peak_nodes,
+        &elem_all_outside,
+        &accum_stresses,
+        &accum_plastic_strains,
+        &accum_eq_plastic,
+        &accum_volume,
+        min_quality,
+        mean_quality,
+        com,
+        yielded_gps,
+        elements.len() * 4,
+        plastic_volume_fraction,
+        max_gp_eq_plastic,
+        max_elem_stress,
+        solve_result,
+        yield_strength_pa,
+        computation_time_ms,
+    )
+}

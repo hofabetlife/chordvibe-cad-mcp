@@ -7,7 +7,7 @@
 
 use std::time::Instant;
 use mcp_cad_core::material::Material;
-use mcp_cad_core::primitives::{create_box, create_cylinder, cut_hole};
+use mcp_cad_core::primitives::{create_box, create_cylinder, create_spur_gear, cut_hole};
 use mcp_cad_fea::boundary::{
     extract_face_triangles, AabbFace, BoundaryConditions, DirichletConstraint, DofComponent,
 };
@@ -709,5 +709,364 @@ fn test_p3_t4_tet10_cantilever_benchmark() {
     );
     let _ = (cb10_half_err_c, cb10_half_err_m, cb10_half_err_f);
 }
+
+// =========================================================================
+// P5-T2: BOUNDARY-CONFORMING TET10 + LOCAL ADAPTIVE REFINEMENT BENCHMARKS
+// =========================================================================
+
+fn run_plate_with_hole_high_accuracy(density: MeshDensity, density_name: &'static str) -> (BenchmarkRow, mcp_cad_fea::MeshQualityMetrics) {
+    let t0 = Instant::now();
+    let material = benchmark_steel();
+    let length = 0.6f64;
+    let width = 0.2f64;
+    let thickness = 0.01f64;
+    let hole_diam = 0.04f64;
+    let hole_radius = hole_diam / 2.0;
+    let force_x = 100_000.0f64;
+
+    let net_area = (width - hole_diam) * thickness;
+    let sigma_nom = force_x / net_area;
+    let d_over_w: f64 = hole_diam / width;
+    #[allow(clippy::approx_constant)]
+    let kt_peterson =
+        3.00 - 3.14 * d_over_w + 3.667 * d_over_w.powi(2) - 1.527 * d_over_w.powi(3);
+    let expected_stress_peterson = kt_peterson * sigma_nom; // 156.654 MPa
+
+    let plate = create_box(length, width, thickness);
+    let perforated = cut_hole(
+        &plate,
+        [0.0, 0.0, -0.01],
+        [0.0, 0.0, 1.0],
+        hole_radius,
+        0.03,
+        None,
+        None,
+    );
+
+    let tet_mesh = TetrahedralMesh::from_mesh_high_accuracy(&perforated, density)
+        .expect("High-accuracy conforming meshing failed on perforated plate");
+    let metrics = tet_mesh.evaluate_quality(&perforated, None, 0.0);
+
+    let mut bc = BoundaryConditions::new();
+    bc.dirichlet.push(DirichletConstraint::FixedAabbFace {
+        face: AabbFace::MinX,
+        tolerance: 2e-4,
+        components: DofComponent::X,
+    });
+    let min_x = tet_mesh.bounding_box().min[0];
+    let center_nodes = tet_mesh.find_nodes_by_predicate(|p| {
+        (p[0] - min_x).abs() <= 2e-4 && p[1].abs() <= 0.02 && p[2].abs() <= 0.006
+    });
+    assert!(
+        !center_nodes.is_empty(),
+        "Must find center nodes at MinX on conforming perforated plate"
+    );
+    for cn in center_nodes {
+        bc.dirichlet.push(DirichletConstraint::FixedNodes {
+            node_ids: vec![cn],
+            components: DofComponent::YZ,
+        });
+    }
+    bc.add_aabb_face_force(AabbFace::MaxX, 2e-4, [force_x, 0.0, 0.0]);
+
+    let solver_opts = SolverOptions {
+        tolerance: 1e-7,
+        max_iterations: 8000,
+    };
+
+    let report = analyze_mesh("perforated_plate_p5t2", &tet_mesh, &material, &bc, Some(solver_opts))
+        .expect("High-accuracy FEA solve failed on perforated plate");
+
+    let gross_area = width * thickness;
+    let delta_gross_m = (force_x * length) / (205.0e9 * gross_area);
+    let hole_compliance_factor =
+        1.0 + (std::f64::consts::PI / 2.0) * (hole_diam * hole_diam) / (width * length);
+    let expected_disp_m = delta_gross_m * hole_compliance_factor;
+
+    let calc_disp_mm = report.max_displacement_m * 1000.0;
+    let an_disp_mm = expected_disp_m * 1000.0;
+    let disp_err = (report.max_displacement_m - expected_disp_m).abs() / expected_disp_m * 100.0;
+
+    let calc_stress_mpa = report.max_stress_von_mises_pa / 1e6;
+    let an_stress_mpa = expected_stress_peterson / 1e6;
+    let stress_err_peterson = (report.max_stress_von_mises_pa - expected_stress_peterson).abs()
+        / expected_stress_peterson
+        * 100.0;
+    let calc_kt = calc_stress_mpa / (sigma_nom / 1e6);
+
+    let row = BenchmarkRow {
+        name: "3b. Plate w/ Hole Conforming TET10".to_string(),
+        density: density_name,
+        element_count: tet_mesh.element_count(),
+        node_count: tet_mesh.nodes.len(),
+        calculated_disp_mm: calc_disp_mm,
+        analytical_disp_mm: an_disp_mm,
+        disp_rel_error_pct: disp_err,
+        calculated_stress_mpa: calc_stress_mpa,
+        analytical_stress_mpa: an_stress_mpa,
+        stress_rel_error_pct: stress_err_peterson,
+        elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
+        additional_note: format!(
+            "Kt={:.3} (an={:.3}) | Js_min={:.3} | rms={:.4}mm | inv={} | gauss_ok={}",
+            calc_kt,
+            kt_peterson,
+            metrics.min_scaled_jacobian,
+            metrics.rms_boundary_deviation_mm,
+            metrics.inverted_elements,
+            metrics.all_tet10_gauss_jacobians_positive
+        ),
+    };
+    (row, metrics)
+}
+
+fn run_lame_cylinder_high_accuracy(density: MeshDensity, density_name: &'static str) -> (BenchmarkRow, mcp_cad_fea::MeshQualityMetrics) {
+    let t0 = Instant::now();
+    let material = benchmark_steel();
+    let a = 0.02f64;
+    let b = 0.04f64;
+    let length = 0.04f64;
+    let pressure_pa = 10.0e6f64;
+
+    let expected_sigma_theta: f64 = pressure_pa * (b * b + a * a) / (b * b - a * a); // 16.6667 MPa
+    let expected_sigma_r: f64 = -pressure_pa; // -10.0 MPa
+    let expected_vm_stress = (expected_sigma_theta.powi(2)
+        - expected_sigma_theta * expected_sigma_r
+        + expected_sigma_r.powi(2))
+    .sqrt(); // 23.3333 MPa
+    let expected_disp_m =
+        (pressure_pa * a / 205.0e9) * ((b * b + a * a) / (b * b - a * a) + 0.30); // 1.9187e-6 m
+
+    let outer_cyl = create_cylinder(b, length, 48);
+    let hollow_cyl = cut_hole(
+        &outer_cyl,
+        [0.0, 0.0, -length * 0.6],
+        [0.0, 0.0, 1.0],
+        a,
+        length * 1.2,
+        None,
+        None,
+    );
+
+    let hole_wall = hollow_cyl
+        .faces
+        .iter()
+        .find(|f| f.role == "hole_wall")
+        .expect("Hollow cylinder must contain hole_wall face");
+    let hole_tris = extract_face_triangles(&hollow_cyl, &[hole_wall.id]);
+
+    let tet_mesh = TetrahedralMesh::from_mesh_high_accuracy(&hollow_cyl, density)
+        .expect("High-accuracy conforming meshing failed on Lamé cylinder");
+    let metrics = tet_mesh.evaluate_quality(&hollow_cyl, None, 0.0);
+
+    let mut bc = BoundaryConditions::new();
+    // 1. Axial support Uz = 0 on bottom cap (z = min_z) -> removes Uz, Rx, Ry
+    bc.dirichlet.push(DirichletConstraint::FixedAabbFace {
+        face: AabbFace::MinZ,
+        tolerance: 2e-4,
+        components: DofComponent::Z,
+    });
+
+    // 2. Minimal kinematic in-plane support on outer diameter to remove Ux, Uy, Rz without
+    //    constraining axisymmetric radial expansion:
+    //    - Uy = 0 at closest outer node to (+b, 0, 0) and (-b, 0, 0)
+    //    - Ux = 0 at closest outer node to (0, +b, 0)
+    let find_closest = |target: [f64; 3]| -> usize {
+        tet_mesh
+            .nodes
+            .iter()
+            .enumerate()
+            .min_by(|(_, na), (_, nb)| {
+                let da = (na.position[0] - target[0]).powi(2)
+                    + (na.position[1] - target[1]).powi(2)
+                    + (na.position[2] - target[2]).powi(2);
+                let db = (nb.position[0] - target[0]).powi(2)
+                    + (nb.position[1] - target[1]).powi(2)
+                    + (nb.position[2] - target[2]).powi(2);
+                da.total_cmp(&db)
+            })
+            .map(|(idx, _)| idx)
+            .unwrap()
+    };
+    let n_pos_x = find_closest([b, 0.0, 0.0]);
+    let n_neg_x = find_closest([-b, 0.0, 0.0]);
+    let n_pos_y = find_closest([0.0, b, 0.0]);
+    bc.dirichlet.push(DirichletConstraint::FixedNodes {
+        node_ids: vec![n_pos_x, n_neg_x],
+        components: DofComponent::Y,
+    });
+    bc.dirichlet.push(DirichletConstraint::FixedNodes {
+        node_ids: vec![n_pos_y],
+        components: DofComponent::X,
+    });
+
+    bc.add_surface_triangles_pressure(Some(hole_wall.name.clone()), hole_tris, 0.0, pressure_pa);
+
+    let solver_opts = SolverOptions {
+        tolerance: 1e-7,
+        max_iterations: 8000,
+    };
+
+    let report = analyze_mesh("lame_cylinder_p5t2", &tet_mesh, &material, &bc, Some(solver_opts))
+        .expect("High-accuracy FEA solve failed on Lamé cylinder");
+
+    let calc_disp_mm = report.max_displacement_m * 1000.0;
+    let an_disp_mm = expected_disp_m * 1000.0;
+    let disp_err = (report.max_displacement_m - expected_disp_m).abs() / expected_disp_m * 100.0;
+
+    let calc_stress_mpa = report.max_stress_von_mises_pa / 1e6;
+    let an_stress_mpa = expected_vm_stress / 1e6;
+    let stress_err =
+        (report.max_stress_von_mises_pa - expected_vm_stress).abs() / expected_vm_stress * 100.0;
+
+    let inner_nodes = tet_mesh.find_nodes_by_predicate(|p| {
+        let r = (p[0] * p[0] + p[1] * p[1]).sqrt();
+        (r - a).abs() <= 0.002
+    });
+    let mean_inner_stress_mpa = if !inner_nodes.is_empty() {
+        inner_nodes
+            .iter()
+            .map(|&nid| report.nodal_von_mises_stresses[nid])
+            .sum::<f64>()
+            / (inner_nodes.len() as f64)
+            / 1e6
+    } else {
+        0.0
+    };
+
+    let row = BenchmarkRow {
+        name: "4b. Lamé Cylinder Conforming TET10".to_string(),
+        density: density_name,
+        element_count: tet_mesh.element_count(),
+        node_count: tet_mesh.nodes.len(),
+        calculated_disp_mm: calc_disp_mm,
+        analytical_disp_mm: an_disp_mm,
+        disp_rel_error_pct: disp_err,
+        calculated_stress_mpa: calc_stress_mpa,
+        analytical_stress_mpa: an_stress_mpa,
+        stress_rel_error_pct: stress_err,
+        elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
+        additional_note: format!(
+            "mean_bore_vM={:.2} MPa | Js_min={:.3} | rms={:.4}mm | inv={} | gauss_ok={}",
+            mean_inner_stress_mpa,
+            metrics.min_scaled_jacobian,
+            metrics.rms_boundary_deviation_mm,
+            metrics.inverted_elements,
+            metrics.all_tet10_gauss_jacobians_positive
+        ),
+    };
+    (row, metrics)
+}
+
+#[test]
+fn test_p5_t2_boundary_conforming_tet10_benchmarks() {
+    println!("\n====================================================================================================");
+    println!("MCP-CAD-FEA P5-T2 BOUNDARY-CONFORMING TET10 + LOCAL REFINEMENT BENCHMARKS");
+    println!("====================================================================================================");
+
+    // 1. Kirsch/Peterson Perforated Plate (600x200x10 mm, d=40 mm, Fx=100 kN, Peterson = 156.654 MPa)
+    let (pl_med, pl_metrics) = run_plate_with_hole_high_accuracy(MeshDensity::Medium, "Medium");
+    pl_med.print_summary();
+
+    // 2. Lamé Thick-Walled Cylinder (a=20, b=40, L=40 mm, p=10 MPa, analytical vM = 23.3333 MPa)
+    let (lm_med, lm_metrics) = run_lame_cylinder_high_accuracy(MeshDensity::Medium, "Medium");
+    lm_med.print_summary();
+
+    // 3. Spur Gear (m=3 mm, z=20, alpha=20 deg, b=15 mm, bore r=7.5 mm):
+    //    Compare unsnapped voxel baseline vs boundary-conforming TET10 mesh
+    let gear = create_spur_gear(0.003, 20, 20.0, 0.015, Some(0.0075), None, None, None, None);
+    let t_gear_voxel = Instant::now();
+    let gear_voxel = TetrahedralMesh::from_mesh(&gear, MeshDensity::Coarse)
+        .expect("Voxel baseline meshing failed on spur gear");
+    let gear_voxel_metrics = gear_voxel.evaluate_quality(&gear, None, 0.0);
+    let gear_voxel_ms = t_gear_voxel.elapsed().as_secs_f64() * 1000.0;
+
+    let t_gear_conf = Instant::now();
+    let gear_conf = TetrahedralMesh::from_mesh_high_accuracy(&gear, MeshDensity::Coarse)
+        .expect("High-accuracy conforming TET10 meshing failed on spur gear");
+    let gear_conf_metrics = gear_conf.evaluate_quality(&gear, None, 0.0);
+    let gear_conf_ms = t_gear_conf.elapsed().as_secs_f64() * 1000.0;
+
+    let rms_reduction_pct = if gear_voxel_metrics.rms_boundary_deviation_mm > 1e-12 {
+        (1.0 - gear_conf_metrics.rms_boundary_deviation_mm / gear_voxel_metrics.rms_boundary_deviation_mm)
+            * 100.0
+    } else {
+        0.0
+    };
+    println!(
+        "[5. Spur Gear m=3 z=20 b=15mm] Voxel: elems={}, nodes={}, rms={:.4} mm ({:.1} ms) | Conforming TET10: elems={}, nodes={}, rms={:.4} mm, Js_min={:.3}, inv={}, gauss_ok={} ({:.1} ms) | RMS reduction: {:.1}%",
+        gear_voxel.element_count(),
+        gear_voxel.nodes.len(),
+        gear_voxel_metrics.rms_boundary_deviation_mm,
+        gear_voxel_ms,
+        gear_conf.element_count(),
+        gear_conf.nodes.len(),
+        gear_conf_metrics.rms_boundary_deviation_mm,
+        gear_conf_metrics.min_scaled_jacobian,
+        gear_conf_metrics.inverted_elements,
+        gear_conf_metrics.all_tet10_gauss_jacobians_positive,
+        gear_conf_ms,
+        rms_reduction_pct,
+    );
+    println!("====================================================================================================\n");
+
+    // Acceptance Criterion 1: Perforated plate (Kirsch/Peterson) peak stress error <= 5.0%
+    assert_eq!(pl_metrics.inverted_elements, 0, "Perforated plate must have 0 inverted elements");
+    assert!(
+        pl_metrics.min_scaled_jacobian >= 0.06,
+        "Perforated plate min_scaled_jacobian must be >= 0.06, got {:.4}",
+        pl_metrics.min_scaled_jacobian
+    );
+    assert!(
+        pl_metrics.all_tet10_gauss_jacobians_positive,
+        "Perforated plate TET10 Gauss Jacobians must all be strictly positive"
+    );
+    assert!(
+        pl_med.stress_rel_error_pct <= 5.0,
+        "P5-T2 FAIL: Perforated plate stress error {:.2}% > 5.0% (calc={:.2} MPa vs Peterson={:.2} MPa)",
+        pl_med.stress_rel_error_pct,
+        pl_med.calculated_stress_mpa,
+        pl_med.analytical_stress_mpa
+    );
+
+    // Acceptance Criterion 2: Lamé thick-walled cylinder peak stress error <= 8.0%
+    assert_eq!(lm_metrics.inverted_elements, 0, "Lamé cylinder must have 0 inverted elements");
+    assert!(
+        lm_metrics.min_scaled_jacobian >= 0.06,
+        "Lamé cylinder min_scaled_jacobian must be >= 0.06, got {:.4}",
+        lm_metrics.min_scaled_jacobian
+    );
+    assert!(
+        lm_metrics.all_tet10_gauss_jacobians_positive,
+        "Lamé cylinder TET10 Gauss Jacobians must all be strictly positive"
+    );
+    assert!(
+        lm_med.stress_rel_error_pct <= 8.0,
+        "P5-T2 FAIL: Lamé cylinder stress error {:.2}% > 8.0% (calc={:.2} MPa vs analytical={:.2} MPa)",
+        lm_med.stress_rel_error_pct,
+        lm_med.calculated_stress_mpa,
+        lm_med.analytical_stress_mpa
+    );
+
+    // Acceptance Criterion 3: Spur gear boundary RMS reduction >= 70% + strictly positive TET10 Gauss Jacobians
+    assert_eq!(gear_conf_metrics.inverted_elements, 0, "Spur gear must have 0 inverted elements");
+    assert!(
+        gear_conf_metrics.min_scaled_jacobian >= 0.06,
+        "Spur gear min_scaled_jacobian must be >= 0.06, got {:.4}",
+        gear_conf_metrics.min_scaled_jacobian
+    );
+    assert!(
+        gear_conf_metrics.all_tet10_gauss_jacobians_positive,
+        "Spur gear TET10 Gauss Jacobians must all be strictly positive"
+    );
+    assert!(
+        rms_reduction_pct >= 70.0,
+        "P5-T2 FAIL: Spur gear boundary RMS reduction {:.1}% < 70.0% (voxel={:.4}mm -> conforming={:.4}mm)",
+        rms_reduction_pct,
+        gear_voxel_metrics.rms_boundary_deviation_mm,
+        gear_conf_metrics.rms_boundary_deviation_mm
+    );
+}
+
+
 
 

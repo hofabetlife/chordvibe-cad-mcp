@@ -168,6 +168,29 @@ fn parse_mesh_density_level(val: &Value, k_to_m: f64) -> Result<MeshDensity, Ser
     }
 }
 
+/// Helper to parse optional `accuracy_mode` (`"fast"`, `"standard"`, or `"high"`).
+fn parse_accuracy_mode(val: Option<&Value>) -> Result<Option<mcp_cad_fea::AccuracyMode>, ServerError> {
+    let Some(v) = val else {
+        return Ok(None);
+    };
+    if v.is_null() {
+        return Ok(None);
+    }
+    let s = v.as_str().ok_or_else(|| {
+        ServerError::InvalidArgument(
+            "Invalid 'accuracy_mode': expected 'fast', 'standard', or 'high'".to_string(),
+        )
+    })?;
+    match s.trim().to_ascii_lowercase().as_str() {
+        "fast" => Ok(Some(mcp_cad_fea::AccuracyMode::Fast)),
+        "standard" => Ok(Some(mcp_cad_fea::AccuracyMode::Standard)),
+        "high" => Ok(Some(mcp_cad_fea::AccuracyMode::High)),
+        other => Err(ServerError::InvalidArgument(format!(
+            "Invalid 'accuracy_mode' value '{other}': expected 'fast', 'standard', or 'high'"
+        ))),
+    }
+}
+
 /// Binds any positional point loads `(target_pos_m, force_n)` to the closest node in `tet_mesh`.
 fn bind_positional_loads_to_mesh(
     base_boundary: &BoundaryConditions,
@@ -268,8 +291,13 @@ pub fn run_fea_analysis(args: &Value, state: &mut EngineState) -> Result<Value, 
         None
     };
 
+    let accuracy_mode_opt = parse_accuracy_mode(args.get("accuracy_mode"))?;
+
     let element_order = match args.get("element_order") {
-        None | Some(Value::Null) => mcp_cad_fea::ElementOrder::Linear,
+        None | Some(Value::Null) => match accuracy_mode_opt {
+            Some(mcp_cad_fea::AccuracyMode::High) => mcp_cad_fea::ElementOrder::Quadratic,
+            _ => mcp_cad_fea::ElementOrder::Linear,
+        },
         Some(v) => {
             if let Some(n) = v.as_u64() {
                 match n {
@@ -312,21 +340,11 @@ pub fn run_fea_analysis(args: &Value, state: &mut EngineState) -> Result<Value, 
     let density = match args.get("mesh_density").and_then(|v| v.as_str()).map(|s| s.to_lowercase()).as_deref() {
         Some("fine") => MeshDensity::Fine,
         Some("medium") => MeshDensity::Medium,
-        _ => MeshDensity::Coarse,
-    };
-
-    // 1. Validate surface mesh topology / generate initial tetrahedral mesh
-    let base_tet_mesh = if convergence_study {
-        TetrahedralMesh::from_mesh(&part.mesh, study_levels[0])?
-    } else {
-        TetrahedralMesh::from_mesh(&part.mesh, density)?
-    };
-    if base_tet_mesh.is_empty() {
-        return Err(ServerError::Internal("Tetrahedral meshing produced an empty mesh".to_string()));
-    }
-    let initial_tet_mesh = match element_order {
-        mcp_cad_fea::ElementOrder::Linear => base_tet_mesh,
-        mcp_cad_fea::ElementOrder::Quadratic => base_tet_mesh.to_tet10(),
+        Some("coarse") => MeshDensity::Coarse,
+        _ => match accuracy_mode_opt {
+            Some(mcp_cad_fea::AccuracyMode::High) => MeshDensity::Medium,
+            _ => MeshDensity::Coarse,
+        },
     };
 
     // 2. Setup boundary conditions (mesh-independent base constraints + optional positional point loads)
@@ -730,6 +748,16 @@ pub fn run_fea_analysis(args: &Value, state: &mut EngineState) -> Result<Value, 
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    let effective_accuracy = accuracy_mode_opt.unwrap_or(mcp_cad_fea::AccuracyMode::Fast);
+    let aabb_diag = {
+        let d = part.mesh.bounding_box().dimensions();
+        (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-3)
+    };
+    let load_refinement_zones: Vec<mcp_cad_fea::RefinementZone> = positional_loads
+        .iter()
+        .map(|&(pos, _)| mcp_cad_fea::RefinementZone::new(pos, (aabb_diag * 0.08).max(5e-3), 1))
+        .collect();
+
     let (report, tet_mesh, study_report_opt) = if convergence_study {
         let surface_mesh = if part.mesh.indices.is_empty() && !part.dag.nodes.is_empty() {
             let settings = mcp_cad_core::tessellation::TessellationSettings::default();
@@ -739,22 +767,69 @@ pub fn run_fea_analysis(args: &Value, state: &mut EngineState) -> Result<Value, 
         } else {
             part.mesh.clone()
         };
-        let (rep, mesh, study_rep) = mcp_cad_fea::run_fea_with_convergence_with_order(
-            part_id,
-            &surface_mesh,
-            &part.material,
-            &study_levels,
-            element_order,
-            max_seconds,
-            None,
-            |m| Ok(bind_positional_loads_to_mesh(&base_boundary, &positional_loads, m)),
-        )?;
+        let (rep, mesh, study_rep) = if accuracy_mode_opt.is_some()
+            && effective_accuracy != mcp_cad_fea::AccuracyMode::Fast
+        {
+            mcp_cad_fea::run_fea_with_convergence_with_accuracy(
+                part_id,
+                &surface_mesh,
+                &part.material,
+                &study_levels,
+                effective_accuracy,
+                element_order,
+                &load_refinement_zones,
+                max_seconds,
+                None,
+                |m| Ok(bind_positional_loads_to_mesh(&base_boundary, &positional_loads, m)),
+            )?
+        } else {
+            mcp_cad_fea::run_fea_with_convergence_with_order(
+                part_id,
+                &surface_mesh,
+                &part.material,
+                &study_levels,
+                element_order,
+                max_seconds,
+                None,
+                |m| Ok(bind_positional_loads_to_mesh(&base_boundary, &positional_loads, m)),
+            )?
+        };
         (rep, mesh, Some(study_rep))
     } else {
+        let initial_tet_mesh = match accuracy_mode_opt {
+            Some(mcp_cad_fea::AccuracyMode::Standard) | Some(mcp_cad_fea::AccuracyMode::High) => {
+                let mut opts = mcp_cad_fea::ConformingMeshOptions::for_accuracy_mode(
+                    effective_accuracy,
+                    density,
+                );
+                opts.element_order = element_order;
+                opts.refinement.zones.extend(load_refinement_zones.clone());
+                TetrahedralMesh::from_mesh_conforming(&part.mesh, &opts)?
+            }
+            None | Some(mcp_cad_fea::AccuracyMode::Fast) => {
+                let base_tet_mesh = TetrahedralMesh::from_mesh(&part.mesh, density)?;
+                if base_tet_mesh.is_empty() {
+                    return Err(ServerError::Internal(
+                        "Tetrahedral meshing produced an empty mesh".to_string(),
+                    ));
+                }
+                match element_order {
+                    mcp_cad_fea::ElementOrder::Linear => base_tet_mesh,
+                    mcp_cad_fea::ElementOrder::Quadratic => base_tet_mesh.to_tet10(),
+                }
+            }
+        };
+        if initial_tet_mesh.is_empty() {
+            return Err(ServerError::Internal(
+                "Tetrahedral meshing produced an empty mesh".to_string(),
+            ));
+        }
         let boundary = bind_positional_loads_to_mesh(&base_boundary, &positional_loads, &initial_tet_mesh);
         let rep = mcp_cad_fea::analyze_mesh(part_id, &initial_tet_mesh, &part.material, &boundary, None)?;
         (rep, initial_tet_mesh, None)
     };
+
+    let is_boundary_conforming = tet_mesh.is_boundary_conforming();
 
     // Send FEA heatmap mesh and normalized stresses to interactive GUI
     let surface_tris = tet_mesh.extract_surface_triangles();
@@ -790,6 +865,8 @@ pub fn run_fea_analysis(args: &Value, state: &mut EngineState) -> Result<Value, 
         "diagnostics": report.diagnostics,
         "warnings": report.diagnostics.notes,
         "element_order": report.element_order,
+        "accuracy_mode": effective_accuracy,
+        "boundary_conforming": is_boundary_conforming,
         "node_count": report.node_count,
         "element_count": report.element_count,
         "computation_time_ms": report.computation_time_ms,
@@ -1006,6 +1083,8 @@ pub fn run_fea_from_simulation(args: &Value, state: &mut EngineState) -> Result<
         None
     };
 
+    let accuracy_mode_opt = parse_accuracy_mode(args.get("accuracy_mode"))?;
+
     // Default to Quadratic TET10 (element_order = 2) for simulation-driven structural bending/inertial relief
     // unless explicitly overridden by the caller (e.g. element_order = 1 for fast linear TET4).
     let element_order = match args.get("element_order") {
@@ -1100,6 +1179,19 @@ pub fn run_fea_from_simulation(args: &Value, state: &mut EngineState) -> Result<
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    let effective_accuracy = accuracy_mode_opt.unwrap_or(mcp_cad_fea::AccuracyMode::Fast);
+    let sim_aabb_diag = {
+        let d = part.mesh.bounding_box().dimensions();
+        (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-3)
+    };
+    let joint_refinement_zones: Vec<mcp_cad_fea::RefinementZone> = joint_specs
+        .iter()
+        .map(|j| {
+            let r = load_radius_m.unwrap_or_else(|| (sim_aabb_diag * 0.08).max(5e-3));
+            mcp_cad_fea::RefinementZone::new(j.anchor_local_m, r, 1)
+        })
+        .collect();
+
     let (mut report, tet_mesh, study_report_opt, sim_source) = if convergence_study {
         let surface_mesh = if part.mesh.indices.is_empty() && !part.dag.nodes.is_empty() {
             let settings = mcp_cad_core::tessellation::TessellationSettings::default();
@@ -1111,44 +1203,92 @@ pub fn run_fea_from_simulation(args: &Value, state: &mut EngineState) -> Result<
         };
         let last_source_cell: std::cell::RefCell<Option<mcp_cad_fea::FeaSimulationSource>> =
             std::cell::RefCell::new(None);
-        let (rep, mesh, study_rep) = mcp_cad_fea::run_fea_with_convergence_with_order(
-            part_id,
-            &surface_mesh,
-            &part.material,
-            &study_levels,
-            element_order,
-            max_seconds,
-            None,
-            |m| {
-                let (bc, src) = mcp_cad_fea::build_simulation_boundary_conditions(
-                    m,
-                    &joint_specs,
-                    &inertia_spec,
-                    load_radius_m,
-                    load_case.time_s,
-                    &load_case.select,
-                    load_case.step_index,
-                    k_from_m,
-                )?;
-                *last_source_cell.borrow_mut() = Some(src);
-                Ok(bc)
-            },
-        )?;
+        let (rep, mesh, study_rep) = if accuracy_mode_opt.is_some()
+            && effective_accuracy != mcp_cad_fea::AccuracyMode::Fast
+        {
+            mcp_cad_fea::run_fea_with_convergence_with_accuracy(
+                part_id,
+                &surface_mesh,
+                &part.material,
+                &study_levels,
+                effective_accuracy,
+                element_order,
+                &joint_refinement_zones,
+                max_seconds,
+                None,
+                |m| {
+                    let (bc, src) = mcp_cad_fea::build_simulation_boundary_conditions(
+                        m,
+                        &joint_specs,
+                        &inertia_spec,
+                        load_radius_m,
+                        load_case.time_s,
+                        &load_case.select,
+                        load_case.step_index,
+                        k_from_m,
+                    )?;
+                    *last_source_cell.borrow_mut() = Some(src);
+                    Ok(bc)
+                },
+            )?
+        } else {
+            mcp_cad_fea::run_fea_with_convergence_with_order(
+                part_id,
+                &surface_mesh,
+                &part.material,
+                &study_levels,
+                element_order,
+                max_seconds,
+                None,
+                |m| {
+                    let (bc, src) = mcp_cad_fea::build_simulation_boundary_conditions(
+                        m,
+                        &joint_specs,
+                        &inertia_spec,
+                        load_radius_m,
+                        load_case.time_s,
+                        &load_case.select,
+                        load_case.step_index,
+                        k_from_m,
+                    )?;
+                    *last_source_cell.borrow_mut() = Some(src);
+                    Ok(bc)
+                },
+            )?
+        };
         let src = last_source_cell.into_inner().ok_or_else(|| {
             ServerError::Internal("Failed to synthesize simulation boundary conditions".to_string())
         })?;
         (rep, mesh, Some(study_rep), src)
     } else {
-        let base_tet_mesh = TetrahedralMesh::from_mesh(&part.mesh, density)?;
-        if base_tet_mesh.is_empty() {
+        let tet_mesh = match accuracy_mode_opt {
+            Some(mcp_cad_fea::AccuracyMode::Standard) | Some(mcp_cad_fea::AccuracyMode::High) => {
+                let mut opts = mcp_cad_fea::ConformingMeshOptions::for_accuracy_mode(
+                    effective_accuracy,
+                    density,
+                );
+                opts.element_order = element_order;
+                opts.refinement.zones.extend(joint_refinement_zones.clone());
+                TetrahedralMesh::from_mesh_conforming(&part.mesh, &opts)?
+            }
+            None | Some(mcp_cad_fea::AccuracyMode::Fast) => {
+                let base_tet_mesh = TetrahedralMesh::from_mesh(&part.mesh, density)?;
+                if base_tet_mesh.is_empty() {
+                    return Err(ServerError::Internal(
+                        "Tetrahedral meshing produced an empty mesh".to_string(),
+                    ));
+                }
+                match element_order {
+                    mcp_cad_fea::ElementOrder::Linear => base_tet_mesh,
+                    mcp_cad_fea::ElementOrder::Quadratic => base_tet_mesh.to_tet10(),
+                }
+            }
+        };
+        if tet_mesh.is_empty() {
             return Err(ServerError::Internal(
                 "Tetrahedral meshing produced an empty mesh".to_string(),
             ));
         }
-        let tet_mesh = match element_order {
-            mcp_cad_fea::ElementOrder::Linear => base_tet_mesh,
-            mcp_cad_fea::ElementOrder::Quadratic => base_tet_mesh.to_tet10(),
-        };
         let (bc, src) = mcp_cad_fea::build_simulation_boundary_conditions(
             &tet_mesh,
             &joint_specs,
@@ -1162,6 +1302,8 @@ pub fn run_fea_from_simulation(args: &Value, state: &mut EngineState) -> Result<
         let rep = mcp_cad_fea::analyze_mesh(part_id, &tet_mesh, &part.material, &bc, None)?;
         (rep, tet_mesh, None, src)
     };
+
+    let is_boundary_conforming = tet_mesh.is_boundary_conforming();
 
     report = report.with_source(sim_source.clone());
 
@@ -1215,6 +1357,8 @@ pub fn run_fea_from_simulation(args: &Value, state: &mut EngineState) -> Result<
         "diagnostics": report.diagnostics,
         "warnings": report.diagnostics.notes,
         "element_order": report.element_order,
+        "accuracy_mode": effective_accuracy,
+        "boundary_conforming": is_boundary_conforming,
         "node_count": report.node_count,
         "element_count": report.element_count,
         "computation_time_ms": report.computation_time_ms,
@@ -1974,5 +2118,26 @@ mod tests {
             "Rotating rod peak centrifugal stress ({vm_mpa:.5} MPa) must match analytical ({sigma_centrifugal_mpa:.5} MPa), error = {rel_err_pct:.2}%"
         );
     }
+
+    #[test]
+    fn test_parse_accuracy_mode_variants() {
+        assert_eq!(parse_accuracy_mode(None).unwrap(), None);
+        assert_eq!(parse_accuracy_mode(Some(&Value::Null)).unwrap(), None);
+        assert_eq!(
+            parse_accuracy_mode(Some(&json!("fast"))).unwrap(),
+            Some(mcp_cad_fea::AccuracyMode::Fast)
+        );
+        assert_eq!(
+            parse_accuracy_mode(Some(&json!("Standard"))).unwrap(),
+            Some(mcp_cad_fea::AccuracyMode::Standard)
+        );
+        assert_eq!(
+            parse_accuracy_mode(Some(&json!("HIGH"))).unwrap(),
+            Some(mcp_cad_fea::AccuracyMode::High)
+        );
+        assert!(parse_accuracy_mode(Some(&json!("ultra"))).is_err());
+        assert!(parse_accuracy_mode(Some(&json!(2))).is_err());
+    }
 }
+
 
