@@ -12,6 +12,10 @@ import type {
   MaterialSpec,
 } from '../types/cad';
 import { getMaterialById } from './materials';
+import {
+  bakePressDestructionCache,
+  detectPressAssembly,
+} from './press_simulation';
 
 type Vec2 = [number, number];
 type Vec3 = [number, number, number];
@@ -1117,6 +1121,18 @@ export function bakeDestructionCacheSync(
   materials: MaterialSpec[],
   config: DestructionSimConfig
 ): DestructionCache {
+  // Detect prismatic press / spring-compression assemblies (e.g., base_plate + spring_1 + press_plate)
+  // and run dedicated axial elastoplastic compression + coil-bind + overload fracture physics.
+  const detectedPress = detectPressAssembly(
+    parts,
+    joints,
+    materials,
+    config.impactTorqueNm > 0 ? Math.max(500, config.impactTorqueNm * 11) : undefined
+  );
+  if (detectedPress) {
+    return bakePressDestructionCache(parts, joints, materials, config, detectedPress);
+  }
+
   const startMs =
     typeof performance !== 'undefined' ? performance.now() : Date.now();
   const safeFps = Math.max(24, Math.min(120, Math.round(config.fps || 60)));

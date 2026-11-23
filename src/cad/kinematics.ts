@@ -67,11 +67,37 @@ export function stepKinematicsAssembly(
         }
       }
     } else if (joint.type === 'prismatic') {
-      const vel =
-        Math.abs(joint.motorSpeedRpm) <= 25
-          ? joint.motorSpeedRpm
-          : joint.motorSpeedRpm * 0.002;
-      const dPos = vel * dtSeconds;
+      const hasExplicitLinear =
+        typeof joint.motorLinearSpeedMs === 'number' &&
+        Number.isFinite(joint.motorLinearSpeedMs) &&
+        Math.abs(joint.motorLinearSpeedMs) > 1e-6;
+      const defaultDir =
+        joint.limits && Math.abs(joint.limits[0]) > Math.abs(joint.limits[1])
+          ? -1
+          : joint.limits && joint.limits[1] < 0
+            ? -1
+            : 1;
+      const vel = hasExplicitLinear
+        ? joint.motorLinearSpeedMs!
+        : Math.abs(joint.motorSpeedRpm) > 1e-6
+          ? Math.abs(joint.motorSpeedRpm) <= 25
+            ? joint.motorSpeedRpm
+            : joint.motorSpeedRpm * 0.002
+          : defaultDir * 0.025;
+      let dPos = vel * dtSeconds;
+      if (joint.limits) {
+        const rawMin = Math.min(joint.limits[0], joint.limits[1]);
+        const rawMax = Math.max(joint.limits[0], joint.limits[1]);
+        const scale = Math.max(Math.abs(rawMin), Math.abs(rawMax)) > 1.0 ? 1e-3 : 1.0;
+        const minL = rawMin * scale;
+        const maxL = rawMax * scale;
+        const nextPos = joint.currentAngleRad + dPos;
+        if (nextPos < minL) {
+          dPos = minL - joint.currentAngleRad;
+        } else if (nextPos > maxL) {
+          dPos = maxL - joint.currentAngleRad;
+        }
+      }
       joint.currentAngleRad += dPos;
       const targetPart =
         partMap.get(joint.partB) ||

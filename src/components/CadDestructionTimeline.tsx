@@ -67,6 +67,8 @@ export const CadDestructionTimeline: React.FC<CadDestructionTimelineProps> = ({
   loopEnabled,
   showStressGlow,
   showSparks,
+  fieldMode = 'shaded',
+  onChangeFieldMode,
   onSeekFrame,
   onTogglePlay,
   onStepFrame,
@@ -284,29 +286,62 @@ export const CadDestructionTimeline: React.FC<CadDestructionTimelineProps> = ({
                   </span>
                 </div>
 
-                <div className="flex items-center gap-1 bg-[#0b0e14] p-0.5 rounded border border-[#232a3a]">
-                  <button
-                    type="button"
-                    onClick={() => setTrackOverlayMode('energy')}
-                    className={`px-1.5 py-0.5 rounded text-[9px] cursor-pointer ${
-                      trackOverlayMode === 'energy'
-                        ? 'bg-[#38bdf8] text-[#0c0e12] font-semibold'
-                        : 'text-[#94a3b8] hover:text-[#f1f5f9]'
-                    }`}
-                  >
-                    Энергии
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setTrackOverlayMode('stress')}
-                    className={`px-1.5 py-0.5 rounded text-[9px] cursor-pointer ${
-                      trackOverlayMode === 'stress'
-                        ? 'bg-[#f97316] text-[#0c0e12] font-semibold'
-                        : 'text-[#94a3b8] hover:text-[#f1f5f9]'
-                    }`}
-                  >
-                    σ_vM
-                  </button>
+                <div className="flex items-center gap-1.5">
+                  {onChangeFieldMode && (
+                    <div
+                      role="group"
+                      aria-label="Поле визуализации 3D"
+                      className="flex items-center gap-0.5 bg-[#0b0e14] p-0.5 rounded border border-[#232a3a]"
+                    >
+                      {(
+                        [
+                          { id: 'shaded', label: 'Shaded', activeCls: 'bg-[#cbd5e1] text-[#0c0e12]' },
+                          { id: 'von_mises', label: 'σ_vM', activeCls: 'bg-[#f97316] text-[#0c0e12]' },
+                          { id: 'plastic_strain', label: 'ε_p', activeCls: 'bg-[#c084fc] text-[#0c0e12]' },
+                          { id: 'damage', label: 'D', activeCls: 'bg-[#ef4444] text-[#ffffff]' },
+                        ] as const
+                      ).map((item) => (
+                        <button
+                          key={item.id}
+                          type="button"
+                          onClick={() => onChangeFieldMode(item.id)}
+                          data-testid={`timeline-field-${item.id}`}
+                          className={`px-1.5 py-0.5 rounded text-[9px] font-mono cursor-pointer transition-colors ${
+                            fieldMode === item.id
+                              ? `${item.activeCls} font-semibold`
+                              : 'text-[#94a3b8] hover:text-[#f1f5f9]'
+                          }`}
+                        >
+                          {item.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                  <div className="flex items-center gap-1 bg-[#0b0e14] p-0.5 rounded border border-[#232a3a]">
+                    <button
+                      type="button"
+                      onClick={() => setTrackOverlayMode('energy')}
+                      className={`px-1.5 py-0.5 rounded text-[9px] cursor-pointer ${
+                        trackOverlayMode === 'energy'
+                          ? 'bg-[#38bdf8] text-[#0c0e12] font-semibold'
+                          : 'text-[#94a3b8] hover:text-[#f1f5f9]'
+                      }`}
+                    >
+                      Энергии
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setTrackOverlayMode('stress')}
+                      className={`px-1.5 py-0.5 rounded text-[9px] cursor-pointer ${
+                        trackOverlayMode === 'stress'
+                          ? 'bg-[#f97316] text-[#0c0e12] font-semibold'
+                          : 'text-[#94a3b8] hover:text-[#f1f5f9]'
+                      }`}
+                    >
+                      График σ
+                    </button>
+                  </div>
                 </div>
               </div>
             )}

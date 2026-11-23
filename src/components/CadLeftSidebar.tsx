@@ -826,7 +826,9 @@ export const CadLeftSidebar: React.FC<CadLeftSidebarProps> = ({
                     {joint.partA} → {joint.partB}
                   </span>
                   <span className="text-[#10b981] shrink-0">
-                    θ = {((joint.currentAngleRad * 180) / Math.PI).toFixed(1)}°
+                    {joint.type === 'prismatic'
+                      ? `Δ = ${(joint.currentAngleRad * 1000).toFixed(1)} мм`
+                      : `θ = ${((joint.currentAngleRad * 180) / Math.PI).toFixed(1)}°`}
                   </span>
                 </div>
 
@@ -844,7 +846,7 @@ export const CadLeftSidebar: React.FC<CadLeftSidebarProps> = ({
                               joint.motorEnabled
                             )
                           }
-                          title="Реверс направления вращения"
+                          title="Реверс направления"
                           className="p-0.5 rounded bg-[#222836] hover:bg-[#2d3545] text-[#cbd5e1] cursor-pointer"
                         >
                           <RotateCw className="w-3 h-3" />
@@ -865,30 +867,50 @@ export const CadLeftSidebar: React.FC<CadLeftSidebarProps> = ({
                       </div>
                     </div>
 
-                    <div className="space-y-1">
-                      <div className="flex justify-between text-[10px] font-mono tabular-nums">
-                        <span className="text-[#64748b]">Скорость привода:</span>
-                        <span className="text-[#f59e0b]">
-                          {joint.motorSpeedRpm} об/мин
-                        </span>
+                    {joint.type === 'prismatic' ? (
+                      <div className="space-y-1 text-[10px] font-mono tabular-nums">
+                        <div className="flex justify-between">
+                          <span className="text-[#64748b]">Усилие / Скорость:</span>
+                          <span className="text-[#f59e0b]">
+                            {Math.round(joint.motorTorqueNm)} Н ·{' '}
+                            {Math.round(Math.abs(joint.motorLinearSpeedMs ?? 0.05) * 1000)} мм/с
+                          </span>
+                        </div>
+                        {joint.limits && (
+                          <div className="flex justify-between">
+                            <span className="text-[#64748b]">Ход шарнира:</span>
+                            <span className="text-[#38bdf8]">
+                              [{(joint.limits[0] * 1000).toFixed(0)}, {(joint.limits[1] * 1000).toFixed(0)}] мм
+                            </span>
+                          </div>
+                        )}
                       </div>
-                      <input
-                        type="range"
-                        min={-120}
-                        max={120}
-                        step={5}
-                        value={joint.motorSpeedRpm}
-                        onChange={(e) =>
-                          onUpdateJointMotor(
-                            joint.id,
-                            parseFloat(e.target.value),
-                            joint.motorTorqueNm,
-                            true
-                          )
-                        }
-                        className="w-full accent-[#10b981] h-1 bg-[#262b36] rounded cursor-pointer"
-                      />
-                    </div>
+                    ) : (
+                      <div className="space-y-1">
+                        <div className="flex justify-between text-[10px] font-mono tabular-nums">
+                          <span className="text-[#64748b]">Скорость привода:</span>
+                          <span className="text-[#f59e0b]">
+                            {joint.motorSpeedRpm} об/мин
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={-120}
+                          max={120}
+                          step={5}
+                          value={joint.motorSpeedRpm}
+                          onChange={(e) =>
+                            onUpdateJointMotor(
+                              joint.id,
+                              parseFloat(e.target.value),
+                              joint.motorTorqueNm,
+                              true
+                            )
+                          }
+                          className="w-full accent-[#10b981] h-1 bg-[#262b36] rounded cursor-pointer"
+                        />
+                      </div>
+                    )}
                   </div>
                 )}
               </div>

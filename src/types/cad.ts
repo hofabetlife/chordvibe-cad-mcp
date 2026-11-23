@@ -203,6 +203,8 @@ export interface KinematicJoint {
   axis: [number, number, number];
   limits?: [number, number];
   motorSpeedRpm: number;
+  /** Signed linear motor speed in m/s for prismatic joints */
+  motorLinearSpeedMs?: number;
   motorTorqueNm: number;
   motorEnabled: boolean;
   currentAngleRad: number;
@@ -423,6 +425,8 @@ export interface CachedFemSurfaceMesh {
 export interface CachedPartFrameState {
   position: [number, number, number];
   rotation: [number, number, number];
+  /** Optional exact orientation quaternion [qx, qy, qz, qw] (used by live Rust physics replays) */
+  quaternion?: [number, number, number, number];
   /** 0..1+ normalized stress ratio against material yieldStrength */
   stressRatio: number;
   /** True while the whole intact parent mesh should be displayed */

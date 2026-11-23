@@ -19,8 +19,10 @@ use mcp_cad_core::export_stl::export_stl_binary;
 use mcp_cad_core::part::Part;
 use mcp_cad_physics::joint::CadJointType;
 use mcp_cad_physics::simulator::CadJointRecord;
+use mcp_cad_physics::telemetry::{CollisionEventType, SimulationSummary};
 
 use crate::state::EngineState;
+use crate::tools::coupled_sim::BakedSimulationRecord;
 
 /// Live scene manifest schema version.
 pub const LIVE_SYNC_SCHEMA_VERSION: &str = "1.0.0";
@@ -124,6 +126,62 @@ pub struct LiveSceneJoint {
     pub motor_max_force: Option<f64>,
 }
 
+/// Single sampled rigid-body pose in a live physics trajectory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LivePhysicsSample {
+    pub time_s: f64,
+    pub position_m: [f64; 3],
+    pub orientation_quat: [f64; 4],
+    pub linear_velocity_m_s: [f64; 3],
+    pub angular_velocity_rad_s: [f64; 3],
+}
+
+/// Sampled rigid-body trajectory for a single CAD part.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LivePhysicsPartTrajectory {
+    pub part_id: String,
+    pub samples: Vec<LivePhysicsSample>,
+}
+
+/// Serialized collision event from `run_physics_simulation`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LivePhysicsCollision {
+    pub time_s: f64,
+    pub body_a: String,
+    pub body_b: String,
+    pub event_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact_normal: Option<[f64; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_impulse: Option<f64>,
+}
+
+/// Compact multi-body physics simulation payload published in `scene.json` after `run_physics_simulation`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LivePhysicsSimulation {
+    pub success: bool,
+    pub duration_s: f64,
+    pub step_count: usize,
+    pub step_size_s: f64,
+    pub peak_joint_forces: HashMap<String, f64>,
+    pub collisions: Vec<LivePhysicsCollision>,
+    pub trajectories: Vec<LivePhysicsPartTrajectory>,
+}
+
+/// Summary metadata for a baked coupled HHT-α elastoplastic/fracture simulation (`coupled_sim.json`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveCoupledSimulationSummary {
+    pub simulation_id: String,
+    pub accuracy_level: String,
+    pub duration_s: f64,
+    pub frame_count: usize,
+    pub peak_von_mises_mpa: f64,
+    pub peak_damage: f64,
+    pub detached_fragments_count: usize,
+    pub events_count: usize,
+    pub data_file: String,
+}
+
 /// Top-level live scene snapshot manifest written atomically to `scene.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveSceneSnapshot {
@@ -139,6 +197,10 @@ pub struct LiveSceneSnapshot {
     pub recent_tools: Vec<LiveToolEvent>,
     pub parts: Vec<LiveScenePart>,
     pub joints: Vec<LiveSceneJoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physics_simulation: Option<LivePhysicsSimulation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coupled_simulation: Option<LiveCoupledSimulationSummary>,
 }
 
 /// Per-EngineState tracker keeping exported STL revisions and recent MCP tool feed.
@@ -146,6 +208,7 @@ pub struct LiveSceneSnapshot {
 pub struct LiveSyncTracker {
     pub recent_tools: Vec<LiveToolEvent>,
     pub exported_part_revisions: HashMap<String, (u64, usize)>,
+    pub exported_coupled_sim_id: Option<String>,
 }
 
 impl LiveSyncTracker {
@@ -704,6 +767,18 @@ pub fn build_live_snapshot(state: &EngineState, source: &str) -> LiveSceneSnapsh
         .map(serialize_live_joint)
         .collect();
 
+    let physics_simulation = state
+        .last_simulation
+        .as_ref()
+        .map(serialize_live_physics_simulation);
+
+    let coupled_simulation = state
+        .coupled_sim
+        .read()
+        .get_simulation(None)
+        .filter(|rec| !rec.frames.is_empty())
+        .map(|rec| serialize_live_coupled_summary(&rec));
+
     LiveSceneSnapshot {
         schema_version: LIVE_SYNC_SCHEMA_VERSION.to_string(),
         revision: seq,
@@ -715,7 +790,222 @@ pub fn build_live_snapshot(state: &EngineState, source: &str) -> LiveSceneSnapsh
         recent_tools: state.live_sync.recent_tools.clone(),
         parts,
         joints,
+        physics_simulation,
+        coupled_simulation,
     }
+}
+
+/// Downsamples a `SimulationSummary` into a compact, browser-ready trajectory bundle (<= 120 frames).
+fn serialize_live_physics_simulation(sim: &SimulationSummary) -> LivePhysicsSimulation {
+    const MAX_TRAJ_SAMPLES: usize = 120;
+
+    let mut part_ids: Vec<&String> = sim.trajectories.keys().collect();
+    part_ids.sort();
+
+    let trajectories: Vec<LivePhysicsPartTrajectory> = part_ids
+        .into_iter()
+        .filter_map(|pid| {
+            let body = sim.trajectories.get(pid)?;
+            let total = body.samples.len();
+            if total == 0 {
+                return None;
+            }
+            let samples: Vec<LivePhysicsSample> = if total <= MAX_TRAJ_SAMPLES {
+                body.samples
+                    .iter()
+                    .map(|s| LivePhysicsSample {
+                        time_s: s.time_s,
+                        position_m: s.position,
+                        orientation_quat: s.orientation_quat,
+                        linear_velocity_m_s: s.linear_velocity,
+                        angular_velocity_rad_s: s.angular_velocity,
+                    })
+                    .collect()
+            } else {
+                let mut picked = Vec::with_capacity(MAX_TRAJ_SAMPLES);
+                let last_idx = total - 1;
+                for i in 0..MAX_TRAJ_SAMPLES {
+                    let idx = ((i as f64) * (last_idx as f64) / ((MAX_TRAJ_SAMPLES - 1) as f64))
+                        .round() as usize;
+                    let s = &body.samples[idx.min(last_idx)];
+                    picked.push(LivePhysicsSample {
+                        time_s: s.time_s,
+                        position_m: s.position,
+                        orientation_quat: s.orientation_quat,
+                        linear_velocity_m_s: s.linear_velocity,
+                        angular_velocity_rad_s: s.angular_velocity,
+                    });
+                }
+                picked
+            };
+            Some(LivePhysicsPartTrajectory {
+                part_id: pid.clone(),
+                samples,
+            })
+        })
+        .collect();
+
+    let collisions: Vec<LivePhysicsCollision> = sim
+        .collisions
+        .iter()
+        .take(64)
+        .map(|c| LivePhysicsCollision {
+            time_s: c.time_s,
+            body_a: c.body_a.clone(),
+            body_b: c.body_b.clone(),
+            event_type: match c.event_type {
+                CollisionEventType::Started => "started".to_string(),
+                CollisionEventType::Stopped => "stopped".to_string(),
+            },
+            contact_normal: c.contact_normal,
+            max_impulse: c.max_impulse,
+        })
+        .collect();
+
+    LivePhysicsSimulation {
+        success: sim.success,
+        duration_s: sim.duration_s,
+        step_count: sim.step_count,
+        step_size_s: sim.step_size_s,
+        peak_joint_forces: sim.peak_joint_forces.clone(),
+        collisions,
+        trajectories,
+    }
+}
+
+/// Builds lightweight summary metadata for a cached `BakedSimulationRecord`.
+fn serialize_live_coupled_summary(record: &BakedSimulationRecord) -> LiveCoupledSimulationSummary {
+    let peak_von_mises_mpa = record
+        .frames
+        .iter()
+        .flat_map(|f| f.parts.iter())
+        .map(|p| p.max_von_mises_mpa)
+        .fold(0.0_f64, f64::max);
+    let peak_damage = record
+        .frames
+        .iter()
+        .flat_map(|f| f.parts.iter())
+        .map(|p| p.max_damage)
+        .fold(0.0_f64, f64::max);
+    let detached_fragments_count = record
+        .frames
+        .last()
+        .map_or(0, |f| f.detached_fragments.len());
+
+    LiveCoupledSimulationSummary {
+        simulation_id: record.simulation_id.clone(),
+        accuracy_level: record.accuracy_level.as_str().to_string(),
+        duration_s: record.duration_s,
+        frame_count: record.frames.len(),
+        peak_von_mises_mpa,
+        peak_damage,
+        detached_fragments_count,
+        events_count: record.events.len(),
+        data_file: "coupled_sim.json".to_string(),
+    }
+}
+
+/// Serializes a compact `coupled_sim.json` payload compatible with Web Studio's `convertRustCoupledSimToDestructionCache`.
+fn build_live_coupled_sim_payload(record: &BakedSimulationRecord) -> Value {
+    const MAX_EXPORT_FRAMES: usize = 60;
+    let total = record.frames.len();
+    let frame_indices: Vec<usize> = if total <= MAX_EXPORT_FRAMES {
+        (0..total).collect()
+    } else {
+        let last = total - 1;
+        (0..MAX_EXPORT_FRAMES)
+            .map(|i| ((i as f64) * (last as f64) / ((MAX_EXPORT_FRAMES - 1) as f64)).round() as usize)
+            .collect()
+    };
+
+    let topo_by_part: HashMap<&str, &Vec<[f64; 3]>> = record
+        .topologies
+        .iter()
+        .map(|t| (t.part_id.as_str(), &t.reference_positions_m))
+        .collect();
+
+    let frames_json: Vec<Value> = frame_indices
+        .iter()
+        .enumerate()
+        .map(|(out_idx, &src_idx)| {
+            let frame = &record.frames[src_idx.min(total - 1)];
+            let parts_json: Vec<Value> = frame
+                .parts
+                .iter()
+                .map(|p| {
+                    let surf_topo = record.surface_topologies.get(p.surface_topology_index);
+                    let ref_pos_opt = topo_by_part.get(p.part_id.as_str()).copied();
+                    let (s_pos, s_ref, s_idx, s_nodes) = if let Some(surf) = surf_topo {
+                        let pos: Vec<[f64; 3]> = surf
+                            .surface_node_indices
+                            .iter()
+                            .map(|&nid| {
+                                p.deformed_positions_m
+                                    .get(nid as usize)
+                                    .copied()
+                                    .unwrap_or([0.0; 3])
+                            })
+                            .collect();
+                        let rpos: Vec<[f64; 3]> = surf
+                            .surface_node_indices
+                            .iter()
+                            .map(|&nid| {
+                                ref_pos_opt
+                                    .and_then(|rp| rp.get(nid as usize).copied())
+                                    .unwrap_or([0.0; 3])
+                            })
+                            .collect();
+                        (pos, rpos, surf.surface_indices.clone(), surf.surface_node_indices.clone())
+                    } else {
+                        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                    };
+                    json!({
+                        "part_id": p.part_id,
+                        "node_count": p.node_count,
+                        "active_element_count": p.active_element_count,
+                        "eroded_element_count": p.eroded_element_indices.len(),
+                        "max_displacement_mm": p.max_displacement_mm,
+                        "max_von_mises_mpa": p.max_von_mises_mpa,
+                        "max_equiv_plastic_strain": p.max_equiv_plastic_strain,
+                        "max_damage": p.max_damage,
+                        "nodal_von_mises_mpa": p.nodal_von_mises_mpa,
+                        "nodal_equiv_plastic_strain": p.nodal_equiv_plastic_strain,
+                        "nodal_damage": p.nodal_damage,
+                        "surface_positions_m": s_pos,
+                        "surface_reference_positions_m": s_ref,
+                        "surface_indices": s_idx,
+                        "surface_node_indices": s_nodes
+                    })
+                })
+                .collect();
+
+            json!({
+                "simulation_id": record.simulation_id,
+                "frame_index": out_idx,
+                "total_frames": frame_indices.len(),
+                "time_s": frame.time_s,
+                "dt_used_s": frame.dt_used_s,
+                "length_unit": "m",
+                "parts": parts_json,
+                "detached_fragments": frame.detached_fragments,
+                "contact_forces": frame.contact_forces,
+                "energy_balance": frame.energy
+            })
+        })
+        .collect();
+
+    json!({
+        "summary": {
+            "simulation_id": record.simulation_id,
+            "accuracy_level": record.accuracy_level.as_str(),
+            "duration_s": record.duration_s,
+            "frame_count": frames_json.len(),
+            "elapsed_ms": record.elapsed_ms,
+            "events": record.events,
+            "fragment_meshes": record.fragment_meshes
+        },
+        "frames": frames_json
+    })
 }
 
 /// Atomically writes bytes to `target_path` by writing to a sibling `.tmp` file first and renaming.
@@ -827,6 +1117,22 @@ pub fn publish_live_snapshot(
         .exported_part_revisions
         .retain(|safe_id, _| active_safe_ids.contains(safe_id));
 
+    let mut coupled_sim_bytes: Option<Vec<u8>> = None;
+    if let Some(record) = state.coupled_sim.read().get_simulation(None) {
+        if !record.frames.is_empty() {
+            let needs_coupled_write = state.live_sync.exported_coupled_sim_id.as_deref()
+                != Some(record.simulation_id.as_str())
+                || dirs.iter().any(|d| !d.join("coupled_sim.json").exists());
+            if needs_coupled_write {
+                let payload = build_live_coupled_sim_payload(&record);
+                if let Ok(bytes) = serde_json::to_vec(&payload) {
+                    coupled_sim_bytes = Some(bytes);
+                    state.live_sync.exported_coupled_sim_id = Some(record.simulation_id.clone());
+                }
+            }
+        }
+    }
+
     let Ok(scene_bytes) = serde_json::to_vec_pretty(&snapshot) else {
         return;
     };
@@ -837,6 +1143,12 @@ pub fn publish_live_snapshot(
             let target = parts_dir.join(format!("{safe_id}.stl"));
             if let Err(e) = atomic_write_bytes(&target, stl_bytes) {
                 tracing::debug!("Live sync STL write skipped for {:?}: {e}", target);
+            }
+        }
+        if let Some(ref c_bytes) = coupled_sim_bytes {
+            let coupled_path = dir.join("coupled_sim.json");
+            if let Err(e) = atomic_write_bytes(&coupled_path, c_bytes) {
+                tracing::debug!("Live sync coupled_sim write skipped for {:?}: {e}", coupled_path);
             }
         }
         let manifest_path = dir.join("scene.json");

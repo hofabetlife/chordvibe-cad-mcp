@@ -1321,11 +1321,20 @@ export const CadViewport3D: React.FC<CadViewport3DProps> = ({
             pState.position[1],
             pState.position[2]
           );
-          child.rotation.set(
-            pState.rotation[0],
-            pState.rotation[1],
-            pState.rotation[2]
-          );
+          if (pState.quaternion) {
+            child.quaternion.set(
+              pState.quaternion[0],
+              pState.quaternion[1],
+              pState.quaternion[2],
+              pState.quaternion[3]
+            );
+          } else {
+            child.rotation.set(
+              pState.rotation[0],
+              pState.rotation[1],
+              pState.rotation[2]
+            );
+          }
 
           if (child instanceof THREE.Mesh && child.userData?.basePositions) {
             const geom = child.geometry as THREE.BufferGeometry;

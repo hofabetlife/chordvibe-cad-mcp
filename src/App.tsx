@@ -31,7 +31,14 @@ import {
   mapRustJointsToWebStudio,
   mapRustMaterialToWebStudio,
   shouldAutoFitCamera,
+  shouldAutoSimulateLiveSnapshot,
 } from './cad/live_sync_adapter';
+import {
+  convertRustCoupledSimToDestructionCache,
+  type RustCoupledSimBakeSummaryJson,
+  type RustCoupledSimFrameJson,
+} from './cad/field_colormaps';
+import { buildDestructionCacheFromLivePhysics } from './cad/press_simulation';
 import { DEFAULT_MATERIALS, getMaterialById } from './cad/materials';
 import {
   createBoxMesh,
@@ -67,6 +74,7 @@ import {
 } from './components/CadDestructionTimeline';
 import {
   bakeDestructionCacheAsync,
+  bakeDestructionCacheSync,
   DEFAULT_DESTRUCTION_CONFIG,
   exportDestructionCacheSummaryJson,
   formatCacheBytes,
@@ -1579,16 +1587,93 @@ export function App() {
         ? mapRustFeaSummaryToWebStudio(selectedLivePart.id, selectedLivePart.fea)
         : null;
 
+      const mappedJoints = mapRustJointsToWebStudio(snapshot.joints);
+      const simConfigForLive: DestructionSimConfig = {
+        ...DEFAULT_DESTRUCTION_CONFIG,
+        scenarioMode: 'impact_crush',
+      };
+
+      let autoSimCache: DestructionCache | null = null;
+      if (snapshot.coupled_simulation && snapshot.coupled_simulation.frame_count > 1) {
+        try {
+          const coupledRes = await fetch(
+            `/api/live-sync/coupled-sim?rev=${encodeURIComponent(String(snapshot.revision))}&t=${encodeURIComponent(String(snapshot.timestamp_ms))}`,
+            { cache: 'no-store' }
+          );
+          if (coupledRes.ok) {
+            const payload = (await coupledRes.json()) as {
+              summary?: RustCoupledSimBakeSummaryJson;
+              frames?: RustCoupledSimFrameJson[];
+            };
+            if (payload?.summary && Array.isArray(payload.frames) && payload.frames.length > 1) {
+              autoSimCache = convertRustCoupledSimToDestructionCache(
+                payload.summary,
+                payload.frames,
+                hydratedParts,
+                workingMaterials,
+                simConfigForLive
+              );
+            }
+          }
+        } catch {
+          // Fall back to physics_simulation or press destruction preview
+        }
+      }
+
+      // Discard stale async hydration if a newer snapshot arrived while fetching coupled sim
+      if (seq !== liveApplySeqRef.current) {
+        return false;
+      }
+
+      if (
+        !autoSimCache &&
+        snapshot.physics_simulation &&
+        snapshot.physics_simulation.trajectories.some((t) => t.samples.length > 1)
+      ) {
+        autoSimCache = buildDestructionCacheFromLivePhysics(
+          hydratedParts,
+          mappedJoints,
+          workingMaterials,
+          snapshot.physics_simulation,
+          simConfigForLive
+        );
+      }
+
+      if (
+        !autoSimCache &&
+        hydratedParts.length > 0 &&
+        shouldAutoSimulateLiveSnapshot(snapshot, mappedJoints)
+      ) {
+        autoSimCache = bakeDestructionCacheSync(
+          hydratedParts,
+          mappedJoints,
+          workingMaterials,
+          simConfigForLive
+        );
+      }
+
       setActivePreset(MCP_LIVE_PRESET_ID);
       setIsSimulatingPhysics(false);
-      setDestructionCache(null);
-      setDestructionFrame(0);
-      setIsPlayingDestruction(false);
-      setIsDestructionCacheStale(false);
       setParts(hydratedParts);
       setSelectedPartId(nextSelectedId);
-      setJoints(mapRustJointsToWebStudio(snapshot.joints));
+      setJoints(mappedJoints);
       setFeaResult(mappedFea);
+
+      if (autoSimCache) {
+        setDestructionConfig(autoSimCache.config);
+        setDestructionCache(autoSimCache);
+        setDestructionFrame(0);
+        setIsDestructionCacheStale(false);
+        if (autoSimCache.maxStressOverallMPa > 10) {
+          setDestructionFieldMode('von_mises');
+        }
+        setIsPlayingDestruction(true);
+      } else {
+        setDestructionCache(null);
+        setDestructionFrame(0);
+        setIsPlayingDestruction(false);
+        setIsDestructionCacheStale(false);
+      }
 
       if (snapshot.recent_tools && snapshot.recent_tools.length > 0) {
         const mappedHistory = mapLiveToolsToMcpHistory(snapshot.recent_tools);
@@ -1606,11 +1691,17 @@ export function App() {
       liveLastAppliedKeyRef.current = snapshotKey;
 
       if (!options?.silent) {
-        const toolMsg =
-          snapshot.last_tool?.summary ||
-          snapshot.last_tool?.tool_name ||
-          `${hydratedParts.length} дет.`;
-        showToast(`MCP Агент: ${toolMsg}`);
+        if (autoSimCache) {
+          showToast(
+            `MCP Симуляция: ${autoSimCache.totalFrames + 1} кадр., σ_max=${autoSimCache.maxStressOverallMPa.toFixed(0)} МПа (${autoSimCache.solverLabel})`
+          );
+        } else {
+          const toolMsg =
+            snapshot.last_tool?.summary ||
+            snapshot.last_tool?.tool_name ||
+            `${hydratedParts.length} дет.`;
+          showToast(`MCP Агент: ${toolMsg}`);
+        }
       }
 
       return true;
@@ -2141,13 +2232,47 @@ export function App() {
     setUiMode('studio_ide');
     setActiveWorkbench('simulation');
     setSimulationSubMode('destruction');
+
+    // Never overwrite an active Live MCP agent assembly or multi-part press scene!
+    if (activePreset === MCP_LIVE_PRESET_ID || parts.length >= 2) {
+      if (!destructionCache && parts.length > 0) {
+        const nextCfg: DestructionSimConfig = {
+          ...destructionConfig,
+          scenarioMode: 'impact_crush',
+        };
+        setDestructionConfig(nextCfg);
+        const baked = bakeDestructionCacheSync(parts, joints, materials, nextCfg);
+        setDestructionCache(baked);
+        setDestructionFrame(0);
+        setIsDestructionCacheStale(false);
+        if (baked.maxStressOverallMPa > 10) {
+          setDestructionFieldMode('von_mises');
+        }
+        setIsPlayingDestruction(true);
+        showToast(
+          `Симуляция разрушения запущена для текущей сборки (${baked.totalFrames + 1} кадр., σ_max=${baked.maxStressOverallMPa.toFixed(0)} МПа)`
+        );
+      }
+      return;
+    }
+
     if (
       activePreset !== 'gears_clash_destruction' &&
       activePreset !== 'gear_overload_burst'
     ) {
       loadScenePreset('gears_clash_destruction', quality);
     }
-  }, [activePreset, loadScenePreset, quality]);
+  }, [
+    activePreset,
+    destructionCache,
+    destructionConfig,
+    joints,
+    loadScenePreset,
+    materials,
+    parts,
+    quality,
+    showToast,
+  ]);
 
   const handleExportDestructionCacheJson = useCallback(() => {
     if (!destructionCache) return;
@@ -2982,11 +3107,7 @@ export function App() {
                     : 'bg-[#0ea5e9]/15 border-[#38bdf8]/50 text-[#38bdf8]'
               }`}
             >
-              <Radio
-                className={`w-3 h-3 shrink-0 ${
-                  liveSyncEnabled && liveSyncConnected ? 'animate-pulse' : ''
-                }`}
-              />
+              <Radio className="w-3 h-3 shrink-0" />
               <span>
                 {!liveSyncEnabled
                   ? liveSnapshot && liveSnapshot.parts.length > 0
@@ -3291,6 +3412,18 @@ export function App() {
                   ? `Watertight (g=${selectedPart?.mesh.eulerGenus ?? 0})`
                   : 'Open Surface'}
               </span>
+              {activePreset === MCP_LIVE_PRESET_ID && parts.length > 0 && (
+                <button
+                  type="button"
+                  onClick={handleBakeDestructionCache}
+                  data-testid="live-run-sim-btn"
+                  className="pointer-events-auto ml-1 flex items-center gap-1 px-2 py-0.5 rounded bg-[#f97316] hover:bg-[#ea580c] text-[#0c0e12] font-semibold cursor-pointer transition-colors"
+                  title="Запустить визуализацию симуляции и разрушения для текущей сборки MCP"
+                >
+                  <Flame className="w-3 h-3" />
+                  <span>Запустить симуляцию</span>
+                </button>
+              )}
             </div>
 
             <div className="hidden lg:flex px-2.5 py-1 rounded bg-[#14171ee0] border border-[#282e3b] items-center gap-2 text-[#94a3b8]">
@@ -3427,6 +3560,7 @@ export function App() {
           setSimulationSubMode(mode);
           if (
             mode === 'destruction' &&
+            activePreset !== MCP_LIVE_PRESET_ID &&
             activePreset !== 'gears_clash_destruction' &&
             activePreset !== 'gear_overload_burst' &&
             parts.length <= 1

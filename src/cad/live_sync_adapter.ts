@@ -83,6 +83,50 @@ export interface LiveSceneJoint {
   motor_max_force?: number | null;
 }
 
+export interface LivePhysicsSample {
+  time_s: number;
+  position_m: [number, number, number];
+  orientation_quat: [number, number, number, number];
+  linear_velocity_m_s: [number, number, number];
+  angular_velocity_rad_s: [number, number, number];
+}
+
+export interface LivePhysicsPartTrajectory {
+  part_id: string;
+  samples: LivePhysicsSample[];
+}
+
+export interface LivePhysicsCollision {
+  time_s: number;
+  body_a: string;
+  body_b: string;
+  event_type: string;
+  contact_normal?: [number, number, number] | null;
+  max_impulse?: number | null;
+}
+
+export interface LivePhysicsSimulation {
+  success: boolean;
+  duration_s: number;
+  step_count: number;
+  step_size_s: number;
+  peak_joint_forces: Record<string, number>;
+  collisions: LivePhysicsCollision[];
+  trajectories: LivePhysicsPartTrajectory[];
+}
+
+export interface LiveCoupledSimulationSummary {
+  simulation_id: string;
+  accuracy_level: string;
+  duration_s: number;
+  frame_count: number;
+  peak_von_mises_mpa: number;
+  peak_damage: number;
+  detached_fragments_count: number;
+  events_count: number;
+  data_file: string;
+}
+
 export interface LiveSceneSnapshot {
   schema_version: string;
   revision: number;
@@ -94,6 +138,8 @@ export interface LiveSceneSnapshot {
   recent_tools: LiveToolEvent[];
   parts: LiveScenePart[];
   joints: LiveSceneJoint[];
+  physics_simulation?: LivePhysicsSimulation | null;
+  coupled_simulation?: LiveCoupledSimulationSummary | null;
 }
 
 export type LiveSyncSourceKind = 'manifest' | 'legacy_stl' | 'rust_http' | 'none';
@@ -222,13 +268,17 @@ export function mapRustJointsToWebStudio(
         ? rawType
         : 'revolute';
 
-    const targetVelRadSec =
+    const rawTargetVel =
       typeof joint.motor_target_velocity === 'number' &&
       Number.isFinite(joint.motor_target_velocity)
         ? joint.motor_target_velocity
         : 0;
 
-    const motorSpeedRpm = Number(((targetVelRadSec * 60) / (2 * Math.PI)).toFixed(2));
+    const motorSpeedRpm =
+      type === 'prismatic'
+        ? 0
+        : Number(((rawTargetVel * 60) / (2 * Math.PI)).toFixed(2));
+    const motorLinearSpeedMs = type === 'prismatic' ? rawTargetVel : undefined;
     const motorTorqueNm =
       typeof joint.motor_max_force === 'number' &&
       Number.isFinite(joint.motor_max_force)
@@ -246,10 +296,11 @@ export function mapRustJointsToWebStudio(
       axis: joint.axis ? [...joint.axis] : [0, 0, 1],
       limits: joint.limits ? [...joint.limits] : undefined,
       motorSpeedRpm,
+      motorLinearSpeedMs,
       motorTorqueNm,
       motorEnabled:
-        typeof joint.motor_target_velocity === 'number' &&
-        Math.abs(joint.motor_target_velocity) > 1e-6,
+        Math.abs(rawTargetVel) > 1e-6 ||
+        (type === 'prismatic' && motorTorqueNm > 0),
       currentAngleRad: 0,
       gearRatio: typeof joint.ratio === 'number' ? joint.ratio : undefined,
     };
@@ -346,6 +397,54 @@ export function shouldAutoFitCamera(
   const nextSorted = [...nextPartIds].sort();
   for (let i = 0; i < prevSorted.length; i++) {
     if (prevSorted[i] !== nextSorted[i]) return true;
+  }
+  return false;
+}
+
+const SIM_TRIGGER_TOOLS = new Set([
+  'run_physics_simulation',
+  'bake_coupled_simulation',
+  'set_joint_motor',
+  'sweep_joint',
+]);
+
+/**
+ * Decides whether a live MCP agent snapshot should automatically hydrate and play
+ * an interactive simulation/destruction timeline rather than freezing as a static image.
+ */
+export function shouldAutoSimulateLiveSnapshot(
+  snapshot: LiveSceneSnapshot,
+  joints: readonly KinematicJoint[]
+): boolean {
+  if (snapshot.coupled_simulation && snapshot.coupled_simulation.frame_count > 1) {
+    return true;
+  }
+  if (
+    snapshot.physics_simulation &&
+    snapshot.physics_simulation.trajectories.some((t) => t.samples.length > 1)
+  ) {
+    return true;
+  }
+  if (
+    snapshot.last_tool &&
+    SIM_TRIGGER_TOOLS.has(snapshot.last_tool.tool_name)
+  ) {
+    return true;
+  }
+  if (
+    snapshot.recent_tools?.some((t) => SIM_TRIGGER_TOOLS.has(t.tool_name))
+  ) {
+    return true;
+  }
+  if (
+    joints.some(
+      (j) =>
+        j.motorEnabled ||
+        Math.abs(j.motorTorqueNm) > 0 ||
+        (j.type === 'prismatic' && Boolean(j.limits))
+    )
+  ) {
+    return true;
   }
   return false;
 }

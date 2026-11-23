@@ -275,6 +275,17 @@ async function startServer() {
     res.status(404).json({ error: `Live STL not found for part '${partId}'` });
   });
 
+  // 0b2. Serve live coupled HHT-α simulation frames exported alongside scene.json
+  app.get('/api/live-sync/coupled-sim', (_req, res) => {
+    const coupled = liveSyncStore.readCoupledSimJson();
+    if (!coupled) {
+      res.status(404).json({ error: 'No live coupled simulation payload available' });
+      return;
+    }
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(coupled);
+  });
+
   // 0c. Server-Sent Events stream pushing real-time MCP agent scene updates to Web Studio
   app.get('/api/live-sync/events', (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');

@@ -39,6 +39,9 @@ export interface PushLiveSnapshotPayload {
   recent_tools?: LiveSceneSnapshot['recent_tools'];
   parts: PushLivePartInput[];
   joints?: LiveSceneSnapshot['joints'];
+  physics_simulation?: LiveSceneSnapshot['physics_simulation'];
+  coupled_simulation?: LiveSceneSnapshot['coupled_simulation'];
+  coupled_sim_payload?: unknown;
 }
 
 interface ResolvedSnapshotCandidate {
@@ -305,6 +308,23 @@ export class LiveSyncStore extends EventEmitter {
     return null;
   }
 
+  public readCoupledSimJson(): unknown | null {
+    const candidate = this.resolveFreshestCandidate();
+    if (!candidate || candidate.sourceKind !== 'manifest') return null;
+    const orderedDirs = [
+      candidate.sourceDir,
+      ...this.getManifestDirs().filter((d) => d !== candidate.sourceDir),
+    ];
+    for (const dir of orderedDirs) {
+      const filePath = path.join(dir, 'coupled_sim.json');
+      const parsed = readJsonSafely<unknown>(filePath);
+      if (parsed) {
+        return parsed.value;
+      }
+    }
+    return null;
+  }
+
   public pushSnapshot(payload: PushLiveSnapshotPayload): LiveSceneSnapshot {
     const now =
       typeof payload.timestamp_ms === 'number' && Number.isFinite(payload.timestamp_ms)
@@ -379,12 +399,21 @@ export class LiveSyncStore extends EventEmitter {
           : [],
       parts: normalizedParts,
       joints: Array.isArray(payload.joints) ? payload.joints : [],
+      physics_simulation: payload.physics_simulation ?? null,
+      coupled_simulation: payload.coupled_simulation ?? null,
     };
 
     const jsonBytes = JSON.stringify(snapshot, null, 2);
+    const coupledBytes =
+      payload.coupled_sim_payload !== undefined && payload.coupled_sim_payload !== null
+        ? JSON.stringify(payload.coupled_sim_payload)
+        : null;
     for (const dir of this.getManifestDirs()) {
       for (const stl of stlPayloads) {
         writeAtomicFile(path.join(dir, 'parts', `${stl.safeId}.stl`), stl.buffer);
+      }
+      if (coupledBytes) {
+        writeAtomicFile(path.join(dir, 'coupled_sim.json'), coupledBytes);
       }
       writeAtomicFile(path.join(dir, 'scene.json'), jsonBytes);
     }
@@ -395,13 +424,15 @@ export class LiveSyncStore extends EventEmitter {
 
   public clearSnapshot(clearLegacyStl = false): void {
     for (const dir of this.getManifestDirs()) {
-      const manifestPath = path.join(dir, 'scene.json');
-      try {
-        if (fs.existsSync(manifestPath)) {
-          fs.unlinkSync(manifestPath);
+      for (const fileName of ['scene.json', 'coupled_sim.json']) {
+        const filePath = path.join(dir, fileName);
+        try {
+          if (fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+          }
+        } catch {
+          // Ignore
         }
-      } catch {
-        // Ignore
       }
       const partsDir = path.join(dir, 'parts');
       try {
