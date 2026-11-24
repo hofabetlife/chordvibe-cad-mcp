@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 import {
   LiveSyncStore,
   isSafeLivePartId,
+  type LiveCoupledSimProgress,
   type PushLiveSnapshotPayload,
 } from './src/server/live_sync_store.ts';
 import type { LiveSyncApiResponse } from './src/cad/live_sync_adapter.ts';
@@ -187,7 +188,7 @@ async function startServer() {
     }
   };
 
-  const broadcastLiveEvent = (eventName: string, payload: LiveSyncApiResponse) => {
+  const broadcastLiveEvent = (eventName: string, payload: unknown) => {
     for (const client of Array.from(liveSseClients)) {
       writeSseEvent(client, eventName, payload);
     }
@@ -198,6 +199,12 @@ async function startServer() {
   });
   liveSyncStore.on('clear', (payload: LiveSyncApiResponse) => {
     broadcastLiveEvent('scene_cleared', payload);
+  });
+  liveSyncStore.on('coupled_progress', (progress: LiveCoupledSimProgress) => {
+    broadcastLiveEvent('coupled_sim_progress', progress);
+  });
+  liveSyncStore.on('coupled_frames', (payload: unknown) => {
+    broadcastLiveEvent('coupled_sim_frames', payload);
   });
 
   const heartbeatTimer = setInterval(() => {
@@ -286,6 +293,32 @@ async function startServer() {
     res.json(coupled);
   });
 
+  // 0b3. Serve & push live coupled FEM solve progress + incremental frames
+  app.get('/api/live-sync/coupled-progress', (_req, res) => {
+    const progress = liveSyncStore.readCoupledSimProgress();
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ active: Boolean(progress), progress });
+  });
+
+  app.post('/api/live-sync/coupled-progress', (req, res) => {
+    const body = req.body as
+      | { progress?: LiveCoupledSimProgress; coupled_sim_payload?: unknown }
+      | undefined;
+    if (!body?.progress || typeof body.progress.job_id !== 'string') {
+      res.status(400).json({ error: 'Payload must contain progress with job_id' });
+      return;
+    }
+    try {
+      const saved = liveSyncStore.pushCoupledSimProgress(
+        body.progress,
+        body.coupled_sim_payload
+      );
+      res.json({ ok: true, progress: saved });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   // 0c. Server-Sent Events stream pushing real-time MCP agent scene updates to Web Studio
   app.get('/api/live-sync/events', (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
@@ -298,6 +331,10 @@ async function startServer() {
 
     const initial = liveSyncStore.readCurrentScene();
     writeSseEvent(res, 'ready', initial);
+    const initialProgress = liveSyncStore.readCoupledSimProgress();
+    if (initialProgress) {
+      writeSseEvent(res, 'coupled_sim_progress', initialProgress);
+    }
 
     const keepalive = setInterval(() => {
       if (!res.writableEnded) {

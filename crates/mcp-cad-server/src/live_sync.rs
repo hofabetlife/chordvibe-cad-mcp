@@ -182,6 +182,35 @@ pub struct LiveCoupledSimulationSummary {
     pub data_file: String,
 }
 
+/// Real-time coupled HHT-α simulation progress telemetry written atomically to `coupled_sim_progress.json`
+/// so cross-process MCP (`stdio`) and HTTP clients stream solver progress and partial frames live.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveCoupledSimProgress {
+    pub job_id: String,
+    pub simulation_id: String,
+    pub state: String,
+    pub accuracy_level: String,
+    pub part_ids: Vec<String>,
+    pub total_time_s: f64,
+    pub current_time_s: f64,
+    pub progress_pct: f64,
+    pub step_count: usize,
+    pub frame_count: usize,
+    pub frames_cached: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_frame_index: Option<usize>,
+    pub current_dt_s: f64,
+    pub bisections: usize,
+    pub eroded_elements: usize,
+    pub detached_fragments: usize,
+    pub max_von_mises_mpa: f64,
+    pub elapsed_ms: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_remaining_ms: Option<f64>,
+    pub stage_label: String,
+    pub updated_at_ms: u64,
+}
+
 /// Top-level live scene snapshot manifest written atomically to `scene.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveSceneSnapshot {
@@ -906,7 +935,7 @@ fn serialize_live_coupled_summary(record: &BakedSimulationRecord) -> LiveCoupled
 }
 
 /// Serializes a compact `coupled_sim.json` payload compatible with Web Studio's `convertRustCoupledSimToDestructionCache`.
-fn build_live_coupled_sim_payload(record: &BakedSimulationRecord) -> Value {
+pub fn build_live_coupled_sim_payload(record: &BakedSimulationRecord) -> Value {
     const MAX_EXPORT_FRAMES: usize = 60;
     let total = record.frames.len();
     let frame_indices: Vec<usize> = if total <= MAX_EXPORT_FRAMES {
@@ -1154,6 +1183,49 @@ pub fn publish_live_snapshot(
         let manifest_path = dir.join("scene.json");
         if let Err(e) = atomic_write_bytes(&manifest_path, &scene_bytes) {
             tracing::debug!("Live sync manifest write skipped for {:?}: {e}", manifest_path);
+        }
+    }
+}
+
+/// Publishes real-time coupled HHT-α simulation progress (`coupled_sim_progress.json`) and,
+/// when available, an incremental partial or final frame bundle (`coupled_sim.json`) to all
+/// live-sync directories so Web CAD Studio displays every newly computed frame as it solves.
+pub fn publish_live_coupled_sim_progress(
+    progress: &LiveCoupledSimProgress,
+    live_record: Option<&BakedSimulationRecord>,
+) {
+    let dirs = resolve_live_sync_dirs();
+    if dirs.is_empty() {
+        return;
+    }
+
+    let Ok(progress_bytes) = serde_json::to_vec(progress) else {
+        return;
+    };
+
+    let coupled_bytes = live_record
+        .filter(|rec| !rec.frames.is_empty())
+        .and_then(|rec| {
+            let payload = build_live_coupled_sim_payload(rec);
+            serde_json::to_vec(&payload).ok()
+        });
+
+    for dir in &dirs {
+        let progress_path = dir.join("coupled_sim_progress.json");
+        if let Err(e) = atomic_write_bytes(&progress_path, &progress_bytes) {
+            tracing::debug!(
+                "Live sync coupled progress write skipped for {:?}: {e}",
+                progress_path
+            );
+        }
+        if let Some(ref c_bytes) = coupled_bytes {
+            let coupled_path = dir.join("coupled_sim.json");
+            if let Err(e) = atomic_write_bytes(&coupled_path, c_bytes) {
+                tracing::debug!(
+                    "Live sync incremental coupled_sim write skipped for {:?}: {e}",
+                    coupled_path
+                );
+            }
         }
     }
 }

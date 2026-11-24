@@ -1807,18 +1807,22 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         // 42. bake_coupled_simulation
         ToolDefinition {
             name: "bake_coupled_simulation".to_string(),
-            description: "Runs, monitors, or cancels a server-side coupled implicit HHT-alpha (f64, unconditionally stable, CFL-free) dynamic FEA + contact + plasticity + fracture simulation bake, caching compact per-frame deformation/stress/damage/fragment/hub_reactions fields on the server and streaming real-time progress over SSE (/api/coupled-sim/events and /sse). Automatically extracts active PhysicsWorld joints and motors (Revolute, Prismatic, Fixed, Gear) into dynamic RBE2 hub couplings so mechanisms and gear trains run without manual initial_velocities. Units: duration_s in seconds (s); dt_ms, dt_min_ms, dt_max_ms in milliseconds (ms); output_fps in frames per second (1/s); hht_alpha in [-0.3, 0.0] (dimensionless); forces in Newtons (N); initial_velocities in m/s; gravity in m/s^2; output stresses in MPa, displacements in mm, energies in J. Example: {\"action\": \"bake\", \"accuracy_level\": \"standard\", \"part_ids\": [\"beam_1\"], \"duration_s\": 0.02, \"dt_ms\": 1.0, \"fixed_faces\": [{\"part_id\": \"beam_1\", \"face\": \"min_x\"}], \"loads\": [{\"part_id\": \"beam_1\", \"face\": \"max_x\", \"force\": [0.0, -500.0, 0.0]}], \"async_mode\": false}. Common errors: PART_NOT_FOUND, INVALID_ARGUMENT (invalid accuracy_level, hht_alpha outside [-0.3, 0.0], non-positive duration_s), JOB_NOT_FOUND (unknown job_id for status/cancel), FEA_ERROR. Next step: call 'query_simulation_frame' to fetch cached deformed coordinates, von Mises stress, plastic strain, damage, contact forces, hub reactions, and detached fragments for any frame or timestamp.".to_string(),
+            description: "Runs, monitors, or cancels a server-side coupled implicit HHT-alpha (f64, unconditionally stable, CFL-free) dynamic FEA + contact + plasticity + fracture simulation bake, caching compact per-frame deformation/stress/damage/fragment/hub_reactions fields incrementally frame-by-frame as they solve and streaming real-time progress + ETA over SSE (/api/coupled-sim/events and /sse) and .mcp_live/coupled_sim_progress.json. If a bake exceeds wait_timeout_ms (default 12000 ms when async_mode is omitted), it automatically yields status='running' with job_id, progress_pct, ETA, and frames_cached instead of hanging so you can poll action='status' or stream live frames immediately with 'query_simulation_frame'. Automatically extracts active PhysicsWorld joints and motors (Revolute, Prismatic, Fixed, Gear) into dynamic RBE2 hub couplings so mechanisms and gear trains run without manual initial_velocities. Units: duration_s in seconds (s); dt_ms, dt_min_ms, dt_max_ms, wait_timeout_ms in milliseconds (ms); output_fps in frames per second (1/s); hht_alpha in [-0.3, 0.0] (dimensionless); forces in Newtons (N); initial_velocities in m/s; gravity in m/s^2; output stresses in MPa, displacements in mm, energies in J. Example: {\"action\": \"bake\", \"accuracy_level\": \"standard\", \"part_ids\": [\"beam_1\"], \"duration_s\": 0.02, \"dt_ms\": 1.0, \"fixed_faces\": [{\"part_id\": \"beam_1\", \"face\": \"min_x\"}], \"loads\": [{\"part_id\": \"beam_1\", \"face\": \"max_x\", \"force\": [0.0, -500.0, 0.0]}], \"wait_timeout_ms\": 5000}. Common errors: PART_NOT_FOUND, INVALID_ARGUMENT (invalid accuracy_level, hht_alpha outside [-0.3, 0.0], non-positive duration_s), JOB_NOT_FOUND (unknown job_id for status/cancel), FEA_ERROR. Next step: if status is 'running', call 'bake_coupled_simulation' with {\"action\": \"status\", \"job_id\": ..., \"wait_timeout_ms\": 5000} or immediately inspect already-solved frames via 'query_simulation_frame'.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
                         "enum": ["bake", "status", "cancel"],
-                        "description": "Operation mode: 'bake' starts a new implicit HHT-alpha coupled pre-bake (default), 'status' queries job progress, 'cancel' stops a running bake job"
+                        "description": "Operation mode: 'bake' starts a new implicit HHT-alpha coupled pre-bake (default), 'status' queries live job progress/ETA/cached frames (supports optional wait_timeout_ms long-polling), 'cancel' stops a running bake job"
                     },
                     "job_id": {
                         "type": "string",
                         "description": "Target bake job ID for action='status' or action='cancel' (defaults to the most recent job)"
+                    },
+                    "wait_timeout_ms": {
+                        "type": "integer",
+                        "description": "Bounded wait window in milliseconds (ms) before returning status='running' on action='bake' (default: 12000 ms when async_mode is omitted, 0 when async_mode=true) or long-poll wait in milliseconds (ms) on action='status' until completion or next new frame"
                     },
                     "accuracy_level": {
                         "type": "string",
@@ -1921,7 +1925,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     },
                     "async_mode": {
                         "type": "boolean",
-                        "description": "If true, runs the bake in a background worker thread and returns job_id immediately for SSE streaming and cancellation; if false (default), blocks until bake completes"
+                        "description": "If true, runs the bake in a background worker thread and returns job_id immediately for SSE streaming and cancellation; if false, blocks until completion; if omitted, waits up to wait_timeout_ms (default 12000 ms) and returns status='running' with progress/ETA if still solving"
                     },
                     "length_unit": {
                         "type": "string",
@@ -1934,17 +1938,17 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         // 43. query_simulation_frame
         ToolDefinition {
             name: "query_simulation_frame".to_string(),
-            description: "Queries a compact cached frame from a previously baked coupled dynamic HHT-alpha simulation by frame_index or nearest time_s, returning deformed nodal coordinates x(t) = X + u(t), active exterior FEM surface triangle meshes (surface_positions_m, surface_reference_positions_m, surface_indices, surface_node_indices reflecting eroded/detached cavities), displacements, von Mises stress, equivalent plastic strain, continuum damage D, eroded elements, detached rigid fragments with synchronized poses and local-space FEM triangle geometry, contact forces, and energy balance. Units: time_s and dt_used_s in seconds (s); deformed_positions and fragment positions in active length_unit ('mm' by default, or 'm'); surface_positions_m, surface_reference_positions_m, position_m, and fragment mesh vertices_m in meters (m); displacements in mm; stresses in MPa; plastic strain and damage D dimensionless; forces in Newtons (N); velocities in m/s and rad/s; energies in Joules (dimensionless/J). Example: {\"frame_index\": 10, \"include_mesh_fields\": true, \"include_fragment_meshes\": true}. Common errors: SIMULATION_NOT_FOUND (run bake_coupled_simulation first), FRAME_OUT_OF_RANGE, PART_NOT_FOUND, INVALID_ARGUMENT. Next step: scrub additional frame indices for timeline playback or fetch cached fragment geometry once via GET /api/coupled-sim/fragments/:sim_id.".to_string(),
+            description: "Queries a compact cached frame from an active (streaming) or completed coupled dynamic HHT-alpha simulation by frame_index or nearest time_s, returning deformed nodal coordinates x(t) = X + u(t), active exterior FEM surface triangle meshes (surface_positions_m, surface_reference_positions_m, surface_indices, surface_node_indices reflecting eroded/detached cavities), displacements, von Mises stress, equivalent plastic strain, continuum damage D, eroded elements, detached rigid fragments with synchronized poses and local-space FEM triangle geometry, contact forces, and energy balance. Works on already-computed frames even while the simulation status is still 'running'. Units: time_s and dt_used_s in seconds (s); deformed_positions and fragment positions in active length_unit ('mm' by default, or 'm'); surface_positions_m, surface_reference_positions_m, position_m, and fragment mesh vertices_m in meters (m); displacements in mm; stresses in MPa; plastic strain and damage D dimensionless; forces in Newtons (N); velocities in m/s and rad/s; energies in Joules (dimensionless/J). Example: {\"frame_index\": 10, \"include_mesh_fields\": true, \"include_fragment_meshes\": true}. Common errors: SIMULATION_NOT_FOUND (run bake_coupled_simulation first), FRAME_OUT_OF_RANGE, PART_NOT_FOUND, INVALID_ARGUMENT. Next step: scrub additional frame indices for timeline playback or fetch cached fragment geometry once via GET /api/coupled-sim/fragments/:sim_id.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "simulation_id": {
                         "type": "string",
-                        "description": "Optional cached simulation ID returned by bake_coupled_simulation (defaults to the most recent cached simulation)"
+                        "description": "Optional cached or currently running simulation ID returned by bake_coupled_simulation (defaults to the most recent simulation)"
                     },
                     "frame_index": {
                         "type": "integer",
-                        "description": "Zero-based timeline frame index to retrieve (dimensionless integer; defaults to the last frame if neither frame_index nor time_s is supplied)"
+                        "description": "Zero-based timeline frame index to retrieve (dimensionless integer; defaults to the latest solved frame if neither frame_index nor time_s is supplied)"
                     },
                     "time_s": {
                         "type": "number",

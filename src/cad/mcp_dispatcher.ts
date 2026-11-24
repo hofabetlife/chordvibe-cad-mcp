@@ -1301,16 +1301,27 @@ export function executeMcpToolOnEngineState(
       const matId = String(params.material_id || params.id || `mat_${Date.now()}`);
       const density = Number(params.density_kg_m3 ?? params.density ?? 7850);
       const E_gpa = Number(params.youngs_modulus_gpa ?? params.young_modulus_gpa ?? 205);
-      const E_pa = params.youngs_modulus_pa
-        ? Number(params.youngs_modulus_pa)
-        : E_gpa * 1e9;
+      const E_pa =
+        params.youngs_modulus_pa !== undefined && params.youngs_modulus_pa !== null
+          ? Number(params.youngs_modulus_pa)
+          : params.young_modulus_pa !== undefined && params.young_modulus_pa !== null
+            ? Number(params.young_modulus_pa)
+            : E_gpa * 1e9;
       const nu = Number(params.poissons_ratio ?? params.poisson_ratio ?? 0.29);
       const yieldMpa = Number(params.yield_strength_mpa ?? 350);
-      const yieldPa = params.yield_strength_pa
-        ? Number(params.yield_strength_pa)
-        : yieldMpa * 1e6;
+      const yieldPa =
+        params.yield_strength_pa !== undefined && params.yield_strength_pa !== null
+          ? Number(params.yield_strength_pa)
+          : yieldMpa * 1e6;
 
-      if (density <= 0 || E_pa <= 0 || yieldPa <= 0) {
+      if (
+        !Number.isFinite(density) ||
+        density <= 0 ||
+        !Number.isFinite(E_pa) ||
+        E_pa <= 0 ||
+        !Number.isFinite(yieldPa) ||
+        yieldPa <= 0
+      ) {
         throw new Error(
           'define_material requires positive density, youngs_modulus, and yield_strength'
         );
@@ -1427,6 +1438,12 @@ export function executeMcpToolOnEngineState(
         throw new Error(`create_joint part_b '${partB}' does not exist`);
       }
 
+      const rawUnit = String(params.length_unit ?? 'mm').toLowerCase();
+      if (rawUnit !== 'mm' && rawUnit !== 'm') {
+        throw new Error(`Unsupported length_unit '${rawUnit}'. Supported: mm, m`);
+      }
+      const kToM = rawUnit === 'm' ? 1.0 : 0.001;
+
       let parsedLimits: [number, number] | undefined;
       if (params.limits !== undefined && params.limits !== null) {
         if (!Array.isArray(params.limits) || params.limits.length !== 2) {
@@ -1444,8 +1461,6 @@ export function executeMcpToolOnEngineState(
               ? [l0, l1]
               : [(l0 * Math.PI) / 180, (l1 * Math.PI) / 180];
         } else if (jointType === 'prismatic') {
-          const lenUnit = String(params.length_unit ?? 'mm').toLowerCase();
-          const kToM = lenUnit === 'm' ? 1.0 : 0.001;
           parsedLimits = [l0 * kToM, l1 * kToM];
         }
       }
@@ -1496,6 +1511,7 @@ export function executeMcpToolOnEngineState(
         joint_type: jointType,
         part_a: partA,
         part_b: partB,
+        length_unit: rawUnit,
       };
       break;
     }
@@ -1987,12 +2003,13 @@ export function executeMcpToolOnEngineState(
       }
       const partId = String(params.part_id || 'imported_stl_part');
       const isFixed = Boolean(params.is_fixed);
-      const density = getDensity('steel_1045');
+      const matId = String(params.material || 'steel_1045');
+      const density = getDensity(matId);
       const mesh = createBoxMesh(0.05, 0.05, 0.05, density);
       const importedPart: CadPart = {
         id: partId,
         name: String(params.name || partId),
-        materialId: String(params.material || 'steel_1045'),
+        materialId: matId,
         isFixed,
         dag: [
           {

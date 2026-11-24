@@ -16,6 +16,7 @@ import {
   bakePressDestructionCache,
   detectPressAssembly,
 } from './press_simulation';
+import { estimateRemainingMs } from './coupled_sim_stream';
 
 type Vec2 = [number, number];
 type Vec3 = [number, number, number];
@@ -1110,31 +1111,62 @@ function alignInitialGearPhaseIfOverlapping(
   b.rot[2] = bestAngle;
 }
 
-/**
- * Synchronous deterministic destruction cache baker with real 480 Hz 2D SAT
- * gear-tooth rigid-body collision detection, hard non-penetration projection,
- * ISO/Lewis tooth bending stress from actual contact impulses, and 2-stage fracture.
- */
-export function bakeDestructionCacheSync(
+export interface DestructionStreamMeta {
+  progressPct: number;
+  stepCount: number;
+  totalSteps: number;
+  framesCached: number;
+  latestFrameIndex: number;
+  timeSec: number;
+  totalDurationSec: number;
+  maxVonMisesMPa: number;
+  activeShards: number;
+  elapsedMs: number;
+  estimatedRemainingMs: number | null;
+  stageLabel: string;
+}
+
+export interface DestructionAsyncBakeOptions {
+  signal?: AbortSignal;
+  onPartialCache?: (
+    cache: DestructionCache,
+    latestFrameIndex: number,
+    meta: DestructionStreamMeta
+  ) => void;
+  onMeta?: (meta: DestructionStreamMeta) => void;
+  yieldEveryFrames?: number;
+}
+
+function computeSingleFrameBytes(f: DestructionCacheFrame): number {
+  let bytes =
+    f.shardPos.byteLength +
+    f.shardQuat.byteLength +
+    f.shardActive.byteLength +
+    f.shardStress.byteLength +
+    (f.shardStressMPa?.byteLength ?? 0) +
+    (f.shardPlasticStrain?.byteLength ?? 0) +
+    (f.shardDamage?.byteLength ?? 0) +
+    f.sparks.byteLength +
+    160;
+  for (const ps of Object.values(f.partStates)) {
+    bytes +=
+      (ps.deformedDisplacements?.byteLength ?? 0) +
+      (ps.nodalStressMPa?.byteLength ?? 0) +
+      (ps.nodalPlasticStrain?.byteLength ?? 0) +
+      (ps.nodalDamage?.byteLength ?? 0);
+  }
+  return bytes;
+}
+
+function createGearDestructionSession(
   parts: CadPart[],
   joints: KinematicJoint[],
   materials: MaterialSpec[],
   config: DestructionSimConfig
-): DestructionCache {
-  // Detect prismatic press / spring-compression assemblies (e.g., base_plate + spring_1 + press_plate)
-  // and run dedicated axial elastoplastic compression + coil-bind + overload fracture physics.
-  const detectedPress = detectPressAssembly(
-    parts,
-    joints,
-    materials,
-    config.impactTorqueNm > 0 ? Math.max(500, config.impactTorqueNm * 11) : undefined
-  );
-  if (detectedPress) {
-    return bakePressDestructionCache(parts, joints, materials, config, detectedPress);
-  }
-
+) {
   const startMs =
     typeof performance !== 'undefined' ? performance.now() : Date.now();
+  const cacheId = `dcache_${Date.now().toString(36)}_${config.seed}`;
   const safeFps = Math.max(24, Math.min(120, Math.round(config.fps || 60)));
   const safeDuration = Math.max(0.5, Math.min(6.0, config.durationSec || 2.5));
   const totalFrames = Math.round(safeDuration * safeFps);
@@ -1552,7 +1584,19 @@ export function bakeDestructionCacheSync(
   const partRtById = new Map<string, InternalPartRuntime>();
   for (const pr of partRuntimes) partRtById.set(pr.part.id, pr);
 
-  for (let frameIdx = 0; frameIdx <= totalFrames; frameIdx++) {
+  let shardGeometryBytes = 0;
+  for (const s of allShards) {
+    shardGeometryBytes +=
+      s.vertices.byteLength +
+      s.normals.byteLength +
+      s.indices.byteLength +
+      s.innerVertices.byteLength +
+      s.innerNormals.byteLength +
+      s.innerIndices.byteLength;
+  }
+  let frameCacheBytes = 0;
+
+  const stepFrame = (frameIdx: number): DestructionCacheFrame => {
     const timeSec = Number((frameIdx * dt).toFixed(4));
 
     let framePeakStress = 0;
@@ -2463,7 +2507,7 @@ export function bakeDestructionCacheSync(
       statusLabel,
     };
 
-    frames.push({
+    const frameObj: DestructionCacheFrame = {
       frameIndex: frameIdx,
       timeSec,
       partStates,
@@ -2476,89 +2520,243 @@ export function bakeDestructionCacheSync(
       shardDamage,
       sparks: packedSparks,
       metrics,
-    });
-  }
+    };
+    frames.push(frameObj);
+    frameCacheBytes += computeSingleFrameBytes(frameObj);
+    return frameObj;
+  };
 
-  let cacheBytes = 0;
-  for (const s of allShards) {
-    cacheBytes +=
-      s.vertices.byteLength +
-      s.normals.byteLength +
-      s.indices.byteLength +
-      s.innerVertices.byteLength +
-      s.innerNormals.byteLength +
-      s.innerIndices.byteLength;
-  }
-  for (const f of frames) {
-    cacheBytes +=
-      f.shardPos.byteLength +
-      f.shardQuat.byteLength +
-      f.shardActive.byteLength +
-      f.shardStress.byteLength +
-      (f.shardStressMPa?.byteLength ?? 0) +
-      (f.shardPlasticStrain?.byteLength ?? 0) +
-      (f.shardDamage?.byteLength ?? 0) +
-      f.sparks.byteLength +
-      160;
-    for (const ps of Object.values(f.partStates)) {
-      cacheBytes +=
-        (ps.deformedDisplacements?.byteLength ?? 0) +
-        (ps.nodalStressMPa?.byteLength ?? 0) +
-        (ps.nodalPlasticStrain?.byteLength ?? 0) +
-        (ps.nodalDamage?.byteLength ?? 0);
-    }
-  }
-
-  const endMs =
-    typeof performance !== 'undefined' ? performance.now() : Date.now();
+  const buildCacheSnapshot = (): DestructionCache => {
+    const nowMs =
+      typeof performance !== 'undefined' ? performance.now() : Date.now();
+    return {
+      id: cacheId,
+      createdAt: new Date().toISOString(),
+      solverBackend: 'web_local_preview',
+      solverLabel: 'Web Local Preview',
+      config: { ...config },
+      fps: safeFps,
+      totalFrames: Math.max(0, frames.length - 1),
+      durationSec: safeDuration,
+      floorY,
+      contactPoint: [...latestContactWorld] as Vec3,
+      bakeTimeMs: Math.max(1, Number((nowMs - startMs).toFixed(1))),
+      cacheBytes: shardGeometryBytes + frameCacheBytes,
+      shards: allShards,
+      frames: [...frames],
+      events: [...events],
+      maxStressOverallMPa: Math.max(1, Number(maxStressOverallMPa.toFixed(1))),
+      yieldStrengthRefMPa: Number(minYieldMPa.toFixed(0)),
+      maxPlasticStrainOverallPct: Math.max(
+        0.5,
+        Number(maxPlasticStrainOverallPct.toFixed(2))
+      ),
+      maxDamageOverall: Number(Math.max(0.01, maxDamageOverall).toFixed(3)),
+      maxEnergyOverallJ: Number(maxEnergyOverallJ.toFixed(4)),
+    };
+  };
 
   return {
-    id: `dcache_${Date.now().toString(36)}_${config.seed}`,
-    createdAt: new Date().toISOString(),
-    solverBackend: 'web_local_preview',
-    solverLabel: 'Web Local Preview',
-    config: { ...config },
-    fps: safeFps,
     totalFrames,
-    durationSec: safeDuration,
-    floorY,
-    contactPoint: latestContactWorld,
-    bakeTimeMs: Math.max(1, Number((endMs - startMs).toFixed(1))),
-    cacheBytes,
-    shards: allShards,
-    frames,
-    events,
-    maxStressOverallMPa: Math.max(1, Number(maxStressOverallMPa.toFixed(1))),
-    yieldStrengthRefMPa: Number(minYieldMPa.toFixed(0)),
-    maxPlasticStrainOverallPct: Math.max(
-      0.5,
-      Number(maxPlasticStrainOverallPct.toFixed(2))
-    ),
-    maxDamageOverall: Number(Math.max(0.01, maxDamageOverall).toFixed(3)),
-    maxEnergyOverallJ: Number(maxEnergyOverallJ.toFixed(4)),
+    safeFps,
+    safeDuration,
+    substeps,
+    stepFrame,
+    buildCacheSnapshot,
   };
 }
 
 /**
- * Chunked asynchronous wrapper so React UI renders smooth progress during cache baking
- * without blocking the main browser thread.
+ * Synchronous deterministic destruction cache baker with real 480 Hz 2D SAT
+ * gear-tooth rigid-body collision detection, hard non-penetration projection,
+ * ISO/Lewis tooth bending stress from actual contact impulses, and 2-stage fracture.
+ */
+export function bakeDestructionCacheSync(
+  parts: CadPart[],
+  joints: KinematicJoint[],
+  materials: MaterialSpec[],
+  config: DestructionSimConfig
+): DestructionCache {
+  const detectedPress = detectPressAssembly(
+    parts,
+    joints,
+    materials,
+    config.impactTorqueNm > 0 ? Math.max(500, config.impactTorqueNm * 11) : undefined
+  );
+  if (detectedPress) {
+    return bakePressDestructionCache(parts, joints, materials, config, detectedPress);
+  }
+
+  const session = createGearDestructionSession(parts, joints, materials, config);
+  for (let frameIdx = 0; frameIdx <= session.totalFrames; frameIdx++) {
+    session.stepFrame(frameIdx);
+  }
+  return session.buildCacheSnapshot();
+}
+
+/**
+ * Chunked asynchronous baker that streams live frames to the UI as they are solved,
+ * supports instant `AbortSignal` cancellation, and computes wall-clock ETA telemetry.
  */
 export async function bakeDestructionCacheAsync(
   parts: CadPart[],
   joints: KinematicJoint[],
   materials: MaterialSpec[],
   config: DestructionSimConfig,
-  onProgress?: (pct: number, stageLabel: string) => void
+  onProgress?: (pct: number, stageLabel: string) => void,
+  options?: DestructionAsyncBakeOptions
 ): Promise<DestructionCache> {
-  onProgress?.(12, 'Генерация 3D осколков (Voronoi)...');
-  await new Promise((r) => setTimeout(r, 18));
-  onProgress?.(45, 'Расчёт SAT-коллизий зубьев и разрушения (480 Гц)...');
-  await new Promise((r) => setTimeout(r, 18));
-  const cache = bakeDestructionCacheSync(parts, joints, materials, config);
-  onProgress?.(88, 'Упаковка кадров в бинарный кэш...');
-  await new Promise((r) => setTimeout(r, 16));
+  const signal = options?.signal;
+  const throwIfAborted = () => {
+    if (signal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+  };
+  throwIfAborted();
+
+  const wallStartMs =
+    typeof performance !== 'undefined' ? performance.now() : Date.now();
+  const yieldStep = Math.max(1, options?.yieldEveryFrames ?? 5);
+  const chunkDelayMs = options?.onPartialCache ? 12 : 0;
+
+  onProgress?.(4, 'Генерация 3D осколков (Voronoi)...');
+  await new Promise((r) => setTimeout(r, chunkDelayMs || 8));
+  throwIfAborted();
+
+  const detectedPress = detectPressAssembly(
+    parts,
+    joints,
+    materials,
+    config.impactTorqueNm > 0 ? Math.max(500, config.impactTorqueNm * 11) : undefined
+  );
+
+  if (detectedPress) {
+    const fullPress = bakePressDestructionCache(
+      parts,
+      joints,
+      materials,
+      config,
+      detectedPress
+    );
+    const totalCount = fullPress.frames.length;
+    let shardBytes = 0;
+    for (const s of fullPress.shards) {
+      shardBytes += s.vertices.byteLength + s.normals.byteLength + s.indices.byteLength;
+    }
+    let accFrameBytes = 0;
+    let runningStress = 1;
+    let runningPlastic = 0.5;
+    let runningDmg = 0.01;
+    let runningEnergy = 1e-4;
+
+    for (let i = 0; i < totalCount; i++) {
+      throwIfAborted();
+      const f = fullPress.frames[i];
+      accFrameBytes += computeSingleFrameBytes(f);
+      if (f.metrics.peakStressMPa > runningStress) runningStress = f.metrics.peakStressMPa;
+      if (f.metrics.maxPlasticStrainPct > runningPlastic) runningPlastic = f.metrics.maxPlasticStrainPct;
+      if (f.metrics.maxDamage > runningDmg) runningDmg = f.metrics.maxDamage;
+      runningEnergy = Math.max(
+        runningEnergy,
+        f.metrics.kineticEnergyJ,
+        f.metrics.elasticEnergyJ,
+        f.metrics.plasticEnergyJ,
+        f.metrics.fractureEnergyJ
+      );
+
+      if (i === 0 || (i + 1) % yieldStep === 0 || i === totalCount - 1) {
+        const pct = Math.min(100, Math.max(5, Math.round(((i + 1) / totalCount) * 100)));
+        const nowMs =
+          typeof performance !== 'undefined' ? performance.now() : Date.now();
+        const elapsedMs = Math.max(1, nowMs - wallStartMs);
+        const stageLabel = `${f.metrics.statusLabel} · кадр ${i + 1}/${totalCount} (${pct}%)`;
+        const meta: DestructionStreamMeta = {
+          progressPct: pct,
+          stepCount: (i + 1) * 4,
+          totalSteps: totalCount * 4,
+          framesCached: i + 1,
+          latestFrameIndex: i,
+          timeSec: f.timeSec,
+          totalDurationSec: fullPress.durationSec,
+          maxVonMisesMPa: runningStress,
+          activeShards: f.metrics.activeShardsCount,
+          elapsedMs,
+          estimatedRemainingMs: estimateRemainingMs(elapsedMs, pct),
+          stageLabel,
+        };
+        onProgress?.(pct, stageLabel);
+        options?.onMeta?.(meta);
+        if (options?.onPartialCache) {
+          const partialCache: DestructionCache = {
+            ...fullPress,
+            totalFrames: i,
+            bakeTimeMs: Number(elapsedMs.toFixed(1)),
+            cacheBytes: shardBytes + accFrameBytes,
+            frames: fullPress.frames.slice(0, i + 1),
+            events: fullPress.events.filter((e) => e.frameIndex <= i),
+            maxStressOverallMPa: Number(runningStress.toFixed(1)),
+            maxPlasticStrainOverallPct: Number(runningPlastic.toFixed(2)),
+            maxDamageOverall: Number(runningDmg.toFixed(3)),
+            maxEnergyOverallJ: Number(runningEnergy.toFixed(4)),
+          };
+          options.onPartialCache(partialCache, i, meta);
+        }
+        if (i < totalCount - 1) {
+          await new Promise((r) => setTimeout(r, chunkDelayMs));
+        }
+      }
+    }
+    onProgress?.(100, 'Кэш готов');
+    return fullPress;
+  }
+
+  const session = createGearDestructionSession(parts, joints, materials, config);
+  const totalCount = session.totalFrames + 1;
+
+  for (let frameIdx = 0; frameIdx <= session.totalFrames; frameIdx++) {
+    throwIfAborted();
+    const frameObj = session.stepFrame(frameIdx);
+
+    if (
+      frameIdx === 0 ||
+      (frameIdx + 1) % yieldStep === 0 ||
+      frameIdx === session.totalFrames
+    ) {
+      const pct = Math.min(
+        100,
+        Math.max(5, Math.round(((frameIdx + 1) / totalCount) * 100))
+      );
+      const nowMs =
+        typeof performance !== 'undefined' ? performance.now() : Date.now();
+      const elapsedMs = Math.max(1, nowMs - wallStartMs);
+      const snapshot = session.buildCacheSnapshot();
+      const stageLabel = `${frameObj.metrics.statusLabel} · кадр ${frameIdx + 1}/${totalCount} (${pct}%)`;
+      const meta: DestructionStreamMeta = {
+        progressPct: pct,
+        stepCount: (frameIdx + 1) * session.substeps,
+        totalSteps: totalCount * session.substeps,
+        framesCached: frameIdx + 1,
+        latestFrameIndex: frameIdx,
+        timeSec: frameObj.timeSec,
+        totalDurationSec: session.safeDuration,
+        maxVonMisesMPa: snapshot.maxStressOverallMPa,
+        activeShards: frameObj.metrics.activeShardsCount,
+        elapsedMs,
+        estimatedRemainingMs: estimateRemainingMs(elapsedMs, pct),
+        stageLabel,
+      };
+      onProgress?.(pct, stageLabel);
+      options?.onMeta?.(meta);
+      options?.onPartialCache?.(snapshot, frameIdx, meta);
+
+      if (frameIdx < session.totalFrames) {
+        await new Promise((r) => setTimeout(r, chunkDelayMs));
+      }
+    }
+  }
+
   onProgress?.(100, 'Кэш готов');
-  return cache;
+  return session.buildCacheSnapshot();
 }
 
 export function formatCacheBytes(bytes: number): string {

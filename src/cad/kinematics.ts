@@ -86,11 +86,8 @@ export function stepKinematicsAssembly(
           : defaultDir * 0.025;
       let dPos = vel * dtSeconds;
       if (joint.limits) {
-        const rawMin = Math.min(joint.limits[0], joint.limits[1]);
-        const rawMax = Math.max(joint.limits[0], joint.limits[1]);
-        const scale = Math.max(Math.abs(rawMin), Math.abs(rawMax)) > 1.0 ? 1e-3 : 1.0;
-        const minL = rawMin * scale;
-        const maxL = rawMax * scale;
+        const minL = Math.min(joint.limits[0], joint.limits[1]);
+        const maxL = Math.max(joint.limits[0], joint.limits[1]);
         const nextPos = joint.currentAngleRad + dPos;
         if (nextPos < minL) {
           dPos = minL - joint.currentAngleRad;

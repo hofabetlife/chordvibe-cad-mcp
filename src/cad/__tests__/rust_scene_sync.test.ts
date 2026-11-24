@@ -699,3 +699,54 @@ test('buildRustSceneSyncPlan preserves prismatic motorLinearSpeedMs in m/s', () 
   assert.equal(motorOp.args.max_force, 2000);
 });
 
+test('buildRustSceneSyncPlan aligns helix primitive upright along Y via [-90, 0, 0] rotation', () => {
+  const spring: CadPart = {
+    id: 'coil_spring_1',
+    name: 'Helical Coil Spring',
+    materialId: 'steel_1045',
+    visible: true,
+    isFixed: false,
+    position: [0, 0.0325, 0],
+    rotation: [0, 0, 0],
+    scale: [1, 1, 1],
+    dag: [
+      {
+        id: 'node_1',
+        name: 'Helix',
+        type: 'helix',
+        enabled: true,
+        params: {
+          helix_radius: 0.0175,
+          wire_radius: 0.0025,
+          pitch: 0.012,
+          height: 0.06,
+          starts: 1,
+          is_right_hand: true,
+        },
+      },
+    ],
+    mesh: makeDummyMesh(0.06),
+  };
+  const cfg: DestructionSimConfig = {
+    scenarioMode: 'impact_crush',
+    durationSec: 1.0,
+    fps: 60,
+    motorRpmLeft: 0,
+    motorRpmRight: 0,
+    impactTorqueNm: 100,
+    brittleness: 0.55,
+    shardCountPerPart: 12,
+    gravityY: -9.81,
+    restitution: 0.3,
+    seed: 1,
+  };
+  const plan = buildRustSceneSyncPlan([spring], [], DEFAULT_MATERIALS, cfg, 'standard');
+  const addOp = plan.operations.find((op) => op.tool === 'add_feature_primitive');
+  assert.ok(addOp);
+  const params = addOp.args.params as Record<string, unknown>;
+  assert.deepEqual(params.rotation_deg, [-90, 0, 0]);
+  assert.deepEqual(plan.bakePayload.fixed_faces, [{ part_id: 'coil_spring_1', face: 'min_y' }]);
+  assert.equal((plan.bakePayload.loads as Array<{ face: string }>)[0].face, 'max_y');
+});
+
+

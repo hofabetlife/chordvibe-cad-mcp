@@ -9,6 +9,11 @@ import {
   Radio,
 } from 'lucide-react';
 
+import {
+  formatDurationMsRu,
+  type LiveFemSolveStatus,
+} from '../cad/coupled_sim_stream';
+
 interface CadStatusBarProps {
   parts: CadPart[];
   selectedPart?: CadPart;
@@ -19,6 +24,7 @@ interface CadStatusBarProps {
   liveSyncConnected?: boolean;
   livePartsCount?: number;
   liveLastTool?: string;
+  liveSolveStatus?: LiveFemSolveStatus | null;
 }
 
 export const CadStatusBar: React.FC<CadStatusBarProps> = ({
@@ -31,6 +37,7 @@ export const CadStatusBar: React.FC<CadStatusBarProps> = ({
   liveSyncConnected = false,
   livePartsCount = 0,
   liveLastTool,
+  liveSolveStatus = null,
 }) => {
   const totalTriangles = parts.reduce(
     (acc, p) => acc + (p.visible ? p.mesh.triangleCount : 0),
@@ -83,8 +90,27 @@ export const CadStatusBar: React.FC<CadStatusBarProps> = ({
         </div>
       </div>
 
-      {/* Right: Kinematics & MCP Live Sync */}
+      {/* Right: Kinematics, Live FEM Solve Progress & MCP Live Sync */}
       <div className="flex items-center gap-3">
+        {liveSolveStatus?.active && (
+          <>
+            <span
+              data-testid="statusbar-fem-progress"
+              className="text-[#38bdf8] font-semibold tabular-nums text-[10px] truncate max-w-[260px]"
+            >
+              FEM {liveSolveStatus.progressPct}% · Кадр{' '}
+              {liveSolveStatus.framesCached}
+              {liveSolveStatus.frameCount > 0
+                ? `/${liveSolveStatus.frameCount}`
+                : ''}
+              {liveSolveStatus.estimatedRemainingMs != null
+                ? ` · ~${formatDurationMsRu(liveSolveStatus.estimatedRemainingMs)}`
+                : ''}
+            </span>
+            <span className="text-[#334155]">|</span>
+          </>
+        )}
+
         <div className="hidden lg:flex items-center gap-1.5 text-[#cbd5e1]">
           <Gauge className="w-3 h-3 text-[#10b981]" />
           <span>{fps} FPS</span>

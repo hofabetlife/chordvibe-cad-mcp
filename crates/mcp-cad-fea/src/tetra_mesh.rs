@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use nalgebra::Vector3;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use mcp_cad_core::part::Part;
 use mcp_cad_core::tessellation::{TessellationQuality, TessellationSettings};
@@ -583,11 +584,24 @@ impl TetrahedralMesh {
                 ));
             }
         }
-        let h = density.target_element_size(&aabb);
+        let mut h = density.target_element_size(&aabb);
+        let helical_wire_diam = crate::conforming_mesh::detect_helical_wire_diameter(mesh);
+        if !matches!(density, MeshDensity::Custom { .. }) {
+            if let Some(d_wire) = helical_wire_diam {
+                let factor = match density {
+                    MeshDensity::Coarse => 0.44,
+                    MeshDensity::Medium => 0.36,
+                    MeshDensity::Fine => 0.28,
+                    MeshDensity::Custom { .. } => 0.40,
+                };
+                h = h.min((d_wire * factor).max(1e-4));
+            }
+        }
+        let max_axis_cells = if helical_wire_diam.is_some() { 88 } else { 60 };
 
-        let nx = ((dims[0] / h).round() as usize).clamp(2, 60);
-        let ny = ((dims[1] / h).round() as usize).clamp(2, 60);
-        let nz = ((dims[2] / h).round() as usize).clamp(2, 60);
+        let nx = ((dims[0] / h).round() as usize).clamp(2, max_axis_cells);
+        let ny = ((dims[1] / h).round() as usize).clamp(2, max_axis_cells);
+        let nz = ((dims[2] / h).round() as usize).clamp(2, max_axis_cells);
 
         // Check if the input mesh is a standard axis-aligned box
         if is_axis_aligned_box(mesh, &aabb) {
@@ -611,7 +625,7 @@ impl TetrahedralMesh {
             if is_sole_thin_axis {
                 n.max(2)
             } else {
-                n.max(min_curved_cells).min(60)
+                n.max(min_curved_cells).min(max_axis_cells)
             }
         };
         let nx = adjust_axis(nx, dims[0]);
@@ -621,7 +635,7 @@ impl TetrahedralMesh {
         let dy = dims[1] / ny as f64;
         let dz = dims[2] / nz as f64;
 
-        // For general shapes: test voxel containment using ray-triangle parity check
+        // For general shapes: test voxel containment using fast 2D grid-accelerated ray casting
         let node_idx = |i: usize, j: usize, k: usize| -> usize {
             i * (ny + 1) * (nz + 1) + j * (nz + 1) + k
         };
@@ -640,22 +654,45 @@ impl TetrahedralMesh {
             }
         }
 
-        // Arbitrary ray direction (non-axial to avoid coplanar degenerate hits)
-        let ray_dir = Vector3::new(0.577, 0.708, 0.408).normalize();
+        let ray_caster = crate::conforming_mesh::FastRayCaster::build(mesh);
+        let is_helical = helical_wire_diam.is_some();
 
-        // Check which voxels have centers inside the mesh
-        let mut kept_tets = Vec::new();
-        let mut used_node_indices = HashSet::new();
-
-        for i in 0..nx {
-            let cx = aabb.min[0] + (i as f64 + 0.5) * dx;
-            for j in 0..ny {
+        // Parallel scan over (i, j) columns of voxels
+        let strips: Vec<Vec<[usize; 4]>> = (0..nx * ny)
+            .into_par_iter()
+            .map(|ij| {
+                let i = ij / ny;
+                let j = ij % ny;
+                let cx = aabb.min[0] + (i as f64 + 0.5) * dx;
                 let cy = aabb.min[1] + (j as f64 + 0.5) * dy;
+                let mut local_tets = Vec::new();
                 for k in 0..nz {
                     let cz = aabb.min[2] + (k as f64 + 0.5) * dz;
                     let center = Vector3::new(cx, cy, cz);
 
-                    if point_inside_mesh(center, ray_dir, mesh) {
+                    let mut keep = ray_caster.is_inside(center.into());
+                    if !keep && is_helical {
+                        let offsets = [
+                            Vector3::new(0.44 * dx, 0.0, 0.0),
+                            Vector3::new(-0.44 * dx, 0.0, 0.0),
+                            Vector3::new(0.0, 0.44 * dy, 0.0),
+                            Vector3::new(0.0, -0.44 * dy, 0.0),
+                            Vector3::new(0.0, 0.0, 0.44 * dz),
+                            Vector3::new(0.0, 0.0, -0.44 * dz),
+                        ];
+                        let mut inside_cnt = 0usize;
+                        for off in offsets {
+                            if ray_caster.is_inside((center + off).into()) {
+                                inside_cnt += 1;
+                                if inside_cnt >= 2 {
+                                    keep = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if keep {
                         let p000 = node_idx(i, j, k);
                         let p100 = node_idx(i + 1, j, k);
                         let p010 = node_idx(i, j + 1, k);
@@ -684,20 +721,86 @@ impl TetrahedralMesh {
                             if det < 0.0 {
                                 tet.swap(1, 2);
                             }
-
-                            for &n in &tet {
-                                used_node_indices.insert(n);
-                            }
-                            kept_tets.push(tet);
+                            local_tets.push(tet);
                         }
                     }
                 }
-            }
-        }
+                local_tets
+            })
+            .collect();
+
+        let mut kept_tets: Vec<[usize; 4]> = strips.into_iter().flatten().collect();
 
         if kept_tets.is_empty() {
             // Fallback: If no voxel centers were strictly inside, fallback to AABB mesh
             return Self::from_box(aabb.min, aabb.max, nx, ny, nz);
+        }
+
+        // For additive helical wires, retain only the largest face-connected component
+        // to eliminate disconnected corner/saddle islands and guarantee 1 node & face component.
+        if is_helical && kept_tets.len() > 1 {
+            let n_elem = kept_tets.len();
+            let mut parent: Vec<usize> = (0..n_elem).collect();
+            let mut size: Vec<usize> = vec![1; n_elem];
+            fn uf_find(parent: &mut [usize], mut x: usize) -> usize {
+                while parent[x] != x {
+                    parent[x] = parent[parent[x]];
+                    x = parent[x];
+                }
+                x
+            }
+            let mut face_owner: HashMap<[usize; 3], usize> = HashMap::with_capacity(n_elem * 2);
+            for (e_idx, &tet) in kept_tets.iter().enumerate() {
+                let faces = [
+                    [tet[0], tet[1], tet[2]],
+                    [tet[0], tet[1], tet[3]],
+                    [tet[0], tet[2], tet[3]],
+                    [tet[1], tet[2], tet[3]],
+                ];
+                for mut f in faces {
+                    f.sort_unstable();
+                    if let Some(&prev) = face_owner.get(&f) {
+                        let ra = uf_find(&mut parent, e_idx);
+                        let rb = uf_find(&mut parent, prev);
+                        if ra != rb {
+                            if size[ra] < size[rb] {
+                                parent[ra] = rb;
+                                size[rb] += size[ra];
+                            } else {
+                                parent[rb] = ra;
+                                size[ra] += size[rb];
+                            }
+                        }
+                    } else {
+                        face_owner.insert(f, e_idx);
+                    }
+                }
+            }
+            let mut best_root = 0usize;
+            let mut best_size = 0usize;
+            for i in 0..n_elem {
+                let r = uf_find(&mut parent, i);
+                if size[r] > best_size {
+                    best_size = size[r];
+                    best_root = r;
+                }
+            }
+            if best_size > 0 && best_size < n_elem {
+                let mut filtered = Vec::with_capacity(best_size);
+                for (i, tet) in kept_tets.into_iter().enumerate() {
+                    if uf_find(&mut parent, i) == best_root {
+                        filtered.push(tet);
+                    }
+                }
+                kept_tets = filtered;
+            }
+        }
+
+        let mut used_node_indices = HashSet::with_capacity(kept_tets.len());
+        for tet in &kept_tets {
+            for &n in tet {
+                used_node_indices.insert(n);
+            }
         }
 
         // Remap active nodes to compact indices 0..N-1
@@ -848,59 +951,6 @@ impl TetrahedralMesh {
         };
         Self::from_mesh_with_accuracy(&mesh, density, mode)
     }
-}
-
-/// Robust Möller-Trumbore ray-triangle intersection test.
-fn ray_triangle_intersect(
-    ray_origin: Vector3<f64>,
-    ray_dir: Vector3<f64>,
-    v0: Vector3<f64>,
-    v1: Vector3<f64>,
-    v2: Vector3<f64>,
-) -> Option<f64> {
-    let edge1 = v1 - v0;
-    let edge2 = v2 - v0;
-    let pvec = ray_dir.cross(&edge2);
-    let det = edge1.dot(&pvec);
-
-    if det.abs() < 1e-12 {
-        return None;
-    }
-
-    let inv_det = 1.0 / det;
-    let tvec = ray_origin - v0;
-    let u = tvec.dot(&pvec) * inv_det;
-    if !(0.0..=1.0).contains(&u) {
-        return None;
-    }
-
-    let qvec = tvec.cross(&edge1);
-    let v = ray_dir.dot(&qvec) * inv_det;
-    if v < 0.0 || u + v > 1.0 {
-        return None;
-    }
-
-    let t = edge2.dot(&qvec) * inv_det;
-    if t > 1e-9 {
-        Some(t)
-    } else {
-        None
-    }
-}
-
-/// Tests if a point is inside a closed triangular mesh via ray casting parity.
-fn point_inside_mesh(point: Vector3<f64>, ray_dir: Vector3<f64>, mesh: &TriangleMesh) -> bool {
-    let mut hit_count = 0;
-    for tri in &mesh.indices {
-        let v0 = mesh.vertices[tri[0] as usize].pos_vec();
-        let v1 = mesh.vertices[tri[1] as usize].pos_vec();
-        let v2 = mesh.vertices[tri[2] as usize].pos_vec();
-
-        if ray_triangle_intersect(point, ray_dir, v0, v1, v2).is_some() {
-            hit_count += 1;
-        }
-    }
-    hit_count % 2 == 1
 }
 
 /// Checks whether a triangle mesh is an axis-aligned box matching `aabb`.

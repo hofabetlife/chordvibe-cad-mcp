@@ -31,7 +31,9 @@ use crate::element::{rotate_voigt_stress, Tet10Element, Tet4Element, Vector12, V
 use crate::error::FeaError;
 use crate::fracture::{partition_fractured_body, DetachedFragment};
 use crate::solver::{CsrMatrix, SolverOptions};
-use crate::sparse_solver::{solve_linear_robust, solve_spd_newton_robust, LinearSolverKind};
+use crate::sparse_solver::{
+    solve_linear_robust, solve_spd_newton_cached, LinearSolverKind, SparseSolverCache,
+};
 use crate::tetra_mesh::TetrahedralMesh;
 
 /// Minimum element count before switching element evaluation loops to `rayon` multi-threading.
@@ -1601,7 +1603,37 @@ impl BodyRuntime {
         }
     }
 
-    fn restore(&mut self, cp: &BodyCheckpoint, mass_kind: MassMatrixKind) {
+    fn checkpoint_into(&self, cp: &mut BodyCheckpoint) {
+        cp.u.resize(self.u.len(), 0.0);
+        cp.u.copy_from_slice(&self.u);
+        cp.v.resize(self.v.len(), 0.0);
+        cp.v.copy_from_slice(&self.v);
+        cp.a.resize(self.a.len(), 0.0);
+        cp.a.copy_from_slice(&self.a);
+        cp.f_int_prev.resize(self.f_int_prev.len(), 0.0);
+        cp.f_int_prev.copy_from_slice(&self.f_int_prev);
+        cp.f_ext_prev.resize(self.f_ext_prev.len(), 0.0);
+        cp.f_ext_prev.copy_from_slice(&self.f_ext_prev);
+        cp.gp_states.resize(self.gp_states.len(), GaussPointState::default());
+        cp.gp_states.copy_from_slice(&self.gp_states);
+        cp.gp_rotations.resize(self.gp_rotations.len(), [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+        cp.gp_rotations.copy_from_slice(&self.gp_rotations);
+        cp.damage_states.resize(self.damage_states.len(), ElementDamageState::default());
+        cp.damage_states.copy_from_slice(&self.damage_states);
+        cp.active_elements.resize(self.active_elements.len(), true);
+        cp.active_elements.copy_from_slice(&self.active_elements);
+        cp.active_nodes.resize(self.active_nodes.len(), true);
+        cp.active_nodes.copy_from_slice(&self.active_nodes);
+        cp.eroded_elements.clear();
+        cp.eroded_elements.extend_from_slice(&self.eroded_elements);
+        cp.cumulative_fracture_energy_j = self.cumulative_fracture_energy_j;
+        cp.hub_states.clear();
+        for h in &self.hubs {
+            cp.hub_states.push((h.q, h.q_dot, h.q_ddot, h.q_effort_prev));
+        }
+    }
+
+    fn restore(&mut self, cp: &BodyCheckpoint, mass_kind: MassMatrixKind, has_contacts: bool) {
         let topo_changed = self.active_elements != cp.active_elements;
         self.u = cp.u.clone();
         self.v = cp.v.clone();
@@ -1624,7 +1656,9 @@ impl BodyRuntime {
         if topo_changed {
             self.rebuild_mass_and_gravity(mass_kind);
         }
-        self.surface.update_from_displacements(&self.mesh, &self.u);
+        if has_contacts {
+            self.surface.update_from_displacements(&self.mesh, &self.u);
+        }
     }
 
     fn update_hub_inertia_estimates(&mut self) {
@@ -1773,9 +1807,9 @@ impl BodyRuntime {
         0.5 * dot_slice(&self.v, &mv)
     }
 
-    fn stiffness_scales(&self) -> Vec<f64> {
+    fn fill_stiffness_scales_into(&self, scales: &mut Vec<f64>) {
         let n_elem = self.elements.element_count();
-        let mut scales = vec![1.0; n_elem];
+        scales.resize(n_elem, 1.0);
         if let Some(dp) = self.damage_params {
             for (e, ds) in self.damage_states.iter().enumerate() {
                 if !self.active_elements[e] || ds.eroded {
@@ -1786,11 +1820,14 @@ impl BodyRuntime {
             }
         } else {
             for (e, &act) in self.active_elements.iter().enumerate() {
-                if !act {
-                    scales[e] = 0.0;
-                }
+                scales[e] = if act { 1.0 } else { 0.0 };
             }
         }
+    }
+
+    fn stiffness_scales(&self) -> Vec<f64> {
+        let mut scales = Vec::new();
+        self.fill_stiffness_scales_into(&mut scales);
         scales
     }
 
@@ -1950,6 +1987,175 @@ fn norm_slice(a: &[f64]) -> f64 {
     dot_slice(a, a).sqrt()
 }
 
+/// Windowed Anderson Acceleration (DIIS / Pulay mixing) with Modified Gram-Schmidt QR
+/// and collinearity dropping. Eliminates low-rank tangent mismatches (such as omitted
+/// geometric stiffness or slowly shifting plasticity zones) while keeping K_eff SPD
+/// and reusing the cached LDL^T factorization from Newton iter 0.
+struct AndersonAccelerator {
+    window: usize,
+    has_f_prev: bool,
+    f_prev: Vec<f64>,
+    df_hist: Vec<Vec<f64>>,
+    dg_hist: Vec<Vec<f64>>,
+    df_pool: Vec<Vec<f64>>,
+    dg_pool: Vec<Vec<f64>>,
+    q_cols: Vec<Vec<f64>>,
+}
+
+impl AndersonAccelerator {
+    fn new(window: usize) -> Self {
+        let w = window.max(1);
+        Self {
+            window: w,
+            has_f_prev: false,
+            f_prev: Vec::new(),
+            df_hist: Vec::with_capacity(w),
+            dg_hist: Vec::with_capacity(w),
+            df_pool: Vec::with_capacity(w),
+            dg_pool: Vec::with_capacity(w),
+            q_cols: (0..w).map(|_| Vec::new()).collect(),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.has_f_prev = false;
+        self.df_pool.append(&mut self.df_hist);
+        self.dg_pool.append(&mut self.dg_hist);
+    }
+
+    fn reset_with_seed(&mut self, f0: &[f64]) {
+        self.f_prev.clear();
+        self.f_prev.extend_from_slice(f0);
+        self.has_f_prev = true;
+        self.df_pool.append(&mut self.df_hist);
+        self.dg_pool.append(&mut self.dg_hist);
+    }
+
+    #[inline]
+    fn is_active(&self) -> bool {
+        !self.df_hist.is_empty()
+    }
+
+    fn step(&mut self, du_prev: &[f64], f_curr: &[f64]) -> Vec<f64> {
+        let n = f_curr.len();
+        if n == 0 || du_prev.len() != n {
+            self.reset_with_seed(f_curr);
+            return f_curr.to_vec();
+        }
+
+        if self.has_f_prev && self.f_prev.len() == n {
+            let mut df = self.df_pool.pop().unwrap_or_default();
+            let mut dg = self.dg_pool.pop().unwrap_or_default();
+            df.resize(n, 0.0);
+            dg.resize(n, 0.0);
+            let mut df_sq = 0.0_f64;
+            for i in 0..n {
+                let d = f_curr[i] - self.f_prev[i];
+                df[i] = d;
+                dg[i] = du_prev[i] + d;
+                df_sq += d * d;
+            }
+            let f_norm = norm_slice(f_curr);
+            if df_sq.is_finite() && df_sq.sqrt() > 1e-14 * f_norm.max(1e-12) {
+                if self.df_hist.len() == self.window {
+                    let old_df = self.df_hist.remove(0);
+                    let old_dg = self.dg_hist.remove(0);
+                    self.df_pool.push(old_df);
+                    self.dg_pool.push(old_dg);
+                }
+                self.df_hist.push(df);
+                self.dg_hist.push(dg);
+            } else {
+                self.df_pool.push(df);
+                self.dg_pool.push(dg);
+            }
+        }
+        self.f_prev.clear();
+        self.f_prev.extend_from_slice(f_curr);
+        self.has_f_prev = true;
+
+        let m = self.df_hist.len();
+        if m == 0 {
+            return f_curr.to_vec();
+        }
+
+        // Modified Gram-Schmidt QR on columns df_hist[0..m] using reusable q_cols buffers
+        let mut r_mat = [[0.0_f64; 8]; 8];
+        let mut active = [false; 8];
+        let m_cap = m.min(8);
+
+        for j in 0..m_cap {
+            let col_norm = norm_slice(&self.df_hist[j]);
+            let (prev_qs, cur_slice) = self.q_cols.split_at_mut(j);
+            let v = &mut cur_slice[0];
+            v.clear();
+            v.extend_from_slice(&self.df_hist[j]);
+            for i in 0..j {
+                if !active[i] {
+                    continue;
+                }
+                let qi = &prev_qs[i];
+                let rij = dot_slice(qi, v);
+                r_mat[i][j] = rij;
+                for (vk, &qik) in v.iter_mut().zip(qi.iter()) {
+                    *vk -= rij * qik;
+                }
+            }
+            let rjj = norm_slice(v);
+            if !rjj.is_finite() || rjj <= 1e-10 * col_norm.max(1e-30) {
+                active[j] = false;
+            } else {
+                active[j] = true;
+                r_mat[j][j] = rjj;
+                let inv = 1.0 / rjj;
+                for val in v.iter_mut() {
+                    *val *= inv;
+                }
+            }
+        }
+
+        let mut rhs = [0.0_f64; 8];
+        for i in 0..m_cap {
+            if active[i] {
+                rhs[i] = dot_slice(&self.q_cols[i], f_curr);
+            }
+        }
+
+        let mut gamma = [0.0_f64; 8];
+        for i in (0..m_cap).rev() {
+            if !active[i] {
+                continue;
+            }
+            let mut s = rhs[i];
+            for j in (i + 1)..m_cap {
+                if active[j] {
+                    s -= r_mat[i][j] * gamma[j];
+                }
+            }
+            gamma[i] = s / r_mat[i][i];
+        }
+
+        let mut dy = f_curr.to_vec();
+        for j in 0..m_cap {
+            let g = gamma[j];
+            if g != 0.0 && g.is_finite() {
+                let dg = &self.dg_hist[j];
+                for (dk, &dgk) in dy.iter_mut().zip(dg.iter()) {
+                    *dk -= g * dgk;
+                }
+            }
+        }
+
+        let f_norm = norm_slice(f_curr);
+        let dy_norm = norm_slice(&dy);
+        if !dy_norm.is_finite() || dy_norm > 8.0 * f_norm.max(1e-30) {
+            self.reset_with_seed(f_curr);
+            return f_curr.to_vec();
+        }
+        dy
+    }
+}
+
 #[inline]
 fn matrix3_to_rows(m: &Matrix3<f64>) -> [[f64; 3]; 3] {
     [
@@ -1957,6 +2163,546 @@ fn matrix3_to_rows(m: &Matrix3<f64>) -> [[f64; 3]; 3] {
         [m[(1, 0)], m[(1, 1)], m[(1, 2)]],
         [m[(2, 0)], m[(2, 1)], m[(2, 2)]],
     ]
+}
+
+/// Reusable scratch workspace for zero-allocation single-body continuum force evaluation.
+struct SingleBodyForceWorkspace {
+    scratch_f: Vec<Vec<f64>>,
+    f_int: Vec<f64>,
+    gp_states: Vec<GaussPointState>,
+    gp_rotations: Vec<[[f64; 3]; 3]>,
+    scales: Vec<f64>,
+}
+
+impl SingleBodyForceWorkspace {
+    fn new() -> Self {
+        Self {
+            scratch_f: Vec::new(),
+            f_int: Vec::new(),
+            gp_states: Vec::new(),
+            gp_rotations: Vec::new(),
+            scales: Vec::new(),
+        }
+    }
+
+    fn recycle(
+        &mut self,
+        f_int: Vec<f64>,
+        gp_states: Vec<GaussPointState>,
+        gp_rotations: Vec<[[f64; 3]; 3]>,
+    ) {
+        if f_int.capacity() >= self.f_int.capacity() {
+            self.f_int = f_int;
+        }
+        if gp_states.capacity() >= self.gp_states.capacity() {
+            self.gp_states = gp_states;
+        }
+        if gp_rotations.capacity() >= self.gp_rotations.capacity() {
+            self.gp_rotations = gp_rotations;
+        }
+    }
+}
+
+/// Evaluates element internal forces without allocating/computing element tangent matrices.
+#[allow(clippy::type_complexity)]
+fn evaluate_body_continuum_forces(
+    body: &BodyRuntime,
+    u_trial: &[f64],
+    opts: &HhtOptions,
+) -> (Vec<f64>, Vec<GaussPointState>, Vec<[[f64; 3]; 3]>, f64, f64) {
+    let mut ws = SingleBodyForceWorkspace::new();
+    evaluate_body_continuum_forces_ws(body, u_trial, opts, &mut ws)
+}
+
+/// Evaluates element internal forces reusing persistent scratch buffers in `ws`.
+#[allow(clippy::type_complexity)]
+fn evaluate_body_continuum_forces_ws(
+    body: &BodyRuntime,
+    u_trial: &[f64],
+    opts: &HhtOptions,
+    ws: &mut SingleBodyForceWorkspace,
+) -> (Vec<f64>, Vec<GaussPointState>, Vec<[[f64; 3]; 3]>, f64, f64) {
+    let n_dofs = body.mesh.node_count() * 3;
+    let mut f_int = std::mem::take(&mut ws.f_int);
+    f_int.resize(n_dofs, 0.0);
+    f_int.fill(0.0);
+
+    let mat = body.effective_material(opts.enable_plasticity);
+    body.fill_stiffness_scales_into(&mut ws.scales);
+    let scales = ws.scales.as_slice();
+    let prev_gp = &body.gp_states;
+    let active = &body.active_elements;
+    let mut total_we = 0.0_f64;
+    let mut total_wp = 0.0_f64;
+
+    let eye = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    let n_workers = rayon::current_num_threads().max(1);
+
+    match &body.elements {
+        DynamicElements::Tet4(elems) => {
+            let n_elems = elems.len();
+            let mut new_gp = std::mem::take(&mut ws.gp_states);
+            new_gp.resize(n_elems, GaussPointState::default());
+            let mut new_rots = std::mem::take(&mut ws.gp_rotations);
+            new_rots.resize(n_elems, eye);
+
+            if n_elems >= DYNAMICS_PAR_THRESHOLD {
+                let chunk_sz = n_elems.div_ceil(n_workers).max(1);
+                let n_chunks = n_elems.div_ceil(chunk_sz).max(1);
+                if ws.scratch_f.len() != n_chunks {
+                    ws.scratch_f = (0..n_chunks).map(|_| vec![0.0_f64; n_dofs]).collect();
+                } else {
+                    for sf in &mut ws.scratch_f {
+                        if sf.len() != n_dofs {
+                            sf.resize(n_dofs, 0.0);
+                        }
+                    }
+                }
+                let energies: Vec<(f64, f64)> = ws
+                    .scratch_f
+                    .par_iter_mut()
+                    .zip(elems.par_chunks(chunk_sz))
+                    .zip(scales.par_chunks(chunk_sz))
+                    .zip(active.par_chunks(chunk_sz))
+                    .zip(prev_gp.par_chunks(chunk_sz))
+                    .zip(new_gp.par_chunks_mut(chunk_sz))
+                    .zip(new_rots.par_chunks_mut(chunk_sz))
+                    .map(|((((((local_f, ec), stc), ac), pgc), ngc), nrc)| {
+                        local_f.fill(0.0);
+                        let mut we = 0.0_f64;
+                        let mut wp = 0.0_f64;
+                        for (idx, elem) in ec.iter().enumerate() {
+                            if !ac[idx] {
+                                ngc[idx] = pgc[idx];
+                                nrc[idx] = eye;
+                                continue;
+                            }
+                            let d_scale = stc[idx];
+                            let mut u_elem = Vector12::zeros();
+                            let mut elem_dofs = [0usize; 12];
+                            for (li, &nid) in elem.node_indices.iter().enumerate() {
+                                let d0 = 3 * nid;
+                                elem_dofs[3 * li] = d0;
+                                elem_dofs[3 * li + 1] = d0 + 1;
+                                elem_dofs[3 * li + 2] = d0 + 2;
+                                u_elem[3 * li] = u_trial[d0];
+                                u_elem[3 * li + 1] = u_trial[d0 + 1];
+                                u_elem[3 * li + 2] = u_trial[d0 + 2];
+                            }
+                            let (f_e, rm, r_mat) = elem.evaluate_nonlinear_forces_only(
+                                &u_elem,
+                                &pgc[idx],
+                                &mat,
+                                opts.corotated,
+                            );
+                            ngc[idx] = rm.state;
+                            nrc[idx] = matrix3_to_rows(&r_mat);
+                            we += d_scale * rm.elastic_energy_density * elem.volume;
+                            wp += rm.state.plastic_energy_density * elem.volume;
+                            for a in 0..12 {
+                                local_f[elem_dofs[a]] += d_scale * f_e[a];
+                            }
+                        }
+                        (we, wp)
+                    })
+                    .collect();
+                if n_dofs >= 8192 {
+                    let f_slices: Vec<&[f64]> = ws.scratch_f.iter().map(Vec::as_slice).collect();
+                    f_int
+                        .par_chunks_mut(2048)
+                        .enumerate()
+                        .for_each(|(c_idx, out_c)| {
+                            let start = c_idx * 2048;
+                            for (ci, fs) in f_slices.iter().enumerate() {
+                                let src = &fs[start..start + out_c.len()];
+                                if ci == 0 {
+                                    out_c.copy_from_slice(src);
+                                } else {
+                                    for (o, &v) in out_c.iter_mut().zip(src.iter()) {
+                                        *o += v;
+                                    }
+                                }
+                            }
+                        });
+                } else {
+                    for lf in ws.scratch_f.iter() {
+                        for (fo, &v) in f_int.iter_mut().zip(lf.iter()) {
+                            *fo += v;
+                        }
+                    }
+                }
+                for &(we, wp) in &energies {
+                    total_we += we;
+                    total_wp += wp;
+                }
+            } else {
+                for (e_idx, elem) in elems.iter().enumerate() {
+                    if !active[e_idx] {
+                        new_gp[e_idx] = prev_gp[e_idx];
+                        new_rots[e_idx] = eye;
+                        continue;
+                    }
+                    let d_scale = scales[e_idx];
+                    let mut u_elem = Vector12::zeros();
+                    let mut elem_dofs = [0usize; 12];
+                    for (li, &nid) in elem.node_indices.iter().enumerate() {
+                        let d0 = 3 * nid;
+                        elem_dofs[3 * li] = d0;
+                        elem_dofs[3 * li + 1] = d0 + 1;
+                        elem_dofs[3 * li + 2] = d0 + 2;
+                        u_elem[3 * li] = u_trial[d0];
+                        u_elem[3 * li + 1] = u_trial[d0 + 1];
+                        u_elem[3 * li + 2] = u_trial[d0 + 2];
+                    }
+                    let (f_e, rm, r_mat) = elem.evaluate_nonlinear_forces_only(
+                        &u_elem,
+                        &prev_gp[e_idx],
+                        &mat,
+                        opts.corotated,
+                    );
+                    new_gp[e_idx] = rm.state;
+                    new_rots[e_idx] = matrix3_to_rows(&r_mat);
+                    total_we += d_scale * rm.elastic_energy_density * elem.volume;
+                    total_wp += rm.state.plastic_energy_density * elem.volume;
+                    for a in 0..12 {
+                        f_int[elem_dofs[a]] += d_scale * f_e[a];
+                    }
+                }
+            }
+            (f_int, new_gp, new_rots, total_we, total_wp)
+        }
+        DynamicElements::Tet10(elems) => {
+            let n_elems = elems.len();
+            let mut new_gp = std::mem::take(&mut ws.gp_states);
+            new_gp.resize(n_elems * 4, GaussPointState::default());
+            let mut new_rots = std::mem::take(&mut ws.gp_rotations);
+            new_rots.resize(n_elems * 4, eye);
+
+            if n_elems >= DYNAMICS_PAR_THRESHOLD {
+                let chunk_sz = n_elems.div_ceil(n_workers).max(1);
+                let n_chunks = n_elems.div_ceil(chunk_sz).max(1);
+                if ws.scratch_f.len() != n_chunks {
+                    ws.scratch_f = (0..n_chunks).map(|_| vec![0.0_f64; n_dofs]).collect();
+                } else {
+                    for sf in &mut ws.scratch_f {
+                        if sf.len() != n_dofs {
+                            sf.resize(n_dofs, 0.0);
+                        }
+                    }
+                }
+                let energies: Vec<(f64, f64)> = ws
+                    .scratch_f
+                    .par_iter_mut()
+                    .zip(elems.par_chunks(chunk_sz))
+                    .zip(scales.par_chunks(chunk_sz))
+                    .zip(active.par_chunks(chunk_sz))
+                    .zip(prev_gp.par_chunks(chunk_sz * 4))
+                    .zip(new_gp.par_chunks_mut(chunk_sz * 4))
+                    .zip(new_rots.par_chunks_mut(chunk_sz * 4))
+                    .map(|((((((local_f, ec), stc), ac), pgc), ngc), nrc)| {
+                        local_f.fill(0.0);
+                        let mut we = 0.0_f64;
+                        let mut wp = 0.0_f64;
+                        for (idx, elem) in ec.iter().enumerate() {
+                            let base = idx * 4;
+                            if !ac[idx] {
+                                for q in 0..4 {
+                                    ngc[base + q] = pgc[base + q];
+                                    nrc[base + q] = eye;
+                                }
+                                continue;
+                            }
+                            let d_scale = stc[idx];
+                            let mut u_elem = Vector30::zeros();
+                            let mut elem_dofs = [0usize; 30];
+                            for (li, &nid) in elem.node_indices.iter().enumerate() {
+                                let d0 = 3 * nid;
+                                elem_dofs[3 * li] = d0;
+                                elem_dofs[3 * li + 1] = d0 + 1;
+                                elem_dofs[3 * li + 2] = d0 + 2;
+                                u_elem[3 * li] = u_trial[d0];
+                                u_elem[3 * li + 1] = u_trial[d0 + 1];
+                                u_elem[3 * li + 2] = u_trial[d0 + 2];
+                            }
+                            let prev4 =
+                                [pgc[base], pgc[base + 1], pgc[base + 2], pgc[base + 3]];
+                            let (f_e, rms, rots) = elem.evaluate_nonlinear_forces_only(
+                                &u_elem,
+                                &prev4,
+                                &mat,
+                                opts.corotated,
+                            );
+                            for q in 0..4 {
+                                ngc[base + q] = rms[q].state;
+                                nrc[base + q] = matrix3_to_rows(&rots[q]);
+                            }
+                            for (rm, &gw) in rms.iter().zip(elem.gauss_weights.iter()) {
+                                we += d_scale * rm.elastic_energy_density * gw;
+                                wp += rm.state.plastic_energy_density * gw;
+                            }
+                            for a in 0..30 {
+                                local_f[elem_dofs[a]] += d_scale * f_e[a];
+                            }
+                        }
+                        (we, wp)
+                    })
+                    .collect();
+                if n_dofs >= 8192 {
+                    let f_slices: Vec<&[f64]> = ws.scratch_f.iter().map(Vec::as_slice).collect();
+                    f_int
+                        .par_chunks_mut(2048)
+                        .enumerate()
+                        .for_each(|(c_idx, out_c)| {
+                            let start = c_idx * 2048;
+                            for (ci, fs) in f_slices.iter().enumerate() {
+                                let src = &fs[start..start + out_c.len()];
+                                if ci == 0 {
+                                    out_c.copy_from_slice(src);
+                                } else {
+                                    for (o, &v) in out_c.iter_mut().zip(src.iter()) {
+                                        *o += v;
+                                    }
+                                }
+                            }
+                        });
+                } else {
+                    for lf in ws.scratch_f.iter() {
+                        for (fo, &v) in f_int.iter_mut().zip(lf.iter()) {
+                            *fo += v;
+                        }
+                    }
+                }
+                for &(we, wp) in &energies {
+                    total_we += we;
+                    total_wp += wp;
+                }
+            } else {
+                for (e_idx, elem) in elems.iter().enumerate() {
+                    let base = e_idx * 4;
+                    if !active[e_idx] {
+                        for q in 0..4 {
+                            new_gp[base + q] = prev_gp[base + q];
+                            new_rots[base + q] = eye;
+                        }
+                        continue;
+                    }
+                    let d_scale = scales[e_idx];
+                    let mut u_elem = Vector30::zeros();
+                    let mut elem_dofs = [0usize; 30];
+                    for (li, &nid) in elem.node_indices.iter().enumerate() {
+                        let d0 = 3 * nid;
+                        elem_dofs[3 * li] = d0;
+                        elem_dofs[3 * li + 1] = d0 + 1;
+                        elem_dofs[3 * li + 2] = d0 + 2;
+                        u_elem[3 * li] = u_trial[d0];
+                        u_elem[3 * li + 1] = u_trial[d0 + 1];
+                        u_elem[3 * li + 2] = u_trial[d0 + 2];
+                    }
+                    let prev4 = [
+                        prev_gp[base],
+                        prev_gp[base + 1],
+                        prev_gp[base + 2],
+                        prev_gp[base + 3],
+                    ];
+                    let (f_e, rms, rots) = elem.evaluate_nonlinear_forces_only(
+                        &u_elem,
+                        &prev4,
+                        &mat,
+                        opts.corotated,
+                    );
+                    for q in 0..4 {
+                        new_gp[base + q] = rms[q].state;
+                        new_rots[base + q] = matrix3_to_rows(&rots[q]);
+                    }
+                    for (rm, &gw) in rms.iter().zip(elem.gauss_weights.iter()) {
+                        total_we += d_scale * rm.elastic_energy_density * gw;
+                        total_wp += rm.state.plastic_energy_density * gw;
+                    }
+                    for a in 0..30 {
+                        f_int[elem_dofs[a]] += d_scale * f_e[a];
+                    }
+                }
+            }
+            (f_int, new_gp, new_rots, total_we, total_wp)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ResidualWorkspace {
+    r_red: Vec<f64>,
+    m_a: Vec<f64>,
+    c_v: Vec<f64>,
+    damp_tmp: Vec<f64>,
+    mod_cand: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SavedLsState {
+    valid: bool,
+    u: Vec<Vec<f64>>,
+    v: Vec<Vec<f64>>,
+    a: Vec<Vec<f64>>,
+    q: Vec<f64>,
+    q_dot: Vec<f64>,
+    q_ddot: Vec<f64>,
+    dy_red: Vec<f64>,
+}
+
+impl SavedLsState {
+    fn copy_from_trials(
+        &mut self,
+        u: &[Vec<f64>],
+        v: &[Vec<f64>],
+        a: &[Vec<f64>],
+        q: &[f64],
+        q_dot: &[f64],
+        q_ddot: &[f64],
+    ) {
+        if self.u.len() != u.len() {
+            self.u = u.to_vec();
+            self.v = v.to_vec();
+            self.a = a.to_vec();
+        } else {
+            for b in 0..u.len() {
+                self.u[b].resize(u[b].len(), 0.0);
+                self.u[b].copy_from_slice(&u[b]);
+                self.v[b].resize(v[b].len(), 0.0);
+                self.v[b].copy_from_slice(&v[b]);
+                self.a[b].resize(a[b].len(), 0.0);
+                self.a[b].copy_from_slice(&a[b]);
+            }
+        }
+        self.q.resize(q.len(), 0.0);
+        self.q.copy_from_slice(q);
+        self.q_dot.resize(q_dot.len(), 0.0);
+        self.q_dot.copy_from_slice(q_dot);
+        self.q_ddot.resize(q_ddot.len(), 0.0);
+        self.q_ddot.copy_from_slice(q_ddot);
+    }
+
+    fn save_with_dy(
+        &mut self,
+        u: &[Vec<f64>],
+        v: &[Vec<f64>],
+        a: &[Vec<f64>],
+        q: &[f64],
+        q_dot: &[f64],
+        q_ddot: &[f64],
+        dy_red: &[f64],
+    ) {
+        self.copy_from_trials(u, v, a, q, q_dot, q_ddot);
+        self.dy_red.resize(dy_red.len(), 0.0);
+        self.dy_red.copy_from_slice(dy_red);
+        self.valid = true;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_hht_residual_into(
+    bodies: &[BodyRuntime],
+    dof_sys: &DynamicDofSystem,
+    v_state: &[Vec<f64>],
+    a_state: &[Vec<f64>],
+    f_res_bodies: &[Vec<f64>],
+    f_ext_next: &[Vec<f64>],
+    c_v_prev: &[Vec<f64>],
+    pilot_efforts: &[f64],
+    alpha: f64,
+    options: &HhtOptions,
+    ws: &mut ResidualWorkspace,
+) -> (f64, f64, f64) {
+    let n_red = dof_sys.n_reduced;
+    let n_free_nodal = dof_sys.n_free_nodal;
+    ws.r_red.resize(n_red, 0.0);
+    ws.r_red.fill(0.0);
+    let mut scale_sq = 0.0_f64;
+
+    let has_rayleigh = options.rayleigh_mass_alpha.abs() > 1e-18
+        || options.rayleigh_stiffness_beta.abs() > 1e-18;
+
+    for (b, body) in bodies.iter().enumerate() {
+        let nd = body.u.len();
+        ws.m_a.resize(nd, 0.0);
+        body.mass_matrix.spmv(&a_state[b], &mut ws.m_a);
+
+        if has_rayleigh {
+            ws.c_v.resize(nd, 0.0);
+            ws.c_v.fill(0.0);
+            if options.rayleigh_mass_alpha.abs() > 1e-18 {
+                ws.damp_tmp.resize(nd, 0.0);
+                body.mass_matrix.spmv(&v_state[b], &mut ws.damp_tmp);
+                for (cv, &mv) in ws.c_v.iter_mut().zip(ws.damp_tmp.iter()) {
+                    *cv += options.rayleigh_mass_alpha * mv;
+                }
+            }
+            if options.rayleigh_stiffness_beta.abs() > 1e-18 {
+                if let Some(ref k0) = body.rayleigh_k0 {
+                    ws.damp_tmp.resize(nd, 0.0);
+                    k0.spmv(&v_state[b], &mut ws.damp_tmp);
+                    for (cv, &kv) in ws.c_v.iter_mut().zip(ws.damp_tmp.iter()) {
+                        *cv += options.rayleigh_stiffness_beta * kv;
+                    }
+                }
+            }
+        }
+
+        let r_red = &mut ws.r_red;
+        let m_a = &ws.m_a;
+        let c_v_next = &ws.c_v;
+        let d_map = &dof_sys.dof_maps[b];
+        let f_ext_n = &f_ext_next[b];
+        let f_ext_p = &body.f_ext_prev;
+        let f_int_n = &f_res_bodies[b];
+        let f_int_p = &body.f_int_prev;
+        let cv_p = &c_v_prev[b];
+        let one_plus_alpha = 1.0 + alpha;
+
+        if has_rayleigh {
+            for d in 0..nd {
+                if let Some((ri, w)) = d_map[d].reduced_and_weight() {
+                    let f_ext_hht = one_plus_alpha * f_ext_n[d] - alpha * f_ext_p[d];
+                    let f_int_hht = one_plus_alpha * f_int_n[d] - alpha * f_int_p[d];
+                    let f_damp_hht = one_plus_alpha * c_v_next[d] - alpha * cv_p[d];
+                    r_red[ri] += w * (f_ext_hht - m_a[d] - f_damp_hht - f_int_hht);
+
+                    let term = w.abs()
+                        * f_ext_hht
+                            .abs()
+                            .max(m_a[d].abs())
+                            .max(f_int_hht.abs());
+                    scale_sq += term * term;
+                }
+            }
+        } else {
+            for d in 0..nd {
+                if let Some((ri, w)) = d_map[d].reduced_and_weight() {
+                    let f_ext_hht = one_plus_alpha * f_ext_n[d] - alpha * f_ext_p[d];
+                    let f_int_hht = one_plus_alpha * f_int_n[d] - alpha * f_int_p[d];
+                    r_red[ri] += w * (f_ext_hht - m_a[d] - f_int_hht);
+
+                    let term = w.abs()
+                        * f_ext_hht
+                            .abs()
+                            .max(m_a[d].abs())
+                            .max(f_int_hht.abs());
+                    scale_sq += term * term;
+                }
+            }
+        }
+    }
+    for (p_idx, &(b_idx, h_idx)) in dof_sys.pilot_to_body_hub.iter().enumerate() {
+        let pi = n_free_nodal + p_idx;
+        let q_prev = bodies[b_idx].hubs[h_idx].q_effort_prev;
+        let q_hht = (1.0 + alpha) * pilot_efforts[p_idx] - alpha * q_prev;
+        ws.r_red[pi] += q_hht;
+        scale_sq += q_hht * q_hht;
+    }
+
+    let r_norm = norm_slice(&ws.r_red);
+    let f_ref = scale_sq.sqrt().max(1e-12);
+    let rel_res = r_norm / f_ref;
+    (r_norm, f_ref, rel_res)
 }
 
 /// Evaluates element internal forces and optionally tangent stiffness for one body (parallelized via `rayon`).
@@ -1970,6 +2716,10 @@ fn evaluate_body_continuum(
     tangent_scale: f64,
     row_entries: &mut [Vec<(usize, f64)>],
 ) -> (Vec<f64>, Vec<GaussPointState>, Vec<[[f64; 3]; 3]>, f64, f64) {
+    if !assemble_tangent {
+        return evaluate_body_continuum_forces(body, u_trial, opts);
+    }
+
     let n_dofs = body.mesh.node_count() * 3;
     let mut f_int = vec![0.0; n_dofs];
     let mat = body.effective_material(opts.enable_plasticity);
@@ -1988,7 +2738,7 @@ fn evaluate_body_continuum(
                         0.0_f64,
                         [0usize; 12],
                         Vector12::zeros(),
-                        None,
+                        crate::element::Matrix12::zeros(),
                         prev_gp[e_idx],
                         [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
                         0.0_f64,
@@ -2007,44 +2757,24 @@ fn evaluate_body_continuum(
                     u_elem[3 * li + 1] = u_trial[d0 + 1];
                     u_elem[3 * li + 2] = u_trial[d0 + 2];
                 }
-                if assemble_tangent {
-                    let (f_e, k_e, rm, r_mat) = elem.evaluate_nonlinear(
-                        &u_elem,
-                        &prev_gp[e_idx],
-                        &mat,
-                        opts.corotated,
-                        opts.include_geometric_stiffness && d_scale >= 0.99,
-                    );
-                    (
-                        true,
-                        d_scale,
-                        elem_dofs,
-                        f_e,
-                        Some(k_e),
-                        rm.state,
-                        matrix3_to_rows(&r_mat),
-                        d_scale * rm.elastic_energy_density * elem.volume,
-                        rm.state.plastic_energy_density * elem.volume,
-                    )
-                } else {
-                    let (f_e, rm, r_mat) = elem.evaluate_nonlinear_forces_only(
-                        &u_elem,
-                        &prev_gp[e_idx],
-                        &mat,
-                        opts.corotated,
-                    );
-                    (
-                        true,
-                        d_scale,
-                        elem_dofs,
-                        f_e,
-                        None,
-                        rm.state,
-                        matrix3_to_rows(&r_mat),
-                        d_scale * rm.elastic_energy_density * elem.volume,
-                        rm.state.plastic_energy_density * elem.volume,
-                    )
-                }
+                let (f_e, k_e, rm, r_mat) = elem.evaluate_nonlinear(
+                    &u_elem,
+                    &prev_gp[e_idx],
+                    &mat,
+                    opts.corotated,
+                    opts.include_geometric_stiffness && d_scale >= 0.99,
+                );
+                (
+                    true,
+                    d_scale,
+                    elem_dofs,
+                    f_e,
+                    k_e,
+                    rm.state,
+                    matrix3_to_rows(&r_mat),
+                    d_scale * rm.elastic_energy_density * elem.volume,
+                    rm.state.plastic_energy_density * elem.volume,
+                )
             };
 
             let results: Vec<_> = if elems.len() >= DYNAMICS_PAR_THRESHOLD {
@@ -2055,7 +2785,7 @@ fn evaluate_body_continuum(
 
             let mut new_gp = Vec::with_capacity(elems.len());
             let mut new_rots = Vec::with_capacity(elems.len());
-            for (is_act, d_scale, elem_dofs, f_e, k_opt, gp, rot, we, wp) in results {
+            for (is_act, d_scale, elem_dofs, f_e, k_e, gp, rot, we, wp) in results {
                 new_gp.push(gp);
                 new_rots.push(rot);
                 if !is_act {
@@ -2066,18 +2796,14 @@ fn evaluate_body_continuum(
                 for a in 0..12 {
                     f_int[elem_dofs[a]] += d_scale * f_e[a];
                 }
-                if let Some(k_e) = k_opt {
-                    let k_mult = tangent_scale * d_scale;
-                    for a in 0..12 {
-                        if let Some((fa, wa)) = dof_map[elem_dofs[a]].reduced_and_weight() {
-                            let row_vec = &mut row_entries[fa];
-                            for b in 0..12 {
-                                if let Some((fb, wb)) = dof_map[elem_dofs[b]].reduced_and_weight() {
-                                    let val = k_mult * wa * wb * k_e[(a, b)];
-                                    if val.abs() > 1e-25 {
-                                        row_vec.push((fb, val));
-                                    }
-                                }
+                let k_mult = tangent_scale * d_scale;
+                for a in 0..12 {
+                    if let Some((fa, wa)) = dof_map[elem_dofs[a]].reduced_and_weight() {
+                        let row_vec = &mut row_entries[fa];
+                        for b in 0..12 {
+                            if let Some((fb, wb)) = dof_map[elem_dofs[b]].reduced_and_weight() {
+                                let val = k_mult * wa * wb * k_e[(a, b)];
+                                row_vec.push((fb, val));
                             }
                         }
                     }
@@ -2095,7 +2821,7 @@ fn evaluate_body_continuum(
                         0.0_f64,
                         [0usize; 30],
                         Vector30::zeros(),
-                        None,
+                        crate::element::Matrix30::zeros(),
                         [
                             prev_gp[base],
                             prev_gp[base + 1],
@@ -2125,66 +2851,35 @@ fn evaluate_body_continuum(
                     prev_gp[base + 2],
                     prev_gp[base + 3],
                 ];
-                if assemble_tangent {
-                    let (f_e, k_e, rms, rots) = elem.evaluate_nonlinear(
-                        &u_elem,
-                        &prev4,
-                        &mat,
-                        opts.corotated,
-                        opts.include_geometric_stiffness && d_scale >= 0.99,
-                    );
-                    let mut we = 0.0;
-                    let mut wp = 0.0;
-                    for (rm, &gw) in rms.iter().zip(elem.gauss_weights.iter()) {
-                        we += d_scale * rm.elastic_energy_density * gw;
-                        wp += rm.state.plastic_energy_density * gw;
-                    }
-                    (
-                        true,
-                        d_scale,
-                        elem_dofs,
-                        f_e,
-                        Some(k_e),
-                        [rms[0].state, rms[1].state, rms[2].state, rms[3].state],
-                        [
-                            matrix3_to_rows(&rots[0]),
-                            matrix3_to_rows(&rots[1]),
-                            matrix3_to_rows(&rots[2]),
-                            matrix3_to_rows(&rots[3]),
-                        ],
-                        we,
-                        wp,
-                    )
-                } else {
-                    let (f_e, rms, rots) = elem.evaluate_nonlinear_forces_only(
-                        &u_elem,
-                        &prev4,
-                        &mat,
-                        opts.corotated,
-                    );
-                    let mut we = 0.0;
-                    let mut wp = 0.0;
-                    for (rm, &gw) in rms.iter().zip(elem.gauss_weights.iter()) {
-                        we += d_scale * rm.elastic_energy_density * gw;
-                        wp += rm.state.plastic_energy_density * gw;
-                    }
-                    (
-                        true,
-                        d_scale,
-                        elem_dofs,
-                        f_e,
-                        None,
-                        [rms[0].state, rms[1].state, rms[2].state, rms[3].state],
-                        [
-                            matrix3_to_rows(&rots[0]),
-                            matrix3_to_rows(&rots[1]),
-                            matrix3_to_rows(&rots[2]),
-                            matrix3_to_rows(&rots[3]),
-                        ],
-                        we,
-                        wp,
-                    )
+                let (f_e, k_e, rms, rots) = elem.evaluate_nonlinear(
+                    &u_elem,
+                    &prev4,
+                    &mat,
+                    opts.corotated,
+                    opts.include_geometric_stiffness && d_scale >= 0.99,
+                );
+                let mut we = 0.0;
+                let mut wp = 0.0;
+                for (rm, &gw) in rms.iter().zip(elem.gauss_weights.iter()) {
+                    we += d_scale * rm.elastic_energy_density * gw;
+                    wp += rm.state.plastic_energy_density * gw;
                 }
+                (
+                    true,
+                    d_scale,
+                    elem_dofs,
+                    f_e,
+                    k_e,
+                    [rms[0].state, rms[1].state, rms[2].state, rms[3].state],
+                    [
+                        matrix3_to_rows(&rots[0]),
+                        matrix3_to_rows(&rots[1]),
+                        matrix3_to_rows(&rots[2]),
+                        matrix3_to_rows(&rots[3]),
+                    ],
+                    we,
+                    wp,
+                )
             };
 
             let results: Vec<_> = if elems.len() >= DYNAMICS_PAR_THRESHOLD {
@@ -2195,7 +2890,7 @@ fn evaluate_body_continuum(
 
             let mut new_gp = Vec::with_capacity(elems.len() * 4);
             let mut new_rots = Vec::with_capacity(elems.len() * 4);
-            for (is_act, d_scale, elem_dofs, f_e, k_opt, gp4, rots4, we, wp) in results {
+            for (is_act, d_scale, elem_dofs, f_e, k_e, gp4, rots4, we, wp) in results {
                 for q in 0..4 {
                     new_gp.push(gp4[q]);
                     new_rots.push(rots4[q]);
@@ -2208,18 +2903,14 @@ fn evaluate_body_continuum(
                 for a in 0..30 {
                     f_int[elem_dofs[a]] += d_scale * f_e[a];
                 }
-                if let Some(k_e) = k_opt {
-                    let k_mult = tangent_scale * d_scale;
-                    for a in 0..30 {
-                        if let Some((fa, wa)) = dof_map[elem_dofs[a]].reduced_and_weight() {
-                            let row_vec = &mut row_entries[fa];
-                            for b in 0..30 {
-                                if let Some((fb, wb)) = dof_map[elem_dofs[b]].reduced_and_weight() {
-                                    let val = k_mult * wa * wb * k_e[(a, b)];
-                                    if val.abs() > 1e-25 {
-                                        row_vec.push((fb, val));
-                                    }
-                                }
+                let k_mult = tangent_scale * d_scale;
+                for a in 0..30 {
+                    if let Some((fa, wa)) = dof_map[elem_dofs[a]].reduced_and_weight() {
+                        let row_vec = &mut row_entries[fa];
+                        for b in 0..30 {
+                            if let Some((fb, wb)) = dof_map[elem_dofs[b]].reduced_and_weight() {
+                                let val = k_mult * wa * wb * k_e[(a, b)];
+                                row_vec.push((fb, val));
                             }
                         }
                     }
@@ -2227,6 +2918,527 @@ fn evaluate_body_continuum(
             }
             (f_int, new_gp, new_rots, total_we, total_wp)
         }
+    }
+}
+
+struct CachedSingleBodyTangentCsr {
+    n_red: usize,
+    active_elements: Vec<bool>,
+    row_ptr: Vec<usize>,
+    col_indices: Vec<usize>,
+    /// Flat per-element `(b, a)` column-major CSR scatter slots (`u32::MAX` for fixed/inactive).
+    elem_slots: Vec<u32>,
+    /// `(slot, wa * wb * m_val)` for mass matrix scatter.
+    mass_slots: Vec<(u32, f64)>,
+    /// `(slot, wa * wb * k0_val)` for Rayleigh stiffness scatter.
+    rayleigh_slots: Vec<(u32, f64)>,
+    /// Reusable per-worker scratch buffers to avoid repeated OS mmap/page-fault churn.
+    scratch_vals: Vec<Vec<f64>>,
+    scratch_f: Vec<Vec<f64>>,
+    scales: Vec<f64>,
+    reusable_k_eff: Option<CsrMatrix>,
+}
+
+impl CachedSingleBodyTangentCsr {
+    #[inline]
+    fn find_slot(row_ptr: &[usize], col_indices: &[usize], fa: usize, fb: usize) -> u32 {
+        let start = row_ptr[fa];
+        let end = row_ptr[fa + 1];
+        match col_indices[start..end].binary_search(&fb) {
+            Ok(pos) => (start + pos) as u32,
+            Err(_) => u32::MAX,
+        }
+    }
+
+    fn build(body: &BodyRuntime, dof_map: &[DynDofMap], k_eff: &CsrMatrix) -> Self {
+        let n_red = k_eff.nrows;
+        let row_ptr = k_eff.row_ptr.clone();
+        let col_indices = k_eff.col_indices.clone();
+        let active = &body.active_elements;
+
+        let elem_slots: Vec<u32> = match &body.elements {
+            DynamicElements::Tet4(elems) => elems
+                .par_iter()
+                .enumerate()
+                .flat_map_iter(|(e_idx, elem)| {
+                    let mut slots = [u32::MAX; 144];
+                    if active[e_idx] {
+                        let mut dofs = [0usize; 12];
+                        for (li, &nid) in elem.node_indices.iter().enumerate() {
+                            dofs[3 * li] = 3 * nid;
+                            dofs[3 * li + 1] = 3 * nid + 1;
+                            dofs[3 * li + 2] = 3 * nid + 2;
+                        }
+                        for b in 0..12 {
+                            if let Some((fb, _)) = dof_map[dofs[b]].reduced_and_weight() {
+                                for a in 0..12 {
+                                    if let Some((fa, _)) = dof_map[dofs[a]].reduced_and_weight() {
+                                        slots[b * 12 + a] =
+                                            Self::find_slot(&row_ptr, &col_indices, fa, fb);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    slots.into_iter()
+                })
+                .collect(),
+            DynamicElements::Tet10(elems) => elems
+                .par_iter()
+                .enumerate()
+                .flat_map_iter(|(e_idx, elem)| {
+                    let mut slots = vec![u32::MAX; 900];
+                    if active[e_idx] {
+                        let mut dofs = [0usize; 30];
+                        for (li, &nid) in elem.node_indices.iter().enumerate() {
+                            dofs[3 * li] = 3 * nid;
+                            dofs[3 * li + 1] = 3 * nid + 1;
+                            dofs[3 * li + 2] = 3 * nid + 2;
+                        }
+                        for b in 0..30 {
+                            if let Some((fb, _)) = dof_map[dofs[b]].reduced_and_weight() {
+                                for a in 0..30 {
+                                    if let Some((fa, _)) = dof_map[dofs[a]].reduced_and_weight() {
+                                        slots[b * 30 + a] =
+                                            Self::find_slot(&row_ptr, &col_indices, fa, fb);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    slots.into_iter()
+                })
+                .collect(),
+        };
+
+        let collect_csr_slots = |csr: &CsrMatrix| -> Vec<(u32, f64)> {
+            let mut out = Vec::with_capacity(csr.values.len());
+            for r in 0..csr.nrows {
+                if let Some((fa, wa)) = dof_map[r].reduced_and_weight() {
+                    for idx in csr.row_ptr[r]..csr.row_ptr[r + 1] {
+                        let c = csr.col_indices[idx];
+                        if let Some((fb, wb)) = dof_map[c].reduced_and_weight() {
+                            let s = Self::find_slot(&row_ptr, &col_indices, fa, fb);
+                            if s != u32::MAX {
+                                out.push((s, wa * wb * csr.values[idx]));
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        };
+
+        let mass_slots = collect_csr_slots(&body.mass_matrix);
+        let rayleigh_slots = body
+            .rayleigh_k0
+            .as_ref()
+            .map(collect_csr_slots)
+            .unwrap_or_default();
+
+        Self {
+            n_red,
+            active_elements: active.clone(),
+            row_ptr,
+            col_indices,
+            elem_slots,
+            mass_slots,
+            rayleigh_slots,
+            scratch_vals: Vec::new(),
+            scratch_f: Vec::new(),
+            scales: Vec::new(),
+            reusable_k_eff: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn assemble(
+        &mut self,
+        body: &BodyRuntime,
+        u_trial: &[f64],
+        opts: &HhtOptions,
+        tangent_scale: f64,
+        m_scale: f64,
+        ck_scale: f64,
+        collect_forces: bool,
+    ) -> (
+        Option<(Vec<f64>, Vec<GaussPointState>, Vec<[[f64; 3]; 3]>, f64, f64)>,
+        CsrMatrix,
+    ) {
+        let n_dofs = body.mesh.node_count() * 3;
+        let nnz = self.col_indices.len();
+        let mat = body.effective_material(opts.enable_plasticity);
+        body.fill_stiffness_scales_into(&mut self.scales);
+        let prev_gp = &body.gp_states;
+        let active = &body.active_elements;
+        let eye = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let n_workers = rayon::current_num_threads().max(1);
+        let n_elems = body.elements.element_count();
+        let chunk_sz = n_elems.div_ceil(n_workers).max(1);
+        let n_chunks = n_elems.div_ceil(chunk_sz).max(1);
+
+        if self.scratch_vals.len() != n_chunks {
+            self.scratch_vals = (0..n_chunks).map(|_| vec![0.0_f64; nnz]).collect();
+        } else {
+            for sv in &mut self.scratch_vals {
+                if sv.len() != nnz {
+                    sv.resize(nnz, 0.0);
+                }
+            }
+        }
+        if collect_forces {
+            if self.scratch_f.len() != n_chunks {
+                self.scratch_f = (0..n_chunks).map(|_| vec![0.0_f64; n_dofs]).collect();
+            } else {
+                for sf in &mut self.scratch_f {
+                    if sf.len() != n_dofs {
+                        sf.resize(n_dofs, 0.0);
+                    }
+                }
+            }
+        }
+
+        let mut k_eff = match self.reusable_k_eff.take() {
+            Some(mut k) if k.nrows == self.n_red && k.values.len() == nnz => {
+                k.values.fill(0.0);
+                k
+            }
+            _ => CsrMatrix {
+                nrows: self.n_red,
+                ncols: self.n_red,
+                row_ptr: self.row_ptr.clone(),
+                col_indices: self.col_indices.clone(),
+                values: vec![0.0_f64; nnz],
+            },
+        };
+
+        let scales = &self.scales;
+        let elem_slots = &self.elem_slots;
+        let scratch_vals = &mut self.scratch_vals;
+        let scratch_f = &mut self.scratch_f;
+        let values = &mut k_eff.values;
+
+        let (f_out, new_gp, new_rots, total_we, total_wp) = match &body.elements {
+            DynamicElements::Tet4(elems) => {
+                let mut new_gp = if collect_forces {
+                    vec![GaussPointState::default(); n_elems]
+                } else {
+                    Vec::new()
+                };
+                let mut new_rots = if collect_forces {
+                    vec![eye; n_elems]
+                } else {
+                    Vec::new()
+                };
+
+                let (total_we, total_wp) = if collect_forces {
+                    let energies: Vec<(f64, f64)> = scratch_vals
+                        .par_iter_mut()
+                        .zip(scratch_f.par_iter_mut())
+                        .zip(new_gp.par_chunks_mut(chunk_sz))
+                        .zip(new_rots.par_chunks_mut(chunk_sz))
+                        .enumerate()
+                        .map(|(c_idx, (((local_vals, local_f), ngc), nrc))| {
+                            local_vals.fill(0.0);
+                            local_f.fill(0.0);
+                            let start = c_idx * chunk_sz;
+                            let end = (start + chunk_sz).min(n_elems);
+                            let mut we = 0.0_f64;
+                            let mut wp = 0.0_f64;
+                            for (idx, e_idx) in (start..end).enumerate() {
+                                if !active[e_idx] {
+                                    ngc[idx] = prev_gp[e_idx];
+                                    nrc[idx] = eye;
+                                    continue;
+                                }
+                                let elem = &elems[e_idx];
+                                let d_scale = scales[e_idx];
+                                let mut u_elem = Vector12::zeros();
+                                let mut elem_dofs = [0usize; 12];
+                                for (li, &nid) in elem.node_indices.iter().enumerate() {
+                                    let d0 = 3 * nid;
+                                    elem_dofs[3 * li] = d0;
+                                    elem_dofs[3 * li + 1] = d0 + 1;
+                                    elem_dofs[3 * li + 2] = d0 + 2;
+                                    u_elem[3 * li] = u_trial[d0];
+                                    u_elem[3 * li + 1] = u_trial[d0 + 1];
+                                    u_elem[3 * li + 2] = u_trial[d0 + 2];
+                                }
+                                let (f_e, k_e, rm, r_mat) = elem.evaluate_nonlinear(
+                                    &u_elem,
+                                    &prev_gp[e_idx],
+                                    &mat,
+                                    opts.corotated,
+                                    opts.include_geometric_stiffness && d_scale >= 0.99,
+                                );
+                                ngc[idx] = rm.state;
+                                nrc[idx] = matrix3_to_rows(&r_mat);
+                                we += d_scale * rm.elastic_energy_density * elem.volume;
+                                wp += rm.state.plastic_energy_density * elem.volume;
+                                for a in 0..12 {
+                                    local_f[elem_dofs[a]] += d_scale * f_e[a];
+                                }
+                                let k_mult = tangent_scale * d_scale;
+                                let slots_e = &elem_slots[e_idx * 144..(e_idx + 1) * 144];
+                                for (&vk, &s_u32) in k_e.as_slice().iter().zip(slots_e.iter()) {
+                                    let s = s_u32 as usize;
+                                    if s < nnz {
+                                        local_vals[s] += k_mult * vk;
+                                    }
+                                }
+                            }
+                            (we, wp)
+                        })
+                        .collect();
+                    let twe = energies.iter().map(|p| p.0).sum();
+                    let twp = energies.iter().map(|p| p.1).sum();
+                    (twe, twp)
+                } else {
+                    scratch_vals
+                        .par_iter_mut()
+                        .enumerate()
+                        .for_each(|(c_idx, local_vals)| {
+                            local_vals.fill(0.0);
+                            let start = c_idx * chunk_sz;
+                            let end = (start + chunk_sz).min(n_elems);
+                            for e_idx in start..end {
+                                if !active[e_idx] {
+                                    continue;
+                                }
+                                let elem = &elems[e_idx];
+                                let d_scale = scales[e_idx];
+                                let mut u_elem = Vector12::zeros();
+                                for (li, &nid) in elem.node_indices.iter().enumerate() {
+                                    let d0 = 3 * nid;
+                                    u_elem[3 * li] = u_trial[d0];
+                                    u_elem[3 * li + 1] = u_trial[d0 + 1];
+                                    u_elem[3 * li + 2] = u_trial[d0 + 2];
+                                }
+                                let (_, k_e, _, _) = elem.evaluate_nonlinear(
+                                    &u_elem,
+                                    &prev_gp[e_idx],
+                                    &mat,
+                                    opts.corotated,
+                                    opts.include_geometric_stiffness && d_scale >= 0.99,
+                                );
+                                let k_mult = tangent_scale * d_scale;
+                                let slots_e = &elem_slots[e_idx * 144..(e_idx + 1) * 144];
+                                for (&vk, &s_u32) in k_e.as_slice().iter().zip(slots_e.iter()) {
+                                    let s = s_u32 as usize;
+                                    if s < nnz {
+                                        local_vals[s] += k_mult * vk;
+                                    }
+                                }
+                            }
+                        });
+                    (0.0, 0.0)
+                };
+
+                let val_slices: Vec<&[f64]> = scratch_vals.iter().map(Vec::as_slice).collect();
+                values
+                    .par_chunks_mut(4096)
+                    .enumerate()
+                    .for_each(|(c_idx, out_c)| {
+                        let start = c_idx * 4096;
+                        for vs in &val_slices {
+                            let src = &vs[start..start + out_c.len()];
+                            for (o, &v) in out_c.iter_mut().zip(src.iter()) {
+                                *o += v;
+                            }
+                        }
+                    });
+
+                if collect_forces {
+                    let mut f_int = vec![0.0_f64; n_dofs];
+                    for lf in scratch_f.iter() {
+                        for (fo, &v) in f_int.iter_mut().zip(lf.iter()) {
+                            *fo += v;
+                        }
+                    }
+                    (f_int, new_gp, new_rots, total_we, total_wp)
+                } else {
+                    (Vec::new(), Vec::new(), Vec::new(), 0.0, 0.0)
+                }
+            }
+            DynamicElements::Tet10(elems) => {
+                let mut new_gp = if collect_forces {
+                    vec![GaussPointState::default(); n_elems * 4]
+                } else {
+                    Vec::new()
+                };
+                let mut new_rots = if collect_forces {
+                    vec![eye; n_elems * 4]
+                } else {
+                    Vec::new()
+                };
+
+                let (total_we, total_wp) = if collect_forces {
+                    let energies: Vec<(f64, f64)> = scratch_vals
+                        .par_iter_mut()
+                        .zip(scratch_f.par_iter_mut())
+                        .zip(new_gp.par_chunks_mut(chunk_sz * 4))
+                        .zip(new_rots.par_chunks_mut(chunk_sz * 4))
+                        .enumerate()
+                        .map(|(c_idx, (((local_vals, local_f), ngc), nrc))| {
+                            local_vals.fill(0.0);
+                            local_f.fill(0.0);
+                            let start = c_idx * chunk_sz;
+                            let end = (start + chunk_sz).min(n_elems);
+                            let mut we = 0.0_f64;
+                            let mut wp = 0.0_f64;
+                            for (idx, e_idx) in (start..end).enumerate() {
+                                let base_local = idx * 4;
+                                let base_global = e_idx * 4;
+                                if !active[e_idx] {
+                                    for q in 0..4 {
+                                        ngc[base_local + q] = prev_gp[base_global + q];
+                                        nrc[base_local + q] = eye;
+                                    }
+                                    continue;
+                                }
+                                let elem = &elems[e_idx];
+                                let d_scale = scales[e_idx];
+                                let mut u_elem = Vector30::zeros();
+                                let mut elem_dofs = [0usize; 30];
+                                for (li, &nid) in elem.node_indices.iter().enumerate() {
+                                    let d0 = 3 * nid;
+                                    elem_dofs[3 * li] = d0;
+                                    elem_dofs[3 * li + 1] = d0 + 1;
+                                    elem_dofs[3 * li + 2] = d0 + 2;
+                                    u_elem[3 * li] = u_trial[d0];
+                                    u_elem[3 * li + 1] = u_trial[d0 + 1];
+                                    u_elem[3 * li + 2] = u_trial[d0 + 2];
+                                }
+                                let prev4 = [
+                                    prev_gp[base_global],
+                                    prev_gp[base_global + 1],
+                                    prev_gp[base_global + 2],
+                                    prev_gp[base_global + 3],
+                                ];
+                                let (f_e, k_e, rms, rots) = elem.evaluate_nonlinear(
+                                    &u_elem,
+                                    &prev4,
+                                    &mat,
+                                    opts.corotated,
+                                    opts.include_geometric_stiffness && d_scale >= 0.99,
+                                );
+                                for q in 0..4 {
+                                    ngc[base_local + q] = rms[q].state;
+                                    nrc[base_local + q] = matrix3_to_rows(&rots[q]);
+                                }
+                                for (rm, &gw) in rms.iter().zip(elem.gauss_weights.iter()) {
+                                    we += d_scale * rm.elastic_energy_density * gw;
+                                    wp += rm.state.plastic_energy_density * gw;
+                                }
+                                for a in 0..30 {
+                                    local_f[elem_dofs[a]] += d_scale * f_e[a];
+                                }
+                                let k_mult = tangent_scale * d_scale;
+                                let slots_e = &elem_slots[e_idx * 900..(e_idx + 1) * 900];
+                                for (&vk, &s_u32) in k_e.as_slice().iter().zip(slots_e.iter()) {
+                                    let s = s_u32 as usize;
+                                    if s < nnz {
+                                        local_vals[s] += k_mult * vk;
+                                    }
+                                }
+                            }
+                            (we, wp)
+                        })
+                        .collect();
+                    let twe = energies.iter().map(|p| p.0).sum();
+                    let twp = energies.iter().map(|p| p.1).sum();
+                    (twe, twp)
+                } else {
+                    scratch_vals
+                        .par_iter_mut()
+                        .enumerate()
+                        .for_each(|(c_idx, local_vals)| {
+                            local_vals.fill(0.0);
+                            let start = c_idx * chunk_sz;
+                            let end = (start + chunk_sz).min(n_elems);
+                            for e_idx in start..end {
+                                if !active[e_idx] {
+                                    continue;
+                                }
+                                let elem = &elems[e_idx];
+                                let d_scale = scales[e_idx];
+                                let base_global = e_idx * 4;
+                                let mut u_elem = Vector30::zeros();
+                                for (li, &nid) in elem.node_indices.iter().enumerate() {
+                                    let d0 = 3 * nid;
+                                    u_elem[3 * li] = u_trial[d0];
+                                    u_elem[3 * li + 1] = u_trial[d0 + 1];
+                                    u_elem[3 * li + 2] = u_trial[d0 + 2];
+                                }
+                                let prev4 = [
+                                    prev_gp[base_global],
+                                    prev_gp[base_global + 1],
+                                    prev_gp[base_global + 2],
+                                    prev_gp[base_global + 3],
+                                ];
+                                let (_, k_e, _, _) = elem.evaluate_nonlinear(
+                                    &u_elem,
+                                    &prev4,
+                                    &mat,
+                                    opts.corotated,
+                                    opts.include_geometric_stiffness && d_scale >= 0.99,
+                                );
+                                let k_mult = tangent_scale * d_scale;
+                                let slots_e = &elem_slots[e_idx * 900..(e_idx + 1) * 900];
+                                for (&vk, &s_u32) in k_e.as_slice().iter().zip(slots_e.iter()) {
+                                    let s = s_u32 as usize;
+                                    if s < nnz {
+                                        local_vals[s] += k_mult * vk;
+                                    }
+                                }
+                            }
+                        });
+                    (0.0, 0.0)
+                };
+
+                let val_slices: Vec<&[f64]> = scratch_vals.iter().map(Vec::as_slice).collect();
+                values
+                    .par_chunks_mut(4096)
+                    .enumerate()
+                    .for_each(|(c_idx, out_c)| {
+                        let start = c_idx * 4096;
+                        for vs in &val_slices {
+                            let src = &vs[start..start + out_c.len()];
+                            for (o, &v) in out_c.iter_mut().zip(src.iter()) {
+                                *o += v;
+                            }
+                        }
+                    });
+
+                if collect_forces {
+                    let mut f_int = vec![0.0_f64; n_dofs];
+                    for lf in scratch_f.iter() {
+                        for (fo, &v) in f_int.iter_mut().zip(lf.iter()) {
+                            *fo += v;
+                        }
+                    }
+                    (f_int, new_gp, new_rots, total_we, total_wp)
+                } else {
+                    (Vec::new(), Vec::new(), Vec::new(), 0.0, 0.0)
+                }
+            }
+        };
+
+        for &(s, wv) in &self.mass_slots {
+            values[s as usize] += m_scale * wv;
+        }
+        if ck_scale.abs() > 0.0 {
+            for &(s, wv) in &self.rayleigh_slots {
+                values[s as usize] += ck_scale * wv;
+            }
+        }
+
+        let forces = if collect_forces {
+            Some((f_out, new_gp, new_rots, total_we, total_wp))
+        } else {
+            None
+        };
+        (forces, k_eff)
     }
 }
 
@@ -3151,7 +4363,11 @@ fn compute_all_hub_reactions(
                 for (c, fn_c) in f_node.iter_mut().enumerate() {
                     let d = d0 + c;
                     let (f_res_eff, f_ext_eff, f_damp_eff) = if use_hht_prev {
-                        let cv_p = c_v_prev.map_or(0.0, |v| v[b_idx][d]);
+                        let cv_p = c_v_prev
+                            .and_then(|v| v.get(b_idx))
+                            .and_then(|vb| vb.get(d))
+                            .copied()
+                            .unwrap_or(0.0);
                         (
                             (1.0 + alpha) * f_res_cur[b_idx][d] - alpha * body.f_int_prev[d],
                             (1.0 + alpha) * f_ext_cur[b_idx][d] - alpha * body.f_ext_prev[d],
@@ -3466,11 +4682,36 @@ pub fn solve_dynamic_hht_coupled<F>(
     body_specs: Vec<DynamicBodySpec>,
     pairs: &[ContactPairSpec],
     options: HhtOptions,
-    mut progress_cb: Option<F>,
+    progress_cb: Option<F>,
     cancel_flag: Option<&AtomicBool>,
 ) -> Result<DynamicHhtReport, FeaError>
 where
     F: FnMut(DynamicProgressUpdate),
+{
+    solve_dynamic_hht_coupled_with_frames(
+        body_specs,
+        pairs,
+        options,
+        progress_cb,
+        None::<fn(&DynamicFrameSnapshot)>,
+        cancel_flag,
+    )
+}
+
+/// Variant of [`solve_dynamic_hht_coupled`] that invokes `frame_cb` immediately whenever
+/// Frame 0 or a newly recorded timeline [`DynamicFrameSnapshot`] finishes computing, enabling
+/// live frame-by-frame streaming to UI viewports and incremental caches during long solves.
+pub fn solve_dynamic_hht_coupled_with_frames<FP, FF>(
+    body_specs: Vec<DynamicBodySpec>,
+    pairs: &[ContactPairSpec],
+    options: HhtOptions,
+    mut progress_cb: Option<FP>,
+    mut frame_cb: Option<FF>,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<DynamicHhtReport, FeaError>
+where
+    FP: FnMut(DynamicProgressUpdate),
+    FF: FnMut(&DynamicFrameSnapshot),
 {
     let start_wall = Instant::now();
 
@@ -3648,7 +4889,9 @@ where
         }
 
         let mut surface = DeformedSurfaceMesh::from_tetra_mesh(&spec.mesh);
-        surface.update_from_displacements(&spec.mesh, &u0);
+        if !pairs.is_empty() {
+            surface.update_from_displacements(&spec.mesh, &u0);
+        }
 
         let eye = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 
@@ -3779,6 +5022,10 @@ where
         hub_reactions: init_hub_reactions,
     });
 
+    if let Some(cb_f) = frame_cb.as_mut() {
+        cb_f(&frames[0]);
+    }
+
     if let Some(cb) = progress_cb.as_mut() {
         let peak_vm = frames[0]
             .bodies
@@ -3812,6 +5059,21 @@ where
     let mut cancelled = false;
     let mut prev_had_contact = false;
     let max_frames = options.max_frames.max(2);
+    let mut linear_cache = SparseSolverCache::default();
+    let mut cached_single_csr: Option<CachedSingleBodyTangentCsr> = None;
+    let mut cached_single_dof_sys: Option<(usize, DynamicDofSystem)> = None;
+    let mut single_force_ws = SingleBodyForceWorkspace::new();
+    let mut res_ws = ResidualWorkspace::default();
+    let mut ls_res_ws = ResidualWorkspace::default();
+    let mut ls_prev = SavedLsState::default();
+    let mut ls_cand = SavedLsState::default();
+    let mut last_ldlt_active_elems = 0usize;
+    let mut clean_step_streak = 0usize;
+    let mut prev_step_ls_count = 0usize;
+
+    let mut step_checkpoints: Vec<BodyCheckpoint> = bodies.iter().map(BodyRuntime::checkpoint).collect();
+    let has_rayleigh_any = options.rayleigh_mass_alpha.abs() > 1e-18
+        || options.rayleigh_stiffness_beta.abs() > 1e-18;
 
     while t_curr < options.total_time_s - 1e-13 {
         if cancel_flag.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
@@ -3830,7 +5092,10 @@ where
 
         let remaining = options.total_time_s - t_curr;
         let mut step_dt = dt.min(remaining);
-        let checkpoints: Vec<BodyCheckpoint> = bodies.iter().map(BodyRuntime::checkpoint).collect();
+        for (b, body) in bodies.iter().enumerate() {
+            body.checkpoint_into(&mut step_checkpoints[b]);
+        }
+        let checkpoints = &step_checkpoints;
         let mut step_accepted = false;
         let mut step_bisections = 0usize;
 
@@ -3839,7 +5104,28 @@ where
             let c0 = 1.0 / (beta * step_dt * step_dt);
             let c1 = gamma / (beta * step_dt);
 
-            let mut dof_sys = DynamicDofSystem::build(&bodies, None);
+            let single_no_pilot = bodies.len() == 1
+                && pairs.is_empty()
+                && bodies[0].hubs.iter().all(|h| !h.is_pilot());
+            let curr_active_elems_step = if single_no_pilot {
+                bodies[0].active_elements.iter().filter(|&&a| a).count()
+            } else {
+                0
+            };
+            let mut owned_dof_sys;
+            let dof_sys: &mut DynamicDofSystem = if single_no_pilot {
+                let cache_ok = cached_single_dof_sys
+                    .as_ref()
+                    .is_some_and(|(cnt, _)| *cnt == curr_active_elems_step);
+                if !cache_ok {
+                    cached_single_dof_sys =
+                        Some((curr_active_elems_step, DynamicDofSystem::build(&bodies, None)));
+                }
+                &mut cached_single_dof_sys.as_mut().expect("cached dof_sys").1
+            } else {
+                owned_dof_sys = DynamicDofSystem::build(&bodies, None);
+                &mut owned_dof_sys
+            };
             let n_free_nodal = dof_sys.n_free_nodal;
             let n_pilots = dof_sys.pilot_to_body_hub.len();
             let n_red = dof_sys.n_reduced;
@@ -3907,10 +5193,16 @@ where
                             + step_dt * body.v[d]
                             + 0.5 * step_dt * step_dt * (1.0 - 2.0 * beta) * body.a[d];
                         vt[d] = body.v[d] + step_dt * (1.0 - gamma) * body.a[d];
-                        // Initial Newton guess = predictor (a_{n+1} = 0)
-                        u_tr[d] = ut[d];
-                        v_tr[d] = vt[d];
-                        a_tr[d] = 0.0;
+                        if step_bisections == 0 && total_steps > 0 {
+                            u_tr[d] = ut[d] + beta * step_dt * step_dt * body.a[d];
+                            v_tr[d] = vt[d] + gamma * step_dt * body.a[d];
+                            a_tr[d] = body.a[d];
+                        } else {
+                            // Initial Newton guess = predictor (a_{n+1} = 0)
+                            u_tr[d] = ut[d];
+                            v_tr[d] = vt[d];
+                            a_tr[d] = 0.0;
+                        }
                     }
                 }
                 // Apply prescribed (non-pilot) hubs at t_next
@@ -3935,7 +5227,11 @@ where
                 v_trial.push(v_tr);
                 a_trial.push(a_tr);
                 f_ext_next.push(body.external_force_at(t_next));
-                c_v_prev.push(body.damping_force(&body.v, &options));
+                if has_rayleigh_any {
+                    c_v_prev.push(body.damping_force(&body.v, &options));
+                } else {
+                    c_v_prev.push(Vec::new());
+                }
             }
             // Apply pilot predictors onto coupled hub nodes
             for (p_idx, &(b_idx, h_idx)) in dof_sys.pilot_to_body_hub.iter().enumerate() {
@@ -3955,75 +5251,161 @@ where
             let mut converged = n_red == 0;
             let mut iters_used = 0usize;
             let mut last_rel_res = f64::NAN;
-            let mut final_f_res: Vec<Vec<f64>> = bodies.iter().map(|b| b.f_int_prev.clone()).collect();
-            let mut final_gp: Vec<Vec<GaussPointState>> =
-                bodies.iter().map(|b| b.gp_states.clone()).collect();
-            let mut final_rots: Vec<Vec<[[f64; 3]; 3]>> =
-                bodies.iter().map(|b| b.gp_rotations.clone()).collect();
+            let mut final_f_res: Vec<Vec<f64>> = if n_red == 0 {
+                bodies.iter().map(|b| b.f_int_prev.clone()).collect()
+            } else {
+                Vec::new()
+            };
+            let mut final_gp: Vec<Vec<GaussPointState>> = if n_red == 0 {
+                bodies.iter().map(|b| b.gp_states.clone()).collect()
+            } else {
+                Vec::new()
+            };
+            let mut final_rots: Vec<Vec<[[f64; 3]; 3]>> = if n_red == 0 {
+                bodies.iter().map(|b| b.gp_rotations.clone()).collect()
+            } else {
+                Vec::new()
+            };
             let mut final_contacts: Vec<DynamicContactForce> = Vec::new();
             let mut final_we = 0.0_f64;
             let mut final_wp = 0.0_f64;
             let mut final_pilot_efforts = vec![0.0_f64; n_pilots];
 
+            let mut step_factors_used = 0usize;
+            let mut step_ls_triggers = 0usize;
+
             if n_red > 0 {
                 let mut frozen_contacts: Option<Vec<FrozenDeformableContact>> = None;
+                let mut cached_ldlt_reuse_count = 0usize;
+                let mut aa = AndersonAccelerator::new(5);
+                let mut last_applied_du: Option<Vec<f64>> = None;
+                let mut ls_triggered_prev_iter = false;
+                let mut consecutive_ls = 0usize;
+                let mut r0_step_norm = f64::INFINITY;
+                let mut prev_r_norm = f64::INFINITY;
+                ls_prev.valid = false;
+                let use_single_fast = bodies.len() == 1 && pairs.is_empty() && n_pilots == 0;
+                let curr_active_elems = curr_active_elems_step;
+                let can_reuse_prev_step_ldlt = use_single_fast
+                    && step_bisections == 0
+                    && prev_step_ls_count == 0
+                    && linear_cache.last_ldlt.as_ref().is_some_and(|f| f.dimension() == n_red)
+                    && linear_cache.last_ldlt_age >= 1
+                    && linear_cache.last_ldlt_age <= 8
+                    && last_ldlt_active_elems == curr_active_elems
+                    && linear_cache.last_ldlt_dt > 0.0
+                    && (linear_cache.last_ldlt_dt - step_dt).abs() <= 1e-12 * step_dt;
+
                 for iter in 0..options.max_newton_iterations {
                     iters_used = iter + 1;
                     dof_sys.refresh_pilot_weights(&bodies, &q_trial);
 
-                    let mut row_entries: Vec<Vec<(usize, f64)>> =
-                        vec![Vec::with_capacity(64); n_red];
+                    let mut row_entries: Vec<Vec<(usize, f64)>> = Vec::new();
+                    let mut tangent_assembled = false;
                     let mut f_res_bodies = Vec::with_capacity(bodies.len());
                     let mut trial_gp_bodies = Vec::with_capacity(bodies.len());
                     let mut trial_rot_bodies = Vec::with_capacity(bodies.len());
                     let mut iter_we = 0.0_f64;
                     let mut iter_wp = 0.0_f64;
 
-                    // Assemble continuum internal forces & (1 + alpha) * T^T K_T T, plus mass/Rayleigh terms
-                    for (b, body) in bodies.iter().enumerate() {
-                        let (f_int, gp, rots, we, wp) = evaluate_body_continuum(
-                            body,
-                            &u_trial[b],
+                    let eval_forces_only = iter >= 1 || can_reuse_prev_step_ldlt;
+                    let m_scale = c0 + (1.0 + alpha) * c1 * options.rayleigh_mass_alpha;
+                    let ck_scale = if options.rayleigh_stiffness_beta.abs() > 1e-18 {
+                        (1.0 + alpha) * c1 * options.rayleigh_stiffness_beta
+                    } else {
+                        0.0
+                    };
+                    let mut prebuilt_k_eff: Option<CsrMatrix> = None;
+
+                    if !eval_forces_only {
+                        tangent_assembled = true;
+                        let fast_hit = use_single_fast
+                            && cached_single_csr.as_ref().is_some_and(|c| {
+                                c.n_red == n_red && c.active_elements == bodies[0].active_elements
+                            });
+                        if fast_hit {
+                            let cached = cached_single_csr.as_mut().expect("fast_hit verified");
+                            let (forces_opt, k_mat) = cached.assemble(
+                                &bodies[0],
+                                &u_trial[0],
+                                &options,
+                                1.0 + alpha,
+                                m_scale,
+                                ck_scale,
+                                true,
+                            );
+                            let (f_int, gp, rots, we, wp) = forces_opt.expect("forces collected");
+                            f_res_bodies.push(f_int);
+                            trial_gp_bodies.push(gp);
+                            trial_rot_bodies.push(rots);
+                            iter_we += we;
+                            iter_wp += wp;
+                            prebuilt_k_eff = Some(k_mat);
+                        } else {
+                            row_entries = vec![Vec::with_capacity(96); n_red];
+                            // Assemble continuum internal forces & (1 + alpha) * T^T K_T T, plus mass/Rayleigh terms
+                            for (b, body) in bodies.iter().enumerate() {
+                                let (f_int, gp, rots, we, wp) = evaluate_body_continuum(
+                                    body,
+                                    &u_trial[b],
+                                    &options,
+                                    true,
+                                    &dof_sys.dof_maps[b],
+                                    1.0 + alpha,
+                                    &mut row_entries,
+                                );
+                                f_res_bodies.push(f_int);
+                                trial_gp_bodies.push(gp);
+                                trial_rot_bodies.push(rots);
+                                iter_we += we;
+                                iter_wp += wp;
+
+                                add_csr_to_reduced_rows(
+                                    &body.mass_matrix,
+                                    &dof_sys.dof_maps[b],
+                                    m_scale,
+                                    &mut row_entries,
+                                );
+                                if ck_scale.abs() > 0.0 {
+                                    if let Some(ref k0) = body.rayleigh_k0 {
+                                        add_csr_to_reduced_rows(
+                                            k0,
+                                            &dof_sys.dof_maps[b],
+                                            ck_scale,
+                                            &mut row_entries,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    } else if use_single_fast {
+                        let (f_int, gp, rots, we, wp) = evaluate_body_continuum_forces_ws(
+                            &bodies[0],
+                            &u_trial[0],
                             &options,
-                            true,
-                            &dof_sys.dof_maps[b],
-                            1.0 + alpha,
-                            &mut row_entries,
+                            &mut single_force_ws,
                         );
                         f_res_bodies.push(f_int);
                         trial_gp_bodies.push(gp);
                         trial_rot_bodies.push(rots);
                         iter_we += we;
                         iter_wp += wp;
-
-                        // Add (c0 + (1 + alpha) * c1 * c_M) * T^T M T
-                        let m_scale = c0 + (1.0 + alpha) * c1 * options.rayleigh_mass_alpha;
-                        add_csr_to_reduced_rows(
-                            &body.mass_matrix,
-                            &dof_sys.dof_maps[b],
-                            m_scale,
-                            &mut row_entries,
-                        );
-                        // Add (1 + alpha) * c1 * c_K * T^T K0 T
-                        if options.rayleigh_stiffness_beta.abs() > 1e-18 {
-                            if let Some(ref k0) = body.rayleigh_k0 {
-                                let ck_scale = (1.0 + alpha) * c1 * options.rayleigh_stiffness_beta;
-                                add_csr_to_reduced_rows(
-                                    k0,
-                                    &dof_sys.dof_maps[b],
-                                    ck_scale,
-                                    &mut row_entries,
-                                );
-                            }
+                    } else {
+                        for (b, body) in bodies.iter().enumerate() {
+                            let (f_int, gp, rots, we, wp) =
+                                evaluate_body_continuum_forces(body, &u_trial[b], &options);
+                            f_res_bodies.push(f_int);
+                            trial_gp_bodies.push(gp);
+                            trial_rot_bodies.push(rots);
+                            iter_we += we;
+                            iter_wp += wp;
                         }
                     }
 
                     // Contact forces & symmetric PSD tangent.
                     // After 4 full BVH iterations without convergence on faceted contact meshes,
                     // freeze the master-facet pairing for the remaining polishing iterations of this step.
-                    let mut captured_frozen = Vec::new();
-                    let capture_this_iter = iter == 4 && frozen_contacts.is_none() && !pairs.is_empty();
-                    let (contacts, contact_e) = evaluate_dynamic_contacts(
+                    let (mut contacts, contact_e) = evaluate_dynamic_contacts(
                         &bodies,
                         pairs,
                         &u_trial,
@@ -4032,20 +5414,13 @@ where
                         c1,
                         &options,
                         &dof_sys.dof_maps,
-                        true,
-                        1.0 + alpha,
+                        tangent_assembled,
+                        if tangent_assembled { 1.0 + alpha } else { 0.0 },
                         &mut f_res_bodies,
                         &mut row_entries,
                         frozen_contacts.as_deref(),
-                        if capture_this_iter {
-                            Some(&mut captured_frozen)
-                        } else {
-                            None
-                        },
+                        None,
                     );
-                    if capture_this_iter && !captured_frozen.is_empty() {
-                        frozen_contacts = Some(captured_frozen);
-                    }
                     iter_we += contact_e;
 
                     // Pilot actuation / motor / damping / spring / limit contributions
@@ -4060,55 +5435,237 @@ where
                             step_dt,
                         );
                         pilot_efforts[p_idx] = q_eff;
-                        let pi = n_free_nodal + p_idx;
-                        let k_scaled = (1.0 + alpha) * k_pilot;
-                        if k_scaled.abs() > 1e-25 {
-                            row_entries[pi].push((pi, k_scaled));
+                        if tangent_assembled {
+                            let pi = n_free_nodal + p_idx;
+                            let k_scaled = (1.0 + alpha) * k_pilot;
+                            if k_scaled.abs() > 1e-25 {
+                                row_entries[pi].push((pi, k_scaled));
+                            }
                         }
                     }
 
                     // Compute HHT-α dynamic residual R on reduced DOFs (free nodal + pilots)
-                    let mut r_red = vec![0.0; n_red];
-                    let mut scale_sq = 0.0_f64;
+                    let (mut r_norm, _f_ref, mut rel_res) = compute_hht_residual_into(
+                        &bodies,
+                        &dof_sys,
+                        &v_trial,
+                        &a_trial,
+                        &f_res_bodies,
+                        &f_ext_next,
+                        &c_v_prev,
+                        &pilot_efforts,
+                        alpha,
+                        &options,
+                        &mut res_ws,
+                    );
 
-                    for (b, body) in bodies.iter().enumerate() {
-                        let mut m_a = vec![0.0; body.u.len()];
-                        body.mass_matrix.spmv(&a_trial[b], &mut m_a);
-                        let c_v_next = body.damping_force(&v_trial[b], &options);
+                    if iter == 0 {
+                        r0_step_norm = r_norm;
+                    }
 
-                        for d in 0..body.u.len() {
-                            if let Some((ri, w)) = dof_sys.dof_maps[b][d].reduced_and_weight() {
-                                let f_ext_hht = (1.0 + alpha) * f_ext_next[b][d]
-                                    - alpha * body.f_ext_prev[d];
-                                let f_int_hht = (1.0 + alpha) * f_res_bodies[b][d]
-                                    - alpha * body.f_int_prev[d];
-                                let f_damp_hht =
-                                    (1.0 + alpha) * c_v_next[d] - alpha * c_v_prev[b][d];
-                                r_red[ri] += w * (f_ext_hht - m_a[d] - f_damp_hht - f_int_hht);
+                    // Lazy backtracking line search: allow iter == 1 to step onto the rotated/hardened
+                    // tangent plane, and allow minor non-monotonicity during Anderson Acceleration
+                    // once the residual is well below the initial step residual.
+                    let ls_growth_limit = if aa.is_active()
+                        && r0_step_norm.is_finite()
+                        && r_norm < 0.25 * r0_step_norm
+                    {
+                        2.5 * prev_r_norm
+                    } else if aa.is_active() {
+                        1.15 * prev_r_norm
+                    } else {
+                        0.98 * prev_r_norm
+                    };
+                    let trigger_ls = eval_forces_only
+                        && options.enable_line_search
+                        && prev_r_norm.is_finite()
+                        && (!r_norm.is_finite()
+                            || (iter >= 2 && r_norm > ls_growth_limit)
+                            || (iter == 1 && r_norm > 1e4 * prev_r_norm.max(1.0)));
+                    if trigger_ls {
+                        if ls_prev.valid {
+                            let mut best_rc = if r_norm.is_finite() {
+                                r_norm
+                            } else {
+                                f64::INFINITY
+                            };
+                            let mut s = 0.5_f64;
+                            for _ls in 0..5 {
+                                ls_cand.copy_from_trials(
+                                    &ls_prev.u,
+                                    &ls_prev.v,
+                                    &ls_prev.a,
+                                    &ls_prev.q,
+                                    &ls_prev.q_dot,
+                                    &ls_prev.q_ddot,
+                                );
 
-                                let term = w.abs()
-                                    * f_ext_hht
-                                        .abs()
-                                        .max(m_a[d].abs())
-                                        .max(f_int_hht.abs());
-                                scale_sq += term * term;
+                                for (fi, &(b, d)) in dof_sys.free_to_body_dof.iter().enumerate() {
+                                    ls_cand.u[b][d] += s * ls_prev.dy_red[fi];
+                                    ls_cand.a[b][d] = c0 * (ls_cand.u[b][d] - u_tilde[b][d]);
+                                    ls_cand.v[b][d] =
+                                        v_tilde[b][d] + c1 * (ls_cand.u[b][d] - u_tilde[b][d]);
+                                }
+                                for (p_idx, &(b_idx, h_idx)) in
+                                    dof_sys.pilot_to_body_hub.iter().enumerate()
+                                {
+                                    let pi = n_free_nodal + p_idx;
+                                    ls_cand.q[p_idx] += s * ls_prev.dy_red[pi];
+                                    ls_cand.q_ddot[p_idx] =
+                                        c0 * (ls_cand.q[p_idx] - q_tilde[p_idx]);
+                                    ls_cand.q_dot[p_idx] = q_dot_tilde[p_idx]
+                                        + c1 * (ls_cand.q[p_idx] - q_tilde[p_idx]);
+                                    bodies[b_idx].hubs[h_idx].apply_kinematics_to_nodes(
+                                        &bodies[b_idx].mesh,
+                                        &bodies[b_idx].active_nodes,
+                                        ls_cand.q[p_idx],
+                                        ls_cand.q_dot[p_idx],
+                                        ls_cand.q_ddot[p_idx],
+                                        &mut ls_cand.u[b_idx],
+                                        &mut ls_cand.v[b_idx],
+                                        &mut ls_cand.a[b_idx],
+                                    );
+                                }
+                                dof_sys.refresh_pilot_weights(&bodies, &ls_cand.q);
+
+                                let mut f_cand = Vec::with_capacity(bodies.len());
+                                let mut gp_cand = Vec::with_capacity(bodies.len());
+                                let mut rots_cand = Vec::with_capacity(bodies.len());
+                                let mut we_cand = 0.0_f64;
+                                let mut wp_cand = 0.0_f64;
+                                for (b, body) in bodies.iter().enumerate() {
+                                    let (fi_b, gp_b, rots_b, we_b, wp_b) =
+                                        if use_single_fast && b == 0 {
+                                            evaluate_body_continuum_forces_ws(
+                                                body,
+                                                &ls_cand.u[b],
+                                                &options,
+                                                &mut single_force_ws,
+                                            )
+                                        } else {
+                                            evaluate_body_continuum_forces(
+                                                body,
+                                                &ls_cand.u[b],
+                                                &options,
+                                            )
+                                        };
+                                    f_cand.push(fi_b);
+                                    gp_cand.push(gp_b);
+                                    rots_cand.push(rots_b);
+                                    we_cand += we_b;
+                                    wp_cand += wp_b;
+                                }
+                                let mut dummy = Vec::new();
+                                let (contacts_c, ce_c) = evaluate_dynamic_contacts(
+                                    &bodies,
+                                    pairs,
+                                    &ls_cand.u,
+                                    &ls_cand.v,
+                                    step_dt,
+                                    c1,
+                                    &options,
+                                    &dof_sys.dof_maps,
+                                    false,
+                                    0.0,
+                                    &mut f_cand,
+                                    &mut dummy,
+                                    frozen_contacts.as_deref(),
+                                    None,
+                                );
+                                we_cand += ce_c;
+                                let mut pilots_cand = vec![0.0_f64; n_pilots];
+                                for (p_idx, &(b_idx, h_idx)) in
+                                    dof_sys.pilot_to_body_hub.iter().enumerate()
+                                {
+                                    let (q_eff_c, _) = bodies[b_idx].hubs[h_idx]
+                                        .eval_pilot_effort_and_tangent(
+                                            ls_cand.q[p_idx],
+                                            ls_cand.q_dot[p_idx],
+                                            t_next,
+                                            c1,
+                                            step_dt,
+                                        );
+                                    pilots_cand[p_idx] = q_eff_c;
+                                }
+                                let (rc_norm, _f_ref_c, rel_cand) = compute_hht_residual_into(
+                                    &bodies,
+                                    &dof_sys,
+                                    &ls_cand.v,
+                                    &ls_cand.a,
+                                    &f_cand,
+                                    &f_ext_next,
+                                    &c_v_prev,
+                                    &pilots_cand,
+                                    alpha,
+                                    &options,
+                                    &mut ls_res_ws,
+                                );
+                                if rc_norm.is_finite() && rc_norm < best_rc {
+                                    best_rc = rc_norm;
+                                    std::mem::swap(&mut u_trial, &mut ls_cand.u);
+                                    std::mem::swap(&mut v_trial, &mut ls_cand.v);
+                                    std::mem::swap(&mut a_trial, &mut ls_cand.a);
+                                    std::mem::swap(&mut q_trial, &mut ls_cand.q);
+                                    std::mem::swap(&mut q_dot_trial, &mut ls_cand.q_dot);
+                                    std::mem::swap(&mut q_ddot_trial, &mut ls_cand.q_ddot);
+                                    if use_single_fast && f_res_bodies.len() == 1 {
+                                        single_force_ws.recycle(
+                                            std::mem::take(&mut f_res_bodies[0]),
+                                            std::mem::take(&mut trial_gp_bodies[0]),
+                                            std::mem::take(&mut trial_rot_bodies[0]),
+                                        );
+                                    }
+                                    f_res_bodies = f_cand;
+                                    trial_gp_bodies = gp_cand;
+                                    trial_rot_bodies = rots_cand;
+                                    contacts = contacts_c;
+                                    iter_we = we_cand;
+                                    iter_wp = wp_cand;
+                                    pilot_efforts = pilots_cand;
+                                    std::mem::swap(&mut res_ws.r_red, &mut ls_res_ws.r_red);
+                                    r_norm = rc_norm;
+                                    rel_res = rel_cand;
+                                } else if use_single_fast && f_cand.len() == 1 {
+                                    single_force_ws.recycle(
+                                        std::mem::take(&mut f_cand[0]),
+                                        std::mem::take(&mut gp_cand[0]),
+                                        std::mem::take(&mut rots_cand[0]),
+                                    );
+                                }
+                                if rc_norm.is_finite() && rc_norm < 0.98 * prev_r_norm {
+                                    break;
+                                }
+                                s *= 0.5;
                             }
+                            dof_sys.refresh_pilot_weights(&bodies, &q_trial);
                         }
-                    }
-                    for (p_idx, &(b_idx, h_idx)) in dof_sys.pilot_to_body_hub.iter().enumerate() {
-                        let pi = n_free_nodal + p_idx;
-                        let q_prev = bodies[b_idx].hubs[h_idx].q_effort_prev;
-                        let q_hht = (1.0 + alpha) * pilot_efforts[p_idx] - alpha * q_prev;
-                        r_red[pi] += q_hht;
-                        scale_sq += q_hht * q_hht;
+                        ls_triggered_prev_iter = true;
+                        consecutive_ls += 1;
+                        step_ls_triggers += 1;
+                        aa.reset();
+                        last_applied_du = None;
+                        if consecutive_ls >= 4
+                            && iter >= 6
+                            && rel_res > 0.25
+                            && step_dt > dt_min * 1.5
+                            && step_bisections < options.max_bisections_per_step
+                        {
+                            if use_single_fast && f_res_bodies.len() == 1 {
+                                single_force_ws.recycle(
+                                    std::mem::take(&mut f_res_bodies[0]),
+                                    std::mem::take(&mut trial_gp_bodies[0]),
+                                    std::mem::take(&mut trial_rot_bodies[0]),
+                                );
+                            }
+                            break;
+                        }
+                    } else {
+                        consecutive_ls = 0;
                     }
 
-                    let r_norm = norm_slice(&r_red);
                     if !r_norm.is_finite() {
                         break;
                     }
-                    let f_ref = scale_sq.sqrt().max(1e-12);
-                    let rel_res = r_norm / f_ref;
                     last_rel_res = rel_res;
 
                     if rel_res <= options.force_tolerance || r_norm <= 1e-11 {
@@ -4123,140 +5680,240 @@ where
                         break;
                     }
 
-                    // Solve K_eff * dy = R
-                    let k_eff = CsrMatrix::from_row_entries(n_red, n_red, row_entries);
-                    let du_res = solve_spd_newton_robust(
-                        &k_eff,
-                        &r_red,
-                        options.linear_solver,
-                        options.linear_solver_options,
-                    );
-                    let Ok(dy_red) = du_res else {
-                        break;
+                    // Solve K_eff * dy = R (reuse recent same-dt LDL^T with Anderson acceleration)
+                    let mut dy_opt: Option<Vec<f64>> = None;
+                    let reusable_ldlt = linear_cache.last_ldlt_age <= 8
+                        && last_ldlt_active_elems == curr_active_elems
+                        && linear_cache.last_ldlt_dt > 0.0
+                        && (linear_cache.last_ldlt_dt - step_dt).abs() <= 1e-12 * step_dt;
+                    let is_stale_prev_step = linear_cache.last_ldlt_age >= 1;
+                    let max_reuse = if is_stale_prev_step { 8 } else { 8 };
+                    let contraction_ok = if is_stale_prev_step {
+                        (iter == 0 && can_reuse_prev_step_ldlt)
+                            || (prev_r_norm.is_finite()
+                                && (r_norm <= 0.72 * prev_r_norm
+                                    || (rel_res <= 5e-4 && r_norm <= 0.90 * prev_r_norm)))
+                    } else {
+                        prev_r_norm.is_finite()
+                            && ((iter == 1 && r_norm <= 1.35 * prev_r_norm)
+                                || r_norm <= 0.99 * prev_r_norm
+                                || (cached_ldlt_reuse_count < 3 && r_norm <= 1.20 * prev_r_norm)
+                                || (aa.is_active()
+                                    && r0_step_norm.is_finite()
+                                    && r_norm <= 0.25 * r0_step_norm
+                                    && r_norm <= 1.5 * prev_r_norm))
                     };
-
-                    // Backtracking line search (active when contacts/pilots exist or iter >= 1)
-                    let mut step_scale = 1.0_f64;
-                    if options.enable_line_search && (iter >= 1 || !pairs.is_empty() || n_pilots > 0)
-                    {
-                        let mut best_scale = 1.0_f64;
-                        let mut best_rc = f64::INFINITY;
-                        let mut s = 1.0_f64;
-                        for _ls in 0..6 {
-                            let mut u_cand = u_trial.clone();
-                            let mut v_cand = v_trial.clone();
-                            let mut a_cand = a_trial.clone();
-                            let mut q_cand = q_trial.clone();
-                            let mut q_dot_cand = q_dot_trial.clone();
-                            let mut q_ddot_cand = q_ddot_trial.clone();
-
-                            for (fi, &(b, d)) in dof_sys.free_to_body_dof.iter().enumerate() {
-                                u_cand[b][d] += s * dy_red[fi];
-                                a_cand[b][d] = c0 * (u_cand[b][d] - u_tilde[b][d]);
-                                v_cand[b][d] = v_tilde[b][d] + c1 * (u_cand[b][d] - u_tilde[b][d]);
-                            }
-                            for (p_idx, &(b_idx, h_idx)) in
-                                dof_sys.pilot_to_body_hub.iter().enumerate()
-                            {
-                                let pi = n_free_nodal + p_idx;
-                                q_cand[p_idx] += s * dy_red[pi];
-                                q_ddot_cand[p_idx] = c0 * (q_cand[p_idx] - q_tilde[p_idx]);
-                                q_dot_cand[p_idx] =
-                                    q_dot_tilde[p_idx] + c1 * (q_cand[p_idx] - q_tilde[p_idx]);
-                                bodies[b_idx].hubs[h_idx].apply_kinematics_to_nodes(
-                                    &bodies[b_idx].mesh,
-                                    &bodies[b_idx].active_nodes,
-                                    q_cand[p_idx],
-                                    q_dot_cand[p_idx],
-                                    q_ddot_cand[p_idx],
-                                    &mut u_cand[b_idx],
-                                    &mut v_cand[b_idx],
-                                    &mut a_cand[b_idx],
+                    let allow_mod_newton = eval_forces_only
+                        && use_single_fast
+                        && reusable_ldlt
+                        && !ls_triggered_prev_iter
+                        && cached_ldlt_reuse_count < max_reuse
+                        && contraction_ok;
+                    if allow_mod_newton {
+                        if let Some(factor) = linear_cache.last_ldlt.as_ref() {
+                            if factor.dimension() == n_red {
+                                linear_cache.scratch.solve_work.resize(n_red, 0.0);
+                                res_ws.mod_cand.resize(n_red, 0.0);
+                                factor.solve_into(
+                                    &res_ws.r_red,
+                                    &mut res_ws.mod_cand,
+                                    &mut linear_cache.scratch.solve_work,
                                 );
+                                if res_ws.mod_cand.iter().all(|v| v.is_finite())
+                                    && dot_slice(&res_ws.mod_cand, &res_ws.r_red) > 0.0
+                                {
+                                    cached_ldlt_reuse_count += 1;
+                                    let accel = if let Some(ref du_prev) = last_applied_du {
+                                        let dy_aa = aa.step(du_prev, &res_ws.mod_cand);
+                                        let mod_sq = dot_slice(&res_ws.mod_cand, &res_ws.mod_cand);
+                                        let aa_sq = dot_slice(&dy_aa, &dy_aa);
+                                        if dot_slice(&dy_aa, &res_ws.r_red) > 0.0
+                                            && aa_sq <= 12.25 * mod_sq
+                                        {
+                                            dy_aa
+                                        } else {
+                                            aa.reset_with_seed(&res_ws.mod_cand);
+                                            res_ws.mod_cand.clone()
+                                        }
+                                    } else {
+                                        aa.reset_with_seed(&res_ws.mod_cand);
+                                        res_ws.mod_cand.clone()
+                                    };
+                                    dy_opt = Some(accel);
+                                }
                             }
-                            dof_sys.refresh_pilot_weights(&bodies, &q_cand);
+                        }
+                    }
 
-                            let mut dummy = Vec::new();
-                            let mut f_cand = Vec::with_capacity(bodies.len());
-                            for (b, body) in bodies.iter().enumerate() {
-                                let (fi_b, _, _, _, _) = evaluate_body_continuum(
-                                    body,
-                                    &u_cand[b],
-                                    &options,
-                                    false,
-                                    &dof_sys.dof_maps[b],
-                                    0.0,
-                                    &mut dummy,
-                                );
-                                f_cand.push(fi_b);
-                            }
-                            let _ = evaluate_dynamic_contacts(
-                                &bodies,
-                                pairs,
-                                &u_cand,
-                                &v_cand,
-                                step_dt,
-                                c1,
+                    let dy_red = if let Some(dy) = dy_opt {
+                        dy
+                    } else {
+                        cached_ldlt_reuse_count = 0;
+                        let k_eff = if let Some(k_mat) = prebuilt_k_eff {
+                            k_mat
+                        } else if !tangent_assembled
+                            && use_single_fast
+                            && cached_single_csr.as_ref().is_some_and(|c| {
+                                c.n_red == n_red && c.active_elements == bodies[0].active_elements
+                            })
+                        {
+                            let cached = cached_single_csr.as_mut().expect("fast_hit verified");
+                            let (_, k_mat) = cached.assemble(
+                                &bodies[0],
+                                &u_trial[0],
                                 &options,
-                                &dof_sys.dof_maps,
+                                1.0 + alpha,
+                                m_scale,
+                                ck_scale,
                                 false,
-                                0.0,
-                                &mut f_cand,
-                                &mut dummy,
-                                frozen_contacts.as_deref(),
-                                None,
                             );
-                            let mut r_cand = vec![0.0; n_red];
-                            for (b, body) in bodies.iter().enumerate() {
-                                let mut m_a = vec![0.0; body.u.len()];
-                                body.mass_matrix.spmv(&a_cand[b], &mut m_a);
-                                let cv = body.damping_force(&v_cand[b], &options);
-                                for d in 0..body.u.len() {
-                                    if let Some((ri, w)) =
-                                        dof_sys.dof_maps[b][d].reduced_and_weight()
-                                    {
-                                        let f_ext_hht = (1.0 + alpha) * f_ext_next[b][d]
-                                            - alpha * body.f_ext_prev[d];
-                                        let f_int_hht = (1.0 + alpha) * f_cand[b][d]
-                                            - alpha * body.f_int_prev[d];
-                                        let f_damp_hht =
-                                            (1.0 + alpha) * cv[d] - alpha * c_v_prev[b][d];
-                                        r_cand[ri] +=
-                                            w * (f_ext_hht - m_a[d] - f_damp_hht - f_int_hht);
+                            k_mat
+                        } else {
+                            if !tangent_assembled {
+                                row_entries = vec![Vec::with_capacity(96); n_red];
+                                let mut dummy_f = Vec::with_capacity(bodies.len());
+                                for (b, body) in bodies.iter().enumerate() {
+                                    let (f_int, _, _, _, _) = evaluate_body_continuum(
+                                        body,
+                                        &u_trial[b],
+                                        &options,
+                                        true,
+                                        &dof_sys.dof_maps[b],
+                                        1.0 + alpha,
+                                        &mut row_entries,
+                                    );
+                                    dummy_f.push(f_int);
+
+                                    add_csr_to_reduced_rows(
+                                        &body.mass_matrix,
+                                        &dof_sys.dof_maps[b],
+                                        m_scale,
+                                        &mut row_entries,
+                                    );
+                                    if ck_scale.abs() > 0.0 {
+                                        if let Some(ref k0) = body.rayleigh_k0 {
+                                            add_csr_to_reduced_rows(
+                                                k0,
+                                                &dof_sys.dof_maps[b],
+                                                ck_scale,
+                                                &mut row_entries,
+                                            );
+                                        }
+                                    }
+                                }
+                                let capture_this_iter =
+                                    iter == 4 && frozen_contacts.is_none() && !pairs.is_empty();
+                                let mut captured_frozen = Vec::new();
+                                let _ = evaluate_dynamic_contacts(
+                                    &bodies,
+                                    pairs,
+                                    &u_trial,
+                                    &v_trial,
+                                    step_dt,
+                                    c1,
+                                    &options,
+                                    &dof_sys.dof_maps,
+                                    true,
+                                    1.0 + alpha,
+                                    &mut dummy_f,
+                                    &mut row_entries,
+                                    frozen_contacts.as_deref(),
+                                    if capture_this_iter {
+                                        Some(&mut captured_frozen)
+                                    } else {
+                                        None
+                                    },
+                                );
+                                if capture_this_iter && !captured_frozen.is_empty() {
+                                    frozen_contacts = Some(captured_frozen);
+                                }
+                                for (p_idx, &(b_idx, h_idx)) in
+                                    dof_sys.pilot_to_body_hub.iter().enumerate()
+                                {
+                                    let hub = &bodies[b_idx].hubs[h_idx];
+                                    let (_, k_pilot) = hub.eval_pilot_effort_and_tangent(
+                                        q_trial[p_idx],
+                                        q_dot_trial[p_idx],
+                                        t_next,
+                                        c1,
+                                        step_dt,
+                                    );
+                                    let pi = n_free_nodal + p_idx;
+                                    let k_scaled = (1.0 + alpha) * k_pilot;
+                                    if k_scaled.abs() > 1e-25 {
+                                        row_entries[pi].push((pi, k_scaled));
                                     }
                                 }
                             }
-                            for (p_idx, &(b_idx, h_idx)) in
-                                dof_sys.pilot_to_body_hub.iter().enumerate()
-                            {
-                                let pi = n_free_nodal + p_idx;
-                                let hub = &bodies[b_idx].hubs[h_idx];
-                                let (q_eff_c, _) = hub.eval_pilot_effort_and_tangent(
-                                    q_cand[p_idx],
-                                    q_dot_cand[p_idx],
-                                    t_next,
-                                    c1,
-                                    step_dt,
-                                );
-                                r_cand[pi] += (1.0 + alpha) * q_eff_c - alpha * hub.q_effort_prev;
+                            let built = CsrMatrix::from_row_entries(n_red, n_red, row_entries);
+                            if use_single_fast {
+                                cached_single_csr = Some(CachedSingleBodyTangentCsr::build(
+                                    &bodies[0],
+                                    &dof_sys.dof_maps[0],
+                                    &built,
+                                ));
                             }
-                            let rc_norm = norm_slice(&r_cand);
-                            if rc_norm.is_finite() && rc_norm < best_rc {
-                                best_rc = rc_norm;
-                                best_scale = s;
-                            }
-                            if rc_norm.is_finite() && rc_norm < 0.98 * r_norm {
-                                break;
-                            }
-                            s *= 0.5;
+                            built
+                        };
+                        let mut iter_solver_opts = options.linear_solver_options;
+                        if options.linear_solver != LinearSolverKind::SparseDirectLdlt {
+                            iter_solver_opts.tolerance = (0.05 * rel_res)
+                                .clamp(options.linear_solver_options.tolerance, 1e-3);
                         }
-                        step_scale = best_scale;
+                        step_factors_used += 1;
+                        let Ok(sol) = solve_spd_newton_cached(
+                            &k_eff,
+                            &res_ws.r_red,
+                            options.linear_solver,
+                            iter_solver_opts,
+                            &mut linear_cache,
+                        ) else {
+                            if use_single_fast {
+                                if let Some(cached) = cached_single_csr.as_mut() {
+                                    cached.reusable_k_eff = Some(k_eff);
+                                }
+                            }
+                            break;
+                        };
+                        linear_cache.last_ldlt_dt = step_dt;
+                        linear_cache.last_ldlt_age = 0;
+                        last_ldlt_active_elems = curr_active_elems;
+                        if use_single_fast {
+                            if let Some(cached) = cached_single_csr.as_mut() {
+                                cached.reusable_k_eff = Some(k_eff);
+                            }
+                        }
+                        aa.reset_with_seed(&sol);
+                        sol
+                    };
+
+                    if use_single_fast && f_res_bodies.len() == 1 {
+                        single_force_ws.recycle(
+                            std::mem::take(&mut f_res_bodies[0]),
+                            std::mem::take(&mut trial_gp_bodies[0]),
+                            std::mem::take(&mut trial_rot_bodies[0]),
+                        );
+                    }
+
+                    ls_triggered_prev_iter = false;
+                    last_applied_du = Some(dy_red.clone());
+                    prev_r_norm = r_norm;
+                    if options.enable_line_search {
+                        ls_prev.save_with_dy(
+                            &u_trial,
+                            &v_trial,
+                            &a_trial,
+                            &q_trial,
+                            &q_dot_trial,
+                            &q_ddot_trial,
+                            &dy_red,
+                        );
                     }
 
                     let mut du_norm_sq = 0.0_f64;
                     let mut u_norm_sq = 0.0_f64;
                     for (fi, &(b, d)) in dof_sys.free_to_body_dof.iter().enumerate() {
-                        let delta = step_scale * dy_red[fi];
+                        let delta = dy_red[fi];
                         u_trial[b][d] += delta;
                         a_trial[b][d] = c0 * (u_trial[b][d] - u_tilde[b][d]);
                         v_trial[b][d] = v_tilde[b][d] + c1 * (u_trial[b][d] - u_tilde[b][d]);
@@ -4265,7 +5922,7 @@ where
                     }
                     for (p_idx, &(b_idx, h_idx)) in dof_sys.pilot_to_body_hub.iter().enumerate() {
                         let pi = n_free_nodal + p_idx;
-                        let dq = step_scale * dy_red[pi];
+                        let dq = dy_red[pi];
                         q_trial[p_idx] += dq;
                         q_ddot_trial[p_idx] = c0 * (q_trial[p_idx] - q_tilde[p_idx]);
                         q_dot_trial[p_idx] =
@@ -4284,8 +5941,14 @@ where
                         );
                     }
 
-                    // Secondary displacement increment check (helpful on linear elastic steps where 1 Newton step is exact)
-                    if du_norm_sq.sqrt() <= 1e-13 * u_norm_sq.sqrt().max(1.0) && iter >= 1 {
+                    // Secondary displacement increment check
+                    let du_norm = du_norm_sq.sqrt();
+                    let u_scale = u_norm_sq.sqrt().max(1.0);
+                    if (du_norm <= 1e-11 * u_scale && iter >= 1)
+                        || (iter >= 6
+                            && du_norm <= 1e-9 * u_norm_sq.sqrt().max(1e-2)
+                            && rel_res <= 2.5 * options.force_tolerance)
+                    {
                         dof_sys.refresh_pilot_weights(&bodies, &q_trial);
                         // Re-evaluate final forces/energies at converged u_trial
                         let mut dummy = Vec::new();
@@ -4295,15 +5958,16 @@ where
                         let mut we_f = 0.0;
                         let mut wp_f = 0.0;
                         for (b, body) in bodies.iter().enumerate() {
-                            let (fi_b, gp, rots, we, wp) = evaluate_body_continuum(
-                                body,
-                                &u_trial[b],
-                                &options,
-                                false,
-                                &dof_sys.dof_maps[b],
-                                0.0,
-                                &mut dummy,
-                            );
+                            let (fi_b, gp, rots, we, wp) = if use_single_fast && b == 0 {
+                                evaluate_body_continuum_forces_ws(
+                                    body,
+                                    &u_trial[b],
+                                    &options,
+                                    &mut single_force_ws,
+                                )
+                            } else {
+                                evaluate_body_continuum_forces(body, &u_trial[b], &options)
+                            };
                             f_final.push(fi_b);
                             gp_final.push(gp);
                             rot_final.push(rots);
@@ -4460,7 +6124,7 @@ where
             if !converged || sudden_event_bisect {
                 // Roll back and bisect Δt
                 for (b, body) in bodies.iter_mut().enumerate() {
-                    body.restore(&checkpoints[b], options.mass_matrix_kind);
+                    body.restore(&checkpoints[b], options.mass_matrix_kind, !pairs.is_empty());
                 }
                 if step_dt <= dt_min * 1.01 || step_bisections >= options.max_bisections_per_step {
                     if converged {
@@ -4498,43 +6162,52 @@ where
                 }
             }
 
-            // Compute HHT-α balanced hub reactions before overwriting prev-step force vectors
-            let step_hub_coords: Vec<Vec<(f64, f64)>> = bodies
-                .iter()
-                .enumerate()
-                .map(|(b_idx, body)| {
-                    body.hubs
-                        .iter()
-                        .enumerate()
-                        .map(|(h_idx, hub)| {
-                            if hub.is_pilot() {
-                                let p_idx = dof_sys
-                                    .pilot_to_body_hub
-                                    .iter()
-                                    .position(|&(pb, ph)| pb == b_idx && ph == h_idx)
-                                    .expect("pilot index");
-                                (q_trial[p_idx], q_dot_trial[p_idx])
-                            } else {
-                                let (qp, qdp, _) = prescribed_next[b_idx][h_idx];
-                                (qp, qdp)
-                            }
-                        })
-                        .collect()
-                })
-                .collect();
-            let step_hub_reactions = compute_all_hub_reactions(
-                &bodies,
-                &u_trial,
-                &v_trial,
-                &a_trial,
-                &final_f_res,
-                &f_ext_next,
-                &step_hub_coords,
-                alpha,
-                true,
-                Some(&c_v_prev),
-                &options,
-            );
+            // Compute HHT-α balanced hub reactions before overwriting prev-step force vectors (only when recording a frame)
+            let is_final_step_pre = t_next >= options.total_time_s - 1e-12;
+            let should_record_pre = frames.len() < max_frames
+                && (is_final_step_pre
+                    || options.output_interval_s <= 0.0
+                    || (t_next - last_frame_time) >= options.output_interval_s - 1e-12);
+            let step_hub_reactions = if should_record_pre && bodies.iter().any(|b| !b.hubs.is_empty()) {
+                let step_hub_coords: Vec<Vec<(f64, f64)>> = bodies
+                    .iter()
+                    .enumerate()
+                    .map(|(b_idx, body)| {
+                        body.hubs
+                            .iter()
+                            .enumerate()
+                            .map(|(h_idx, hub)| {
+                                if hub.is_pilot() {
+                                    let p_idx = dof_sys
+                                        .pilot_to_body_hub
+                                        .iter()
+                                        .position(|&(pb, ph)| pb == b_idx && ph == h_idx)
+                                        .expect("pilot index");
+                                    (q_trial[p_idx], q_dot_trial[p_idx])
+                                } else {
+                                    let (qp, qdp, _) = prescribed_next[b_idx][h_idx];
+                                    (qp, qdp)
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect();
+                compute_all_hub_reactions(
+                    &bodies,
+                    &u_trial,
+                    &v_trial,
+                    &a_trial,
+                    &final_f_res,
+                    &f_ext_next,
+                    &step_hub_coords,
+                    alpha,
+                    true,
+                    Some(&c_v_prev),
+                    &options,
+                )
+            } else {
+                Vec::new()
+            };
 
             // Accumulate pilot actuator work and commit hub states
             for (p_idx, &(b_idx, h_idx)) in dof_sys.pilot_to_body_hub.iter().enumerate() {
@@ -4559,20 +6232,30 @@ where
             }
 
             // Accept converged step: accumulate external work (trapezoidal) and commit states
+            let is_single_body = bodies.len() == 1;
             for (b, body) in bodies.iter_mut().enumerate() {
                 for d in 0..body.u.len() {
                     let du = u_trial[b][d] - body.u[d];
                     let f_avg = 0.5 * (body.f_ext_prev[d] + f_ext_next[b][d]);
                     cumulative_ext_work += f_avg * du;
                 }
-                body.u = u_trial[b].clone();
-                body.v = v_trial[b].clone();
-                body.a = a_trial[b].clone();
-                body.f_int_prev = final_f_res[b].clone();
-                body.f_ext_prev = f_ext_next[b].clone();
-                body.gp_states = final_gp[b].clone();
-                body.gp_rotations = final_rots[b].clone();
-                body.surface.update_from_displacements(&body.mesh, &body.u);
+                std::mem::swap(&mut body.u, &mut u_trial[b]);
+                std::mem::swap(&mut body.v, &mut v_trial[b]);
+                std::mem::swap(&mut body.a, &mut a_trial[b]);
+                std::mem::swap(&mut body.f_int_prev, &mut final_f_res[b]);
+                std::mem::swap(&mut body.f_ext_prev, &mut f_ext_next[b]);
+                std::mem::swap(&mut body.gp_states, &mut final_gp[b]);
+                std::mem::swap(&mut body.gp_rotations, &mut final_rots[b]);
+                if b == 0 && is_single_body {
+                    single_force_ws.recycle(
+                        std::mem::take(&mut final_f_res[0]),
+                        std::mem::take(&mut final_gp[0]),
+                        std::mem::take(&mut final_rots[0]),
+                    );
+                }
+                if !pairs.is_empty() {
+                    body.surface.update_from_displacements(&body.mesh, &body.u);
+                }
 
                 // Log first plastic yield event
                 if !body.plastic_yield_logged
@@ -4741,6 +6424,9 @@ where
                     },
                     hub_reactions: step_hub_reactions,
                 });
+                if let Some(cb_f) = frame_cb.as_mut() {
+                    cb_f(&frames[frame_idx]);
+                }
             }
 
             if let Some(cb) = progress_cb.as_mut() {
@@ -4768,9 +6454,31 @@ where
                 });
             }
 
-            // Smooth adaptive step growth after easy convergence
-            if step_bisections == 0 && iters_used <= 4 && max_damage_jump < 0.05 {
-                dt = (step_dt * 1.5).min(dt_max);
+            if linear_cache.last_ldlt.is_some() {
+                linear_cache.last_ldlt_age += 1;
+            }
+
+            prev_step_ls_count = step_ls_triggers;
+            // Adaptive step growth after clean convergence (factorization-aware for ModNewton+AA)
+            if step_bisections == 0
+                && step_ls_triggers == 0
+                && max_damage_jump < 0.05
+                && max_plastic_jump < 0.02
+            {
+                if (step_factors_used <= 1 && iters_used <= 10) || iters_used <= 5 {
+                    dt = (step_dt * 1.25).min(dt_max);
+                    clean_step_streak = 0;
+                } else if iters_used <= 14 && step_factors_used <= 2 {
+                    clean_step_streak += 1;
+                    if clean_step_streak >= 3 {
+                        dt = (step_dt * 1.15).min(dt_max);
+                        clean_step_streak = 0;
+                    }
+                } else {
+                    clean_step_streak = 0;
+                }
+            } else {
+                clean_step_streak = 0;
             }
 
             step_accepted = true;

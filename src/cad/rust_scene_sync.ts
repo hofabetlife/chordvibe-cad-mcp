@@ -390,6 +390,9 @@ export function mapDagNodeToRustOperation(
 
     case 'helix': {
       const params: Record<string, unknown> = { ...p };
+      if (!Array.isArray(params.rotation_deg)) {
+        params.rotation_deg = [-90, 0, 0];
+      }
       return {
         tool: 'add_feature_primitive',
         args: {

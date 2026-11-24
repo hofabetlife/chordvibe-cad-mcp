@@ -588,6 +588,51 @@ impl SurfaceBvh {
         }
         d2
     }
+
+    /// Bottom-up O(n) AABB refit preserving existing BVH topology without re-sorting.
+    fn refit(&mut self, positions: &[[f64; 3]], triangles: &[[usize; 3]]) {
+        if self.nodes.is_empty() || self.tri_order.len() != triangles.len() {
+            *self = Self::build(positions, triangles);
+            return;
+        }
+        for idx in (0..self.nodes.len()).rev() {
+            let count = self.nodes[idx].count;
+            if count > 0 {
+                let start = self.nodes[idx].left_or_start;
+                let mut min = [f64::INFINITY; 3];
+                let mut max = [f64::NEG_INFINITY; 3];
+                for &ti in &self.tri_order[start..start + count] {
+                    let [i0, i1, i2] = triangles[ti];
+                    let p0 = positions[i0];
+                    let p1 = positions[i1];
+                    let p2 = positions[i2];
+                    for k in 0..3 {
+                        min[k] = min[k].min(p0[k]).min(p1[k]).min(p2[k]);
+                        max[k] = max[k].max(p0[k]).max(p1[k]).max(p2[k]);
+                    }
+                }
+                self.nodes[idx].min = min;
+                self.nodes[idx].max = max;
+            } else {
+                let left = self.nodes[idx].left_or_start;
+                let right = self.nodes[idx].right_child;
+                let lmin = self.nodes[left].min;
+                let lmax = self.nodes[left].max;
+                let rmin = self.nodes[right].min;
+                let rmax = self.nodes[right].max;
+                self.nodes[idx].min = [
+                    lmin[0].min(rmin[0]),
+                    lmin[1].min(rmin[1]),
+                    lmin[2].min(rmin[2]),
+                ];
+                self.nodes[idx].max = [
+                    lmax[0].max(rmax[0]),
+                    lmax[1].max(rmax[1]),
+                    lmax[2].max(rmax[2]),
+                ];
+            }
+        }
+    }
 }
 
 /// Outward-oriented deformed exterior surface skin of a tetrahedral body, supporting
@@ -908,7 +953,11 @@ impl DeformedSurfaceMesh {
             }
         }
 
-        self.bvh = SurfaceBvh::build(&self.current_positions, &self.triangles);
+        if self.bvh.nodes.is_empty() || self.bvh.tri_order.len() != self.triangles.len() {
+            self.bvh = SurfaceBvh::build(&self.current_positions, &self.triangles);
+        } else {
+            self.bvh.refit(&self.current_positions, &self.triangles);
+        }
     }
 
     /// Computes exact closest-point projection and Bærentzen–Aanæs signed gap of point `p`

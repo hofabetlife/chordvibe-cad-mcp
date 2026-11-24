@@ -739,7 +739,7 @@ export interface RustCoupledSimBakeSummaryJson {
   fragment_meshes?: RustCoupledSimFragmentMeshJson[];
 }
 
-function mapRustEventType(
+export function mapRustEventType(
   rawType: string
 ): DestructionTimelineEvent['type'] {
   const lower = rawType.toLowerCase();
@@ -757,7 +757,7 @@ function mapRustEventType(
   return 'contact';
 }
 
-function flattenVec3List(
+export function flattenVec3List(
   input: RustVec3List | undefined
 ): Float32Array | undefined {
   if (!input || input.length === 0) return undefined;
@@ -833,7 +833,7 @@ function computeSmoothVertexNormals(
   return normals;
 }
 
-function gatherSurfaceScalars(
+export function gatherSurfaceScalars(
   volumeField: number[] | undefined,
   surfaceNodeIndices: number[] | undefined,
   surfaceVertexCount: number
@@ -856,7 +856,7 @@ function gatherSurfaceScalars(
   return undefined;
 }
 
-function buildFragmentGeometryFromRustMesh(
+export function buildFragmentGeometryFromRustMesh(
   mesh: RustCoupledSimFragmentMeshJson,
   fallbackParentPartId: string,
   mat: MaterialSpec,
@@ -898,7 +898,7 @@ function buildFragmentGeometryFromRustMesh(
   };
 }
 
-function buildSmallFragmentBox(
+export function buildSmallFragmentBox(
   id: string,
   parentPartId: string,
   mat: MaterialSpec,

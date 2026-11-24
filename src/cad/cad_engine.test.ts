@@ -22,6 +22,7 @@ import { stepKinematicsAssembly } from './kinematics';
 import {
   DEFAULT_MATERIALS,
   MATERIALS_LIBRARY,
+  assertValidMaterialSpec,
   getMaterialById,
   normalizeMaterialSpec,
   resolveMaterialAlias,
@@ -41,8 +42,12 @@ import {
   GOLDEN_WINDOWS_MAPPINGS,
   RUST_MCP_TOOLS_COUNT,
   TS_MCP_TOOLS_COUNT,
+  buildStandaloneNativeStlPart,
   getWindowsWgpuArtifactUrl,
+  hydrateImportedStlPartInScene,
+  resolveNativeStlMaterialSpec,
 } from './native_bridge';
+import { detectPressAssembly } from './press_simulation';
 import { ENGINEERING_WORKBENCHES } from './workbenches';
 
 describe('MCP-CAD Core Geometry & Topological Verification Suite', () => {
@@ -1667,15 +1672,19 @@ describe('MCP-CAD Core Geometry & Topological Verification Suite', () => {
       params: { width: 0.04, height: 0.04, depth: 0.04 },
     }).nextState;
 
+    // Default length_unit is 'mm' (matches Rust create_joint contract: [-500, 500] mm -> [-0.5, 0.5] m)
     const jPrism = executeMcpToolOnEngineState(state, 'create_joint', {
       joint_id: 'j_prism_p2_t15',
       joint_type: 'prismatic',
       part_a: 'ground',
       part_b: 'slider_carriage',
       axis: [1, 0, 0],
-      limits: [-0.5, 0.5],
+      limits: [-500, 500],
     });
+    assert.equal(jPrism.response.length_unit, 'mm');
     state = jPrism.nextState;
+    const prismJoint = state.joints.find((j) => j.id === 'j_prism_p2_t15')!;
+    assert.deepEqual(prismJoint.limits, [-0.5, 0.5]);
 
     state = executeMcpToolOnEngineState(state, 'set_joint_motor', {
       joint_id: 'j_prism_p2_t15',
@@ -2637,6 +2646,1260 @@ describe('MCP-CAD Core Geometry & Topological Verification Suite', () => {
     assert.equal(
       getMaterialById('aluminum_6061_t6', MATERIALS_LIBRARY).colorHex,
       '#c4cdd6'
+    );
+  });
+
+  it('verifies P5-T27: docs/MCP_API_REFERENCE.md define_material section matches Rust inputSchema and response properties', () => {
+    const modRs = fs.readFileSync(
+      path.resolve(process.cwd(), 'crates/mcp-cad-server/src/tools/mod.rs'),
+      'utf8'
+    );
+    const cadRs = fs.readFileSync(
+      path.resolve(process.cwd(), 'crates/mcp-cad-server/src/tools/cad.rs'),
+      'utf8'
+    );
+    const apiRef = fs.readFileSync(
+      path.resolve(process.cwd(), 'docs/MCP_API_REFERENCE.md'),
+      'utf8'
+    );
+
+    // 1. Extract define_material input_schema properties & required fields from Rust mod.rs
+    const schemaMatch = modRs.match(
+      /name:\s*"define_material"\.to_string\(\)[\s\S]*?"properties":\s*\{([\s\S]*?)\n\s*\},\s*\n\s*"required":\s*\[([\s\S]*?)\]/
+    );
+    assert.ok(schemaMatch, 'Could not locate define_material input_schema in mod.rs');
+
+    const rustInputParams = Array.from(
+      schemaMatch[1].matchAll(/^\s*"([a-z0-9_]+)":\s*\{/gm),
+      (m) => m[1]
+    );
+    const rustRequiredParams = new Set(
+      Array.from(schemaMatch[2].matchAll(/"([a-z0-9_]+)"/g), (m) => m[1])
+    );
+    assert.ok(
+      rustInputParams.length >= 13,
+      `Expected >= 13 define_material schema params in mod.rs, found ${rustInputParams.length}`
+    );
+    assert.ok(rustRequiredParams.size === 5, 'Expected 5 required params in define_material');
+
+    // 2. Extract define_material response "properties" keys from Rust cad.rs
+    const cadRespMatch = cadRs.match(
+      /"status":\s*"material_registered"[\s\S]*?"properties":\s*\{([\s\S]*?)\n\s*\},/
+    );
+    assert.ok(cadRespMatch, 'Could not locate define_material response JSON in cad.rs');
+    const rustResponseProps = Array.from(
+      cadRespMatch[1].matchAll(/^\s*"([a-z0-9_]+)":/gm),
+      (m) => m[1]
+    );
+    assert.ok(
+      rustResponseProps.length >= 14,
+      `Expected >= 14 response properties in cad.rs define_material, found ${rustResponseProps.length}`
+    );
+
+    // 3. Extract section ### 25. `define_material` from docs/MCP_API_REFERENCE.md
+    const secStart = apiRef.indexOf('### 25. `define_material`');
+    const secEnd = apiRef.indexOf('### 26. `batch_cad_operations`');
+    assert.ok(secStart !== -1 && secEnd > secStart, 'Could not isolate section 25 in MCP_API_REFERENCE.md');
+    const section = apiRef.slice(secStart, secEnd);
+
+    // Verify every Rust inputSchema parameter is documented in the parameters table with matching required flag
+    const tableRowRe = /^\|\s*`([a-z0-9_]+)`\s*\|\s*(?:\\.|[^|])+\|\s*([^|]+)\|/gm;
+    const docTable = new Map<string, string>();
+    for (const m of section.matchAll(tableRowRe)) {
+      docTable.set(m[1], m[2].trim());
+    }
+
+    for (const param of rustInputParams) {
+      assert.ok(
+        docTable.has(param),
+        `docs/MCP_API_REFERENCE.md define_material table is missing Rust schema parameter '${param}'`
+      );
+      const reqCell = docTable.get(param)!;
+      if (rustRequiredParams.has(param)) {
+        assert.ok(
+          reqCell.includes('Да'),
+          `Parameter '${param}' must be marked required ('Да') in MCP_API_REFERENCE.md, got '${reqCell}'`
+        );
+      } else {
+        assert.ok(
+          reqCell.includes('Нет'),
+          `Parameter '${param}' must be marked optional ('Нет') in MCP_API_REFERENCE.md, got '${reqCell}'`
+        );
+      }
+    }
+
+    // 4. Parse both JSON code blocks (request and response) in section 25
+    const jsonBlocks = Array.from(section.matchAll(/```json\n([\s\S]*?)\n```/g), (m) => m[1]);
+    assert.equal(jsonBlocks.length, 2, 'Expected exactly 2 JSON example blocks (request and response)');
+
+    const reqObj = JSON.parse(jsonBlocks[0]);
+    const respEnvelope = JSON.parse(jsonBlocks[1]);
+    assert.equal(reqObj.params.name, 'define_material');
+
+    const reqArgs = reqObj.params.arguments as Record<string, unknown>;
+    const respPayload = JSON.parse(respEnvelope.result.content[0].text) as {
+      status: string;
+      material_id: string;
+      properties: Record<string, unknown>;
+      units: Record<string, unknown>;
+    };
+
+    assert.equal(respPayload.status, 'material_registered');
+    assert.equal(respPayload.material_id, reqArgs.id);
+    assert.ok(respPayload.units && respPayload.units.length === 'mm', 'Response example must include units metadata');
+
+    for (const propKey of rustResponseProps) {
+      assert.ok(
+        Object.prototype.hasOwnProperty.call(respPayload.properties, propKey),
+        `Response example in MCP_API_REFERENCE.md is missing properties.${propKey}`
+      );
+    }
+
+    // 5. Verify example arguments satisfy physical material invariants and match response conversions
+    const normalizedExample = normalizeMaterialSpec({
+      id: String(reqArgs.id),
+      name: String(reqArgs.name),
+      youngsModulus: Number(reqArgs.young_modulus_gpa) * 1e9,
+      poissonsRatio: Number(reqArgs.poisson_ratio),
+      yieldStrength: Number(reqArgs.yield_strength_mpa) * 1e6,
+      density: Number(reqArgs.density_kg_m3),
+      ultimate_strength_mpa: reqArgs.ultimate_strength_mpa,
+      hardening_modulus_pa: reqArgs.hardening_modulus_pa,
+      fracture_strain: reqArgs.fracture_strain,
+      fracture_energy_j_m2: reqArgs.fracture_energy_j_m2,
+      friction_coeff: reqArgs.friction_coeff,
+      failure_mode: reqArgs.failure_mode,
+    });
+    const validation = validateMaterialSpec(normalizedExample);
+    assert.equal(
+      validation.valid,
+      true,
+      `Example material in MCP_API_REFERENCE.md violates invariants: ${validation.errors.join('; ')}`
+    );
+    assert.equal(respPayload.properties.ultimate_strength_mpa, reqArgs.ultimate_strength_mpa);
+    assert.equal(
+      respPayload.properties.ultimate_strength_pa,
+      Number(reqArgs.ultimate_strength_mpa) * 1e6
+    );
+    assert.equal(respPayload.properties.hardening_modulus_pa, reqArgs.hardening_modulus_pa);
+    assert.equal(respPayload.properties.fracture_strain, reqArgs.fracture_strain);
+    assert.equal(respPayload.properties.fracture_energy_j_m2, reqArgs.fracture_energy_j_m2);
+    assert.equal(respPayload.properties.friction_coeff, reqArgs.friction_coeff);
+    assert.equal(respPayload.properties.failure_mode, reqArgs.failure_mode);
+  });
+
+  it('verifies P5-T29: import_stl computes mesh mass and inertia from params.material density for presets, aliases, and custom materials', () => {
+    const baseState: EngineStateSnapshot = {
+      parts: [],
+      selectedPartId: '',
+      joints: [],
+      materials: [...DEFAULT_MATERIALS],
+      feaResult: null,
+      physicsFrames: [],
+      quality: 'standard',
+      renderMode: 'shaded',
+    };
+
+    const expectedVolume = 0.05 * 0.05 * 0.05; // 1.25e-4 m^3
+
+    const assertPartMass = (part: any, expectedDensity: number, label: string) => {
+      assert.ok(
+        Math.abs(part.mesh.mass - part.mesh.volume * expectedDensity) < 1e-12,
+        `Expected ${label} exact mass = volume * ${expectedDensity} (${part.mesh.volume * expectedDensity}), got ${part.mesh.mass}`
+      );
+      assert.ok(
+        Math.abs(part.mesh.mass - expectedVolume * expectedDensity) < 1e-6,
+        `Expected ${label} nominal mass ${expectedVolume * expectedDensity}, got ${part.mesh.mass}`
+      );
+    };
+
+    // 1. Default material ('steel_1045', density = 7850 kg/m^3)
+    const impDefault = executeMcpToolOnEngineState(baseState, 'import_stl', {
+      file_path: 'output/default_block.stl',
+      part_id: 'stl_default',
+    });
+    const partDefault = impDefault.nextState.parts.find((p) => p.id === 'stl_default');
+    assert.ok(partDefault, 'stl_default should be imported');
+    assert.equal(partDefault.materialId, 'steel_1045');
+    assertPartMass(partDefault, 7850, 'steel_1045');
+
+    // 2. Direct preset ID 'alu_6061' (density = 2700 kg/m^3)
+    const impAlu = executeMcpToolOnEngineState(impDefault.nextState, 'import_stl', {
+      file_path: 'output/alu_bracket.stl',
+      part_id: 'stl_alu',
+      material: 'alu_6061',
+    });
+    const partAlu = impAlu.nextState.parts.find((p) => p.id === 'stl_alu');
+    assert.ok(partAlu, 'stl_alu should be imported');
+    assert.equal(partAlu.materialId, 'alu_6061');
+    assertPartMass(partAlu, 2700, 'alu_6061');
+
+    // 3. Alias 'pyrex' -> 'borosilicate_glass' (density = 2500 kg/m^3)
+    const impPyrex = executeMcpToolOnEngineState(impAlu.nextState, 'import_stl', {
+      file_path: 'output/glass_bulb.stl',
+      part_id: 'stl_pyrex',
+      material: 'pyrex',
+    });
+    const partPyrex = impPyrex.nextState.parts.find((p) => p.id === 'stl_pyrex');
+    assert.ok(partPyrex, 'stl_pyrex should be imported');
+    assert.equal(partPyrex.materialId, 'pyrex');
+    assertPartMass(partPyrex, 2500, 'pyrex');
+
+    // 4. Canonical Rust ID alias 'aluminum_6061_t6' -> 'alu_6061' (density = 2700 kg/m^3)
+    const impRustAl = executeMcpToolOnEngineState(impPyrex.nextState, 'import_stl', {
+      file_path: 'output/rust_al_housing.stl',
+      part_id: 'stl_rust_al',
+      material: 'aluminum_6061_t6',
+    });
+    const partRustAl = impRustAl.nextState.parts.find((p) => p.id === 'stl_rust_al');
+    assert.ok(partRustAl, 'stl_rust_al should be imported');
+    assert.equal(partRustAl.materialId, 'aluminum_6061_t6');
+    assertPartMass(partRustAl, 2700, 'aluminum_6061_t6');
+
+    // 5. Custom material registered via define_material (density = 1500 kg/m^3)
+    const { nextState: stateWithCustom } = executeMcpToolOnEngineState(
+      impRustAl.nextState,
+      'define_material',
+      {
+        material_id: 'custom_cfrp_1500',
+        density_kg_m3: 1500,
+        youngs_modulus_gpa: 70,
+        poissons_ratio: 0.3,
+        yield_strength_mpa: 450,
+      }
+    );
+    const impCustom = executeMcpToolOnEngineState(stateWithCustom, 'import_stl', {
+      file_path: 'output/cfrp_rib.stl',
+      part_id: 'stl_cfrp',
+      material: 'custom_cfrp_1500',
+    });
+    const partCustom = impCustom.nextState.parts.find((p) => p.id === 'stl_cfrp');
+    assert.ok(partCustom, 'stl_cfrp should be imported');
+    assert.equal(partCustom.materialId, 'custom_cfrp_1500');
+    assertPartMass(partCustom, 1500, 'custom_cfrp_1500');
+
+    // Verify inertia tensor scales linearly with density as well
+    assert.ok(
+      Math.abs(partPyrex.mesh.inertiaTensor[0] / partDefault.mesh.inertiaTensor[0] - 2500 / 7850) < 1e-9,
+      'Expected inertiaTensor to scale proportionally with assigned material density'
+    );
+
+    // Verify list_parts reports consistent mass_kg for all imported parts
+    const listed = executeMcpToolOnEngineState(impCustom.nextState, 'list_parts', {}).response;
+    const byId = new Map<string, any>(listed.parts.map((p: any) => [p.part_id, p]));
+    assert.equal(byId.get('stl_default').mass_kg, Number((expectedVolume * 7850).toFixed(4)));
+    assert.equal(byId.get('stl_alu').mass_kg, Number((expectedVolume * 2700).toFixed(4)));
+    assert.equal(byId.get('stl_pyrex').mass_kg, Number((expectedVolume * 2500).toFixed(4)));
+    assert.equal(byId.get('stl_rust_al').mass_kg, Number((expectedVolume * 2700).toFixed(4)));
+    assert.equal(byId.get('stl_cfrp').mass_kg, Number((expectedVolume * 1500).toFixed(4)));
+  });
+
+  it('verifies P5-T30: create_joint prismatic limits honor default mm and explicit m length_unit consistently with Rust contract', () => {
+    const makeSliderState = (): EngineStateSnapshot => {
+      let state: EngineStateSnapshot = {
+        parts: [],
+        selectedPartId: '',
+        joints: [],
+        materials: [...DEFAULT_MATERIALS],
+        feaResult: null,
+        physicsFrames: [],
+        quality: 'standard',
+        renderMode: 'shaded',
+      };
+      state = executeMcpToolOnEngineState(state, 'add_feature_primitive', {
+        part_id: 'slider_p5_t30',
+        primitive_type: 'box',
+        params: { width: 0.04, height: 0.04, depth: 0.04 },
+      }).nextState;
+      return state;
+    };
+
+    // 1. Default length_unit ('mm'): limits [-500, 500] mm -> internal [-0.5, 0.5] m
+    let stateMm = makeSliderState();
+    const resMm = executeMcpToolOnEngineState(stateMm, 'create_joint', {
+      joint_id: 'j_prism_mm',
+      joint_type: 'prismatic',
+      part_a: 'ground',
+      part_b: 'slider_p5_t30',
+      axis: [1, 0, 0],
+      limits: [-500, 500],
+    });
+    assert.equal(resMm.response.length_unit, 'mm');
+    stateMm = resMm.nextState;
+    assert.deepEqual(stateMm.joints[0].limits, [-0.5, 0.5]);
+
+    stateMm = executeMcpToolOnEngineState(stateMm, 'set_joint_motor', {
+      joint_id: 'j_prism_mm',
+      target_velocity: 1.5,
+      max_force: 300.0,
+    }).nextState;
+    stateMm = executeMcpToolOnEngineState(stateMm, 'run_physics_simulation', {
+      duration_seconds: 0.4,
+      dt: 0.01,
+    }).nextState;
+    const sliderMm = stateMm.parts.find((p) => p.id === 'slider_p5_t30')!;
+    assert.ok(
+      Math.abs(sliderMm.position[0] - 0.5) < 1e-6,
+      `Expected slider to clamp at +0.5 m with limits [-500, 500] mm, got ${sliderMm.position[0]}`
+    );
+
+    // 2. Explicit length_unit ('m'): limits [-0.5, 0.5] m -> internal [-0.5, 0.5] m
+    let stateM = makeSliderState();
+    const resM = executeMcpToolOnEngineState(stateM, 'create_joint', {
+      joint_id: 'j_prism_m',
+      joint_type: 'prismatic',
+      part_a: 'ground',
+      part_b: 'slider_p5_t30',
+      axis: [1, 0, 0],
+      limits: [-0.5, 0.5],
+      length_unit: 'm',
+    });
+    assert.equal(resM.response.length_unit, 'm');
+    stateM = resM.nextState;
+    assert.deepEqual(stateM.joints[0].limits, [-0.5, 0.5]);
+
+    stateM = executeMcpToolOnEngineState(stateM, 'set_joint_motor', {
+      joint_id: 'j_prism_m',
+      target_velocity: 1.5,
+      max_force: 300.0,
+    }).nextState;
+    stateM = executeMcpToolOnEngineState(stateM, 'run_physics_simulation', {
+      duration_seconds: 0.4,
+      dt: 0.01,
+    }).nextState;
+    const sliderM = stateM.parts.find((p) => p.id === 'slider_p5_t30')!;
+    assert.ok(
+      Math.abs(sliderM.position[0] - 0.5) < 1e-6,
+      `Expected slider to clamp at +0.5 m with length_unit='m' limits [-0.5, 0.5], got ${sliderM.position[0]}`
+    );
+
+    // 3. Default length_unit ('mm') with small sub-millimeter limits [-0.5, 0.5] -> [-0.0005, 0.0005] m
+    const resSubMm = executeMcpToolOnEngineState(makeSliderState(), 'create_joint', {
+      joint_id: 'j_prism_submm',
+      joint_type: 'prismatic',
+      part_a: 'ground',
+      part_b: 'slider_p5_t30',
+      axis: [1, 0, 0],
+      limits: [-0.5, 0.5],
+    });
+    assert.ok(
+      Math.abs(resSubMm.nextState.joints[0].limits![0] - -0.0005) < 1e-12 &&
+        Math.abs(resSubMm.nextState.joints[0].limits![1] - 0.0005) < 1e-12,
+      `Expected [-0.5, 0.5] in default mm to convert to [-0.0005, 0.0005] m, got ${JSON.stringify(resSubMm.nextState.joints[0].limits)}`
+    );
+
+    // 4. Unsupported length_unit must be rejected (matches Rust state.resolve_length_unit)
+    assert.throws(
+      () =>
+        executeMcpToolOnEngineState(makeSliderState(), 'create_joint', {
+          joint_id: 'j_bad_unit',
+          joint_type: 'prismatic',
+          part_a: 'ground',
+          part_b: 'slider_p5_t30',
+          axis: [1, 0, 0],
+          limits: [-10, 10],
+          length_unit: 'inch',
+        }),
+      /length_unit/
+    );
+
+    // 5. Revolute limits default to 'deg' and honor limits_unit: 'rad'
+    const resRevDeg = executeMcpToolOnEngineState(makeSliderState(), 'create_joint', {
+      joint_id: 'j_rev_deg',
+      joint_type: 'revolute',
+      part_a: 'ground',
+      part_b: 'slider_p5_t30',
+      axis: [0, 0, 1],
+      limits: [-90, 90],
+    });
+    assert.ok(Math.abs(resRevDeg.nextState.joints[0].limits![0] - -Math.PI / 2) < 1e-12);
+    assert.ok(Math.abs(resRevDeg.nextState.joints[0].limits![1] - Math.PI / 2) < 1e-12);
+
+    const resRevRad = executeMcpToolOnEngineState(makeSliderState(), 'create_joint', {
+      joint_id: 'j_rev_rad',
+      joint_type: 'revolute',
+      part_a: 'ground',
+      part_b: 'slider_p5_t30',
+      axis: [0, 0, 1],
+      limits: [-Math.PI / 2, Math.PI / 2],
+      limits_unit: 'rad',
+    });
+    assert.ok(Math.abs(resRevRad.nextState.joints[0].limits![0] - -Math.PI / 2) < 1e-12);
+    assert.ok(Math.abs(resRevRad.nextState.joints[0].limits![1] - Math.PI / 2) < 1e-12);
+  });
+
+  it('verifies P5-T31: strict failure_mode validation, Rust keys in normalizeMaterialSpec, and zero-value rejection in define_material', () => {
+    // 1. normalizeMaterialSpec reads canonical Rust MCP keys (young_modulus_gpa, young_modulus_pa, poisson_ratio)
+    const fromRustGpa = normalizeMaterialSpec({
+      id: 'rust_inconel_718',
+      name: 'Inconel 718',
+      young_modulus_gpa: 200,
+      poisson_ratio: 0.28,
+      yield_strength_mpa: 1035,
+      density_kg_m3: 8190,
+      failure_mode: 'BRITTLE',
+    });
+    assert.equal(validateMaterialSpec(fromRustGpa).valid, true);
+    assert.equal(fromRustGpa.youngsModulus, 200e9);
+    assert.equal(fromRustGpa.poissonsRatio, 0.28);
+    assert.equal(fromRustGpa.yieldStrength, 1035e6);
+    assert.equal(fromRustGpa.density, 8190);
+    assert.equal(fromRustGpa.failureMode, 'brittle');
+    assert.equal(fromRustGpa.hardeningModulusPa, 0);
+    assert.equal(fromRustGpa.fractureStrain, 0.002);
+
+    const fromRustPa = normalizeMaterialSpec({
+      id: 'rust_pa_alloy',
+      young_modulus_pa: 72.5e9,
+      poisson_ratio: 0.33,
+      yield_strength_pa: 310e6,
+      density_kg_m3: 2780,
+      failure_mode: ' Ductile ',
+    });
+    assert.equal(validateMaterialSpec(fromRustPa).valid, true);
+    assert.equal(fromRustPa.youngsModulus, 72.5e9);
+    assert.equal(fromRustPa.poissonsRatio, 0.33);
+    assert.equal(fromRustPa.failureMode, 'ductile');
+
+    // 2. Unknown / empty / non-string failure_mode is preserved and rejected by validateMaterialSpec & assertValidMaterialSpec
+    for (const badMode of ['ceramic', '', '   ', 42]) {
+      const invalidSpec = normalizeMaterialSpec({
+        id: 'invalid_mode_mat',
+        young_modulus_gpa: 100,
+        poisson_ratio: 0.3,
+        yield_strength_mpa: 250,
+        density_kg_m3: 4500,
+        failure_mode: badMode,
+      });
+      const validation = validateMaterialSpec(invalidSpec);
+      assert.equal(
+        validation.valid,
+        false,
+        `Expected failure_mode=${JSON.stringify(badMode)} to fail validateMaterialSpec`
+      );
+      assert.ok(
+        validation.errors.some((e) => e.includes('failureMode')),
+        `Expected failureMode error for ${JSON.stringify(badMode)}, got: ${validation.errors.join('; ')}`
+      );
+      assert.throws(() => assertValidMaterialSpec(invalidSpec), /failureMode/);
+    }
+
+    const makeBaseState = (): EngineStateSnapshot => ({
+      parts: [],
+      selectedPartId: '',
+      joints: [],
+      materials: [...DEFAULT_MATERIALS],
+      feaResult: null,
+      physicsFrames: [],
+      quality: 'standard',
+      renderMode: 'shaded',
+    });
+
+    // 3. TS define_material rejects unknown / empty failure_mode
+    assert.throws(
+      () =>
+        executeMcpToolOnEngineState(makeBaseState(), 'define_material', {
+          id: 'bad_ceramic',
+          young_modulus_gpa: 300,
+          poisson_ratio: 0.22,
+          yield_strength_mpa: 400,
+          density_kg_m3: 3900,
+          failure_mode: 'ceramic',
+        }),
+      /failureMode/
+    );
+    assert.throws(
+      () =>
+        executeMcpToolOnEngineState(makeBaseState(), 'define_material', {
+          id: 'empty_mode',
+          young_modulus_gpa: 300,
+          poisson_ratio: 0.22,
+          yield_strength_mpa: 400,
+          density_kg_m3: 3900,
+          failure_mode: '   ',
+        }),
+      /failureMode/
+    );
+
+    // 4. TS define_material rejects explicit 0 for youngs_modulus_pa, young_modulus_pa, and yield_strength_pa (no truthiness fallback)
+    assert.throws(
+      () =>
+        executeMcpToolOnEngineState(makeBaseState(), 'define_material', {
+          id: 'zero_e_pa',
+          youngs_modulus_pa: 0,
+          poisson_ratio: 0.3,
+          yield_strength_mpa: 250,
+          density_kg_m3: 7850,
+        }),
+      /positive density, youngs_modulus, and yield_strength/
+    );
+    assert.throws(
+      () =>
+        executeMcpToolOnEngineState(makeBaseState(), 'define_material', {
+          id: 'zero_rust_e_pa',
+          young_modulus_pa: 0,
+          young_modulus_gpa: 205,
+          poisson_ratio: 0.3,
+          yield_strength_mpa: 250,
+          density_kg_m3: 7850,
+        }),
+      /positive density, youngs_modulus, and yield_strength/
+    );
+    assert.throws(
+      () =>
+        executeMcpToolOnEngineState(makeBaseState(), 'define_material', {
+          id: 'zero_yield_pa',
+          young_modulus_gpa: 205,
+          poisson_ratio: 0.3,
+          yield_strength_pa: 0,
+          yield_strength_mpa: 350,
+          density_kg_m3: 7850,
+        }),
+      /positive density, youngs_modulus, and yield_strength/
+    );
+    assert.throws(
+      () =>
+        executeMcpToolOnEngineState(makeBaseState(), 'define_material', {
+          id: 'nan_e_pa',
+          youngs_modulus_pa: Number.NaN,
+          poisson_ratio: 0.3,
+          yield_strength_mpa: 350,
+          density_kg_m3: 7850,
+        }),
+      /positive density, youngs_modulus, and yield_strength/
+    );
+
+    // 5. TS define_material succeeds with valid canonical Rust keys and brittle failure_mode
+    const okRes = executeMcpToolOnEngineState(makeBaseState(), 'define_material', {
+      id: 'silicon_carbide_p5_t31',
+      name: 'Silicon Carbide',
+      young_modulus_gpa: 410,
+      poisson_ratio: 0.14,
+      yield_strength_mpa: 550,
+      density_kg_m3: 3100,
+      failure_mode: 'brittle',
+    });
+    const registered = okRes.nextState.materials.find((m) => m.id === 'silicon_carbide_p5_t31');
+    assert.ok(registered, 'Expected custom brittle material to be registered');
+    assert.equal(registered.youngsModulus, 410e9);
+    assert.equal(registered.poissonsRatio, 0.14);
+    assert.equal(registered.yieldStrength, 550e6);
+    assert.equal(registered.density, 3100);
+    assert.equal(registered.failureMode, 'brittle');
+    assert.equal(registered.hardeningModulusPa, 0);
+    assert.equal(okRes.response.failure_mode, 'brittle');
+    assert.equal(okRes.response.youngs_modulus_gpa, 410);
+  });
+
+  it('verifies P5-T32: docs/MCP_API_REFERENCE.md TOC contains working anchor links for all 43 documented MCP tools', () => {
+    const modRs = fs.readFileSync(
+      path.resolve(process.cwd(), 'crates/mcp-cad-server/src/tools/mod.rs'),
+      'utf8'
+    );
+    const apiRef = fs.readFileSync(
+      path.resolve(process.cwd(), 'docs/MCP_API_REFERENCE.md'),
+      'utf8'
+    );
+
+    // 1. Extract all registered Rust MCP tool names from list_tools() in mod.rs
+    const listToolsMatch = modRs.match(
+      /pub fn list_tools\(\)\s*->\s*Vec<ToolDefinition>\s*\{([\s\S]*?)\n\}/
+    );
+    assert.ok(listToolsMatch, 'Could not locate list_tools() in crates/mcp-cad-server/src/tools/mod.rs');
+    const rustToolNames = Array.from(
+      listToolsMatch[1].matchAll(/ToolDefinition\s*\{\s*\n\s*name:\s*"([a-z0-9_]+)"\.to_string\(\)/g),
+      (m) => m[1]
+    );
+    assert.equal(
+      rustToolNames.length,
+      43,
+      `Expected 43 Rust MCP tools in list_tools(), found ${rustToolNames.length}`
+    );
+
+    // 2. Isolate the "## Оглавление" block in docs/MCP_API_REFERENCE.md
+    const tocStart = apiRef.indexOf('## Оглавление');
+    const tocEnd = apiRef.indexOf('## Общие положения');
+    assert.ok(tocStart !== -1 && tocEnd > tocStart, 'Could not isolate ## Оглавление in docs/MCP_API_REFERENCE.md');
+    const tocSection = apiRef.slice(tocStart, tocEnd);
+
+    // Parse all numbered tool entries in the TOC: - [N. `tool_name`](#anchor)
+    const tocEntries = Array.from(
+      tocSection.matchAll(/^\s*-\s*\[(\d+)\.\s*`([a-z0-9_]+)`\]\(#([^)]+)\)/gm),
+      (m) => ({
+        index: Number(m[1]),
+        name: m[2],
+        anchor: m[3],
+      })
+    );
+
+    assert.equal(
+      tocEntries.length,
+      43,
+      `Expected 43 tool links in docs/MCP_API_REFERENCE.md TOC, found ${tocEntries.length}`
+    );
+
+    // Verify sequential numbering 1..43 and explicit presence of 42 and 43
+    for (let i = 0; i < tocEntries.length; i++) {
+      assert.equal(
+        tocEntries[i].index,
+        i + 1,
+        `Expected TOC tool entry #${i + 1} to have index ${i + 1}, got ${tocEntries[i].index} (${tocEntries[i].name})`
+      );
+    }
+    assert.deepEqual(tocEntries[41], {
+      index: 42,
+      name: 'bake_coupled_simulation',
+      anchor: '42-bake_coupled_simulation',
+    });
+    assert.deepEqual(tocEntries[42], {
+      index: 43,
+      name: 'query_simulation_frame',
+      anchor: '43-query_simulation_frame',
+    });
+
+    // 3. Verify 1:1 parity between TOC tool names and Rust ToolDefinition catalog
+    const tocToolSet = new Set(tocEntries.map((e) => e.name));
+    assert.equal(tocToolSet.size, 43, 'Duplicate tool names found in TOC');
+    for (const rustName of rustToolNames) {
+      assert.ok(
+        tocToolSet.has(rustName),
+        `Rust MCP tool '${rustName}' is missing from docs/MCP_API_REFERENCE.md TOC`
+      );
+    }
+
+    // 4. Compute GitHub Flavored Markdown heading slugs for all ### headings in docs/MCP_API_REFERENCE.md
+    //    and verify every TOC tool link resolves to an existing document heading
+    const toGfmSlug = (headingText: string): string =>
+      headingText
+        .trim()
+        .toLowerCase()
+        .replace(/`/g, '')
+        .replace(/[^\p{L}\p{N}_ -]/gu, '')
+        .replace(/\s+/g, '-');
+
+    const bodySection = apiRef.slice(tocEnd);
+    const headingSlugs = new Set<string>();
+    const toolHeadings = new Map<number, string>();
+    for (const m of bodySection.matchAll(/^###\s+(.+)$/gm)) {
+      const raw = m[1].trim();
+      headingSlugs.add(toGfmSlug(raw));
+      const toolMatch = raw.match(/^(\d+)\.\s*`([a-z0-9_]+)`$/);
+      if (toolMatch) {
+        toolHeadings.set(Number(toolMatch[1]), toolMatch[2]);
+      }
+    }
+
+    assert.equal(
+      toolHeadings.size,
+      43,
+      `Expected 43 tool section headings in docs/MCP_API_REFERENCE.md, found ${toolHeadings.size}`
+    );
+
+    for (const entry of tocEntries) {
+      assert.ok(
+        headingSlugs.has(entry.anchor),
+        `Broken TOC anchor '#${entry.anchor}' for tool ${entry.index}. ${entry.name}`
+      );
+      assert.equal(
+        toolHeadings.get(entry.index),
+        entry.name,
+        `TOC entry #${entry.index} ('${entry.name}') does not match section heading ('${toolHeadings.get(entry.index)}')`
+      );
+    }
+  });
+
+  it('verifies P5-T33: handleLoadNativeStlUrl resolves material density via getMaterialById and hydrates MCP import_stl without wiping scene or part metadata', () => {
+    // 1. Standalone rim STL resolves alu_6061 (2700 kg/m³) rather than hardcoded steel (7850 kg/m³)
+    const rimResolved = resolveNativeStlMaterialSpec('/output/car_rim.stl', MATERIALS_LIBRARY);
+    assert.equal(rimResolved.partId, 'car_rim');
+    assert.equal(rimResolved.materialId, 'alu_6061');
+    assert.equal(rimResolved.density, 2700);
+
+    const sampleBox = createBoxMesh(0.1, 0.08, 0.04, 1000); // V = 0.00032 m³
+    const binaryStl = exportMeshToStlBinary(sampleBox, 'sample_rim');
+    const rimMesh = parseStlBuffer(binaryStl, rimResolved.density, 1.0);
+    const steelMesh = parseStlBuffer(binaryStl, 7850, 1.0);
+
+    assert.ok(
+      Math.abs(rimMesh.mass - sampleBox.volume * 2700) < 1e-6,
+      `Expected rim mass ~${(sampleBox.volume * 2700).toFixed(6)} kg, got ${rimMesh.mass}`
+    );
+    assert.ok(
+      Math.abs(rimMesh.mass / steelMesh.mass - 2700 / 7850) < 1e-6,
+      'Expected rim mass ratio vs steel to match 2700 / 7850'
+    );
+    for (let axis = 0; axis < 3; axis++) {
+      assert.ok(
+        Math.abs(rimMesh.inertiaTensor[axis] / steelMesh.inertiaTensor[axis] - 2700 / 7850) < 1e-6,
+        `Expected rim inertia[${axis}] ratio vs steel to match 2700 / 7850`
+      );
+    }
+
+    const standaloneRimPart = buildStandaloneNativeStlPart(
+      '/output/car_rim.stl',
+      'car_rim.stl (31 629 Δ)',
+      rimMesh,
+      rimResolved.materialId,
+      rimResolved.partId
+    );
+    assert.equal(standaloneRimPart.id, 'car_rim');
+    assert.equal(standaloneRimPart.materialId, 'alu_6061');
+    assert.equal(standaloneRimPart.mesh.mass, rimMesh.mass);
+
+    // 2. Explicit canonical Rust IDs, aliases, and custom materials resolve exact density
+    const pyrexResolved = resolveNativeStlMaterialSpec(
+      '/output/lightbulb_e27.stl',
+      MATERIALS_LIBRARY,
+      'pyrex'
+    );
+    assert.equal(pyrexResolved.density, 2500);
+    assert.equal(pyrexResolved.material.id, 'borosilicate_glass');
+
+    const rustAlResolved = resolveNativeStlMaterialSpec(
+      '/output/piston.stl',
+      MATERIALS_LIBRARY,
+      'aluminum_6061_t6'
+    );
+    assert.equal(rustAlResolved.density, 2700);
+    assert.equal(rustAlResolved.material.id, 'alu_6061');
+
+    // 3. End-to-end MCP import_stl + async hydration preserves other scene parts, part_id, name, materialId, isFixed, and density
+    const existingPart = {
+      id: 'existing_bracket',
+      name: 'Existing Bracket',
+      materialId: 'steel_1045',
+      isFixed: false,
+      dag: [],
+      mesh: createBoxMesh(0.06, 0.04, 0.02, 7850),
+      visible: true,
+      position: [0.15, 0, 0] as [number, number, number],
+      rotation: [0, 0, 0] as [number, number, number],
+      scale: [1, 1, 1] as [number, number, number],
+    };
+
+    const baseState: EngineStateSnapshot = {
+      parts: [existingPart],
+      selectedPartId: 'existing_bracket',
+      joints: [],
+      materials: [...MATERIALS_LIBRARY],
+      feaResult: null,
+      physicsFrames: [],
+      quality: 'standard',
+      renderMode: 'shaded',
+    };
+
+    const definedMat = executeMcpToolOnEngineState(baseState, 'define_material', {
+      id: 'custom_composite',
+      name: 'Carbon Composite',
+      young_modulus_gpa: 70,
+      poisson_ratio: 0.25,
+      yield_strength_mpa: 450,
+      density_kg_m3: 1600,
+    });
+
+    const impRes = executeMcpToolOnEngineState(definedMat.nextState, 'import_stl', {
+      file_path: 'output/imported_housing.stl',
+      part_id: 'housing_fixed_01',
+      name: 'Fixed Pyrex Housing',
+      material: 'pyrex',
+      is_fixed: true,
+    });
+
+    assert.equal(impRes.nextState.parts.length, 2);
+    const importedBeforeHydrate = impRes.nextState.parts.find((p) => p.id === 'housing_fixed_01');
+    assert.ok(importedBeforeHydrate, 'import_stl must create target part with requested part_id');
+
+    const hydrateSpec = resolveNativeStlMaterialSpec(
+      impRes.response.native_stl_url,
+      impRes.nextState.materials,
+      importedBeforeHydrate.materialId
+    );
+    assert.equal(hydrateSpec.density, 2500);
+    const parsedHousingMesh = parseStlBuffer(binaryStl, hydrateSpec.density, 1.0);
+
+    const hydrated = hydrateImportedStlPartInScene(
+      impRes.nextState.parts,
+      String(impRes.response.part_id),
+      String(impRes.response.native_stl_url),
+      parsedHousingMesh,
+      impRes.nextState.materials
+    );
+
+    assert.equal(hydrated.parts.length, 2, 'Hydration must preserve all existing parts in scene');
+    assert.strictEqual(
+      hydrated.parts[0],
+      impRes.nextState.parts[0],
+      'Unrelated scene parts must remain completely untouched during STL hydration'
+    );
+    assert.equal(hydrated.parts[0].id, 'existing_bracket');
+    assert.equal(hydrated.parts[0].materialId, 'steel_1045');
+    assert.equal(hydrated.parts[0].mesh.mass, existingPart.mesh.mass);
+    assert.ok(hydrated.hydratedPart, 'Target imported part must be hydrated');
+    assert.equal(hydrated.hydratedPart.id, 'housing_fixed_01');
+    assert.equal(hydrated.hydratedPart.name, 'Fixed Pyrex Housing');
+    assert.equal(hydrated.hydratedPart.materialId, 'pyrex');
+    assert.equal(hydrated.hydratedPart.isFixed, true);
+    assert.equal(hydrated.hydratedPart.nativeStlUrl, '/output/imported_housing.stl');
+    assert.equal(hydrated.hydratedPart.mesh.triangleCount, parsedHousingMesh.triangleCount);
+    assert.ok(
+      Math.abs(hydrated.hydratedPart.mesh.mass - parsedHousingMesh.volume * 2500) < 1e-6,
+      `Expected hydrated mass for pyrex (~${(parsedHousingMesh.volume * 2500).toFixed(6)} kg), got ${hydrated.hydratedPart.mesh.mass}`
+    );
+    assert.equal(
+      hydrated.hydratedPart.dag[0].params.triangles,
+      parsedHousingMesh.triangleCount
+    );
+
+    // 4. Race guard: if materialId was switched to custom_composite (1600 kg/m³) while STL fetch was in flight,
+    //    hydration rescales mass & inertia to 1600 kg/m³ without mutating the cached mesh
+    const partsWithUpdatedMat = impRes.nextState.parts.map((p) =>
+      p.id === 'housing_fixed_01' ? { ...p, materialId: 'custom_composite' } : p
+    );
+    const parsedMassBeforeRace = parsedHousingMesh.mass;
+    const rescaledHydrated = hydrateImportedStlPartInScene(
+      partsWithUpdatedMat,
+      'housing_fixed_01',
+      String(impRes.response.native_stl_url),
+      parsedHousingMesh,
+      impRes.nextState.materials
+    );
+    assert.ok(rescaledHydrated.hydratedPart);
+    assert.ok(
+      Math.abs(rescaledHydrated.hydratedPart.mesh.mass - parsedHousingMesh.volume * 1600) < 1e-6,
+      'Expected hydration to match updated custom material density (1600 kg/m³)'
+    );
+    assert.equal(
+      parsedHousingMesh.mass,
+      parsedMassBeforeRace,
+      'Cached parsedMesh must not be mutated during density rescaling'
+    );
+
+    // 5. Deleted part guard: if the imported part was removed before hydration finishes, scene is untouched
+    const missingHydrated = hydrateImportedStlPartInScene(
+      [existingPart],
+      'housing_fixed_01',
+      '/output/imported_housing.stl',
+      parsedHousingMesh,
+      impRes.nextState.materials
+    );
+    assert.equal(missingHydrated.hydratedPart, null);
+    assert.equal(missingHydrated.parts.length, 1);
+    assert.strictEqual(missingHydrated.parts[0], existingPart);
+
+    // 6. Contract check on src/App.tsx: no hardcoded 7850 in handleLoadNativeStlUrl and hydratePartId is wired
+    const appTsx = fs.readFileSync(path.resolve(process.cwd(), 'src/App.tsx'), 'utf8');
+    assert.ok(
+      !appTsx.includes('loadCachedRustStlMesh(stlUrl, 7850)'),
+      'src/App.tsx must not hardcode density 7850 in handleLoadNativeStlUrl'
+    );
+    assert.ok(
+      appTsx.includes('hydratePartId: String(response.part_id)'),
+      'src/App.tsx must pass hydratePartId when hydrating MCP import_stl results'
+    );
+  });
+
+  it('verifies P5-T34: docs/MCP_API_REFERENCE.md create_joint section matches Rust inputSchema, physics.rs units/ratio, and response metadata', () => {
+    const modRs = fs.readFileSync(
+      path.resolve(process.cwd(), 'crates/mcp-cad-server/src/tools/mod.rs'),
+      'utf8'
+    );
+    const physicsRs = fs.readFileSync(
+      path.resolve(process.cwd(), 'crates/mcp-cad-server/src/tools/physics.rs'),
+      'utf8'
+    );
+    const stateRs = fs.readFileSync(
+      path.resolve(process.cwd(), 'crates/mcp-cad-server/src/state.rs'),
+      'utf8'
+    );
+    const apiRef = fs.readFileSync(
+      path.resolve(process.cwd(), 'docs/MCP_API_REFERENCE.md'),
+      'utf8'
+    );
+
+    // 1. Extract create_joint input_schema JSON from Rust mod.rs
+    const schemaMatch = modRs.match(
+      /name:\s*"create_joint"\.to_string\(\)[\s\S]*?input_schema:\s*json!\((\{[\s\S]*?\})\),\s*\n\s*\},/
+    );
+    assert.ok(schemaMatch, 'Could not locate create_joint input_schema in mod.rs');
+    const rustSchema = JSON.parse(schemaMatch[1]) as {
+      properties: Record<string, unknown>;
+      required: string[];
+    };
+
+    const rustSchemaParams = Object.keys(rustSchema.properties);
+    const rustRequiredParams = new Set(rustSchema.required);
+    assert.ok(
+      rustSchemaParams.length >= 14,
+      `Expected >= 14 create_joint schema params in mod.rs, found ${rustSchemaParams.length}: ${rustSchemaParams.join(', ')}`
+    );
+    assert.deepEqual(
+      Array.from(rustRequiredParams).sort(),
+      ['joint_type', 'part_a', 'part_b'],
+      'Expected required params of create_joint to be joint_type, part_a, part_b'
+    );
+
+    // 2. Confirm physics.rs supports limits_unit, computes ratio = ta / tb, and returns joint_id + length_unit + units
+    const createJointFnMatch = physicsRs.match(
+      /pub fn create_joint\([\s\S]*?\n\}/
+    );
+    assert.ok(createJointFnMatch, 'Could not locate pub fn create_joint in physics.rs');
+    const createJointFn = createJointFnMatch[0];
+    assert.ok(
+      createJointFn.includes('args.get("limits_unit")'),
+      'Expected physics.rs create_joint to read limits_unit'
+    );
+    assert.ok(
+      createJointFn.includes('let r = ta / tb;'),
+      'Expected physics.rs create_joint to compute ratio = ta / tb'
+    );
+    assert.ok(
+      createJointFn.includes('"joint_id": joint_id') &&
+        createJointFn.includes('"length_unit": unit.as_str()') &&
+        createJointFn.includes('"units": unit.units_metadata()'),
+      'Expected physics.rs create_joint response to contain joint_id, length_unit, and units'
+    );
+
+    // Extract units_metadata() keys from state.rs
+    const unitsMetaMatch = stateRs.match(
+      /pub fn units_metadata\(&self\)\s*->\s*Value\s*\{\s*json!\(\{([\s\S]*?)\}\)/
+    );
+    assert.ok(unitsMetaMatch, 'Could not locate units_metadata() in state.rs');
+    const rustUnitsKeys = Array.from(
+      unitsMetaMatch[1].matchAll(/^\s*"([a-z0-9_]+)":/gm),
+      (m) => m[1]
+    );
+    assert.ok(
+      rustUnitsKeys.length >= 17,
+      `Expected >= 17 keys in LengthUnit::units_metadata(), found ${rustUnitsKeys.length}`
+    );
+
+    // 3. Isolate section ### 11. `create_joint` in docs/MCP_API_REFERENCE.md
+    const secStart = apiRef.indexOf('### 11. `create_joint`');
+    const secEnd = apiRef.indexOf('### 12. `set_joint_motor`');
+    assert.ok(
+      secStart !== -1 && secEnd > secStart,
+      'Could not isolate section 11 (create_joint) in docs/MCP_API_REFERENCE.md'
+    );
+    const section = apiRef.slice(secStart, secEnd);
+
+    // 4. Parse parameters table rows: | `param` ... | type | required | description |
+    const tableRowRe = /^\|\s*`([a-z0-9_]+)`[^|]*\|\s*[^|]+\|\s*([^|]+)\|\s*([^|]+)\|/gm;
+    const docTable = new Map<string, { required: string; desc: string }>();
+    for (const m of section.matchAll(tableRowRe)) {
+      docTable.set(m[1], { required: m[2].trim(), desc: m[3].trim() });
+    }
+
+    const expectedParams = Array.from(new Set([...rustSchemaParams, 'limits_unit']));
+    for (const param of expectedParams) {
+      assert.ok(
+        docTable.has(param),
+        `docs/MCP_API_REFERENCE.md create_joint table is missing parameter '${param}'`
+      );
+      const entry = docTable.get(param)!;
+      if (rustRequiredParams.has(param)) {
+        assert.ok(
+          entry.required.includes('Да'),
+          `Parameter '${param}' must be marked required ('Да'), got '${entry.required}'`
+        );
+      } else {
+        assert.ok(
+          entry.required.includes('Нет'),
+          `Parameter '${param}' must be marked optional ('Нет'), got '${entry.required}'`
+        );
+      }
+    }
+
+    // 5. Verify units and gear ratio descriptions match Rust contract (no stale strings)
+    const anchorADesc = docTable.get('anchor_a')!.desc;
+    const anchorBDesc = docTable.get('anchor_b')!.desc;
+    assert.ok(
+      anchorADesc.includes('length_unit') && anchorADesc.includes('"mm"') && anchorADesc.includes('"m"'),
+      `anchor_a must document active length_unit ("mm" default, "m"), got: ${anchorADesc}`
+    );
+    assert.ok(
+      anchorBDesc.includes('length_unit') && anchorBDesc.includes('"mm"') && anchorBDesc.includes('"m"'),
+      `anchor_b must document active length_unit ("mm" default, "m"), got: ${anchorBDesc}`
+    );
+    assert.ok(
+      !anchorADesc.includes('(м)') && !anchorBDesc.includes('(м)'),
+      'anchor_a/anchor_b must not claim meters-only "(м)"'
+    );
+
+    const limitsDesc = docTable.get('limits')!.desc;
+    assert.ok(
+      limitsDesc.includes('deg') &&
+        limitsDesc.includes('limits_unit') &&
+        limitsDesc.includes('rad') &&
+        limitsDesc.includes('length_unit') &&
+        limitsDesc.includes('"mm"'),
+      `limits must document deg/rad via limits_unit for revolute and length_unit ("mm"/"m") for prismatic, got: ${limitsDesc}`
+    );
+    assert.ok(
+      !limitsDesc.includes('в радианах или метрах'),
+      'limits must not contain stale "(в радианах или метрах)" wording'
+    );
+
+    const lengthUnitDesc = docTable.get('length_unit')!.desc;
+    assert.ok(
+      lengthUnitDesc.includes('"mm"') && lengthUnitDesc.includes('"m"'),
+      `length_unit must document "mm" and "m", got: ${lengthUnitDesc}`
+    );
+
+    const limitsUnitDesc = docTable.get('limits_unit')!.desc;
+    assert.ok(
+      limitsUnitDesc.includes('"deg"') && limitsUnitDesc.includes('"rad"'),
+      `limits_unit must document "deg" and "rad", got: ${limitsUnitDesc}`
+    );
+
+    const teethADesc = docTable.get('teeth_a')!.desc;
+    const teethBDesc = docTable.get('teeth_b')!.desc;
+    const ratioDesc = docTable.get('ratio')!.desc;
+    assert.ok(
+      teethADesc.includes('ratio = teeth_a / teeth_b') &&
+        teethBDesc.includes('ratio = teeth_a / teeth_b'),
+      'teeth_a and teeth_b must document ratio = teeth_a / teeth_b'
+    );
+    assert.ok(
+      !section.includes('i = -z_A / z_B'),
+      'create_joint section must not contain stale formula i = -z_A / z_B'
+    );
+    assert.ok(
+      ratioDesc.includes('-\\text{ratio}') && ratioDesc.includes('Положительное значение'),
+      `ratio must document positive counter-rotation convention (omega_B = -ratio * omega_A), got: ${ratioDesc}`
+    );
+
+    // 6. Parse and validate all JSON example blocks in section 11
+    const jsonBlocks = Array.from(section.matchAll(/```json\n([\s\S]*?)\n```/g), (m) => m[1]);
+    assert.ok(
+      jsonBlocks.length >= 3,
+      `Expected >= 3 JSON blocks (requests + response) in create_joint section, found ${jsonBlocks.length}`
+    );
+
+    const allowedKeys = new Set([...expectedParams, 'id']);
+    const requestExamples: Array<Record<string, unknown>> = [];
+    let responsePayload: Record<string, unknown> | null = null;
+
+    for (const rawBlock of jsonBlocks) {
+      const parsed = JSON.parse(rawBlock) as Record<string, any>;
+      assert.equal(parsed.jsonrpc, '2.0');
+      if (parsed.method === 'tools/call') {
+        assert.equal(parsed.params.name, 'create_joint');
+        const args = parsed.params.arguments as Record<string, unknown>;
+        for (const reqKey of rustRequiredParams) {
+          assert.ok(
+            Object.prototype.hasOwnProperty.call(args, reqKey),
+            `create_joint request example is missing required parameter '${reqKey}'`
+          );
+        }
+        for (const key of Object.keys(args)) {
+          assert.ok(
+            allowedKeys.has(key),
+            `create_joint request example uses undocumented parameter '${key}'`
+          );
+        }
+        requestExamples.push(args);
+      } else if (parsed.result?.content?.[0]?.text) {
+        responsePayload = JSON.parse(parsed.result.content[0].text) as Record<string, unknown>;
+      }
+    }
+
+    assert.ok(requestExamples.length >= 2, 'Expected at least 2 create_joint request examples');
+    assert.ok(responsePayload, 'Expected a JSON-RPC response example for create_joint');
+    assert.equal(typeof responsePayload.joint_id, 'string');
+    assert.equal(responsePayload.length_unit, 'mm');
+    assert.ok(
+      responsePayload.units && typeof responsePayload.units === 'object',
+      'Response example must include units metadata object'
+    );
+    for (const unitKey of rustUnitsKeys) {
+      assert.ok(
+        Object.prototype.hasOwnProperty.call(responsePayload.units, unitKey),
+        `create_joint response example is missing units.${unitKey}`
+      );
+    }
+
+    // 7. Execute revolute & prismatic request examples against TS dispatcher to verify unit conversion
+    const dummyBox = createBoxMesh(0.05, 0.05, 0.05, 7850);
+    const makePart = (id: string, isFixed = false) => ({
+      id,
+      name: id,
+      materialId: 'steel_1045',
+      isFixed,
+      dag: [],
+      mesh: dummyBox,
+      visible: true,
+      position: [0, 0, 0] as [number, number, number],
+      rotation: [0, 0, 0] as [number, number, number],
+      scale: [1, 1, 1] as [number, number, number],
+    });
+    const testState: EngineStateSnapshot = {
+      parts: [
+        makePart('gearbox_housing', true),
+        makePart('pinion_gear', false),
+        makePart('driven_gear', false),
+        makePart('slider_carriage', false),
+      ],
+      selectedPartId: 'pinion_gear',
+      joints: [],
+      materials: [...MATERIALS_LIBRARY],
+      feaResult: null,
+      physicsFrames: [],
+      quality: 'standard',
+      renderMode: 'shaded',
+    };
+
+    const revExample = requestExamples.find((r) => r.joint_type === 'revolute');
+    assert.ok(revExample, 'Expected a revolute request example');
+    const revRes = executeMcpToolOnEngineState(testState, 'create_joint', revExample);
+    assert.equal(revRes.response.length_unit, 'mm');
+    const revJoint = revRes.nextState.joints.find((j) => j.id === revExample.joint_id);
+    assert.ok(revJoint && revJoint.limits, 'Revolute example should register joint with limits');
+    assert.ok(
+      Math.abs(revJoint.limits[0] - -Math.PI) < 1e-6 &&
+        Math.abs(revJoint.limits[1] - Math.PI) < 1e-6,
+      `Expected revolute limits [-180, 180] deg -> [-pi, pi] rad, got ${JSON.stringify(revJoint.limits)}`
+    );
+
+    const prismExample = requestExamples.find((r) => r.joint_type === 'prismatic');
+    assert.ok(prismExample, 'Expected a prismatic request example');
+    const prismRes = executeMcpToolOnEngineState(revRes.nextState, 'create_joint', prismExample);
+    assert.equal(prismRes.response.length_unit, 'mm');
+    const prismJoint = prismRes.nextState.joints.find((j) => j.id === prismExample.joint_id);
+    assert.ok(prismJoint && prismJoint.limits, 'Prismatic example should register joint with limits');
+    assert.ok(
+      Math.abs(prismJoint.limits[0] - -0.25) < 1e-9 &&
+        Math.abs(prismJoint.limits[1] - 0.25) < 1e-9,
+      `Expected prismatic limits [-250, 250] mm -> [-0.25, 0.25] m, got ${JSON.stringify(prismJoint.limits)}`
+    );
+  });
+
+  it('verifies P5-T35: prismatic joint.limits > 1.0 m are honored in SI meters without spurious 1e-3 division in stepKinematicsAssembly and press_simulation', () => {
+    // 1. Long-stroke prismatic gantry via MCP create_joint (limits: [-1500, 1500] mm -> [-1.5, 1.5] m)
+    let state: EngineStateSnapshot = {
+      parts: [],
+      selectedPartId: '',
+      joints: [],
+      materials: [...DEFAULT_MATERIALS],
+      feaResult: null,
+      physicsFrames: [],
+      quality: 'standard',
+      renderMode: 'shaded',
+    };
+
+    state = executeMcpToolOnEngineState(state, 'add_feature_primitive', {
+      part_id: 'gantry_carriage_p5_t35',
+      primitive_type: 'box',
+      params: { width: 0.1, height: 0.1, depth: 0.1 },
+    }).nextState;
+
+    state = executeMcpToolOnEngineState(state, 'create_joint', {
+      joint_id: 'j_gantry_1500mm',
+      joint_type: 'prismatic',
+      part_a: 'ground',
+      part_b: 'gantry_carriage_p5_t35',
+      axis: [1, 0, 0],
+      limits: [-1500, 1500], // default length_unit='mm' -> internal [-1.5, 1.5] m
+    }).nextState;
+
+    assert.deepEqual(state.joints[0].limits, [-1.5, 1.5]);
+
+    // Drive at +2.0 m/s for 1.0 s -> should clamp at +1.5 m (NOT +0.0015 m!)
+    state = executeMcpToolOnEngineState(state, 'set_joint_motor', {
+      joint_id: 'j_gantry_1500mm',
+      target_velocity: 2.0,
+      max_force: 500.0,
+    }).nextState;
+
+    state = executeMcpToolOnEngineState(state, 'run_physics_simulation', {
+      duration_seconds: 1.0,
+      dt: 0.02,
+    }).nextState;
+
+    const carriagePos = state.parts.find((p) => p.id === 'gantry_carriage_p5_t35')!;
+    assert.ok(
+      Math.abs(carriagePos.position[0] - 1.5) < 1e-6,
+      `Expected gantry carriage to reach +1.5 m travel limit, got ${carriagePos.position[0]}`
+    );
+
+    // Reverse at -4.0 m/s for 1.0 s -> from +1.5 m to -1.5 m clamp
+    state = executeMcpToolOnEngineState(state, 'set_joint_motor', {
+      joint_id: 'j_gantry_1500mm',
+      target_velocity: -4.0,
+      max_force: 500.0,
+    }).nextState;
+
+    const steppedReverse = stepKinematicsAssembly(state.parts, state.joints, 1.0);
+    const carriageNeg = steppedReverse.updatedParts.find((p) => p.id === 'gantry_carriage_p5_t35')!;
+    assert.ok(
+      Math.abs(carriageNeg.position[0] - -1.5) < 1e-6,
+      `Expected gantry carriage to clamp at -1.5 m on reverse stroke, got ${carriageNeg.position[0]}`
+    );
+
+    // 2. Large-stroke press assembly (> 1.0 m prismatic limits: [0, -1.25] m) in detectPressAssembly
+    const steelDensity = 7850;
+    const aluDensity = 2700;
+    const basePart = {
+      id: 'heavy_base',
+      name: 'Heavy Base Plate',
+      materialId: 'steel_1045',
+      dag: [{ id: 'b1', name: 'Box', type: 'box' as const, params: { width: 0.5, height: 0.5, depth: 0.1 }, enabled: true }],
+      mesh: createBoxMesh(0.5, 0.5, 0.1, steelDensity),
+      visible: true,
+      isFixed: true,
+      position: [0, 0, -1.05] as [number, number, number],
+      rotation: [0, 0, 0] as [number, number, number],
+      scale: [1, 1, 1] as [number, number, number],
+    };
+    const tallColumn = {
+      id: 'tall_specimen',
+      name: 'Tall Column Specimen',
+      materialId: 'alu_6061',
+      dag: [{ id: 'c1', name: 'Box', type: 'box' as const, params: { width: 0.2, height: 0.2, depth: 2.0 }, enabled: true }],
+      mesh: createBoxMesh(0.2, 0.2, 2.0, aluDensity),
+      visible: true,
+      isFixed: false,
+      position: [0, 0, 0] as [number, number, number],
+      rotation: [0, 0, 0] as [number, number, number],
+      scale: [1, 1, 1] as [number, number, number],
+    };
+    const pressRam = {
+      id: 'heavy_press_ram',
+      name: 'Heavy Press Ram',
+      materialId: 'steel_1045',
+      dag: [{ id: 'p1', name: 'Box', type: 'box' as const, params: { width: 0.5, height: 0.5, depth: 0.1 }, enabled: true }],
+      mesh: createBoxMesh(0.5, 0.5, 0.1, steelDensity),
+      visible: true,
+      isFixed: false,
+      position: [0, 0, 1.05] as [number, number, number],
+      rotation: [0, 0, 0] as [number, number, number],
+      scale: [1, 1, 1] as [number, number, number],
+    };
+    const pressJoint = {
+      id: 'ram_slider',
+      name: 'Ram Slider',
+      type: 'prismatic' as const,
+      partA: 'heavy_base',
+      partB: 'heavy_press_ram',
+      anchor: [0, 0, -1.0] as [number, number, number],
+      anchorB: [0, 0, 1.0] as [number, number, number],
+      axis: [0, 0, 1] as [number, number, number],
+      limits: [0, -1.25] as [number, number], // 1.25 m stroke (> 1.0 m!)
+      motorSpeedRpm: 0,
+      motorLinearSpeedMs: -0.5,
+      motorTorqueNm: 50000,
+      motorEnabled: true,
+      currentAngleRad: 0,
+    };
+
+    const detected = detectPressAssembly(
+      [basePart, tallColumn, pressRam],
+      [pressJoint],
+      DEFAULT_MATERIALS
+    );
+    assert.ok(detected, 'Expected large-stroke press assembly to be detected');
+    assert.ok(
+      Math.abs(detected.maxStrokeM - 1.25) < 1e-6,
+      `Expected detectPressAssembly maxStrokeM to preserve 1.25 m (> 1.0 m) without dividing by 1000, got ${detected.maxStrokeM}`
     );
   });
 });

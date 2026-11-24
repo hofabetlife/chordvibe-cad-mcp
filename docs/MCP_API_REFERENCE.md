@@ -58,6 +58,8 @@
    - [39. `check_interference`](#39-check_interference)
    - [40. `sweep_joint`](#40-sweep_joint)
    - [41. `apply_recipe`](#41-apply_recipe)
+   - [42. `bake_coupled_simulation`](#42-bake_coupled_simulation)
+   - [43. `query_simulation_frame`](#43-query_simulation_frame)
 
 ---
 
@@ -694,24 +696,26 @@
 #### Входные параметры
 | Параметр | Тип | Обязательный | Описание |
 |---|---|---|---|
-| `joint_id` (или `id`) | `string` | Нет | Пользовательский идентификатор сочленения (по умолчанию автогенерируется `joint-<uuid>`). При дублировании возвращает ошибку `JOINT_ALREADY_EXISTS` |
-| `joint_type` | `string` | Да | `"revolute"`, `"prismatic"`, `"spherical"`, `"fixed"`, `"gear"` |
+| `joint_id` (или `id`) | `string` | Нет | Пользовательский непустой идентификатор сочленения (по умолчанию автогенерируется `joint-<uuid>`). При дублировании возвращает ошибку `JOINT_ALREADY_EXISTS` |
+| `joint_type` | `string` | Да | Тип сочленения: `"revolute"`, `"prismatic"`, `"spherical"`, `"fixed"`, `"gear"` (регистронезависимо) |
 | `part_a` | `string` | Да | Идентификатор первой сопрягаемой детали (или `"ground"` / `"world"` для привязки к неподвижному пространству; обрабатывается регистронезависимо) |
-| `part_b` | `string` | Да | Идентификатор второй сопрягаемой детали (или `"ground"` / `"world"`; обрабатывается регистронезависимо) |
-| `anchor_a` | `[number, number, number]` | Нет | Точка крепления `[x, y, z]` в СК детали A (м). По умолчанию `[0, 0, 0]` |
-| `anchor_b` | `[number, number, number]` | Нет | Точка крепления `[x, y, z]` в СК детали B (м). По умолчанию `[0, 0, 0]` |
-| `axis` | `[number, number, number]` | Нет | Направляющая ось `[x, y, z]` (обязательна для revolute/prismatic) |
-| `limits` | `[number, number]` | Нет | Пределы движения `[min, max]` (в радианах или метрах) |
-| `ratio` | `number` | Нет | Передаточное отношение для `joint_type: "gear"` ($i = \omega_B / \omega_A$). Должно быть конечным ненулевым числом ($|\text{ratio}| \ge 10^{-9}$). Отрицательное значение указывает на встречное вращение (внешнее зацепление) |
-| `teeth_a` | `number` | Нет | Число зубьев ведущей шестерни $z_A$ (альтернатива `ratio`; строго положительное число $> 0$; рассчитывает $i = -z_A / z_B$) |
-| `teeth_b` | `number` | Нет | Число зубьев ведомой шестерни $z_B$ (альтернатива `ratio`; строго положительное число $> 0$) |
-| `axis_a` | `[number, number, number]` | Нет | Ось вращения шестерни A (по умолчанию `[0, 0, 1]`; ненулевой вектор) |
-| `axis_b` | `[number, number, number]` | Нет | Ось вращения шестерни B (по умолчанию `[0, 0, 1]`; ненулевой вектор) |
+| `part_b` | `string` | Да | Идентификатор второй сопрягаемой детали (или `"ground"` / `"world"`; обрабатывается регистронезависимо; не может совпадать с `part_a`, включая пару `"ground"`/`"world"`) |
+| `length_unit` | `string` | Нет | Локальное переопределение линейной единицы для данного вызова (`"mm"` или `"m"`; по умолчанию используется активная `length_unit` сессии, стартово `"mm"`). Применяется к `anchor_a`, `anchor_b` и к `limits` для `"prismatic"` |
+| `anchor_a` | `[number, number, number]` | Нет | Точка крепления `[x, y, z]` в локальной СК детали A в активной `length_unit` (`"mm"` по умолчанию, или `"m"`). По умолчанию `[0, 0, 0]` |
+| `anchor_b` | `[number, number, number]` | Нет | Точка крепления `[x, y, z]` в локальной СК детали B в активной `length_unit` (`"mm"` по умолчанию, или `"m"`). По умолчанию `[0, 0, 0]` |
+| `axis` | `[number, number, number]` | Нет | Безразмерный ненулевой направляющий вектор оси `[x, y, z]` ($\lVert v \rVert \ge 10^{-7}$): по умолчанию `[0, 0, 1]` для `"revolute"` и `"gear"` (как фолбэк для `axis_a`/`axis_b`), `[1, 0, 0]` для `"prismatic"` |
+| `limits` | `[number, number]` | Нет | Пределы движения `[min, max]` (`min <= max`): для `"revolute"` — в градусах (`deg`) по умолчанию (либо в радианах `rad` при `limits_unit: "rad"`); для `"prismatic"` — в активной `length_unit` (`"mm"` по умолчанию, или `"m"`) |
+| `limits_unit` | `string` | Нет | Единица измерения `limits` для вращательного шарнира (`"revolute"`): `"deg"` (по умолчанию) или `"rad"` |
+| `ratio` | `number` | Нет | Безразмерное передаточное отношение для `joint_type: "gear"` в кинематической связи $\omega_B \cdot \hat{\mathbf{z}}_B = -\text{ratio}\,(\omega_A \cdot \hat{\mathbf{z}}_A)$. Конечное ненулевое число ($\lvert\text{ratio}\rvert \ge 10^{-9}$). Положительное значение задаёт встречное вращение (внешнее зацепление), отрицательное — сонаправленное (внутреннее зацепление). По умолчанию `1.0`, если не заданы `teeth_a`/`teeth_b` |
+| `teeth_a` | `number` | Нет | Число зубьев ведущей шестерни $z_A$ (альтернатива `ratio`, строго положительное число $> 0$); вместе с `teeth_b` вычисляет `ratio = teeth_a / teeth_b` ($\omega_B = -(z_A / z_B)\,\omega_A$) |
+| `teeth_b` | `number` | Нет | Число зубьев ведомой шестерни $z_B$ (альтернатива `ratio`, строго положительное число $> 0$); вместе с `teeth_a` вычисляет `ratio = teeth_a / teeth_b` |
+| `axis_a` | `[number, number, number]` | Нет | Безразмерный вектор оси вращения шестерни A для `"gear"` (по умолчанию значение `axis` или `[0, 0, 1]`; ненулевой вектор $\lVert v \rVert \ge 10^{-7}$) |
+| `axis_b` | `[number, number, number]` | Нет | Безразмерный вектор оси вращения шестерни B для `"gear"` (по умолчанию значение `axis` или `[0, 0, 1]`; ненулевой вектор $\lVert v \rVert \ge 10^{-7}$) |
 
 > **Примечание по зубчатым передачам (`"gear"`):**  
-> При создании сопряжения типа `"gear"` физический движок строго валидирует входные параметры: передаточное отношение `ratio` должно быть конечным ненулевым ($|\text{ratio}| \ge 10^{-9}$), параметры `teeth_a` и `teeth_b` должны быть строго положительными ($> 0$), а оси вращения `axis_a` и `axis_b` — ненулевыми векторами ($\|v\| \ge 10^{-7}$). При некорректных параметрах возвращается ошибка `INVALID_ARGUMENT` с указанием конкретного `param`. Движок автоматически отключает прямой полигональный контакт между зубьями (`contacts_enabled(false)`), исключая заклинивание выпуклых оболочек colliders, и на каждом шаге времени строго синхронизирует угловые скорости шестерней согласно передаточному отношению $\omega_B = -\text{ratio} \cdot \omega_A$.
+> При создании сопряжения типа `"gear"` физический движок строго валидирует входные параметры: передаточное отношение `ratio` должно быть конечным ненулевым ($|\text{ratio}| \ge 10^{-9}$), при задании `teeth_a`/`teeth_b` оба значения должны быть строго положительными ($> 0$) и дают `ratio = teeth_a / teeth_b`, а оси вращения `axis_a` и `axis_b` должны быть ненулевыми векторами ($\|v\| \ge 10^{-7}$). При некорректных параметрах возвращается ошибка `INVALID_ARGUMENT` с указанием конкретного `param`. Движок автоматически отключает прямой полигональный контакт между зубьями (`contacts_enabled(false)`), исключая заклинивание выпуклых оболочек коллайдеров, и на каждом шаге времени строго синхронизирует угловые скорости шестерён согласно $\omega_B \cdot \hat{\mathbf{z}}_B = -\text{ratio}\,(\omega_A \cdot \hat{\mathbf{z}}_A)$ (положительное `ratio` даёт встречное внешнее зацепление, отрицательное — сонаправленное внутреннее).
 
-#### Пример запроса (вращательный шарнир на неподвижную раму)
+#### Пример запроса (вращательный шарнир с пределами в `deg` и якорем в `mm`)
 ```json
 {
   "jsonrpc": "2.0",
@@ -720,18 +724,22 @@
   "params": {
     "name": "create_joint",
     "arguments": {
+      "joint_id": "j_pinion_axis",
       "joint_type": "revolute",
       "part_a": "gearbox_housing",
       "part_b": "pinion_gear",
-      "anchor_a": [0.0, 0.0, 0.0],
+      "length_unit": "mm",
+      "anchor_a": [30.0, 0.0, 0.0],
       "anchor_b": [0.0, 0.0, 0.0],
-      "axis": [0.0, 0.0, 1.0]
+      "axis": [0.0, 0.0, 1.0],
+      "limits": [-180.0, 180.0],
+      "limits_unit": "deg"
     }
   }
 }
 ```
 
-#### Пример запроса (зубчатое зацепление шестерней)
+#### Пример запроса (зубчатое зацепление шестерён)
 ```json
 {
   "jsonrpc": "2.0",
@@ -744,7 +752,32 @@
       "part_a": "pinion_gear",
       "part_b": "driven_gear",
       "teeth_a": 20,
-      "teeth_b": 40
+      "teeth_b": 40,
+      "axis_a": [0.0, 0.0, 1.0],
+      "axis_b": [0.0, 0.0, 1.0]
+    }
+  }
+}
+```
+
+#### Пример запроса (призматический шарнир с ходом в `mm`)
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 13,
+  "method": "tools/call",
+  "params": {
+    "name": "create_joint",
+    "arguments": {
+      "joint_id": "j_slider_rail",
+      "joint_type": "prismatic",
+      "part_a": "ground",
+      "part_b": "slider_carriage",
+      "length_unit": "mm",
+      "anchor_a": [0.0, 0.0, 0.0],
+      "anchor_b": [0.0, 0.0, 0.0],
+      "axis": [1.0, 0.0, 0.0],
+      "limits": [-250.0, 250.0]
     }
   }
 }
@@ -759,7 +792,7 @@
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"joint_id\": \"joint-550e8400-e29b-41d4-a716-446655440000\"\n}"
+        "text": "{\n  \"joint_id\": \"j_pinion_axis\",\n  \"length_unit\": \"mm\",\n  \"units\": {\n    \"length\": \"mm\",\n    \"area\": \"mm²\",\n    \"volume\": \"mm³\",\n    \"volume_si\": \"m³\",\n    \"mass\": \"kg\",\n    \"density\": \"kg/m³\",\n    \"force\": \"N\",\n    \"torque\": \"N·m\",\n    \"stress\": \"MPa\",\n    \"stress_output\": \"MPa\",\n    \"young_modulus\": \"GPa\",\n    \"displacement\": \"mm\",\n    \"displacement_output\": \"mm\",\n    \"angle\": \"deg\",\n    \"angular_velocity\": \"rad/s\",\n    \"linear_velocity\": \"m/s\",\n    \"time\": \"s\"\n  }\n}"
       }
     ]
   }
@@ -1439,17 +1472,27 @@
 
 ### 25. `define_material`
 
-Динамически регистрирует новый инженерный конструкционный материал в глобальном реестре материалов системы. Зарегистрированный материал немедленно становится доступным для назначения деталям (`create_part`), расчета массы деталей и $3\times 3$ тензоров инерции в `f64` физике (`mcp-cad-physics`), а также для 3D МКЭ-расчета прочности (`run_fea_analysis`).
+Динамически регистрирует новый инженерный конструкционный материал в глобальном реестре материалов системы (включая линейно-упругие свойства, параметры $J_2$-пластичности, упрочнения, контактного трения и континуального разрушения Фазы 5 / `ADR-005`). Зарегистрированный материал немедленно становится доступным для назначения деталям (`create_part`), расчета массы деталей и $3\times 3$ тензоров инерции в `f64` физике (`mcp-cad-physics`), а также для линейного, нелинейного упруго-пластического и динамического 3D МКЭ-анализа (`run_fea_analysis`, `run_fea_from_simulation`, `bake_coupled_simulation`).
 
 #### Входные параметры
 | Параметр | Тип | Обязательный | Описание |
 |---|---|:---:|---|
-| `id` | `string` | **Да** | Уникальный буквенно-цифровой идентификатор материала (например, `"carbon_fiber_t700"`) |
-| `young_modulus_gpa` | `number` | **Да** | Модуль продольной упругости Юнга $E$ в гигапаскалях ($GPa > 0$) |
+| `id` | `string` | **Да** | Уникальный буквенно-цифровой идентификатор материала (например, `"carbon_fiber_t700"`; не может быть пустым) |
+| `young_modulus_gpa` | `number` | **Да** | Модуль продольной упругости Юнга $E$ в гигапаскалях (`GPa`, $E > 0$) |
 | `poisson_ratio` | `number` | **Да** | Коэффициент Пуассона $\nu$ (безразмерный, $0.0 < \nu < 0.5$) |
-| `yield_strength_mpa` | `number` | **Да** | Предел текучести $\sigma_y$ в мегапаскалях ($MPa > 0$) |
-| `density_kg_m3` | `number` | **Да** | Плотность материала $\rho$ в $кг/м^3$ ($> 0$) |
-| `name` | `string` | Нет | Человекочитаемое наименование материала (создает синоним) |
+| `yield_strength_mpa` | `number` | **Да** | Предел текучести $\sigma_y$ в мегапаскалях (`MPa`, $\sigma_y > 0$) |
+| `density_kg_m3` | `number` | **Да** | Плотность материала $\rho$ в $\text{кг/м}^3$ (`kg/m³`, $\rho > 0$) |
+| `name` | `string` | Нет | Человекочитаемое наименование материала (если `name != id`, дополнительно регистрирует синоним в реестре) |
+| `ultimate_strength_pa` | `number` | Нет | Предел прочности на растяжение $\sigma_u$ в паскалях (`Pa`, должен удовлетворять $\sigma_u \ge \sigma_y > 0$). При одновременной передаче с `ultimate_strength_mpa` имеет приоритет `ultimate_strength_pa`. По умолчанию: $1.25\,\sigma_y$ для `"ductile"`, $\sigma_y$ для `"brittle"` |
+| `ultimate_strength_mpa` | `number` | Нет | Предел прочности на растяжение $\sigma_u$ в мегапаскалях (`MPa`, конвертируется в `Pa` умножением на $10^6$; $\sigma_u \ge \sigma_y > 0$). Используется, если не задан `ultimate_strength_pa` |
+| `hardening_modulus_pa` | `number` | Нет | Модуль изотропного линейного упрочнения $H$ в паскалях (`Pa`, $H \ge 0$). По умолчанию: $0.01\,E$ для `"ductile"`, `0.0` для `"brittle"` |
+| `fracture_strain` | `number` | Нет | Критическая эквивалентная пластическая деформация разрушения $\varepsilon_f$ (безразмерная, $\varepsilon_f > 0$). По умолчанию: `0.15` для `"ductile"`, `0.002` для `"brittle"` |
+| `fracture_energy_j_m2` | `number` | Нет | Удельная энергия разрушения $G_f$ в джоулях на квадратный метр (`J/m²`, $G_f > 0$). По умолчанию: `15000.0` для `"ductile"`, `50.0` для `"brittle"` |
+| `friction_coeff` | `number` | Нет | Коэффициент сухого трения скольжения Кулона $\mu$ (безразмерный, $\mu \ge 0$). По умолчанию: `0.25` для `"ductile"`, `0.20` для `"brittle"` |
+| `failure_mode` | `"ductile" \| "brittle"` | Нет | Конститутивный режим разрушения: `"ductile"` (вязкий $J_2$/Райс–Трейси, по умолчанию) или `"brittle"` (хрупкий критерий Ренкина $\sigma_1 \ge \sigma_u$). Выбор `"brittle"` также переключает физические значения по умолчанию для неуказанных полей Фазы 5 |
+
+> **Физические инварианты валидации (`INVALID_ARGUMENT`):**  
+> При регистрации проверяются все конститутивные ограничения: $E > 0$, $0 < \nu < 0.5$, $\rho > 0$, $\sigma_u \ge \sigma_y > 0$, $H \ge 0$, $\varepsilon_f > 0$, $G_f > 0$, $\mu \ge 0$, `failure_mode ∈ {"ductile", "brittle"}`. Все числовые значения должны быть конечными (`f64::is_finite`).
 
 #### Пример запроса
 ```json
@@ -1465,7 +1508,13 @@
       "young_modulus_gpa": 230.0,
       "poisson_ratio": 0.30,
       "yield_strength_mpa": 1600.0,
-      "density_kg_m3": 1750.0
+      "density_kg_m3": 1750.0,
+      "ultimate_strength_mpa": 2200.0,
+      "hardening_modulus_pa": 2500000000.0,
+      "fracture_strain": 0.018,
+      "fracture_energy_j_m2": 12000.0,
+      "friction_coeff": 0.22,
+      "failure_mode": "brittle"
     }
   }
 }
@@ -1480,7 +1529,7 @@
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"status\": \"material_registered\",\n  \"material_id\": \"carbon_fiber_t700\",\n  \"properties\": {\n    \"name\": \"Carbon Fiber High Modulus T700\",\n    \"young_modulus_gpa\": 230.0,\n    \"young_modulus_pa\": 230000000000.0,\n    \"poisson_ratio\": 0.3,\n    \"yield_strength_mpa\": 1600.0,\n    \"yield_strength_pa\": 1600000000.0,\n    \"density_kg_m3\": 1750.0\n  }\n}"
+        "text": "{\n  \"status\": \"material_registered\",\n  \"material_id\": \"carbon_fiber_t700\",\n  \"properties\": {\n    \"name\": \"Carbon Fiber High Modulus T700\",\n    \"young_modulus_gpa\": 230.0,\n    \"young_modulus_pa\": 230000000000.0,\n    \"poisson_ratio\": 0.3,\n    \"yield_strength_mpa\": 1600.0,\n    \"yield_strength_pa\": 1600000000.0,\n    \"ultimate_strength_pa\": 2200000000.0,\n    \"ultimate_strength_mpa\": 2200.0,\n    \"hardening_modulus_pa\": 2500000000.0,\n    \"fracture_strain\": 0.018,\n    \"fracture_energy_j_m2\": 12000.0,\n    \"friction_coeff\": 0.22,\n    \"failure_mode\": \"brittle\",\n    \"density_kg_m3\": 1750.0\n  },\n  \"units\": {\n    \"length\": \"mm\",\n    \"area\": \"mm²\",\n    \"volume\": \"mm³\",\n    \"volume_si\": \"m³\",\n    \"mass\": \"kg\",\n    \"density\": \"kg/m³\",\n    \"force\": \"N\",\n    \"torque\": \"N·m\",\n    \"stress\": \"MPa\",\n    \"stress_output\": \"MPa\",\n    \"young_modulus\": \"GPa\",\n    \"displacement\": \"mm\",\n    \"displacement_output\": \"mm\",\n    \"angle\": \"deg\",\n    \"angular_velocity\": \"rad/s\",\n    \"linear_velocity\": \"m/s\",\n    \"time\": \"s\"\n  }\n}"
       }
     ]
   }

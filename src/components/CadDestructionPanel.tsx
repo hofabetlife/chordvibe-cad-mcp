@@ -30,6 +30,10 @@ import {
   buildEnergyBalanceSeries,
   DEFORMATION_SCALE_PRESETS,
 } from '../cad/field_colormaps';
+import {
+  formatDurationMsRu,
+  type LiveFemSolveStatus,
+} from '../cad/coupled_sim_stream';
 
 interface CadDestructionPanelProps {
   config: DestructionSimConfig;
@@ -38,6 +42,7 @@ interface CadDestructionPanelProps {
   isBaking: boolean;
   bakeProgressPct: number;
   bakeStageLabel: string;
+  liveSolveStatus?: LiveFemSolveStatus | null;
   isCacheStale: boolean;
   fieldMode: DestructionFieldMode;
   deformScale: DeformationScalePreset;
@@ -166,6 +171,7 @@ export const CadDestructionPanel: React.FC<CadDestructionPanelProps> = ({
   isBaking,
   bakeProgressPct,
   bakeStageLabel,
+  liveSolveStatus = null,
   isCacheStale,
   fieldMode,
   deformScale,
@@ -717,19 +723,25 @@ export const CadDestructionPanel: React.FC<CadDestructionPanelProps> = ({
             </span>
           </button>
 
-          {isBaking && (
-            <div className="space-y-1.5">
+          {(isBaking || liveSolveStatus?.active) && (
+            <div className="space-y-1.5 bg-[#12151c] border border-[#253147] rounded p-2">
               <div className="w-full h-1.5 rounded bg-[#0c0f15] overflow-hidden">
                 <div
-                  className="h-full bg-[#f97316] transition-all duration-150"
-                  style={{ width: `${bakeProgressPct}%` }}
+                  className="h-full bg-[#38bdf8] transition-all duration-150"
+                  style={{
+                    width: `${
+                      liveSolveStatus?.active
+                        ? liveSolveStatus.progressPct
+                        : bakeProgressPct
+                    }%`,
+                  }}
                 />
               </div>
               <div className="flex items-center justify-between gap-2">
-                <div className="text-[10px] font-mono text-[#94a3b8] truncate">
-                  {bakeStageLabel}
+                <div className="text-[10px] font-mono text-[#e2e8f0] truncate">
+                  {liveSolveStatus?.stageLabel || bakeStageLabel}
                 </div>
-                {canCancelBake && onCancelBake && (
+                {(canCancelBake || liveSolveStatus?.cancellable) && onCancelBake && (
                   <button
                     type="button"
                     data-testid="cancel-bake-btn"
@@ -741,6 +753,30 @@ export const CadDestructionPanel: React.FC<CadDestructionPanelProps> = ({
                   </button>
                 )}
               </div>
+              {liveSolveStatus && (
+                <div className="grid grid-cols-2 gap-1 text-[10px] font-mono tabular-nums text-[#94a3b8]">
+                  <span>
+                    Кадр:{' '}
+                    <strong className="text-[#f97316]">
+                      {liveSolveStatus.framesCached}
+                    </strong>
+                    {liveSolveStatus.frameCount > 0
+                      ? `/${liveSolveStatus.frameCount}`
+                      : ''}
+                  </span>
+                  <span className="text-right">
+                    t={liveSolveStatus.currentTimeSec.toFixed(3)}с · σ=
+                    <strong className="text-[#fb923c]">
+                      {liveSolveStatus.maxVonMisesMPa.toFixed(0)}
+                    </strong>
+                    МПа
+                  </span>
+                  <span>Прошло: {formatDurationMsRu(liveSolveStatus.elapsedMs)}</span>
+                  <span className="text-right text-[#38bdf8]">
+                    Осталось: {formatDurationMsRu(liveSolveStatus.estimatedRemainingMs)}
+                  </span>
+                </div>
+              )}
             </div>
           )}
 

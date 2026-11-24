@@ -442,8 +442,8 @@ export function detectPressAssembly(
     const [l0, l1] = prismaticJoint.limits;
     const jointSpan = Math.abs(l1 - l0);
     if (jointSpan > 1e-4) {
-      // Joint limits in Rust are stored in meters (e.g. [0, -0.036] -> 0.036 m), or mm if > 1.0
-      const limitM = jointSpan > 1.0 ? jointSpan * 1e-3 : jointSpan;
+      // Joint limits are always stored in SI meters (e.g. [0, -0.036] -> 0.036 m, or [-1.5, 1.5] -> 3.0 m)
+      const limitM = jointSpan;
       // Never let press plate penetrate past the base plate!
       const clearanceToBase = Math.max(0.002, baseFaceS - pressMaxS - solidHeightM * 0.32);
       maxStrokeM = Math.min(limitM, clearanceToBase);

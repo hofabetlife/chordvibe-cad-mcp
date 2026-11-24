@@ -42,6 +42,7 @@ import { CadQueryOptimizerPanel } from './CadQueryOptimizerPanel';
 import { CadDestructionPanel } from './CadDestructionPanel';
 import { FEA_QUICK_LOAD_PRESETS } from '../cad/workbenches';
 import type { RustAccuracyLevel } from '../cad/rust_scene_sync';
+import type { LiveFemSolveStatus } from '../cad/coupled_sim_stream';
 
 export type RightInspectorTab =
   | 'geometry'
@@ -76,6 +77,7 @@ interface CadRightSidebarProps {
   isBakingDestruction?: boolean;
   bakeProgressPct?: number;
   bakeStageLabel?: string;
+  liveSolveStatus?: LiveFemSolveStatus | null;
   isDestructionCacheStale?: boolean;
   destructionFieldMode?: DestructionFieldMode;
   destructionDeformScale?: DeformationScalePreset;
@@ -164,6 +166,7 @@ export const CadRightSidebar: React.FC<CadRightSidebarProps> = ({
   isBakingDestruction = false,
   bakeProgressPct = 0,
   bakeStageLabel = '',
+  liveSolveStatus = null,
   isDestructionCacheStale = false,
   destructionFieldMode = 'shaded',
   destructionDeformScale = 1,
@@ -849,6 +852,7 @@ export const CadRightSidebar: React.FC<CadRightSidebarProps> = ({
               isBaking={isBakingDestruction}
               bakeProgressPct={bakeProgressPct}
               bakeStageLabel={bakeStageLabel}
+              liveSolveStatus={liveSolveStatus}
               isCacheStale={isDestructionCacheStale}
               fieldMode={destructionFieldMode}
               deformScale={destructionDeformScale}

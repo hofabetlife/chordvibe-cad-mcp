@@ -1064,7 +1064,7 @@ fn build_coil_spring(
         .parts
         .get(&part_id)
         .map(|p| {
-            let mat = p.material();
+            let mat = &p.material;
             mat.youngs_modulus_gpa / (2.0 * (1.0 + mat.poissons_ratio))
         })
         .unwrap_or(79.3);

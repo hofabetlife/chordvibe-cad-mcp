@@ -3,7 +3,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -19,10 +20,10 @@ use mcp_cad_fea::conforming_mesh::AccuracyMode;
 use mcp_cad_fea::contact::ContactPairSpec;
 use mcp_cad_fea::damage::DamageMaterialParams;
 use mcp_cad_fea::dynamics::{
-    solve_dynamic_hht_coupled, DynamicBodySpec, DynamicContactForce, DynamicEnergyBalance,
-    DynamicFrameSnapshot, DynamicHhtReport, DynamicHubCoupling, DynamicHubReaction,
-    DynamicPrismaticDrive, DynamicProgressUpdate, DynamicRevoluteDrive, DynamicTimelineEvent,
-    HhtOptions, MassMatrixKind, TimeForceCurve,
+    solve_dynamic_hht_coupled_with_frames, DynamicBodySpec, DynamicContactForce,
+    DynamicEnergyBalance, DynamicFrameSnapshot, DynamicHhtReport, DynamicHubCoupling,
+    DynamicHubReaction, DynamicPrismaticDrive, DynamicProgressUpdate, DynamicRevoluteDrive,
+    DynamicTimelineEvent, HhtOptions, MassMatrixKind, TimeForceCurve,
 };
 use mcp_cad_fea::elasticity::J2MaterialParams;
 use mcp_cad_fea::sparse_solver::LinearSolverKind;
@@ -33,6 +34,9 @@ use mcp_cad_physics::{
 };
 
 use crate::error::ServerError;
+use crate::live_sync::{
+    now_unix_ms, publish_live_coupled_sim_progress, LiveCoupledSimProgress,
+};
 use crate::state::{EngineState, LengthUnit};
 
 /// Maximum number of completed coupled simulations retained in the in-memory frame cache.
@@ -78,7 +82,7 @@ impl CoupledAccuracyLevel {
         match self {
             Self::Standard => (MeshDensity::Coarse, AccuracyMode::Fast),
             Self::High => (MeshDensity::Medium, AccuracyMode::Standard),
-            Self::Ultra => (MeshDensity::Medium, AccuracyMode::High),
+            Self::Ultra => (MeshDensity::Coarse, AccuracyMode::High),
         }
     }
 
@@ -94,23 +98,23 @@ impl CoupledAccuracyLevel {
                 opts.dt_initial_s = (duration_s / 20.0).clamp(1e-4, 2e-3);
                 opts.dt_min_s = 1e-6;
                 opts.dt_max_s = (duration_s / 5.0).clamp(opts.dt_initial_s, 1e-2);
-                opts.force_tolerance = 1e-5;
+                opts.force_tolerance = 5e-5;
                 opts.max_frames = 300;
             }
             Self::High => {
                 opts.alpha = -0.05;
-                opts.dt_initial_s = (duration_s / 40.0).clamp(5e-5, 1e-3);
+                opts.dt_initial_s = (duration_s / 30.0).clamp(5e-5, 1.5e-3);
                 opts.dt_min_s = 5e-7;
-                opts.dt_max_s = (duration_s / 10.0).clamp(opts.dt_initial_s, 5e-3);
-                opts.force_tolerance = 1e-6;
+                opts.dt_max_s = (duration_s / 8.0).clamp(opts.dt_initial_s, 5e-3);
+                opts.force_tolerance = 3e-5;
                 opts.max_frames = 600;
             }
             Self::Ultra => {
                 opts.alpha = -0.05;
-                opts.dt_initial_s = (duration_s / 60.0).clamp(2.5e-5, 5e-4);
+                opts.dt_initial_s = (duration_s / 30.0).clamp(5e-5, 1.5e-3);
                 opts.dt_min_s = 1e-7;
-                opts.dt_max_s = (duration_s / 15.0).clamp(opts.dt_initial_s, 2.5e-3);
-                opts.force_tolerance = 1e-6;
+                opts.dt_max_s = (duration_s / 8.0).clamp(opts.dt_initial_s, 5e-3);
+                opts.force_tolerance = 2.5e-5;
                 opts.max_frames = 1200;
             }
         }
@@ -139,11 +143,16 @@ pub enum CoupledSimSseEvent {
         progress_pct: f64,
         step_count: usize,
         frame_count: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        latest_frame_index: Option<usize>,
         current_dt_s: f64,
         bisections: usize,
         eroded_elements: usize,
         detached_fragments: usize,
         max_von_mises_mpa: f64,
+        elapsed_ms: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        estimated_remaining_ms: Option<f64>,
     },
     /// Emitted when baking finishes and all frames are cached.
     Completed {
@@ -363,6 +372,23 @@ pub enum BakeJobState {
     Failed,
 }
 
+/// Estimates remaining wall-clock solve time in milliseconds from elapsed time and `%` completion.
+fn compute_estimated_remaining_ms(elapsed_ms: f64, progress_pct: f64) -> Option<f64> {
+    if !elapsed_ms.is_finite() || !progress_pct.is_finite() {
+        return None;
+    }
+    if progress_pct >= 99.9 {
+        return Some(0.0);
+    }
+    if progress_pct >= 1.5 && elapsed_ms >= 50.0 {
+        let remaining = (elapsed_ms * (100.0 - progress_pct)) / progress_pct;
+        if remaining.is_finite() && remaining >= 0.0 {
+            return Some((remaining * 10.0).round() / 10.0);
+        }
+    }
+    None
+}
+
 /// Tracked status of a single bake job (for polling via MCP `status` or HTTP `/api/coupled-sim/status`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoupledJobStatus {
@@ -376,6 +402,9 @@ pub struct CoupledJobStatus {
     pub current_time_s: f64,
     pub step_count: usize,
     pub frame_count: usize,
+    pub frames_cached: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_frame_index: Option<usize>,
     pub current_dt_s: f64,
     pub bisections: usize,
     pub eroded_elements: usize,
@@ -383,14 +412,20 @@ pub struct CoupledJobStatus {
     pub max_von_mises_mpa: f64,
     pub elapsed_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_remaining_ms: Option<f64>,
+    pub stage_label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
 /// Thread-safe server manager holding active bake jobs, cancellation tokens, and cached frame records.
 pub struct CoupledSimulationManager {
     jobs: HashMap<String, CoupledJobStatus>,
+    job_starts: HashMap<String, Instant>,
     cancel_flags: HashMap<String, Arc<AtomicBool>>,
     simulations: HashMap<String, Arc<BakedSimulationRecord>>,
+    active_builds: HashMap<String, Arc<RwLock<BakedSimulationRecord>>>,
+    active_sim_order: Vec<String>,
     simulation_order: Vec<String>,
     latest_simulation_id: Option<String>,
     latest_job_id: Option<String>,
@@ -407,8 +442,11 @@ impl CoupledSimulationManager {
     pub fn new() -> Self {
         Self {
             jobs: HashMap::new(),
+            job_starts: HashMap::new(),
             cancel_flags: HashMap::new(),
             simulations: HashMap::new(),
+            active_builds: HashMap::new(),
+            active_sim_order: Vec::new(),
             simulation_order: Vec::new(),
             latest_simulation_id: None,
             latest_job_id: None,
@@ -436,23 +474,55 @@ impl CoupledSimulationManager {
             current_time_s: 0.0,
             step_count: 0,
             frame_count: 0,
+            frames_cached: 0,
+            latest_frame_index: None,
             current_dt_s: 0.0,
             bisections: 0,
             eroded_elements: 0,
             detached_fragments: 0,
             max_von_mises_mpa: 0.0,
-            elapsed_ms: None,
+            elapsed_ms: Some(0.0),
+            estimated_remaining_ms: None,
+            stage_label: "Инициализация HHT-α сетки и связей...".to_string(),
             error: None,
         };
         self.jobs.insert(job_id.clone(), status);
+        self.job_starts.insert(job_id.clone(), Instant::now());
         self.cancel_flags
             .insert(job_id.clone(), Arc::clone(&cancel_flag));
         self.latest_job_id = Some(job_id);
         cancel_flag
     }
 
-    /// Updates live progress metrics for a running job.
-    pub fn update_progress(&mut self, job_id: &str, update: &DynamicProgressUpdate) {
+    /// Registers an active incremental `BakedSimulationRecord` so frames can be queried
+    /// live while the solve is still in progress.
+    pub fn begin_live_build(
+        &mut self,
+        sim_id: String,
+        initial_record: BakedSimulationRecord,
+    ) -> Arc<RwLock<BakedSimulationRecord>> {
+        let handle = Arc::new(RwLock::new(initial_record));
+        self.active_builds.insert(sim_id.clone(), Arc::clone(&handle));
+        self.active_sim_order.retain(|id| id != &sim_id);
+        self.active_sim_order.push(sim_id.clone());
+        self.latest_simulation_id = Some(sim_id);
+        handle
+    }
+
+    /// Updates live progress metrics for a running job and returns elapsed/ETA snapshot.
+    pub fn update_progress(
+        &mut self,
+        job_id: &str,
+        update: &DynamicProgressUpdate,
+    ) -> (f64, Option<f64>, Option<usize>) {
+        let elapsed_ms = self
+            .job_starts
+            .get(job_id)
+            .map(|t| (t.elapsed().as_secs_f64() * 1000.0 * 10.0).round() / 10.0)
+            .unwrap_or(0.0);
+        let eta_ms = compute_estimated_remaining_ms(elapsed_ms, update.progress_pct);
+        let mut latest_frame_idx = update.frame_count.checked_sub(1);
+
         if let Some(job) = self.jobs.get_mut(job_id) {
             job.current_time_s = update.time_s;
             job.progress_pct = update.progress_pct;
@@ -463,6 +533,36 @@ impl CoupledSimulationManager {
             job.eroded_elements = update.eroded_elements;
             job.detached_fragments = update.detached_fragments;
             job.max_von_mises_mpa = update.max_von_mises_pa * 1e-6;
+            job.elapsed_ms = Some(elapsed_ms);
+            job.estimated_remaining_ms = eta_ms;
+            if job.frames_cached > 0 {
+                latest_frame_idx = Some(job.frames_cached - 1);
+            }
+            job.latest_frame_index = latest_frame_idx;
+            job.stage_label = format!(
+                "HHT-α: {:.0}% · шаг {} · кадр {}",
+                update.progress_pct,
+                update.step_count,
+                job.frames_cached.max(update.frame_count)
+            );
+        }
+        (elapsed_ms, eta_ms, latest_frame_idx)
+    }
+
+    /// Records that a new incremental frame has been converted and cached for live queries.
+    pub fn update_live_frame_count(
+        &mut self,
+        job_id: &str,
+        frames_cached: usize,
+        latest_frame_index: usize,
+    ) {
+        if let Some(job) = self.jobs.get_mut(job_id) {
+            job.frames_cached = frames_cached;
+            job.frame_count = job.frame_count.max(frames_cached);
+            job.latest_frame_index = Some(latest_frame_index);
+            if let Some(t0) = self.job_starts.get(job_id) {
+                job.elapsed_ms = Some((t0.elapsed().as_secs_f64() * 1000.0 * 10.0).round() / 10.0);
+            }
         }
     }
 
@@ -473,6 +573,7 @@ impl CoupledSimulationManager {
             if let Some(job) = self.jobs.get_mut(job_id) {
                 if job.state == BakeJobState::Running {
                     job.state = BakeJobState::Cancelling;
+                    job.stage_label = "Остановка расчёта...".to_string();
                 }
             }
             return true;
@@ -488,6 +589,10 @@ impl CoupledSimulationManager {
         let elapsed_ms = record.elapsed_ms;
         let step_count = record.total_steps;
         let bisections = record.total_bisections;
+        let latest_frame_idx = frame_count.checked_sub(1);
+
+        self.active_builds.remove(&sim_id);
+        self.active_sim_order.retain(|id| id != &sim_id);
 
         if let Some(job) = self.jobs.get_mut(job_id) {
             job.state = if cancelled {
@@ -497,9 +602,17 @@ impl CoupledSimulationManager {
             };
             job.progress_pct = if cancelled { job.progress_pct } else { 100.0 };
             job.frame_count = frame_count;
+            job.frames_cached = frame_count;
+            job.latest_frame_index = latest_frame_idx;
             job.step_count = step_count;
             job.bisections = bisections;
             job.elapsed_ms = Some(elapsed_ms);
+            job.estimated_remaining_ms = Some(0.0);
+            job.stage_label = if cancelled {
+                format!("Остановлено (сохранено кадров: {frame_count})")
+            } else {
+                format!("Расчёт завершён ({frame_count} кадр.)")
+            };
         }
 
         self.simulations.insert(sim_id.clone(), Arc::new(record));
@@ -516,7 +629,12 @@ impl CoupledSimulationManager {
     /// Marks a job as failed with an error message.
     pub fn fail_job(&mut self, job_id: &str, error: String) {
         if let Some(job) = self.jobs.get_mut(job_id) {
+            let sim_id = job.simulation_id.clone();
+            self.active_builds.remove(&sim_id);
+            self.active_sim_order.retain(|id| id != &sim_id);
             job.state = BakeJobState::Failed;
+            job.estimated_remaining_ms = None;
+            job.stage_label = format!("Ошибка расчёта: {error}");
             job.error = Some(error);
         }
     }
@@ -524,18 +642,60 @@ impl CoupledSimulationManager {
     /// Returns job status for a specific `job_id` or the most recent job if `None`.
     pub fn job_status(&self, job_id: Option<&str>) -> Option<CoupledJobStatus> {
         let id = job_id.or(self.latest_job_id.as_deref())?;
-        self.jobs.get(id).cloned()
+        let mut st = self.jobs.get(id).cloned()?;
+        if matches!(st.state, BakeJobState::Running | BakeJobState::Cancelling) {
+            if let Some(t0) = self.job_starts.get(id) {
+                let elapsed = (t0.elapsed().as_secs_f64() * 1000.0 * 10.0).round() / 10.0;
+                st.elapsed_ms = Some(elapsed);
+                st.estimated_remaining_ms = compute_estimated_remaining_ms(elapsed, st.progress_pct);
+            }
+        }
+        Some(st)
     }
 
     /// Lists all tracked job statuses.
     pub fn list_jobs(&self) -> Vec<CoupledJobStatus> {
-        self.jobs.values().cloned().collect()
+        self.jobs.keys().filter_map(|id| self.job_status(Some(id))).collect()
     }
 
-    /// Retrieves a cached simulation record by ID or returns the latest cached simulation.
+    /// Retrieves a completed cached simulation record by ID or returns the latest cached simulation.
     pub fn get_simulation(&self, simulation_id: Option<&str>) -> Option<Arc<BakedSimulationRecord>> {
         let id = simulation_id.or(self.latest_simulation_id.as_deref())?;
         self.simulations.get(id).cloned()
+    }
+
+    /// Visits either a completed simulation or a currently active streaming simulation build.
+    pub fn with_simulation_record<R>(
+        &self,
+        simulation_id: Option<&str>,
+        f: impl FnOnce(&BakedSimulationRecord) -> R,
+    ) -> Option<R> {
+        if let Some(id) = simulation_id {
+            if let Some(rec) = self.simulations.get(id) {
+                return Some(f(rec));
+            }
+            if let Some(live) = self.active_builds.get(id) {
+                let guard = live.read();
+                return Some(f(&guard));
+            }
+            return None;
+        }
+        if let Some(latest_id) = self.latest_simulation_id.as_deref() {
+            if let Some(live) = self.active_builds.get(latest_id) {
+                let guard = live.read();
+                return Some(f(&guard));
+            }
+            if let Some(rec) = self.simulations.get(latest_id) {
+                return Some(f(rec));
+            }
+        }
+        if let Some(active_id) = self.active_sim_order.last() {
+            if let Some(live) = self.active_builds.get(active_id) {
+                let guard = live.read();
+                return Some(f(&guard));
+            }
+        }
+        None
     }
 
     /// Lists summary metadata for all cached simulations.
@@ -558,6 +718,8 @@ pub struct PreparedCoupledBake {
     pub options: HhtOptions,
     pub gravity: [f64; 3],
     pub async_mode: bool,
+    pub async_mode_explicit: Option<bool>,
+    pub wait_timeout_ms: Option<u64>,
     pub applied_joint_couplings: Vec<AppliedJointCouplingSummary>,
     pub applied_gear_couplings: Vec<GearJointCouplingSpec>,
 }
@@ -1058,11 +1220,15 @@ pub fn prepare_coupled_bake_from_parts_with_physics(
 
     let force_curve = parse_force_curve(args.get("force_curve"))?;
 
-    let async_mode = args
+    let async_mode_explicit = args
         .get("async_mode")
         .or_else(|| args.get("async"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+        .and_then(|v| v.as_bool());
+    let async_mode = async_mode_explicit.unwrap_or(false);
+    let wait_timeout_ms = args
+        .get("wait_timeout_ms")
+        .and_then(|v| v.as_u64())
+        .map(|ms| ms.min(120_000));
 
     // Select parts to include
     let selected_ids: Vec<String> = if let Some(arr) = args.get("part_ids").and_then(|v| v.as_array())
@@ -1102,15 +1268,15 @@ pub fn prepare_coupled_bake_from_parts_with_physics(
     };
 
     // Per-part fixed faces map: accepts either simple strings ["min_x"] (applied to first part)
-    // or objects [{"part_id": "p1", "face": "min_x"}].
-    let mut fixed_by_part: HashMap<String, Vec<String>> = HashMap::new();
+    // or objects [{"part_id": "p1", "face": "min_x", "tolerance": 0.001}].
+    let mut fixed_by_part: HashMap<String, Vec<(String, Option<f64>)>> = HashMap::new();
     if let Some(arr) = args.get("fixed_faces").and_then(|v| v.as_array()) {
         for item in arr {
             if let Some(face_str) = item.as_str() {
                 fixed_by_part
                     .entry(selected_ids[0].clone())
                     .or_default()
-                    .push(face_str.to_string());
+                    .push((face_str.to_string(), None));
             } else if let Some(obj) = item.as_object() {
                 let pid = obj
                     .get("part_id")
@@ -1125,16 +1291,20 @@ pub fn prepare_coupled_bake_from_parts_with_physics(
                             "Each object in 'fixed_faces' must specify 'face'".to_string(),
                         )
                     })?;
+                let tol = obj
+                    .get("tolerance")
+                    .and_then(|v| v.as_f64())
+                    .filter(|v| v.is_finite() && *v > 0.0);
                 fixed_by_part
                     .entry(pid)
                     .or_default()
-                    .push(face_str.to_string());
+                    .push((face_str.to_string(), tol));
             }
         }
     }
 
-    // Per-part loads: [{"part_id": ..., "face": "max_x", "force": [fx, fy, fz]}]
-    let mut loads_by_part: HashMap<String, Vec<(String, [f64; 3])>> = HashMap::new();
+    // Per-part loads: [{"part_id": ..., "face": "max_x", "force": [fx, fy, fz], "tolerance": 0.001}]
+    let mut loads_by_part: HashMap<String, Vec<(String, [f64; 3], Option<f64>)>> = HashMap::new();
     if let Some(arr) = args.get("loads").and_then(|v| v.as_array()) {
         for item in arr {
             let pid = item
@@ -1154,7 +1324,14 @@ pub fn prepare_coupled_bake_from_parts_with_physics(
                 )
             })?;
             let force = parse_vec3(force_val, "loads[].force")?;
-            loads_by_part.entry(pid).or_default().push((face_str, force));
+            let tol = item
+                .get("tolerance")
+                .and_then(|v| v.as_f64())
+                .filter(|v| v.is_finite() && *v > 0.0);
+            loads_by_part
+                .entry(pid)
+                .or_default()
+                .push((face_str, force, tol));
         }
     }
 
@@ -1274,9 +1451,12 @@ pub fn prepare_coupled_bake_from_parts_with_physics(
             J2MaterialParams::from_material(&part.material).map_err(ServerError::Fea)?;
 
         let mut bc = BoundaryConditions::new();
+        let part_dims = part.bounding_box().dimensions();
+        let min_dim = part_dims[0].min(part_dims[1]).min(part_dims[2]).max(1e-4);
+        let default_aabb_tol = (0.04 * min_dim).clamp(2.5e-4, 2.0e-3);
         let has_explicit_fixed = fixed_by_part.get(pid).is_some_and(|v| !v.is_empty());
         if let Some(faces) = fixed_by_part.get(pid) {
-            for f_str in faces {
+            for (f_str, tol_opt) in faces {
                 let face = parse_aabb_face(f_str).ok_or_else(|| {
                     ServerError::InvalidArgument(format!(
                         "Invalid AABB face '{f_str}' in 'fixed_faces': expected min_x, max_x, min_y, max_y, min_z, or max_z"
@@ -1284,13 +1464,13 @@ pub fn prepare_coupled_bake_from_parts_with_physics(
                 })?;
                 bc.dirichlet.push(DirichletConstraint::FixedAabbFace {
                     face,
-                    tolerance: 1e-4,
+                    tolerance: tol_opt.unwrap_or(default_aabb_tol),
                     components: DofComponent::All,
                 });
             }
         }
         if let Some(part_loads) = loads_by_part.get(pid) {
-            for (f_str, force) in part_loads {
+            for (f_str, force, tol_opt) in part_loads {
                 let face = parse_aabb_face(f_str).ok_or_else(|| {
                     ServerError::InvalidArgument(format!(
                         "Invalid AABB face '{f_str}' in 'loads': expected min_x, max_x, min_y, max_y, min_z, or max_z"
@@ -1298,7 +1478,7 @@ pub fn prepare_coupled_bake_from_parts_with_physics(
                 })?;
                 bc.neumann.push(NeumannLoad::AabbFaceForce {
                     face,
-                    tolerance: 1e-4,
+                    tolerance: tol_opt.unwrap_or(default_aabb_tol),
                     total_force: *force,
                 });
             }
@@ -1420,6 +1600,8 @@ pub fn prepare_coupled_bake_from_parts_with_physics(
         options,
         gravity,
         async_mode,
+        async_mode_explicit,
+        wait_timeout_ms,
         applied_joint_couplings,
         applied_gear_couplings,
     })
@@ -1572,60 +1754,99 @@ pub fn extract_active_surface_topology(
     }
 }
 
-/// Converts a raw [`DynamicHhtReport`] into a compact [`BakedSimulationRecord`], synchronizing any
-/// detached fractured fragments through `mcp_cad_physics::PhysicsWorld::step_coupled_fragments_for_dt`
-/// across the adaptive timeline frames and extracting deduplicated active exterior surface topologies
-/// plus local-space fragment triangle meshes (`P5-T6`, `P5-T15`).
-pub fn build_baked_simulation_record(
-    prepared: &PreparedCoupledBake,
-    report: DynamicHhtReport,
-) -> BakedSimulationRecord {
-    let topologies: Vec<BakedPartTopology> = prepared
-        .bodies
-        .iter()
-        .map(|b| BakedPartTopology {
-            part_id: b.part_id.clone(),
-            node_count: b.mesh.node_count(),
-            element_count: b.mesh.element_count(),
-            element_order: if b.mesh.is_tet10() {
-                "TET10".to_string()
-            } else {
-                "TET4".to_string()
-            },
-            reference_positions_m: b.mesh.nodes.iter().map(|n| n.position).collect(),
-        })
-        .collect();
+/// Stateful incremental frame builder converting each [`DynamicFrameSnapshot`] into a
+/// compact [`BakedFrameCache`] on-the-fly so partial simulations can be inspected and
+/// streamed frame-by-frame while the HHT-α solver is still running.
+struct IncrementalBakeBuilder {
+    body_index_by_id: HashMap<String, usize>,
+    body_meshes: Vec<TetrahedralMesh>,
+    prev_active_masks: Vec<Option<Vec<bool>>>,
+    prev_topo_indices: Vec<usize>,
+    frag_world: PhysicsWorld,
+    spawned_frag_ids: HashSet<String>,
+    active_frag_ids: Vec<String>,
+    frag_meta: HashMap<String, (String, usize, usize, f64)>,
+    prev_time_s: f64,
+}
 
-    let body_index_by_id: HashMap<&str, usize> = prepared
-        .bodies
-        .iter()
-        .enumerate()
-        .map(|(i, b)| (b.part_id.as_str(), i))
-        .collect();
+impl IncrementalBakeBuilder {
+    fn new(prepared: &PreparedCoupledBake) -> (Self, BakedSimulationRecord) {
+        let topologies: Vec<BakedPartTopology> = prepared
+            .bodies
+            .iter()
+            .map(|b| BakedPartTopology {
+                part_id: b.part_id.clone(),
+                node_count: b.mesh.node_count(),
+                element_count: b.mesh.element_count(),
+                element_order: if b.mesh.is_tet10() {
+                    "TET10".to_string()
+                } else {
+                    "TET4".to_string()
+                },
+                reference_positions_m: b.mesh.nodes.iter().map(|n| n.position).collect(),
+            })
+            .collect();
 
-    // Deduplicated active exterior surface topologies across frames per body (`P5-T15`)
-    let mut surface_topologies: Vec<ActiveSurfaceTopology> = Vec::new();
-    let mut prev_active_masks: Vec<Option<Vec<bool>>> = vec![None; prepared.bodies.len()];
-    let mut prev_topo_indices: Vec<usize> = vec![0; prepared.bodies.len()];
+        let body_index_by_id: HashMap<String, usize> = prepared
+            .bodies
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (b.part_id.clone(), i))
+            .collect();
+        let body_meshes: Vec<TetrahedralMesh> =
+            prepared.bodies.iter().map(|b| b.mesh.clone()).collect();
+        let n_bodies = prepared.bodies.len();
 
-    // Synchronize detached rigid fragments through PhysicsWorld across frame intervals
-    let mut frag_world = PhysicsWorld::with_gravity(prepared.gravity);
-    let mut spawned_frag_ids: HashSet<String> = HashSet::new();
-    let mut active_frag_ids: Vec<String> = Vec::new();
-    let mut frag_meta: HashMap<String, (String, usize, usize, f64)> = HashMap::new();
-    let mut fragment_meshes: Vec<BakedFragmentMesh> = Vec::new();
-    let mut prev_time_s = 0.0_f64;
+        let record = BakedSimulationRecord {
+            simulation_id: prepared.simulation_id.clone(),
+            job_id: prepared.job_id.clone(),
+            accuracy_level: prepared.accuracy_level,
+            part_ids: prepared.bodies.iter().map(|b| b.part_id.clone()).collect(),
+            duration_s: prepared.options.total_time_s,
+            topologies,
+            surface_topologies: Vec::new(),
+            fragment_meshes: Vec::new(),
+            frames: Vec::new(),
+            events: Vec::new(),
+            total_steps: 0,
+            total_newton_iterations: 0,
+            total_bisections: 0,
+            min_dt_used_s: prepared.options.dt_initial_s,
+            max_dt_used_s: prepared.options.dt_initial_s,
+            cfl_critical_dt_s: 1e-6,
+            cfl_ratio_max: 0.0,
+            initial_total_energy_j: 0.0,
+            final_total_energy_j: 0.0,
+            max_energy_drift_pct: 0.0,
+            cancelled: false,
+            elapsed_ms: 0.0,
+            applied_joint_couplings: prepared.applied_joint_couplings.clone(),
+            applied_gear_couplings: prepared.applied_gear_couplings.clone(),
+        };
 
-    let mut frames = Vec::with_capacity(report.frames.len());
-    for snap in report.frames {
-        let dt_frame = (snap.time_s - prev_time_s).max(0.0);
+        let builder = Self {
+            body_index_by_id,
+            body_meshes,
+            prev_active_masks: vec![None; n_bodies],
+            prev_topo_indices: vec![0; n_bodies],
+            frag_world: PhysicsWorld::with_gravity(prepared.gravity),
+            spawned_frag_ids: HashSet::new(),
+            active_frag_ids: Vec::new(),
+            frag_meta: HashMap::new(),
+            prev_time_s: 0.0,
+        };
 
-        // Spawn any newly detached fragments that appeared on or before this frame
+        (builder, record)
+    }
+
+    fn push_frame(&mut self, snap: DynamicFrameSnapshot, record: &mut BakedSimulationRecord) -> usize {
+        let dt_frame = (snap.time_s - self.prev_time_s).max(0.0);
+
         for frag in &snap.detached_fragments {
-            if spawned_frag_ids.insert(frag.fragment_id.clone()) {
+            if self.spawned_frag_ids.insert(frag.fragment_id.clone()) {
                 let baked_mesh = BakedFragmentMesh::from_detached_fragment(frag);
                 let bounding_radius_m = baked_mesh.bounding_radius_m;
-                fragment_meshes.push(baked_mesh);
+                record.fragment_meshes.push(baked_mesh);
 
                 let spec = FragmentSpawnSpec {
                     fragment_id: frag.fragment_id.clone(),
@@ -1642,9 +1863,9 @@ pub fn build_baked_simulation_record(
                     friction: 0.3,
                     restitution: 0.3,
                 };
-                if frag_world.spawn_detached_fragment(&spec).is_ok() {
-                    active_frag_ids.push(frag.fragment_id.clone());
-                    frag_meta.insert(
+                if self.frag_world.spawn_detached_fragment(&spec).is_ok() {
+                    self.active_frag_ids.push(frag.fragment_id.clone());
+                    self.frag_meta.insert(
                         frag.fragment_id.clone(),
                         (
                             frag.source_part_id.clone(),
@@ -1657,11 +1878,10 @@ pub fn build_baked_simulation_record(
             }
         }
 
-        // Resolve active exterior surface topology index for each surviving body at this frame
         let mut frame_surf_topo_indices: Vec<usize> = Vec::with_capacity(snap.bodies.len());
         for b_frame in &snap.bodies {
-            if let Some(&b_idx) = body_index_by_id.get(b_frame.part_id.as_str()) {
-                let tet_mesh = &prepared.bodies[b_idx].mesh;
+            if let Some(&b_idx) = self.body_index_by_id.get(b_frame.part_id.as_str()) {
+                let tet_mesh = &self.body_meshes[b_idx];
                 let n_elems = tet_mesh.element_count();
                 let mut active_mask = vec![true; n_elems];
                 for &e in &b_frame.eroded_element_indices {
@@ -1678,39 +1898,38 @@ pub fn build_baked_simulation_record(
                         }
                     }
                 }
-                let topo_idx = if prev_active_masks[b_idx].as_deref()
+                let topo_idx = if self.prev_active_masks[b_idx].as_deref()
                     == Some(active_mask.as_slice())
                 {
-                    prev_topo_indices[b_idx]
+                    self.prev_topo_indices[b_idx]
                 } else {
                     let surf_topo = extract_active_surface_topology(tet_mesh, &active_mask);
-                    let idx = surface_topologies.len();
-                    surface_topologies.push(surf_topo);
-                    prev_active_masks[b_idx] = Some(active_mask);
-                    prev_topo_indices[b_idx] = idx;
+                    let idx = record.surface_topologies.len();
+                    record.surface_topologies.push(surf_topo);
+                    self.prev_active_masks[b_idx] = Some(active_mask);
+                    self.prev_topo_indices[b_idx] = idx;
                     idx
                 };
                 frame_surf_topo_indices.push(topo_idx);
             } else {
-                let idx = surface_topologies.len();
-                surface_topologies.push(ActiveSurfaceTopology::default());
+                let idx = record.surface_topologies.len();
+                record.surface_topologies.push(ActiveSurfaceTopology::default());
                 frame_surf_topo_indices.push(idx);
             }
         }
 
-        // Advance active detached rigid fragments synchronously over this adaptive frame interval
-        let baked_fragments: Vec<BakedFragmentFrame> = if !active_frag_ids.is_empty() {
-            let (poses, _cols) = frag_world.step_coupled_fragments_for_dt(
+        let baked_fragments: Vec<BakedFragmentFrame> = if !self.active_frag_ids.is_empty() {
+            let (poses, _cols) = self.frag_world.step_coupled_fragments_for_dt(
                 dt_frame,
                 0.002,
-                &active_frag_ids,
+                &self.active_frag_ids,
                 snap.time_s,
             );
             poses
                 .into_iter()
                 .map(|p| {
                     let (source_part_id, detachment_step, element_count, bounding_radius_m) =
-                        frag_meta
+                        self.frag_meta
                             .get(&p.fragment_id)
                             .cloned()
                             .unwrap_or_else(|| ("unknown".to_string(), 0, 0, 0.0));
@@ -1733,40 +1952,46 @@ pub fn build_baked_simulation_record(
             Vec::new()
         };
 
-        prev_time_s = snap.time_s;
-        frames.push(convert_snapshot_to_cache(
-            snap,
-            baked_fragments,
-            &frame_surf_topo_indices,
-        ));
+        self.prev_time_s = snap.time_s;
+        let cache = convert_snapshot_to_cache(snap, baked_fragments, &frame_surf_topo_indices);
+        let idx = cache.frame_index;
+        record.frames.push(cache);
+        idx
     }
 
-    BakedSimulationRecord {
-        simulation_id: prepared.simulation_id.clone(),
-        job_id: prepared.job_id.clone(),
-        accuracy_level: prepared.accuracy_level,
-        part_ids: prepared.bodies.iter().map(|b| b.part_id.clone()).collect(),
-        duration_s: prepared.options.total_time_s,
-        topologies,
-        surface_topologies,
-        fragment_meshes,
-        frames,
-        events: report.events,
-        total_steps: report.total_steps,
-        total_newton_iterations: report.total_newton_iterations,
-        total_bisections: report.total_bisections,
-        min_dt_used_s: report.min_dt_used_s,
-        max_dt_used_s: report.max_dt_used_s,
-        cfl_critical_dt_s: report.cfl_critical_dt_s,
-        cfl_ratio_max: report.cfl_ratio_max,
-        initial_total_energy_j: report.initial_total_energy_j,
-        final_total_energy_j: report.final_total_energy_j,
-        max_energy_drift_pct: report.max_energy_drift_pct,
-        cancelled: report.cancelled,
-        elapsed_ms: report.elapsed_ms,
-        applied_joint_couplings: prepared.applied_joint_couplings.clone(),
-        applied_gear_couplings: prepared.applied_gear_couplings.clone(),
+    fn apply_report_metadata(report: DynamicHhtReport, record: &mut BakedSimulationRecord) {
+        record.events = report.events;
+        record.total_steps = report.total_steps;
+        record.total_newton_iterations = report.total_newton_iterations;
+        record.total_bisections = report.total_bisections;
+        record.min_dt_used_s = report.min_dt_used_s;
+        record.max_dt_used_s = report.max_dt_used_s;
+        record.cfl_critical_dt_s = report.cfl_critical_dt_s;
+        record.cfl_ratio_max = report.cfl_ratio_max;
+        record.initial_total_energy_j = report.initial_total_energy_j;
+        record.final_total_energy_j = report.final_total_energy_j;
+        record.max_energy_drift_pct = report.max_energy_drift_pct;
+        record.cancelled = report.cancelled;
+        record.elapsed_ms = report.elapsed_ms;
     }
+}
+
+/// Converts a raw [`DynamicHhtReport`] into a compact [`BakedSimulationRecord`], synchronizing any
+/// detached fractured fragments through `mcp_cad_physics::PhysicsWorld::step_coupled_fragments_for_dt`
+/// across the adaptive timeline frames and extracting deduplicated active exterior surface topologies
+/// plus local-space fragment triangle meshes (`P5-T6`, `P5-T15`).
+pub fn build_baked_simulation_record(
+    prepared: &PreparedCoupledBake,
+    mut report: DynamicHhtReport,
+) -> BakedSimulationRecord {
+    let (mut builder, mut record) = IncrementalBakeBuilder::new(prepared);
+    let raw_frames = std::mem::take(&mut report.frames);
+    record.frames.reserve(raw_frames.len());
+    for snap in raw_frames {
+        builder.push_frame(snap, &mut record);
+    }
+    IncrementalBakeBuilder::apply_report_metadata(report, &mut record);
+    record
 }
 
 /// Converts a single `DynamicFrameSnapshot` into the compact `BakedFrameCache` with MPa/mm summary fields.
@@ -1810,8 +2035,42 @@ fn convert_snapshot_to_cache(
     }
 }
 
-/// Executes a prepared coupled bake synchronously on the calling thread, streaming real-time SSE
-/// progress events and honoring cancellation via `cancel_flag`.
+fn build_live_progress_snapshot(status: &CoupledJobStatus) -> LiveCoupledSimProgress {
+    let state_str = match status.state {
+        BakeJobState::Running => "running",
+        BakeJobState::Cancelling => "cancelling",
+        BakeJobState::Completed => "completed",
+        BakeJobState::Cancelled => "cancelled",
+        BakeJobState::Failed => "failed",
+    };
+    LiveCoupledSimProgress {
+        job_id: status.job_id.clone(),
+        simulation_id: status.simulation_id.clone(),
+        state: state_str.to_string(),
+        accuracy_level: status.accuracy_level.as_str().to_string(),
+        part_ids: status.part_ids.clone(),
+        total_time_s: status.total_time_s,
+        current_time_s: status.current_time_s,
+        progress_pct: status.progress_pct,
+        step_count: status.step_count,
+        frame_count: status.frame_count,
+        frames_cached: status.frames_cached,
+        latest_frame_index: status.latest_frame_index,
+        current_dt_s: status.current_dt_s,
+        bisections: status.bisections,
+        eroded_elements: status.eroded_elements,
+        detached_fragments: status.detached_fragments,
+        max_von_mises_mpa: status.max_von_mises_mpa,
+        elapsed_ms: status.elapsed_ms.unwrap_or(0.0),
+        estimated_remaining_ms: status.estimated_remaining_ms,
+        stage_label: status.stage_label.clone(),
+        updated_at_ms: now_unix_ms(),
+    }
+}
+
+/// Executes a prepared coupled bake synchronously on the calling thread, caching every
+/// calculated frame immediately for live queries and streaming real-time SSE + `.mcp_live`
+/// progress events while honoring cancellation via `cancel_flag`.
 pub fn execute_prepared_bake_blocking(
     prepared: PreparedCoupledBake,
     manager: SharedCoupledSimManager,
@@ -1822,6 +2081,13 @@ pub fn execute_prepared_bake_blocking(
     let sim_id = prepared.simulation_id.clone();
     let part_ids: Vec<String> = prepared.bodies.iter().map(|b| b.part_id.clone()).collect();
 
+    let (builder_init, initial_record) = IncrementalBakeBuilder::new(&prepared);
+    let builder_shared = Arc::new(Mutex::new(builder_init));
+    let live_record_handle = {
+        let mut m = manager.write();
+        m.begin_live_build(sim_id.clone(), initial_record)
+    };
+
     let _ = events_tx.send(CoupledSimSseEvent::Started {
         job_id: job_id.clone(),
         simulation_id: sim_id.clone(),
@@ -1830,16 +2096,58 @@ pub fn execute_prepared_bake_blocking(
         total_time_s: prepared.options.total_time_s,
     });
 
+    let last_live_emit = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(5)));
+    let last_log_emit = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(5)));
+
+    let mgr_frame = Arc::clone(&manager);
+    let job_frame = job_id.clone();
+    let live_rec_frame = Arc::clone(&live_record_handle);
+    let builder_frame = Arc::clone(&builder_shared);
+    let last_emit_frame = Arc::clone(&last_live_emit);
+
+    let frame_cb = move |snap: &DynamicFrameSnapshot| {
+        let (frame_idx, frames_cached) = {
+            let mut b = builder_frame.lock().expect("incremental builder lock");
+            let mut rec = live_rec_frame.write();
+            let idx = b.push_frame(snap.clone(), &mut rec);
+            (idx, rec.frames.len())
+        };
+        let status_opt = {
+            let mut m = mgr_frame.write();
+            m.update_live_frame_count(&job_frame, frames_cached, frame_idx);
+            m.job_status(Some(&job_frame))
+        };
+        if let Some(status) = status_opt {
+            let should_emit = frame_idx == 0 || {
+                let mut t = last_emit_frame.lock().expect("live emit lock");
+                if t.elapsed() >= Duration::from_millis(250) {
+                    *t = Instant::now();
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_emit {
+                let live_prog = build_live_progress_snapshot(&status);
+                let rec_guard = live_rec_frame.read();
+                publish_live_coupled_sim_progress(&live_prog, Some(&rec_guard));
+            }
+        }
+    };
+
     let mgr_cb = Arc::clone(&manager);
     let tx_cb = events_tx.clone();
     let job_cb = job_id.clone();
     let sim_cb = sim_id.clone();
+    let last_emit_prog = Arc::clone(&last_live_emit);
+    let last_log_prog = Arc::clone(&last_log_emit);
 
     let progress_cb = move |upd: DynamicProgressUpdate| {
-        {
+        let (elapsed_ms, eta_ms, latest_frame_idx, status_opt) = {
             let mut m = mgr_cb.write();
-            m.update_progress(&job_cb, &upd);
-        }
+            let (el, eta, lfi) = m.update_progress(&job_cb, &upd);
+            (el, eta, lfi, m.job_status(Some(&job_cb)))
+        };
         let _ = tx_cb.send(CoupledSimSseEvent::Progress {
             job_id: job_cb.clone(),
             simulation_id: sim_cb.clone(),
@@ -1848,39 +2156,102 @@ pub fn execute_prepared_bake_blocking(
             progress_pct: upd.progress_pct,
             step_count: upd.step_count,
             frame_count: upd.frame_count,
+            latest_frame_index: latest_frame_idx,
             current_dt_s: upd.current_dt_s,
             bisections: upd.bisections,
             eroded_elements: upd.eroded_elements,
             detached_fragments: upd.detached_fragments,
             max_von_mises_mpa: upd.max_von_mises_pa * 1e-6,
+            elapsed_ms,
+            estimated_remaining_ms: eta_ms,
         });
+
+        if let Some(status) = status_opt {
+            let should_write_progress = {
+                let mut t = last_emit_prog.lock().expect("live emit lock");
+                if t.elapsed() >= Duration::from_millis(350) {
+                    *t = Instant::now();
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_write_progress {
+                let live_prog = build_live_progress_snapshot(&status);
+                publish_live_coupled_sim_progress(&live_prog, None);
+            }
+
+            let should_log = {
+                let mut t = last_log_prog.lock().expect("live log lock");
+                if t.elapsed() >= Duration::from_secs(1) {
+                    *t = Instant::now();
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_log {
+                tracing::info!(
+                    job_id = %job_cb,
+                    simulation_id = %sim_cb,
+                    progress_pct = upd.progress_pct,
+                    step = upd.step_count,
+                    frames_cached = status.frames_cached,
+                    elapsed_ms,
+                    eta_ms = ?eta_ms,
+                    max_vm_mpa = upd.max_von_mises_pa * 1e-6,
+                    "bake_coupled_simulation live progress"
+                );
+            }
+        }
     };
 
-    let solve_res = solve_dynamic_hht_coupled(
+    let solve_res = solve_dynamic_hht_coupled_with_frames(
         prepared.bodies.clone(),
         &prepared.contact_pairs,
         prepared.options,
         Some(progress_cb),
+        Some(frame_cb),
         Some(cancel_flag.as_ref()),
     );
 
     match solve_res {
         Ok(report) => {
-            let record = build_baked_simulation_record(&prepared, report);
-            let cancelled = record.cancelled;
-            let frame_count = record.frames.len();
-            let total_steps = record.total_steps;
-            let total_bisections = record.total_bisections;
-            let cfl_ratio_max = record.cfl_ratio_max;
-            let max_energy_drift_pct = record.max_energy_drift_pct;
-            let elapsed_ms = record.elapsed_ms;
+            let cancelled = report.cancelled;
+            let total_steps = report.total_steps;
+            let total_bisections = report.total_bisections;
+            let cfl_ratio_max = report.cfl_ratio_max;
+            let max_energy_drift_pct = report.max_energy_drift_pct;
+            let elapsed_ms = report.elapsed_ms;
 
-            let stored = {
-                let mut m = manager.write();
-                m.finish_job_with_record(&job_id, record);
-                m.get_simulation(Some(&sim_id))
-                    .expect("just stored simulation record")
+            let mut final_record = {
+                let guard = live_record_handle.read();
+                guard.clone()
             };
+            // Ensure all frames exist if a solver skipped callback or differed in count
+            if final_record.frames.len() < report.frames.len() {
+                let mut builder = builder_shared.lock().expect("incremental builder lock");
+                for snap in report.frames.iter().skip(final_record.frames.len()) {
+                    builder.push_frame(snap.clone(), &mut final_record);
+                }
+            }
+            let frame_count = final_record.frames.len();
+            IncrementalBakeBuilder::apply_report_metadata(report, &mut final_record);
+
+            let (stored, terminal_status) = {
+                let mut m = manager.write();
+                m.finish_job_with_record(&job_id, final_record);
+                let rec = m
+                    .get_simulation(Some(&sim_id))
+                    .expect("just stored simulation record");
+                let st = m.job_status(Some(&job_id));
+                (rec, st)
+            };
+
+            if let Some(status) = terminal_status {
+                let live_prog = build_live_progress_snapshot(&status);
+                publish_live_coupled_sim_progress(&live_prog, Some(&stored));
+            }
 
             if cancelled {
                 let _ = events_tx.send(CoupledSimSseEvent::Cancelled {
@@ -1906,9 +2277,14 @@ pub fn execute_prepared_bake_blocking(
         }
         Err(err) => {
             let err_msg = err.to_string();
-            {
+            let terminal_status = {
                 let mut m = manager.write();
                 m.fail_job(&job_id, err_msg.clone());
+                m.job_status(Some(&job_id))
+            };
+            if let Some(status) = terminal_status {
+                let live_prog = build_live_progress_snapshot(&status);
+                publish_live_coupled_sim_progress(&live_prog, None);
             }
             let _ = events_tx.send(CoupledSimSseEvent::Failed {
                 job_id,
@@ -1920,8 +2296,48 @@ pub fn execute_prepared_bake_blocking(
     }
 }
 
-/// Launches a prepared bake either asynchronously (spawning a background worker thread) or
-/// synchronously (blocking until complete) and returns the structured JSON response payload.
+fn format_running_job_ack_json(
+    job: &CoupledJobStatus,
+    applied_joint_couplings_count: usize,
+    applied_gear_couplings_count: usize,
+    unit: LengthUnit,
+) -> Value {
+    json!({
+        "status": "running",
+        "job_id": job.job_id,
+        "simulation_id": job.simulation_id,
+        "accuracy_level": job.accuracy_level.as_str(),
+        "part_ids": job.part_ids,
+        "duration_s": job.total_time_s,
+        "progress_pct": job.progress_pct,
+        "current_time_s": job.current_time_s,
+        "step_count": job.step_count,
+        "frame_count": job.frame_count,
+        "frames_cached": job.frames_cached,
+        "latest_frame_index": job.latest_frame_index,
+        "current_dt_s": job.current_dt_s,
+        "bisections": job.bisections,
+        "eroded_elements": job.eroded_elements,
+        "detached_fragments": job.detached_fragments,
+        "max_von_mises_mpa": job.max_von_mises_mpa,
+        "elapsed_ms": job.elapsed_ms,
+        "estimated_remaining_ms": job.estimated_remaining_ms,
+        "stage_label": job.stage_label,
+        "applied_joint_couplings_count": applied_joint_couplings_count,
+        "applied_gear_couplings_count": applied_gear_couplings_count,
+        "sse_endpoint": "/api/coupled-sim/events",
+        "message": "Coupled HHT-alpha bake is running in the background and streaming solved frames live.",
+        "next_step": format!(
+            "Call 'bake_coupled_simulation' with {{\"action\": \"status\", \"job_id\": \"{}\", \"wait_timeout_ms\": 5000}} to wait for the next frame/completion, or call 'query_simulation_frame' with {{\"simulation_id\": \"{}\"}} to inspect already-cached frames right away.",
+            job.job_id, job.simulation_id
+        ),
+        "units": unit.units_metadata()
+    })
+}
+
+/// Launches a prepared bake either asynchronously, synchronously (`async_mode: false`), or with
+/// a bounded wait window (`async_mode` omitted -> yields `"running"` after `wait_timeout_ms`, default 12s)
+/// so short solves return inline while heavy solves never hang an MCP agent.
 pub fn launch_prepared_bake(
     prepared: PreparedCoupledBake,
     manager: SharedCoupledSimManager,
@@ -1933,7 +2349,8 @@ pub fn launch_prepared_bake(
     let acc = prepared.accuracy_level;
     let part_ids: Vec<String> = prepared.bodies.iter().map(|b| b.part_id.clone()).collect();
     let duration_s = prepared.options.total_time_s;
-    let async_mode = prepared.async_mode;
+    let async_mode_explicit = prepared.async_mode_explicit;
+    let wait_timeout_ms = prepared.wait_timeout_ms;
 
     let cancel_flag = {
         let mut m = manager.write();
@@ -1949,34 +2366,64 @@ pub fn launch_prepared_bake(
     let applied_joint_couplings_count = prepared.applied_joint_couplings.len();
     let applied_gear_couplings_count = prepared.applied_gear_couplings.len();
 
-    if async_mode {
-        let mgr_bg = Arc::clone(&manager);
-        let tx_bg = events_tx.clone();
-        std::thread::Builder::new()
-            .name(format!("hht-bake-{job_id}"))
-            .spawn(move || {
-                let _ = execute_prepared_bake_blocking(prepared, mgr_bg, tx_bg, cancel_flag);
-            })
-            .map_err(|e| {
-                ServerError::Internal(format!("Failed to spawn HHT-α bake worker thread: {e}"))
-            })?;
-
-        return Ok(json!({
-            "status": "running",
-            "job_id": job_id,
-            "simulation_id": sim_id,
-            "accuracy_level": acc.as_str(),
-            "part_ids": part_ids,
-            "duration_s": duration_s,
-            "applied_joint_couplings_count": applied_joint_couplings_count,
-            "applied_gear_couplings_count": applied_gear_couplings_count,
-            "sse_endpoint": "/api/coupled-sim/events",
-            "units": unit.units_metadata()
-        }));
+    if async_mode_explicit == Some(false) {
+        let record = execute_prepared_bake_blocking(prepared, manager, events_tx, cancel_flag)?;
+        return Ok(format_baked_summary_json(&record, unit));
     }
 
-    let record = execute_prepared_bake_blocking(prepared, manager, events_tx, cancel_flag)?;
-    Ok(format_baked_summary_json(&record, unit))
+    let (done_tx, done_rx) =
+        std::sync::mpsc::sync_channel::<Result<Arc<BakedSimulationRecord>, ServerError>>(1);
+    let mgr_bg = Arc::clone(&manager);
+    let tx_bg = events_tx.clone();
+    std::thread::Builder::new()
+        .name(format!("hht-bake-{job_id}"))
+        .spawn(move || {
+            let res = execute_prepared_bake_blocking(prepared, mgr_bg, tx_bg, cancel_flag);
+            let _ = done_tx.send(res);
+        })
+        .map_err(|e| {
+            ServerError::Internal(format!("Failed to spawn HHT-α bake worker thread: {e}"))
+        })?;
+
+    if async_mode_explicit == Some(true) {
+        let status = {
+            let m = manager.read();
+            m.job_status(Some(&job_id))
+        };
+        if let Some(job) = status {
+            return Ok(format_running_job_ack_json(
+                &job,
+                applied_joint_couplings_count,
+                applied_gear_couplings_count,
+                unit,
+            ));
+        }
+    }
+
+    // Bounded interactive wait when `async_mode` is omitted: fast solves complete inline,
+    // heavy solves cleanly yield `"status": "running"` with live progress/ETA instead of hanging.
+    let timeout = Duration::from_millis(wait_timeout_ms.unwrap_or(12_000));
+    match done_rx.recv_timeout(timeout) {
+        Ok(Ok(record)) => Ok(format_baked_summary_json(&record, unit)),
+        Ok(Err(err)) => Err(err),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            let job = {
+                let m = manager.read();
+                m.job_status(Some(&job_id)).ok_or_else(|| {
+                    ServerError::Internal(format!("Lost tracked bake job '{job_id}'"))
+                })?
+            };
+            Ok(format_running_job_ack_json(
+                &job,
+                applied_joint_couplings_count,
+                applied_gear_couplings_count,
+                unit,
+            ))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(ServerError::Internal(
+            "HHT-α bake worker thread exited unexpectedly".to_string(),
+        )),
+    }
 }
 
 /// Formats a compact JSON summary for a completed or cancelled [`BakedSimulationRecord`].
@@ -2039,38 +2486,37 @@ pub fn format_baked_summary_json(record: &BakedSimulationRecord, unit: LengthUni
     })
 }
 
-/// Retrieves all cached local-space triangle meshes of detached fragments for a simulation
+/// Retrieves all cached local-space triangle meshes of detached fragments for an active or completed simulation
 /// (transferred once per simulation by HTTP clients via `/api/coupled-sim/fragments/:sim_id`, `P5-T15`).
 pub fn query_cached_fragment_meshes_from_manager(
     sim_id_opt: Option<&str>,
     manager: &SharedCoupledSimManager,
     unit: LengthUnit,
 ) -> Result<Value, ServerError> {
-    let record = {
-        let m = manager.read();
-        m.get_simulation(sim_id_opt).ok_or_else(|| {
-            if let Some(id) = sim_id_opt {
-                ServerError::InvalidArgument(format!(
-                    "SIMULATION_NOT_FOUND: No cached coupled simulation with id '{id}'. Run 'bake_coupled_simulation' first."
-                ))
-            } else {
-                ServerError::InvalidArgument(
-                    "SIMULATION_NOT_FOUND: No cached coupled simulation exists yet. Run 'bake_coupled_simulation' first."
-                        .to_string(),
-                )
-            }
-        })?
-    };
-
-    Ok(json!({
-        "simulation_id": record.simulation_id,
-        "fragment_count": record.fragment_meshes.len(),
-        "fragments": record.fragment_meshes,
-        "units": unit.units_metadata()
-    }))
+    let m = manager.read();
+    m.with_simulation_record(sim_id_opt, |record| {
+        json!({
+            "simulation_id": record.simulation_id,
+            "fragment_count": record.fragment_meshes.len(),
+            "fragments": record.fragment_meshes,
+            "units": unit.units_metadata()
+        })
+    })
+    .ok_or_else(|| {
+        if let Some(id) = sim_id_opt {
+            ServerError::InvalidArgument(format!(
+                "SIMULATION_NOT_FOUND: No cached coupled simulation with id '{id}'. Run 'bake_coupled_simulation' first."
+            ))
+        } else {
+            ServerError::InvalidArgument(
+                "SIMULATION_NOT_FOUND: No cached coupled simulation exists yet. Run 'bake_coupled_simulation' first."
+                    .to_string(),
+            )
+        }
+    })
 }
 
-/// Queries a single cached frame from [`CoupledSimulationManager`] by `frame_index` or nearest `time_s`.
+/// Queries a single cached frame from [`CoupledSimulationManager`] (completed or live streaming) by `frame_index` or nearest `time_s`.
 pub fn query_cached_frame_from_manager(
     args: &Value,
     manager: &SharedCoupledSimManager,
@@ -2087,235 +2533,236 @@ pub fn query_cached_frame_from_manager(
         .and_then(|v| v.as_bool())
         .unwrap_or(include_mesh_fields);
 
-    let record = {
-        let m = manager.read();
-        m.get_simulation(sim_id_opt).ok_or_else(|| {
-            if let Some(id) = sim_id_opt {
-                ServerError::InvalidArgument(format!(
-                    "SIMULATION_NOT_FOUND: No cached coupled simulation with id '{id}'. Run 'bake_coupled_simulation' first."
-                ))
-            } else {
-                ServerError::InvalidArgument(
-                    "SIMULATION_NOT_FOUND: No cached coupled simulation exists yet. Run 'bake_coupled_simulation' first."
-                        .to_string(),
-                )
+    let m = manager.read();
+    let res_opt = m.with_simulation_record(sim_id_opt, |record| -> Result<Value, ServerError> {
+        if record.frames.is_empty() {
+            return Err(ServerError::InvalidArgument(format!(
+                "Cached simulation '{}' contains 0 frames so far.",
+                record.simulation_id
+            )));
+        }
+
+        let frame_idx = if let Some(idx_u64) = args.get("frame_index").and_then(|v| v.as_u64()) {
+            let idx = idx_u64 as usize;
+            if idx >= record.frames.len() {
+                return Err(ServerError::InvalidArgument(format!(
+                    "FRAME_OUT_OF_RANGE: frame_index {idx} exceeds available frames [0..{}]",
+                    record.frames.len() - 1
+                )));
             }
-        })?
-    };
+            idx
+        } else if let Some(t_req) = args.get("time_s").and_then(|v| v.as_f64()) {
+            if !t_req.is_finite() || t_req < 0.0 {
+                return Err(ServerError::InvalidArgument(format!(
+                    "Invalid 'time_s' ({t_req}): must be a non-negative finite number in seconds"
+                )));
+            }
+            record
+                .frames
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| {
+                    (a.time_s - t_req)
+                        .abs()
+                        .partial_cmp(&(b.time_s - t_req).abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map_or(0, |(idx, _)| idx)
+        } else {
+            record.frames.len() - 1
+        };
 
-    if record.frames.is_empty() {
-        return Err(ServerError::InvalidArgument(format!(
-            "Cached simulation '{}' contains 0 frames.",
-            record.simulation_id
-        )));
-    }
+        let frame = &record.frames[frame_idx];
+        let scale_len = unit.from_meters_factor();
 
-    let frame_idx = if let Some(idx_u64) = args.get("frame_index").and_then(|v| v.as_u64()) {
-        let idx = idx_u64 as usize;
-        if idx >= record.frames.len() {
-            return Err(ServerError::InvalidArgument(format!(
-                "FRAME_OUT_OF_RANGE: frame_index {idx} exceeds available frames [0..{}]",
-                record.frames.len() - 1
-            )));
-        }
-        idx
-    } else if let Some(t_req) = args.get("time_s").and_then(|v| v.as_f64()) {
-        if !t_req.is_finite() || t_req < 0.0 {
-            return Err(ServerError::InvalidArgument(format!(
-                "Invalid 'time_s' ({t_req}): must be a non-negative finite number in seconds"
-            )));
-        }
-        record
-            .frames
+        let topo_by_part: HashMap<&str, &BakedPartTopology> = record
+            .topologies
             .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| {
-                (a.time_s - t_req)
-                    .abs()
-                    .partial_cmp(&(b.time_s - t_req).abs())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map_or(0, |(idx, _)| idx)
-    } else {
-        record.frames.len() - 1
-    };
+            .map(|t| (t.part_id.as_str(), t))
+            .collect();
+        let frag_mesh_by_id: HashMap<&str, &BakedFragmentMesh> = record
+            .fragment_meshes
+            .iter()
+            .map(|fm| (fm.fragment_id.as_str(), fm))
+            .collect();
 
-    let frame = &record.frames[frame_idx];
-    let scale_len = unit.from_meters_factor();
+        let parts_json: Vec<Value> = frame
+            .parts
+            .iter()
+            .filter(|p| part_filter.is_none_or(|f| f == p.part_id))
+            .map(|p| {
+                let surf_topo = record.surface_topologies.get(p.surface_topology_index);
+                let surface_vertex_count = surf_topo.map_or(0, |s| s.surface_node_indices.len());
+                let surface_triangle_count = surf_topo.map_or(0, |s| s.surface_indices.len() / 3);
+                let mut obj = json!({
+                    "part_id": p.part_id,
+                    "node_count": p.node_count,
+                    "active_element_count": p.active_element_count,
+                    "eroded_element_count": p.eroded_element_indices.len(),
+                    "eroded_element_indices": p.eroded_element_indices,
+                    "surface_vertex_count": surface_vertex_count,
+                    "surface_triangle_count": surface_triangle_count,
+                    "max_displacement_mm": p.max_displacement_mm,
+                    "max_von_mises_mpa": p.max_von_mises_mpa,
+                    "max_equiv_plastic_strain": p.max_equiv_plastic_strain,
+                    "max_damage": p.max_damage,
+                });
+                if include_mesh_fields {
+                    let deformed_coords: Vec<[f64; 3]> = p
+                        .deformed_positions_m
+                        .iter()
+                        .map(|c| [c[0] * scale_len, c[1] * scale_len, c[2] * scale_len])
+                        .collect();
+                    let displacements: Vec<[f64; 3]> = p
+                        .displacements_m
+                        .iter()
+                        .map(|d| [d[0] * 1e3, d[1] * 1e3, d[2] * 1e3])
+                        .collect();
+                    let ref_positions_opt = topo_by_part
+                        .get(p.part_id.as_str())
+                        .map(|t| t.reference_positions_m.as_slice());
 
-    let topo_by_part: HashMap<&str, &BakedPartTopology> = record
-        .topologies
-        .iter()
-        .map(|t| (t.part_id.as_str(), t))
-        .collect();
-    let frag_mesh_by_id: HashMap<&str, &BakedFragmentMesh> = record
-        .fragment_meshes
-        .iter()
-        .map(|fm| (fm.fragment_id.as_str(), fm))
-        .collect();
+                    let (surface_positions_m, surface_reference_positions_m, surface_indices, surface_node_indices) =
+                        if let Some(surf) = surf_topo {
+                            let s_pos: Vec<[f64; 3]> = surf
+                                .surface_node_indices
+                                .iter()
+                                .map(|&nid| {
+                                    p.deformed_positions_m
+                                        .get(nid as usize)
+                                        .copied()
+                                        .unwrap_or([0.0; 3])
+                                })
+                                .collect();
+                            let s_ref: Vec<[f64; 3]> = surf
+                                .surface_node_indices
+                                .iter()
+                                .map(|&nid| {
+                                    ref_positions_opt
+                                        .and_then(|rp| rp.get(nid as usize).copied())
+                                        .unwrap_or_else(|| {
+                                            let def = p
+                                                .deformed_positions_m
+                                                .get(nid as usize)
+                                                .copied()
+                                                .unwrap_or([0.0; 3]);
+                                            let disp = p
+                                                .displacements_m
+                                                .get(nid as usize)
+                                                .copied()
+                                                .unwrap_or([0.0; 3]);
+                                            [def[0] - disp[0], def[1] - disp[1], def[2] - disp[2]]
+                                        })
+                                })
+                                .collect();
+                            (
+                                s_pos,
+                                s_ref,
+                                surf.surface_indices.clone(),
+                                surf.surface_node_indices.clone(),
+                            )
+                        } else {
+                            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                        };
 
-    let parts_json: Vec<Value> = frame
-        .parts
-        .iter()
-        .filter(|p| part_filter.is_none_or(|f| f == p.part_id))
-        .map(|p| {
-            let surf_topo = record.surface_topologies.get(p.surface_topology_index);
-            let surface_vertex_count = surf_topo.map_or(0, |s| s.surface_node_indices.len());
-            let surface_triangle_count = surf_topo.map_or(0, |s| s.surface_indices.len() / 3);
-            let mut obj = json!({
-                "part_id": p.part_id,
-                "node_count": p.node_count,
-                "active_element_count": p.active_element_count,
-                "eroded_element_count": p.eroded_element_indices.len(),
-                "eroded_element_indices": p.eroded_element_indices,
-                "surface_vertex_count": surface_vertex_count,
-                "surface_triangle_count": surface_triangle_count,
-                "max_displacement_mm": p.max_displacement_mm,
-                "max_von_mises_mpa": p.max_von_mises_mpa,
-                "max_equiv_plastic_strain": p.max_equiv_plastic_strain,
-                "max_damage": p.max_damage,
-            });
-            if include_mesh_fields {
-                let deformed_coords: Vec<[f64; 3]> = p
-                    .deformed_positions_m
-                    .iter()
-                    .map(|c| [c[0] * scale_len, c[1] * scale_len, c[2] * scale_len])
-                    .collect();
-                let displacements: Vec<[f64; 3]> = p
-                    .displacements_m
-                    .iter()
-                    .map(|d| [d[0] * 1e3, d[1] * 1e3, d[2] * 1e3])
-                    .collect();
-                let ref_positions_opt = topo_by_part
-                    .get(p.part_id.as_str())
-                    .map(|t| t.reference_positions_m.as_slice());
-
-                let (surface_positions_m, surface_reference_positions_m, surface_indices, surface_node_indices) =
-                    if let Some(surf) = surf_topo {
-                        let s_pos: Vec<[f64; 3]> = surf
-                            .surface_node_indices
-                            .iter()
-                            .map(|&nid| {
-                                p.deformed_positions_m
-                                    .get(nid as usize)
-                                    .copied()
-                                    .unwrap_or([0.0; 3])
-                            })
-                            .collect();
-                        let s_ref: Vec<[f64; 3]> = surf
-                            .surface_node_indices
-                            .iter()
-                            .map(|&nid| {
-                                ref_positions_opt
-                                    .and_then(|rp| rp.get(nid as usize).copied())
-                                    .unwrap_or_else(|| {
-                                        let def = p
-                                            .deformed_positions_m
-                                            .get(nid as usize)
-                                            .copied()
-                                            .unwrap_or([0.0; 3]);
-                                        let disp = p
-                                            .displacements_m
-                                            .get(nid as usize)
-                                            .copied()
-                                            .unwrap_or([0.0; 3]);
-                                        [def[0] - disp[0], def[1] - disp[1], def[2] - disp[2]]
-                                    })
-                            })
-                            .collect();
-                        (
-                            s_pos,
-                            s_ref,
-                            surf.surface_indices.clone(),
-                            surf.surface_node_indices.clone(),
-                        )
-                    } else {
-                        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
-                    };
-
-                let map = obj.as_object_mut().expect("json object");
-                map.insert("deformed_positions".to_string(), json!(deformed_coords));
-                map.insert("displacements_mm".to_string(), json!(displacements));
-                map.insert(
-                    "nodal_von_mises_mpa".to_string(),
-                    json!(p.nodal_von_mises_mpa),
-                );
-                map.insert(
-                    "nodal_equiv_plastic_strain".to_string(),
-                    json!(p.nodal_equiv_plastic_strain),
-                );
-                map.insert("nodal_damage".to_string(), json!(p.nodal_damage));
-                map.insert("surface_positions_m".to_string(), json!(surface_positions_m));
-                map.insert(
-                    "surface_reference_positions_m".to_string(),
-                    json!(surface_reference_positions_m),
-                );
-                map.insert("surface_indices".to_string(), json!(surface_indices));
-                map.insert(
-                    "surface_node_indices".to_string(),
-                    json!(surface_node_indices),
-                );
-            }
-            obj
-        })
-        .collect();
-
-    if let Some(pid) = part_filter {
-        if parts_json.is_empty() {
-            return Err(ServerError::PartNotFound(pid.to_string()));
-        }
-    }
-
-    let fragments_json: Vec<Value> = frame
-        .detached_fragments
-        .iter()
-        .map(|f| {
-            let mut fobj = json!({
-                "fragment_id": f.fragment_id,
-                "source_part_id": f.source_part_id,
-                "detachment_step": f.detachment_step,
-                "mass_kg": f.mass_kg,
-                "position": [
-                    f.position_m[0] * scale_len,
-                    f.position_m[1] * scale_len,
-                    f.position_m[2] * scale_len
-                ],
-                "position_m": f.position_m,
-                "orientation_quat": f.orientation_quat,
-                "linear_velocity_m_s": f.linear_velocity_m_s,
-                "angular_velocity_rad_s": f.angular_velocity_rad_s,
-                "kinetic_energy_j": f.kinetic_energy_j,
-                "element_count": f.element_count,
-                "bounding_radius_m": f.bounding_radius_m,
-            });
-            if include_fragment_meshes {
-                if let Some(fm) = frag_mesh_by_id.get(f.fragment_id.as_str()) {
-                    fobj.as_object_mut()
-                        .expect("json object")
-                        .insert("mesh".to_string(), json!(fm));
+                    let map = obj.as_object_mut().expect("json object");
+                    map.insert("deformed_positions".to_string(), json!(deformed_coords));
+                    map.insert("displacements_mm".to_string(), json!(displacements));
+                    map.insert(
+                        "nodal_von_mises_mpa".to_string(),
+                        json!(p.nodal_von_mises_mpa),
+                    );
+                    map.insert(
+                        "nodal_equiv_plastic_strain".to_string(),
+                        json!(p.nodal_equiv_plastic_strain),
+                    );
+                    map.insert("nodal_damage".to_string(), json!(p.nodal_damage));
+                    map.insert("surface_positions_m".to_string(), json!(surface_positions_m));
+                    map.insert(
+                        "surface_reference_positions_m".to_string(),
+                        json!(surface_reference_positions_m),
+                    );
+                    map.insert("surface_indices".to_string(), json!(surface_indices));
+                    map.insert(
+                        "surface_node_indices".to_string(),
+                        json!(surface_node_indices),
+                    );
                 }
-            }
-            fobj
-        })
-        .collect();
+                obj
+            })
+            .collect();
 
-    Ok(json!({
-        "simulation_id": record.simulation_id,
-        "job_id": record.job_id,
-        "accuracy_level": record.accuracy_level.as_str(),
-        "frame_index": frame.frame_index,
-        "total_frames": record.frames.len(),
-        "time_s": frame.time_s,
-        "duration_s": record.duration_s,
-        "dt_used_s": frame.dt_used_s,
-        "newton_iterations": frame.newton_iterations,
-        "parts": parts_json,
-        "detached_fragments": fragments_json,
-        "contact_forces": frame.contact_forces,
-        "hub_reactions": frame.hub_reactions,
-        "energy_balance": frame.energy,
-        "units": unit.units_metadata()
-    }))
+        if let Some(pid) = part_filter {
+            if parts_json.is_empty() {
+                return Err(ServerError::PartNotFound(pid.to_string()));
+            }
+        }
+
+        let fragments_json: Vec<Value> = frame
+            .detached_fragments
+            .iter()
+            .map(|f| {
+                let mut fobj = json!({
+                    "fragment_id": f.fragment_id,
+                    "source_part_id": f.source_part_id,
+                    "detachment_step": f.detachment_step,
+                    "mass_kg": f.mass_kg,
+                    "position": [
+                        f.position_m[0] * scale_len,
+                        f.position_m[1] * scale_len,
+                        f.position_m[2] * scale_len
+                    ],
+                    "position_m": f.position_m,
+                    "orientation_quat": f.orientation_quat,
+                    "linear_velocity_m_s": f.linear_velocity_m_s,
+                    "angular_velocity_rad_s": f.angular_velocity_rad_s,
+                    "kinetic_energy_j": f.kinetic_energy_j,
+                    "element_count": f.element_count,
+                    "bounding_radius_m": f.bounding_radius_m,
+                });
+                if include_fragment_meshes {
+                    if let Some(fm) = frag_mesh_by_id.get(f.fragment_id.as_str()) {
+                        fobj.as_object_mut()
+                            .expect("json object")
+                            .insert("mesh".to_string(), json!(fm));
+                    }
+                }
+                fobj
+            })
+            .collect();
+
+        Ok(json!({
+            "simulation_id": record.simulation_id,
+            "job_id": record.job_id,
+            "accuracy_level": record.accuracy_level.as_str(),
+            "frame_index": frame.frame_index,
+            "total_frames": record.frames.len(),
+            "time_s": frame.time_s,
+            "duration_s": record.duration_s,
+            "dt_used_s": frame.dt_used_s,
+            "newton_iterations": frame.newton_iterations,
+            "parts": parts_json,
+            "detached_fragments": fragments_json,
+            "contact_forces": frame.contact_forces,
+            "hub_reactions": frame.hub_reactions,
+            "energy_balance": frame.energy,
+            "units": unit.units_metadata()
+        }))
+    });
+
+    match res_opt {
+        Some(res) => res,
+        None => Err(if let Some(id) = sim_id_opt {
+            ServerError::InvalidArgument(format!(
+                "SIMULATION_NOT_FOUND: No cached coupled simulation with id '{id}'. Run 'bake_coupled_simulation' first."
+            ))
+        } else {
+            ServerError::InvalidArgument(
+                "SIMULATION_NOT_FOUND: No cached coupled simulation exists yet. Run 'bake_coupled_simulation' first."
+                    .to_string(),
+            )
+        }),
+    }
 }
 
 /// MCP Tool #42: `bake_coupled_simulation`
@@ -2333,16 +2780,78 @@ pub fn bake_coupled_simulation(args: &Value, state: &mut EngineState) -> Result<
     match action.as_str() {
         "status" => {
             let job_id = args.get("job_id").and_then(|v| v.as_str());
-            let m = state.coupled_sim.read();
-            let status = m.job_status(job_id).ok_or_else(|| {
-                ServerError::InvalidArgument(
-                    "JOB_NOT_FOUND: No coupled simulation bake job matches the requested job_id."
-                        .to_string(),
-                )
-            })?;
+            let wait_ms = args
+                .get("wait_timeout_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                .min(30_000);
+
+            let initial_status = {
+                let m = state.coupled_sim.read();
+                m.job_status(job_id).ok_or_else(|| {
+                    ServerError::InvalidArgument(
+                        "JOB_NOT_FOUND: No coupled simulation bake job matches the requested job_id."
+                            .to_string(),
+                    )
+                })?
+            };
+
+            let status = if wait_ms > 0
+                && matches!(
+                    initial_status.state,
+                    BakeJobState::Running | BakeJobState::Cancelling
+                ) {
+                let start = Instant::now();
+                let timeout = Duration::from_millis(wait_ms);
+                let initial_frames = initial_status.frames_cached;
+                loop {
+                    std::thread::sleep(Duration::from_millis(50));
+                    let latest_opt = {
+                        let m = state.coupled_sim.read();
+                        m.job_status(Some(&initial_status.job_id))
+                    };
+                    let Some(latest) = latest_opt else {
+                        break initial_status;
+                    };
+                    let finished = !matches!(
+                        latest.state,
+                        BakeJobState::Running | BakeJobState::Cancelling
+                    );
+                    let got_new_frame = latest.frames_cached > initial_frames;
+                    if finished || got_new_frame || start.elapsed() >= timeout {
+                        break latest;
+                    }
+                }
+            } else {
+                initial_status
+            };
+
+            let next_step = match status.state {
+                BakeJobState::Running | BakeJobState::Cancelling => {
+                    if let Some(latest_idx) = status.latest_frame_index {
+                        format!(
+                            "Inspect cached frame 0..{latest_idx} via query_simulation_frame {{\"simulation_id\": \"{}\", \"frame_index\": {latest_idx}}} or poll status again.",
+                            status.simulation_id
+                        )
+                    } else {
+                        "Solver is advancing the first step; poll status again with wait_timeout_ms.".to_string()
+                    }
+                }
+                BakeJobState::Completed | BakeJobState::Cancelled => format!(
+                    "Call query_simulation_frame {{\"simulation_id\": \"{}\"}} to inspect all {} cached frames.",
+                    status.simulation_id, status.frames_cached
+                ),
+                BakeJobState::Failed => "Check parameters and retry bake_coupled_simulation.".to_string(),
+            };
+
+            let cached_simulations = {
+                let m = state.coupled_sim.read();
+                m.list_cached_simulation_ids()
+            };
             Ok(json!({
                 "job": status,
-                "cached_simulations": m.list_cached_simulation_ids(),
+                "cached_simulations": cached_simulations,
+                "next_step": next_step,
                 "units": unit.units_metadata()
             }))
         }

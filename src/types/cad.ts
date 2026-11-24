@@ -201,6 +201,7 @@ export interface KinematicJoint {
   anchor: [number, number, number];
   anchorB?: [number, number, number];
   axis: [number, number, number];
+  /** Travel limits in SI units: radians for revolute joints, meters for prismatic joints */
   limits?: [number, number];
   motorSpeedRpm: number;
   /** Signed linear motor speed in m/s for prismatic joints */

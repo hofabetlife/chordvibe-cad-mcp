@@ -29,6 +29,30 @@ export interface PushLivePartInput extends Partial<LiveScenePart> {
   stl_base64?: string;
 }
 
+export interface LiveCoupledSimProgress {
+  job_id: string;
+  simulation_id: string;
+  state: 'running' | 'cancelling' | 'completed' | 'cancelled' | 'failed' | string;
+  accuracy_level: string;
+  part_ids: string[];
+  total_time_s: number;
+  current_time_s: number;
+  progress_pct: number;
+  step_count: number;
+  frame_count: number;
+  frames_cached: number;
+  latest_frame_index?: number | null;
+  current_dt_s: number;
+  bisections: number;
+  eroded_elements: number;
+  detached_fragments: number;
+  max_von_mises_mpa: number;
+  elapsed_ms: number;
+  estimated_remaining_ms?: number | null;
+  stage_label: string;
+  updated_at_ms: number;
+}
+
 export interface PushLiveSnapshotPayload {
   revision?: number;
   timestamp_ms?: number;
@@ -110,6 +134,8 @@ export class LiveSyncStore extends EventEmitter {
   private readonly watchers: fs.FSWatcher[] = [];
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private lastSignature = '';
+  private lastCoupledProgressSignature = '';
+  private lastCoupledFramesSignature = '';
   private pushSequence = 1;
 
   constructor(options: LiveSyncStoreOptions) {
@@ -310,11 +336,12 @@ export class LiveSyncStore extends EventEmitter {
 
   public readCoupledSimJson(): unknown | null {
     const candidate = this.resolveFreshestCandidate();
-    if (!candidate || candidate.sourceKind !== 'manifest') return null;
-    const orderedDirs = [
-      candidate.sourceDir,
-      ...this.getManifestDirs().filter((d) => d !== candidate.sourceDir),
-    ];
+    const orderedDirs = candidate && candidate.sourceKind === 'manifest'
+      ? [
+          candidate.sourceDir,
+          ...this.getManifestDirs().filter((d) => d !== candidate.sourceDir),
+        ]
+      : this.getManifestDirs();
     for (const dir of orderedDirs) {
       const filePath = path.join(dir, 'coupled_sim.json');
       const parsed = readJsonSafely<unknown>(filePath);
@@ -323,6 +350,107 @@ export class LiveSyncStore extends EventEmitter {
       }
     }
     return null;
+  }
+
+  private resolveFreshestCoupledProgress(): {
+    signature: string;
+    progress: LiveCoupledSimProgress;
+  } | null {
+    const candidates: Array<{
+      freshnessMs: number;
+      signature: string;
+      progress: LiveCoupledSimProgress;
+    }> = [];
+    for (const dir of this.getManifestDirs()) {
+      const filePath = path.join(dir, 'coupled_sim_progress.json');
+      const loaded = readJsonSafely<LiveCoupledSimProgress>(filePath);
+      if (loaded && loaded.value && typeof loaded.value.job_id === 'string') {
+        const p = loaded.value;
+        const freshnessMs = Math.max(p.updated_at_ms || 0, Math.floor(loaded.mtimeMs));
+        candidates.push({
+          freshnessMs,
+          signature: `${filePath}:${p.job_id}:${p.state}:${p.progress_pct}:${p.step_count}:${p.frames_cached}:${p.updated_at_ms}:${Math.floor(loaded.mtimeMs)}`,
+          progress: p,
+        });
+      }
+    }
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => b.freshnessMs - a.freshnessMs);
+    return {
+      signature: candidates[0].signature,
+      progress: candidates[0].progress,
+    };
+  }
+
+  private resolveFreshestCoupledFramesSignature(): {
+    signature: string;
+    payload: unknown;
+  } | null {
+    const candidates: Array<{
+      mtimeMs: number;
+      signature: string;
+      payload: unknown;
+    }> = [];
+    for (const dir of this.getManifestDirs()) {
+      const filePath = path.join(dir, 'coupled_sim.json');
+      try {
+        if (!fs.existsSync(filePath)) continue;
+        const stat = fs.statSync(filePath);
+        if (!stat.isFile() || stat.size === 0) continue;
+        const raw = fs.readFileSync(filePath, 'utf8');
+        const parsed = JSON.parse(raw) as {
+          summary?: { simulation_id?: string; frame_count?: number };
+          frames?: unknown[];
+        };
+        const simId = parsed?.summary?.simulation_id ?? '';
+        const frameCount = Array.isArray(parsed?.frames) ? parsed.frames.length : 0;
+        candidates.push({
+          mtimeMs: stat.mtimeMs,
+          signature: `${filePath}:${simId}:${frameCount}:${stat.size}:${Math.floor(stat.mtimeMs)}`,
+          payload: parsed,
+        });
+      } catch {
+        // Ignore transient write
+      }
+    }
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    return {
+      signature: candidates[0].signature,
+      payload: candidates[0].payload,
+    };
+  }
+
+  public readCoupledSimProgress(): LiveCoupledSimProgress | null {
+    return this.resolveFreshestCoupledProgress()?.progress ?? null;
+  }
+
+  public pushCoupledSimProgress(
+    progress: LiveCoupledSimProgress,
+    coupledSimPayload?: unknown
+  ): LiveCoupledSimProgress {
+    const normalized: LiveCoupledSimProgress = {
+      ...progress,
+      updated_at_ms:
+        typeof progress.updated_at_ms === 'number' && progress.updated_at_ms > 0
+          ? progress.updated_at_ms
+          : Date.now(),
+    };
+    const progBytes = JSON.stringify(normalized);
+    const coupledBytes =
+      coupledSimPayload !== undefined && coupledSimPayload !== null
+        ? JSON.stringify(coupledSimPayload)
+        : null;
+
+    for (const dir of this.getManifestDirs()) {
+      if (coupledBytes) {
+        writeAtomicFile(path.join(dir, 'coupled_sim.json'), coupledBytes);
+      }
+      writeAtomicFile(path.join(dir, 'coupled_sim_progress.json'), progBytes);
+    }
+
+    this.checkForUpdates();
+    return normalized;
   }
 
   public pushSnapshot(payload: PushLiveSnapshotPayload): LiveSceneSnapshot {
@@ -424,7 +552,7 @@ export class LiveSyncStore extends EventEmitter {
 
   public clearSnapshot(clearLegacyStl = false): void {
     for (const dir of this.getManifestDirs()) {
-      for (const fileName of ['scene.json', 'coupled_sim.json']) {
+      for (const fileName of ['scene.json', 'coupled_sim.json', 'coupled_sim_progress.json']) {
         const filePath = path.join(dir, fileName);
         try {
           if (fs.existsSync(filePath)) {
@@ -484,23 +612,49 @@ export class LiveSyncStore extends EventEmitter {
     const candidate = this.resolveFreshestCandidate();
     const nextSignature = candidate ? candidate.signature : '';
 
-    if (nextSignature === this.lastSignature) {
-      return;
+    if (nextSignature !== this.lastSignature) {
+      this.lastSignature = nextSignature;
+      if (candidate) {
+        this.emit('update', {
+          active: true,
+          sourceKind: candidate.sourceKind,
+          snapshot: candidate.snapshot,
+        } satisfies LiveSyncApiResponse);
+      } else {
+        this.emit('clear', {
+          active: false,
+          sourceKind: 'none',
+          snapshot: null,
+        } satisfies LiveSyncApiResponse);
+      }
     }
 
-    this.lastSignature = nextSignature;
-    if (candidate) {
-      this.emit('update', {
-        active: true,
-        sourceKind: candidate.sourceKind,
-        snapshot: candidate.snapshot,
-      } satisfies LiveSyncApiResponse);
-    } else {
-      this.emit('clear', {
-        active: false,
-        sourceKind: 'none',
-        snapshot: null,
-      } satisfies LiveSyncApiResponse);
+    const coupledFrames = this.resolveFreshestCoupledFramesSignature();
+    const nextFramesSig = coupledFrames ? coupledFrames.signature : '';
+    if (nextFramesSig !== this.lastCoupledFramesSignature) {
+      this.lastCoupledFramesSignature = nextFramesSig;
+      if (coupledFrames) {
+        const payload = coupledFrames.payload as {
+          summary?: { simulation_id?: string; frame_count?: number };
+          frames?: unknown[];
+        };
+        this.emit('coupled_frames', {
+          simulation_id: payload?.summary?.simulation_id ?? '',
+          frame_count: Array.isArray(payload?.frames)
+            ? payload.frames.length
+            : (payload?.summary?.frame_count ?? 0),
+          payload: coupledFrames.payload,
+        });
+      }
+    }
+
+    const coupledProgress = this.resolveFreshestCoupledProgress();
+    const nextProgSig = coupledProgress ? coupledProgress.signature : '';
+    if (nextProgSig !== this.lastCoupledProgressSignature) {
+      this.lastCoupledProgressSignature = nextProgSig;
+      if (coupledProgress) {
+        this.emit('coupled_progress', coupledProgress.progress);
+      }
     }
   }
 
@@ -509,6 +663,10 @@ export class LiveSyncStore extends EventEmitter {
 
     const initial = this.resolveFreshestCandidate();
     this.lastSignature = initial ? initial.signature : '';
+    this.lastCoupledProgressSignature =
+      this.resolveFreshestCoupledProgress()?.signature ?? '';
+    this.lastCoupledFramesSignature =
+      this.resolveFreshestCoupledFramesSignature()?.signature ?? '';
 
     const dirsToWatch = [
       ...this.getManifestDirs(),

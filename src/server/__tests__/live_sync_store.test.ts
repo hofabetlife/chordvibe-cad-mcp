@@ -196,3 +196,88 @@ test('LiveSyncStore falls back to legacy output/_mcp_preview_live.stl and picks 
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('LiveSyncStore streams coupled_progress and coupled_frames independently of scene.json', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-live-coupled-test-'));
+  const tempLive = path.join(root, 'os_temp_live');
+  const legacyStl = path.join(root, 'output', '_mcp_preview_live.stl');
+
+  try {
+    const store = new LiveSyncStore({
+      workspaceRoot: root,
+      tempLiveDir: tempLive,
+      legacyStlPath: legacyStl,
+    });
+
+    let progressEvents = 0;
+    let framesEvents = 0;
+    let lastProgressPct = 0;
+    let lastFrameCount = 0;
+
+    store.on('coupled_progress', (p: { progress_pct: number }) => {
+      progressEvents += 1;
+      lastProgressPct = p.progress_pct;
+    });
+    store.on('coupled_frames', (f: { frame_count: number }) => {
+      framesEvents += 1;
+      lastFrameCount = f.frame_count;
+    });
+
+    // Stream step 1 (35% with 2 cached frames) without scene.json present yet
+    store.pushCoupledSimProgress(
+      {
+        job_id: 'job_live_1',
+        simulation_id: 'sim_live_1',
+        state: 'running',
+        accuracy_level: 'standard',
+        part_ids: ['gear_1'],
+        total_time_s: 0.1,
+        current_time_s: 0.035,
+        progress_pct: 35,
+        step_count: 140,
+        frame_count: 6,
+        frames_cached: 2,
+        latest_frame_index: 1,
+        current_dt_s: 0.00025,
+        bisections: 0,
+        eroded_elements: 0,
+        detached_fragments: 0,
+        max_von_mises_mpa: 310,
+        elapsed_ms: 3500,
+        estimated_remaining_ms: 6500,
+        stage_label: 'HHT-α FEM · шаг 140',
+        updated_at_ms: 1_700_000_001_000,
+      },
+      {
+        summary: { simulation_id: 'sim_live_1', duration_s: 0.1, frame_count: 2 },
+        frames: [
+          { simulation_id: 'sim_live_1', frame_index: 0, total_frames: 6, time_s: 0, parts: [] },
+          { simulation_id: 'sim_live_1', frame_index: 1, total_frames: 6, time_s: 0.02, parts: [] },
+        ],
+      }
+    );
+
+    assert.equal(progressEvents, 1);
+    assert.equal(framesEvents, 1);
+    assert.equal(lastProgressPct, 35);
+    assert.equal(lastFrameCount, 2);
+
+    const readProg = store.readCoupledSimProgress();
+    assert.ok(readProg);
+    assert.equal(readProg.state, 'running');
+    assert.equal(readProg.estimated_remaining_ms, 6500);
+
+    // Standalone readCoupledSimJson works even when scene.json has not been written yet
+    const readSim = store.readCoupledSimJson() as { frames?: unknown[] } | null;
+    assert.ok(readSim);
+    assert.equal(readSim.frames?.length, 2);
+
+    // Clear cleans up coupled_sim_progress.json and coupled_sim.json
+    store.clearSnapshot();
+    assert.equal(store.readCoupledSimProgress(), null);
+    assert.equal(store.readCoupledSimJson(), null);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+

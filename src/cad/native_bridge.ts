@@ -8,12 +8,17 @@ import {
   RenderMode,
 } from '../types/cad';
 import { parseStlBuffer } from './primitives';
+import { getMaterialById } from './materials';
 import { MCP_TOOLS_CATALOG } from './mcp_dispatcher';
 import {
-  convertRustCoupledSimToDestructionCache,
   type RustCoupledSimBakeSummaryJson,
   type RustCoupledSimFrameJson,
 } from './field_colormaps';
+import {
+  estimateRemainingMs,
+  IncrementalRustSimAssembler,
+  type LiveFemSolveStatus,
+} from './coupled_sim_stream';
 import {
   buildRustSceneSyncPlan,
   resolveRustEndpoint,
@@ -180,6 +185,180 @@ export async function loadCachedRustStlMesh(
 
 export function getCachedRustStlCount(): number {
   return stlMeshCache.size;
+}
+
+export interface NativeStlLoadOptions {
+  /** Optional explicit material ID, canonical Rust material ID, or alias used to resolve density via getMaterialById */
+  materialId?: string;
+  /** Optional materials registry snapshot (e.g. nextState.materials right after executeMcpToolOnEngineState) */
+  materials?: MaterialSpec[];
+  /**
+   * When set (e.g. during async hydration after MCP `import_stl`), updates only the matching part
+   * in-place without wiping other parts, joints, part_id, materialId, name, or isFixed.
+   */
+  hydratePartId?: string;
+}
+
+export interface ResolvedNativeStlMaterial {
+  partId: string;
+  materialId: string;
+  material: MaterialSpec;
+  density: number;
+}
+
+/**
+ * Resolves the target part ID, material ID, and physical density (kg/m³) for a native STL URL
+ * using `getMaterialById` so `rim` parts and explicit material overrides never fall back to a
+ * hardcoded 7850 kg/m³ steel density.
+ */
+export function resolveNativeStlMaterialSpec(
+  stlUrl: string,
+  materials: MaterialSpec[],
+  explicitMaterialId?: string
+): ResolvedNativeStlMaterial {
+  const partId =
+    stlUrl
+      .split('/')
+      .pop()
+      ?.replace(/\.stl$/i, '') || 'native_stl';
+  const trimmedExplicit = explicitMaterialId?.trim();
+  const materialId =
+    trimmedExplicit ||
+    (partId.toLowerCase().includes('rim') ? 'alu_6061' : 'steel_1045');
+  const material = getMaterialById(materialId, materials);
+  return {
+    partId,
+    materialId,
+    material,
+    density: material.density,
+  };
+}
+
+/**
+ * Rescales a parsed mesh's mass and principal inertia tensor to match `targetDensity` (kg/m³)
+ * without mutating the input mesh object.
+ */
+export function rescaleMeshForDensity(
+  mesh: MeshGeometryData,
+  targetDensity: number
+): MeshGeometryData {
+  if (
+    !Number.isFinite(targetDensity) ||
+    targetDensity <= 0 ||
+    !Number.isFinite(mesh.volume) ||
+    mesh.volume <= 0
+  ) {
+    return mesh;
+  }
+  const targetMass = mesh.volume * targetDensity;
+  if (
+    mesh.mass > 0 &&
+    Math.abs(targetMass - mesh.mass) / Math.max(mesh.mass, 1e-12) <= 1e-9
+  ) {
+    return mesh;
+  }
+  const ratio = mesh.mass > 0 ? targetMass / mesh.mass : 1;
+  return {
+    ...mesh,
+    mass: targetMass,
+    inertiaTensor: [
+      mesh.inertiaTensor[0] * ratio,
+      mesh.inertiaTensor[1] * ratio,
+      mesh.inertiaTensor[2] * ratio,
+    ],
+  };
+}
+
+/**
+ * Builds a standalone `CadPart` for direct native STL inspection (`handleLoadNativeStlUrl` without `hydratePartId`).
+ */
+export function buildStandaloneNativeStlPart(
+  stlUrl: string,
+  label: string,
+  parsedMesh: MeshGeometryData,
+  materialId: string,
+  partId?: string
+): CadPart {
+  const resolvedPartId =
+    partId ||
+    stlUrl
+      .split('/')
+      .pop()
+      ?.replace(/\.stl$/i, '') ||
+    'native_stl';
+  return {
+    id: resolvedPartId,
+    name: `Rust STL: ${label.split(' ')[0]}`,
+    materialId,
+    dag: [
+      {
+        id: 'node_stl',
+        name: `Compiled Windows STL (${parsedMesh.triangleCount.toLocaleString()} tris)`,
+        type: 'stl_import',
+        params: {
+          file_path: stlUrl,
+          triangles: parsedMesh.triangleCount,
+          mesh: parsedMesh,
+        },
+        enabled: true,
+      },
+    ],
+    mesh: parsedMesh,
+    visible: true,
+    position: [0, 0, 0],
+    rotation: [0, 0, 0],
+    scale: [1, 1, 1],
+    nativeStlUrl: stlUrl,
+  };
+}
+
+/**
+ * Hydrates the parsed STL mesh onto a specific imported part in `prevParts`, preserving all other
+ * parts in the scene as well as the target part's `id`, `name`, `materialId`, `isFixed`, transform,
+ * and non-STL DAG nodes.
+ */
+export function hydrateImportedStlPartInScene(
+  prevParts: CadPart[],
+  targetPartId: string,
+  stlUrl: string,
+  parsedMesh: MeshGeometryData,
+  materials?: MaterialSpec[]
+): { parts: CadPart[]; hydratedPart: CadPart | null } {
+  let hydratedPart: CadPart | null = null;
+  const parts = prevParts.map((part) => {
+    if (part.id !== targetPartId) {
+      return part;
+    }
+    const targetDensity = materials
+      ? getMaterialById(part.materialId, materials).density
+      : undefined;
+    const finalMesh =
+      targetDensity !== undefined
+        ? rescaleMeshForDensity(parsedMesh, targetDensity)
+        : parsedMesh;
+    const nextDag = part.dag.map((node) =>
+      node.type === 'stl_import'
+        ? {
+            ...node,
+            params: {
+              ...node.params,
+              file_path: node.params?.file_path ?? stlUrl,
+              triangles: finalMesh.triangleCount,
+              mesh: finalMesh,
+            },
+          }
+        : node
+    );
+    hydratedPart = {
+      ...part,
+      mesh: finalMesh,
+      dag: nextDag,
+      nativeStlUrl: part.nativeStlUrl || stlUrl,
+    };
+    return hydratedPart;
+  });
+
+  return { parts, hydratedPart };
 }
 
 /**
@@ -558,6 +737,12 @@ export interface NativeCoupledBakeOptions {
   joints?: readonly KinematicJoint[];
   accuracyLevel?: RustAccuracyLevel;
   onJobId?: (jobId: string) => void;
+  onStatusUpdate?: (status: LiveFemSolveStatus) => void;
+  onPartialCache?: (
+    cache: DestructionCache,
+    latestFrameIndex: number,
+    status: LiveFemSolveStatus
+  ) => void;
   signal?: AbortSignal;
   /** Internal test flag to bypass MCP scene sync when parts already live on server. */
   skipSceneSync?: boolean;
@@ -566,8 +751,8 @@ export interface NativeCoupledBakeOptions {
 /**
  * Synchronizes the active Web Studio scene into the native Rust `mcp-cad-server`,
  * bakes a real f64 coupled implicit HHT-α dynamic FEM simulation (`/api/coupled-sim/*`),
- * streams SSE progress (with polling fallback & cancellation), and adapts all frames
- * into a `DestructionCache` tagged with `solverBackend: 'rust_fem_f64'` (`Rust FEM f64`).
+ * streams SSE/poll progress AND incremental frames live as they are computed,
+ * and adapts all frames into a `DestructionCache` tagged with `solverBackend: 'rust_fem_f64'`.
  */
 export async function bakeNativeCoupledSimulation(
   endpointUrl: string,
@@ -649,17 +834,140 @@ export async function bakeNativeCoupledSimulation(
     opts.onJobId?.(jobId);
   }
 
+  const expectedDurationS = Number(
+    bakeAck?.duration_s ?? bakePayload.duration_s ?? config.durationSec
+  );
   let simulationId: string | undefined = bakeAck?.simulation_id;
   let totalFrames: number = bakeAck?.frame_count ?? bakeAck?.total_frames ?? 0;
   let bakeSummary: RustCoupledSimBakeSummaryJson = {
     simulation_id: simulationId || 'latest',
     accuracy_level: accuracyLevel,
-    duration_s: bakeAck?.duration_s ?? Number(bakePayload.duration_s ?? config.durationSec),
+    duration_s: expectedDurationS,
     total_frames: totalFrames,
     frame_count: totalFrames,
     bake_time_ms: bakeAck?.elapsed_ms ?? bakeAck?.bake_time_ms,
     elapsed_ms: bakeAck?.elapsed_ms ?? bakeAck?.bake_time_ms,
     events: bakeAck?.events,
+  };
+
+  const assembler = new IncrementalRustSimAssembler(
+    bakeSummary,
+    parts,
+    materials,
+    config
+  );
+  const solveStartMs = Date.now();
+  let availableFrames = Math.max(
+    Number(bakeAck?.frames_cached ?? 0),
+    Number(bakeAck?.frame_count ?? 0)
+  );
+  let fetchedUpTo = -1;
+  let fetchedFragCount = 0;
+  let fetchedFragmentMeshesOnce = false;
+  let pumpPromise: Promise<void> | null = null;
+
+  let latestStatus: LiveFemSolveStatus = {
+    active: bakeAck?.status !== 'completed',
+    source: 'rust_fem',
+    state: bakeAck?.status === 'completed' ? 'completed' : 'running',
+    jobId: jobId ?? null,
+    simulationId: simulationId ?? null,
+    progressPct: bakeAck?.status === 'completed' ? 100 : 20,
+    currentTimeSec: 0,
+    totalTimeSec: expectedDurationS,
+    stepCount: 0,
+    frameCount: totalFrames,
+    framesCached: availableFrames,
+    latestFrameIndex: Math.max(0, availableFrames - 1),
+    currentDtSec: 0,
+    bisections: 0,
+    erodedElements: 0,
+    detachedFragments: 0,
+    maxVonMisesMPa: 0,
+    elapsedMs: Number(bakeAck?.elapsed_ms ?? 0),
+    estimatedRemainingMs: null,
+    stageLabel: `Rust FEM f64 (${accuracyLevel}): запуск HHT-α расчёта...`,
+    cancellable: Boolean(jobId),
+  };
+
+  const refreshFragments = async (force = false): Promise<void> => {
+    const simKey = simulationId || 'latest';
+    if (!force && fetchedFragmentMeshesOnce && latestStatus.detachedFragments <= fetchedFragCount) {
+      return;
+    }
+    try {
+      const fragsRes = await fetch(
+        `${coupledBase}/fragments/${encodeURIComponent(simKey)}?length_unit=m`,
+        { signal }
+      );
+      if (fragsRes.ok) {
+        const fragsJson = await fragsRes.json();
+        if (Array.isArray(fragsJson?.fragments)) {
+          fetchedFragmentMeshesOnce = true;
+          fetchedFragCount = Math.max(fetchedFragCount, fragsJson.fragments.length);
+          bakeSummary = {
+            ...bakeSummary,
+            fragment_meshes: fragsJson.fragments,
+          };
+          assembler.updateSummary({ fragment_meshes: fragsJson.fragments });
+        }
+      }
+    } catch {
+      if (signal?.aborted) throw new RustBakeCancelledError();
+    }
+  };
+
+  const fetchMissingFramesUpTo = async (
+    targetFrameCount: number,
+    emitLiveCallbacks: boolean
+  ): Promise<void> => {
+    const simKey = simulationId || 'latest';
+    if (latestStatus.detachedFragments > fetchedFragCount || !fetchedFragmentMeshesOnce) {
+      await refreshFragments(false);
+    }
+    for (let i = fetchedUpTo + 1; i < targetFrameCount; i++) {
+      if (signal?.aborted) throw new RustBakeCancelledError();
+      const fragInlineParam = fetchedFragmentMeshesOnce ? 'false' : 'true';
+      const fRes = await fetch(
+        `${coupledBase}/frames/${encodeURIComponent(simKey)}/${i}?include_mesh_fields=true&include_fragment_meshes=${fragInlineParam}&length_unit=m`,
+        { signal }
+      );
+      if (!fRes.ok) {
+        if (emitLiveCallbacks && (fRes.status === 404 || fRes.status === 409)) {
+          break;
+        }
+        throw new Error(`Failed loading Rust FEM frame ${i}: HTTP ${fRes.status}`);
+      }
+      const fJson: RustCoupledSimFrameJson = await fRes.json();
+      assembler.appendFrame(fJson);
+      fetchedUpTo = i;
+      if (opts.onPartialCache) {
+        const partialCache = assembler.buildCache();
+        opts.onPartialCache(partialCache, i, latestStatus);
+      }
+      if (!emitLiveCallbacks && targetFrameCount > 0) {
+        const tailPct = 86 + Math.round(((i + 1) / targetFrameCount) * 13);
+        onProgress?.(
+          Math.min(99, tailPct),
+          `Rust FEM f64: загрузка поверхностных сеток и полей кадра ${i + 1}/${targetFrameCount}...`
+        );
+      }
+    }
+  };
+
+  const schedulePump = () => {
+    if (!simulationId || pumpPromise) return;
+    pumpPromise = (async () => {
+      try {
+        while (fetchedUpTo + 1 < availableFrames && !signal?.aborted) {
+          const target = availableFrames;
+          await fetchMissingFramesUpTo(target, true);
+          if (fetchedUpTo + 1 >= availableFrames) break;
+        }
+      } finally {
+        pumpPromise = null;
+      }
+    })();
   };
 
   if (jobId && bakeAck?.status !== 'completed') {
@@ -683,6 +991,66 @@ export async function bakeNativeCoupledSimulation(
         else resolve();
       };
 
+      const handleProgressSample = (data: Record<string, any>) => {
+        if (typeof data.simulation_id === 'string' && data.simulation_id) {
+          simulationId = data.simulation_id;
+          assembler.updateSummary({ simulation_id: simulationId });
+        }
+        const rawPct = Math.max(0, Math.min(100, Number(data.progress_pct ?? latestStatus.progressPct)));
+        const elapsedMs = Number(data.elapsed_ms ?? Date.now() - solveStartMs);
+        const framesCached = Number(
+          data.frames_cached ?? data.frame_count ?? availableFrames
+        );
+        const frameCount = Number(data.frame_count ?? data.total_frames ?? totalFrames);
+        const latestIdx =
+          typeof data.latest_frame_index === 'number'
+            ? Math.max(0, data.latest_frame_index)
+            : Math.max(0, framesCached - 1);
+        const etaMs =
+          typeof data.estimated_remaining_ms === 'number' && data.estimated_remaining_ms >= 0
+            ? data.estimated_remaining_ms
+            : estimateRemainingMs(elapsedMs, rawPct);
+
+        const stageLabel =
+          data.stage_label ||
+          `Rust FEM f64 (HHT-α): шаг ${data.step_count ?? 0}, t=${Number(data.time_s ?? 0).toFixed(4)}с, σ_max=${Number(data.max_von_mises_mpa ?? 0).toFixed(0)} МПа`;
+
+        latestStatus = {
+          active: true,
+          source: 'rust_fem',
+          state: 'running',
+          jobId,
+          simulationId: simulationId ?? null,
+          progressPct: Math.round(rawPct),
+          currentTimeSec: Number(data.time_s ?? latestStatus.currentTimeSec),
+          totalTimeSec: Number(data.duration_s ?? expectedDurationS),
+          stepCount: Number(data.step_count ?? latestStatus.stepCount),
+          frameCount,
+          framesCached,
+          latestFrameIndex: latestIdx,
+          currentDtSec: Number(data.current_dt_s ?? latestStatus.currentDtSec),
+          bisections: Number(data.bisections ?? latestStatus.bisections),
+          erodedElements: Number(data.eroded_elements ?? latestStatus.erodedElements),
+          detachedFragments: Number(data.detached_fragments ?? latestStatus.detachedFragments),
+          maxVonMisesMPa: Number(data.max_von_mises_mpa ?? latestStatus.maxVonMisesMPa),
+          elapsedMs,
+          estimatedRemainingMs: etaMs,
+          stageLabel,
+          cancellable: true,
+        };
+
+        opts.onStatusUpdate?.(latestStatus);
+        const scaledPct = Math.min(84, Math.max(20, 20 + Math.round(rawPct * 0.64)));
+        onProgress?.(scaledPct, stageLabel);
+
+        if (framesCached > availableFrames) {
+          availableFrames = framesCached;
+        }
+        if (simulationId && availableFrames > fetchedUpTo + 1) {
+          schedulePump();
+        }
+      };
+
       if (signal) {
         if (signal.aborted) {
           onAbort();
@@ -699,15 +1067,11 @@ export async function bakeNativeCoupledSimulation(
               const data = JSON.parse((evt as MessageEvent).data);
               if (data.job_id && data.job_id !== jobId) return;
               if (data.event === 'progress') {
-                const rawPct = Number(data.progress_pct || 0);
-                const pct = Math.min(84, Math.max(22, 20 + Math.round(rawPct * 0.64)));
-                onProgress?.(
-                  pct,
-                  `Rust FEM f64 (HHT-α): шаг ${data.step_count ?? 0}, t=${Number(data.time_s ?? 0).toFixed(4)}с, σ_max=${Number(data.max_von_mises_mpa ?? 0).toFixed(0)} МПа`
-                );
+                handleProgressSample(data);
               } else if (data.event === 'completed') {
                 simulationId = data.simulation_id || simulationId;
                 totalFrames = data.frame_count ?? data.total_frames ?? totalFrames;
+                availableFrames = Math.max(availableFrames, totalFrames);
                 bakeSummary = {
                   ...bakeSummary,
                   simulation_id: simulationId || 'latest',
@@ -717,6 +1081,7 @@ export async function bakeNativeCoupledSimulation(
                   elapsed_ms: data.elapsed_ms ?? data.bake_time_ms,
                   events: data.events ?? bakeSummary.events,
                 };
+                assembler.updateSummary(bakeSummary);
                 finish();
               } else if (data.event === 'cancelled') {
                 finish(new RustBakeCancelledError());
@@ -732,7 +1097,7 @@ export async function bakeNativeCoupledSimulation(
         }
       }
 
-      // Polling safety net in case SSE drops or isn't supported (e.g. Node unit tests)
+      // Polling safety net (200ms) for environments without SSE or buffered SSE
       pollTimer = setInterval(async () => {
         try {
           const stRes = await fetch(
@@ -745,6 +1110,7 @@ export async function bakeNativeCoupledSimulation(
           if (jobState === 'completed') {
             simulationId = job.simulation_id || simulationId;
             totalFrames = job.frame_count ?? job.total_frames ?? totalFrames;
+            availableFrames = Math.max(availableFrames, totalFrames);
             bakeSummary = {
               ...bakeSummary,
               simulation_id: simulationId || 'latest',
@@ -754,22 +1120,19 @@ export async function bakeNativeCoupledSimulation(
               elapsed_ms: job.elapsed_ms ?? job.bake_time_ms,
               events: job.events ?? st.events ?? bakeSummary.events,
             };
+            assembler.updateSummary(bakeSummary);
             finish();
           } else if (jobState === 'cancelled') {
             finish(new RustBakeCancelledError());
           } else if (jobState === 'failed') {
             finish(new Error(job.error || 'Rust FEM job failed'));
           } else if (typeof job?.progress_pct === 'number') {
-            const pct = Math.min(84, Math.max(22, 20 + Math.round(job.progress_pct * 0.64)));
-            onProgress?.(
-              pct,
-              `Rust FEM f64: расчёт (${Math.round(job.progress_pct)}%)...`
-            );
+            handleProgressSample(job);
           }
         } catch {
           // Retry next poll tick
         }
-      }, 250);
+      }, 200);
     });
   }
 
@@ -777,61 +1140,33 @@ export async function bakeNativeCoupledSimulation(
     throw new RustBakeCancelledError();
   }
 
-  const simKey = simulationId || 'latest';
-
-  // P5-T15: Fetch local-space detached fragment triangle meshes once per simulation
-  let fetchedFragmentMeshesOnce = false;
-  try {
-    onProgress?.(85, 'Rust FEM f64: загрузка сеток фрагментов...');
-    const fragsRes = await fetch(
-      `${coupledBase}/fragments/${encodeURIComponent(simKey)}?length_unit=m`,
-      { signal }
-    );
-    if (fragsRes.ok) {
-      const fragsJson = await fragsRes.json();
-      if (Array.isArray(fragsJson?.fragments)) {
-        bakeSummary = {
-          ...bakeSummary,
-          fragment_meshes: fragsJson.fragments,
-        };
-        fetchedFragmentMeshesOnce = true;
-      }
+  if (pumpPromise) {
+    try {
+      await pumpPromise;
+    } catch {
+      if (signal?.aborted) throw new RustBakeCancelledError();
     }
-  } catch (err) {
-    if (signal?.aborted) throw new RustBakeCancelledError();
-    // Fallback to inline fragment meshes per frame when endpoint is unavailable
-    void err;
   }
 
-  const frameCount = Math.max(1, totalFrames);
-  const rustFrames: RustCoupledSimFrameJson[] = [];
-  const fragInlineParam = fetchedFragmentMeshesOnce ? 'false' : 'true';
+  assembler.updateSummary(bakeSummary);
+  await refreshFragments(true);
 
-  for (let i = 0; i < frameCount; i++) {
-    if (signal?.aborted) throw new RustBakeCancelledError();
-    onProgress?.(
-      86 + Math.round((i / frameCount) * 13),
-      `Rust FEM f64: загрузка поверхностных сеток и полей кадра ${i + 1}/${frameCount}...`
-    );
-    const fRes = await fetch(
-      `${coupledBase}/frames/${encodeURIComponent(simKey)}/${i}?include_mesh_fields=true&include_fragment_meshes=${fragInlineParam}&length_unit=m`,
-      { signal }
-    );
-    if (!fRes.ok) {
-      throw new Error(`Failed loading Rust FEM frame ${i}: HTTP ${fRes.status}`);
-    }
-    const fJson: RustCoupledSimFrameJson = await fRes.json();
-    rustFrames.push(fJson);
-  }
+  const frameCount = Math.max(1, totalFrames, availableFrames);
+  latestStatus = {
+    ...latestStatus,
+    active: false,
+    state: 'completed',
+    progressPct: 100,
+    frameCount,
+    framesCached: frameCount,
+    estimatedRemainingMs: null,
+    cancellable: false,
+    stageLabel: 'Rust FEM f64: финализация кэша...',
+  };
+  await fetchMissingFramesUpTo(frameCount, false);
 
   onProgress?.(100, 'Rust FEM f64 кэш готов');
-  return convertRustCoupledSimToDestructionCache(
-    bakeSummary,
-    rustFrames,
-    parts,
-    materials,
-    config
-  );
+  return assembler.buildCache();
 }
 
 

@@ -122,7 +122,7 @@ impl CsrMatrix {
     #[inline]
     pub fn spmv(&self, x: &[f64], y: &mut [f64]) {
         let nrows = self.nrows.min(y.len());
-        if nrows >= 512 {
+        if self.values.len() >= 16_384 && nrows >= 512 {
             let row_ptr = &self.row_ptr;
             let col_indices = &self.col_indices;
             let values = &self.values;

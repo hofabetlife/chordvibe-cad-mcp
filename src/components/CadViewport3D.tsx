@@ -166,6 +166,7 @@ export const CadViewport3D: React.FC<CadViewport3DProps> = ({
     >
   >(new Map());
   const sparksLineRef = useRef<THREE.LineSegments | null>(null);
+  const loadedCacheIdRef = useRef<string | null>(null);
   const gridHelperRef = useRef<THREE.GridHelper | null>(null);
   const axesHelperRef = useRef<THREE.AxesHelper | null>(null);
 
@@ -932,90 +933,93 @@ export const CadViewport3D: React.FC<CadViewport3DProps> = ({
     renderOnceRef.current?.();
   }, [parts, joints, selectedPartId, renderMode, showCadEdges, showReferenceGrid, materials, feaResult, deformScale, viewportLayout, activeView]);
 
-  // Build 3D Fracture Shard Meshes & Bench Surface ONCE whenever a new DestructionCache is baked
+  // Build 3D Fracture Shard Meshes & Bench Surface incrementally when a DestructionCache starts or streams new shards
   useEffect(() => {
     const dGroup = destructionGroupRef.current;
     const benchGroup = destructionBenchRef.current;
     if (!dGroup || !benchGroup) return;
 
-    // Dispose previous shard geometries, FEM surface meshes & materials cleanly
-    for (const entry of shardEntriesRef.current) {
-      entry.group.traverse((obj) => {
-        if (obj instanceof THREE.Mesh) {
-          obj.geometry.dispose();
-        }
-      });
-      entry.outerMat.dispose();
-      entry.innerMat.dispose();
-    }
-    shardEntriesRef.current = [];
-    for (const femEntry of femSurfaceEntriesRef.current.values()) {
-      femEntry.geometry.dispose();
-      femEntry.material.dispose();
-    }
-    femSurfaceEntriesRef.current.clear();
-    while (dGroup.children.length > 0) {
-      dGroup.remove(dGroup.children[0]);
-    }
-    while (benchGroup.children.length > 0) {
-      const ch = benchGroup.children[0];
-      if (ch instanceof THREE.Mesh) {
-        ch.geometry.dispose();
-        if (Array.isArray(ch.material)) ch.material.forEach((m) => m.dispose());
-        else ch.material.dispose();
-      }
-      benchGroup.remove(ch);
-    }
+    const isSameStreamingCache =
+      Boolean(destructionCache) &&
+      loadedCacheIdRef.current === destructionCache!.id &&
+      destructionCache!.shards.length >= shardEntriesRef.current.length;
 
-    if (!destructionCache) {
-      benchGroup.visible = false;
-      if (sparksLineRef.current) {
-        sparksLineRef.current.geometry.setDrawRange(0, 0);
-      }
-      // Ensure intact part meshes are visible again
-      if (partGroupRef.current) {
-        partGroupRef.current.children.forEach((c) => {
-          c.visible = true;
+    if (!isSameStreamingCache) {
+      // Dispose previous shard geometries, FEM surface meshes & materials cleanly
+      for (const entry of shardEntriesRef.current) {
+        entry.group.traverse((obj) => {
+          if (obj instanceof THREE.Mesh) {
+            obj.geometry.dispose();
+          }
         });
+        entry.outerMat.dispose();
+        entry.innerMat.dispose();
       }
-      return;
+      shardEntriesRef.current = [];
+      for (const femEntry of femSurfaceEntriesRef.current.values()) {
+        femEntry.geometry.dispose();
+        femEntry.material.dispose();
+      }
+      femSurfaceEntriesRef.current.clear();
+      while (dGroup.children.length > 0) {
+        dGroup.remove(dGroup.children[0]);
+      }
+      while (benchGroup.children.length > 0) {
+        const ch = benchGroup.children[0];
+        if (ch instanceof THREE.Mesh) {
+          ch.geometry.dispose();
+          if (Array.isArray(ch.material)) ch.material.forEach((m) => m.dispose());
+          else ch.material.dispose();
+        }
+        benchGroup.remove(ch);
+      }
+
+      if (!destructionCache) {
+        loadedCacheIdRef.current = null;
+        benchGroup.visible = false;
+        if (sparksLineRef.current) {
+          sparksLineRef.current.geometry.setDrawRange(0, 0);
+        }
+        // Ensure intact part meshes are visible again
+        if (partGroupRef.current) {
+          partGroupRef.current.children.forEach((c) => {
+            c.visible = true;
+          });
+        }
+        return;
+      }
+
+      loadedCacheIdRef.current = destructionCache.id;
+
+      // Build grounded subtle test-bench grid surface at floorY so falling shards have clear contact grounding
+      const floorGrid = new THREE.GridHelper(0.32, 16, 0x475569, 0x2c3444);
+      floorGrid.position.set(0, destructionCache.floorY + 0.0002, 0);
+      benchGroup.add(floorGrid);
+
+      const floorPlaneGeom = new THREE.PlaneGeometry(0.34, 0.34);
+      const floorPlaneMat = new THREE.MeshStandardMaterial({
+        color: 0x1b2029,
+        roughness: 0.88,
+        metalness: 0.12,
+        transparent: true,
+        opacity: 0.65,
+        polygonOffset: true,
+        polygonOffsetFactor: 2,
+        polygonOffsetUnits: 2,
+      });
+      const floorPlane = new THREE.Mesh(floorPlaneGeom, floorPlaneMat);
+      floorPlane.rotation.x = -Math.PI / 2;
+      floorPlane.position.set(0, destructionCache.floorY - 0.0001, 0);
+      floorPlane.receiveShadow = true;
+      benchGroup.add(floorPlane);
+      benchGroup.visible = true;
     }
 
-    // Build grounded subtle test-bench grid surface at floorY so falling shards have clear contact grounding
-    const floorGrid = new THREE.GridHelper(0.32, 16, 0x475569, 0x2c3444);
-    floorGrid.position.set(0, destructionCache.floorY + 0.0002, 0);
-    benchGroup.add(floorGrid);
+    if (!destructionCache) return;
 
-    const floorPlaneGeom = new THREE.PlaneGeometry(0.34, 0.34);
-    const floorPlaneMat = new THREE.MeshStandardMaterial({
-      color: 0x1b2029,
-      roughness: 0.88,
-      metalness: 0.12,
-      transparent: true,
-      opacity: 0.65,
-      polygonOffset: true,
-      polygonOffsetFactor: 2,
-      polygonOffsetUnits: 2,
-    });
-    const floorPlane = new THREE.Mesh(floorPlaneGeom, floorPlaneMat);
-    floorPlane.rotation.x = -Math.PI / 2;
-    floorPlane.position.set(0, destructionCache.floorY - 0.0001, 0);
-    floorPlane.receiveShadow = true;
-    benchGroup.add(floorPlane);
-    benchGroup.visible = true;
-
-    const entries: {
-      group: THREE.Group;
-      parentPartId: string;
-      outerMat: THREE.MeshStandardMaterial;
-      innerMat: THREE.MeshStandardMaterial;
-      baseOuterColor: THREE.Color;
-      baseInnerColor: THREE.Color;
-      baseRoughness: number;
-      baseMetalness: number;
-    }[] = [];
-
-    for (const shard of destructionCache.shards) {
+    const entries = shardEntriesRef.current;
+    for (let si = entries.length; si < destructionCache.shards.length; si++) {
+      const shard = destructionCache.shards[si];
       const sGroup = new THREE.Group();
       sGroup.visible = false;
 
@@ -1089,8 +1093,6 @@ export const CadViewport3D: React.FC<CadViewport3DProps> = ({
       });
     }
 
-    shardEntriesRef.current = entries;
-
     // P5-T15: Pre-create reusable Three.js meshes for any parts carrying active exterior FEM surface meshes
     const femPartIds = new Set<string>();
     for (const f of destructionCache.frames) {
@@ -1102,6 +1104,7 @@ export const CadViewport3D: React.FC<CadViewport3DProps> = ({
     }
     const femMap = femSurfaceEntriesRef.current;
     for (const pid of femPartIds) {
+      if (femMap.has(pid)) continue;
       const partObj = parts.find((p) => p.id === pid);
       const matSpec = partObj
         ? getMaterialById(partObj.materialId, materials)
@@ -1492,6 +1495,10 @@ export const CadViewport3D: React.FC<CadViewport3DProps> = ({
 
     for (let i = 0; i < entries.length; i++) {
       const entry = entries[i];
+      if (i >= frame.shardActive.length) {
+        entry.group.visible = false;
+        continue;
+      }
       const pState = frame.partStates[entry.parentPartId];
       // For Rust FEM f64, detached fragments fly off while the parent FEM body still has active elements (intact === true).
       const showShard =

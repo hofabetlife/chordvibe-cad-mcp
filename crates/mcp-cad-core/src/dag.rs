@@ -962,7 +962,7 @@ impl FeatureTree {
                         settings,
                     );
                     if mesh.is_empty() {
-                        return Err(CadError::GeometryError(
+                        return Err(CadError::EvaluationError(
                             "Helix generator produced an empty mesh".into(),
                         ));
                     }

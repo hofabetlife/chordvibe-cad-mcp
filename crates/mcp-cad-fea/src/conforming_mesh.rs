@@ -374,6 +374,46 @@ pub fn closest_point_on_segment_3d(
     ([q.x, q.y, q.z], (vp - q).norm(), [tang.x, tang.y, tang.z])
 }
 
+/// Reusable O(1)-reset stamp scratch buffer to eliminate per-query `HashSet` allocations.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct SpatialQueryScratch {
+    marks: Vec<u32>,
+    stamp: u32,
+}
+
+impl SpatialQueryScratch {
+    #[inline]
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            marks: vec![0; capacity],
+            stamp: 0,
+        }
+    }
+
+    #[inline]
+    fn next_stamp(&mut self, len: usize) -> u32 {
+        if self.marks.len() < len {
+            self.marks.resize(len, 0);
+        }
+        self.stamp = self.stamp.wrapping_add(1);
+        if self.stamp == 0 {
+            self.marks.fill(0);
+            self.stamp = 1;
+        }
+        self.stamp
+    }
+
+    #[inline]
+    fn mark(&mut self, idx: usize, stamp: u32) -> bool {
+        if self.marks[idx] == stamp {
+            false
+        } else {
+            self.marks[idx] = stamp;
+            true
+        }
+    }
+}
+
 /// Uniform 3D spatial hash index over CAD triangles for fast closest-point projection.
 #[derive(Debug, Clone)]
 pub struct SurfaceSpatialIndex<'a> {
@@ -387,7 +427,8 @@ pub struct SurfaceSpatialIndex<'a> {
 impl<'a> SurfaceSpatialIndex<'a> {
     /// Builds a 3D spatial grid covering all triangles of `surface`.
     pub fn build(surface: &'a TriangleMesh) -> Self {
-        Self::build_subset(surface, &(0..surface.indices.len()).collect::<Vec<_>>())
+        let all: Vec<usize> = (0..surface.indices.len()).collect();
+        Self::build_subset(surface, &all)
     }
 
     /// Builds a 3D spatial grid covering only the specified triangle indices of `surface`.
@@ -420,7 +461,7 @@ impl<'a> SurfaceSpatialIndex<'a> {
         let cell_size = (diag / (n_tri as f64).cbrt().max(1.0)).max(1e-4);
         let inv_cell = 1.0 / cell_size;
 
-        let mut grid: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
+        let mut grid: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::with_capacity(n_tri * 2);
         for &idx in tri_indices {
             let tri = &surface.indices[idx];
             let a = surface.vertices[tri[0] as usize].position;
@@ -481,10 +522,22 @@ impl<'a> SurfaceSpatialIndex<'a> {
     /// Projects point `p` onto the closest point of the indexed CAD surface, returning
     /// `(closest_point, distance, triangle_index, unit_normal)`.
     pub fn project_point(&self, p: [f64; 3]) -> ([f64; 3], f64, usize, [f64; 3]) {
-        if self.surface.indices.is_empty() {
+        let mut scratch = SpatialQueryScratch::new(self.surface.indices.len());
+        self.project_point_with_scratch(p, &mut scratch)
+    }
+
+    /// Zero-allocation closest-point projection using a caller-supplied [`SpatialQueryScratch`].
+    pub(crate) fn project_point_with_scratch(
+        &self,
+        p: [f64; 3],
+        scratch: &mut SpatialQueryScratch,
+    ) -> ([f64; 3], f64, usize, [f64; 3]) {
+        let n_tris = self.surface.indices.len();
+        if n_tris == 0 {
             return (p, 0.0, 0, [0.0, 0.0, 1.0]);
         }
 
+        let stamp = scratch.next_stamp(n_tris);
         let ci = ((p[0] - self.min_bound[0]) * self.inv_cell).floor() as i32;
         let cj = ((p[1] - self.min_bound[1]) * self.inv_cell).floor() as i32;
         let ck = ((p[2] - self.min_bound[2]) * self.inv_cell).floor() as i32;
@@ -493,7 +546,6 @@ impl<'a> SurfaceSpatialIndex<'a> {
         let mut best_dist = f64::INFINITY;
         let mut best_idx = 0usize;
         let mut best_normal = [0.0, 0.0, 1.0];
-        let mut visited = HashSet::new();
 
         for r in 0_i32..=5_i32 {
             for di in -r..=r {
@@ -504,7 +556,7 @@ impl<'a> SurfaceSpatialIndex<'a> {
                         }
                         if let Some(list) = self.grid.get(&(ci + di, cj + dj, ck + dk)) {
                             for &idx in list {
-                                if visited.insert(idx) {
+                                if scratch.mark(idx, stamp) {
                                     let tri = &self.surface.indices[idx];
                                     let a = self.surface.vertices[tri[0] as usize].position;
                                     let b = self.surface.vertices[tri[1] as usize].position;
@@ -530,7 +582,7 @@ impl<'a> SurfaceSpatialIndex<'a> {
         // Exact fallback if query point was far from indexed cells
         if !best_dist.is_finite() || best_dist >= 4.0 * self.cell_size {
             for (idx, tri) in self.surface.indices.iter().enumerate() {
-                if visited.insert(idx) {
+                if scratch.mark(idx, stamp) {
                     let a = self.surface.vertices[tri[0] as usize].position;
                     let b = self.surface.vertices[tri[1] as usize].position;
                     let c = self.surface.vertices[tri[2] as usize].position;
@@ -549,17 +601,22 @@ impl<'a> SurfaceSpatialIndex<'a> {
     }
 
     /// Computes distance from `p` to the indexed subset of triangles, bounded by `max_search_dist`.
-    fn distance_within(&self, p: [f64; 3], max_search_dist: f64) -> f64 {
+    pub(crate) fn distance_within_with_scratch(
+        &self,
+        p: [f64; 3],
+        max_search_dist: f64,
+        scratch: &mut SpatialQueryScratch,
+    ) -> f64 {
         if self.grid.is_empty() {
             return f64::INFINITY;
         }
+        let stamp = scratch.next_stamp(self.surface.indices.len());
         let r_max = ((max_search_dist * self.inv_cell).ceil() as i32 + 1).clamp(1, 5);
         let ci = ((p[0] - self.min_bound[0]) * self.inv_cell).floor() as i32;
         let cj = ((p[1] - self.min_bound[1]) * self.inv_cell).floor() as i32;
         let ck = ((p[2] - self.min_bound[2]) * self.inv_cell).floor() as i32;
 
         let mut best_dist = f64::INFINITY;
-        let mut visited = HashSet::new();
 
         for r in 0_i32..=r_max {
             for di in -r..=r {
@@ -570,7 +627,7 @@ impl<'a> SurfaceSpatialIndex<'a> {
                         }
                         if let Some(list) = self.grid.get(&(ci + di, cj + dj, ck + dk)) {
                             for &idx in list {
-                                if visited.insert(idx) {
+                                if scratch.mark(idx, stamp) {
                                     let tri = &self.surface.indices[idx];
                                     let a = self.surface.vertices[tri[0] as usize].position;
                                     let b = self.surface.vertices[tri[1] as usize].position;
@@ -775,23 +832,26 @@ impl SharpFeatureIndex {
         best_pt
     }
 
-    fn project_to_sharp_edge(
+    fn project_to_sharp_edge_with_scratch(
         &self,
         p: [f64; 3],
         max_dist: f64,
+        scratch: &mut SpatialQueryScratch,
     ) -> Option<([f64; 3], f64, [f64; 3])> {
-        self.project_to_sharp_edge_with_normals(p, max_dist)
+        self.project_to_sharp_edge_with_normals_scratch(p, max_dist, scratch)
             .map(|proj| (proj.point, proj.dist, proj.tangent))
     }
 
-    fn project_to_sharp_edge_with_normals(
+    fn project_to_sharp_edge_with_normals_scratch(
         &self,
         p: [f64; 3],
         max_dist: f64,
+        scratch: &mut SpatialQueryScratch,
     ) -> Option<SharpEdgeProjection> {
         if self.edges.is_empty() {
             return None;
         }
+        let stamp = scratch.next_stamp(self.edges.len());
         let r_max = ((max_dist * self.inv_cell).ceil() as i32 + 1).clamp(1, 4);
         let ci = ((p[0] - self.min_bound[0]) * self.inv_cell).floor() as i32;
         let cj = ((p[1] - self.min_bound[1]) * self.inv_cell).floor() as i32;
@@ -802,7 +862,6 @@ impl SharpFeatureIndex {
         let mut best_tang = [1.0, 0.0, 0.0];
         let mut best_normals = (Vector3::new(1.0, 0.0, 0.0), Vector3::new(0.0, 1.0, 0.0));
         let mut found = false;
-        let mut visited = HashSet::new();
 
         for r in 0_i32..=r_max {
             for di in -r..=r {
@@ -813,7 +872,7 @@ impl SharpFeatureIndex {
                         }
                         if let Some(list) = self.edge_grid.get(&(ci + di, cj + dj, ck + dk)) {
                             for &e_idx in list {
-                                if visited.insert(e_idx) {
+                                if scratch.mark(e_idx, stamp) {
                                     let (a, b) = self.edges[e_idx];
                                     let (q, d, t) = closest_point_on_segment_3d(p, a, b);
                                     if d <= best_dist {
@@ -857,7 +916,7 @@ struct SharpEdgeProjection {
 }
 
 /// Fast 2D `(Y, Z)` grid-accelerated ray-casting inside/outside tester for closed triangle meshes.
-struct FastRayCaster<'a> {
+pub(crate) struct FastRayCaster<'a> {
     mesh: &'a TriangleMesh,
     ray_dir: Vector3<f64>,
     min_y: f64,
@@ -870,7 +929,7 @@ struct FastRayCaster<'a> {
 }
 
 impl<'a> FastRayCaster<'a> {
-    fn build(mesh: &'a TriangleMesh) -> Self {
+    pub(crate) fn build(mesh: &'a TriangleMesh) -> Self {
         let aabb = mesh.bounding_box();
         let dims = aabb.dimensions();
         let n_tri = mesh.indices.len().max(1);
@@ -928,7 +987,7 @@ impl<'a> FastRayCaster<'a> {
         }
     }
 
-    fn is_inside(&self, point: [f64; 3]) -> bool {
+    pub(crate) fn is_inside(&self, point: [f64; 3]) -> bool {
         let iy = ((point[1] - self.min_y) * self.inv_dy).floor() as isize;
         let iz = ((point[2] - self.min_z) * self.inv_dz).floor() as isize;
         if iy < 0 || iy >= self.ny as isize || iz < 0 || iz >= self.nz as isize {
@@ -948,6 +1007,110 @@ impl<'a> FastRayCaster<'a> {
         }
         hits % 2 == 1
     }
+}
+
+/// Detects whether `mesh` is an additive thin helical wire/spring solid (as opposed to a
+/// helical groove/thread cut into a solid shaft) and returns its wire cross-section diameter `2 * r_wire`.
+pub(crate) fn detect_helical_wire_diameter(mesh: &TriangleMesh) -> Option<f64> {
+    if mesh.faces.is_empty() {
+        return None;
+    }
+    let mut has_additive_helix = false;
+    let mut helix_radius_max = 0.0_f64;
+    let mut cap_wire_radius: Option<f64> = None;
+
+    for f in &mesh.faces {
+        let role_lc = f.role.to_ascii_lowercase();
+        let name_lc = f.name.to_ascii_lowercase();
+        if role_lc.contains("groove")
+            || role_lc.contains("thread")
+            || role_lc.contains("notch")
+            || name_lc.contains("groove")
+            || name_lc.contains("thread")
+        {
+            return None;
+        }
+        if f.aliases.iter().any(|a| {
+            let al = a.to_ascii_lowercase();
+            al.contains("groove") || al.contains("thread") || al.contains("flute")
+        }) {
+            return None;
+        }
+        if f.kind == FaceKind::Helical {
+            has_additive_helix = true;
+            if let Some(hr) = f.radius {
+                if hr.is_finite() && hr > 0.0 {
+                    helix_radius_max = helix_radius_max.max(hr);
+                }
+            }
+        } else if f.kind == FaceKind::Plane
+            && (name_lc.contains("cap")
+                || role_lc.contains("cap")
+                || f.aliases.iter().any(|a| a.contains("cap")))
+        {
+            if let Some(r) = f.radius {
+                if r.is_finite() && r > 1e-9 {
+                    cap_wire_radius = Some(match cap_wire_radius {
+                        Some(prev) => prev.min(r),
+                        None => r,
+                    });
+                }
+            }
+        }
+    }
+
+    if !has_additive_helix {
+        return None;
+    }
+
+    if let Some(wr) = cap_wire_radius {
+        if helix_radius_max <= 0.0 || wr < helix_radius_max {
+            return Some(2.0 * wr);
+        }
+    }
+
+    // Fallback: estimate wire radius from cap face triangles if descriptor radius is absent
+    let cap_ids: Vec<u32> = mesh
+        .faces
+        .iter()
+        .filter(|f| f.kind == FaceKind::Plane)
+        .map(|f| f.id)
+        .collect();
+    if !cap_ids.is_empty() && mesh.face_ids.len() == mesh.indices.len() {
+        let cap_id = cap_ids[0];
+        let mut pts = Vec::new();
+        for (ti, &fid) in mesh.face_ids.iter().enumerate() {
+            if fid == cap_id {
+                let tri = &mesh.indices[ti];
+                for &vi in tri {
+                    pts.push(mesh.vertices[vi as usize].position);
+                }
+            }
+        }
+        if !pts.is_empty() {
+            let mut c = [0.0; 3];
+            for &p in &pts {
+                c[0] += p[0];
+                c[1] += p[1];
+                c[2] += p[2];
+            }
+            let inv = 1.0 / (pts.len() as f64);
+            c[0] *= inv;
+            c[1] *= inv;
+            c[2] *= inv;
+            let mut max_r = 0.0_f64;
+            for &p in &pts {
+                let r = ((p[0] - c[0]).powi(2) + (p[1] - c[1]).powi(2) + (p[2] - c[2]).powi(2))
+                    .sqrt();
+                max_r = max_r.max(r);
+            }
+            if max_r > 1e-7 {
+                return Some(2.0 * max_r);
+            }
+        }
+    }
+
+    None
 }
 
 #[inline]
@@ -1139,9 +1302,10 @@ pub fn evaluate_mesh_metrics(
     let mut feat_count = 0usize;
 
     let spatial = SurfaceSpatialIndex::build(cad_mesh);
+    let mut query_scratch = SpatialQueryScratch::new(cad_mesh.indices.len());
     for &nid in &boundary_nodes {
         let p = tet_mesh.nodes[nid].position;
-        let (_, d_cad, _, _) = spatial.project_point(p);
+        let (_, d_cad, _, _) = spatial.project_point_with_scratch(p, &mut query_scratch);
         if d_cad > max_dev_m {
             max_dev_m = d_cad;
         }
@@ -1204,6 +1368,7 @@ fn detect_refinement_seed_triangles(
 ) -> (Vec<usize>, Vec<usize>) {
     let mut high_priority = HashSet::new();
     let mut general_curved = HashSet::new();
+    let is_helical_wire = detect_helical_wire_diameter(mesh).is_some();
 
     // 1. Named / typed CAD face metadata
     if mesh.face_ids.len() == mesh.indices.len() && !mesh.faces.is_empty() {
@@ -1211,6 +1376,16 @@ fn detect_refinement_seed_triangles(
         for f in &mesh.faces {
             let role_lc = f.role.to_ascii_lowercase();
             let name_lc = f.name.to_ascii_lowercase();
+            let is_helical_groove = f.kind == FaceKind::Helical
+                && (role_lc.contains("groove")
+                    || role_lc.contains("thread")
+                    || role_lc.contains("notch")
+                    || name_lc.contains("groove")
+                    || name_lc.contains("thread")
+                    || f.aliases.iter().any(|a| {
+                        let al = a.to_ascii_lowercase();
+                        al.contains("groove") || al.contains("thread") || al.contains("flute")
+                    }));
             let is_concentrator = role_lc.contains("hole")
                 || role_lc.contains("fillet")
                 || role_lc.contains("groove")
@@ -1224,7 +1399,7 @@ fn detect_refinement_seed_triangles(
                 || name_lc.contains("groove")
                 || name_lc.contains("root")
                 || f.kind == FaceKind::Torus
-                || f.kind == FaceKind::Helical;
+                || is_helical_groove;
             face_map.insert(f.id, (f.kind, is_concentrator));
         }
 
@@ -1310,8 +1485,10 @@ fn detect_refinement_seed_triangles(
             if dot < cos_concave {
                 let c_diff = tri_centroids[t1] - tri_centroids[t0];
                 if c_diff.dot(&n0) > 1e-9 * diag {
-                    high_priority.insert(t0);
-                    high_priority.insert(t1);
+                    if !is_helical_wire {
+                        high_priority.insert(t0);
+                        high_priority.insert(t1);
+                    }
                     general_curved.insert(t0);
                     general_curved.insert(t1);
                 }
@@ -1389,10 +1566,13 @@ pub(crate) fn build_octree_conforming_tet4(
         ));
     }
 
-    let max_depth = if refinement.enabled {
-        refinement.max_depth.min(3)
-    } else {
+    let helical_wire_diam = detect_helical_wire_diameter(surface);
+    let max_depth = if !refinement.enabled {
         0
+    } else if helical_wire_diam.is_some() {
+        refinement.max_depth.min(1)
+    } else {
+        refinement.max_depth.min(3)
     };
 
     // Detect curved & stress-concentrator features
@@ -1424,13 +1604,28 @@ pub(crate) fn build_octree_conforming_tet4(
             (vol_aabb / (h0 * h0 * h0)).clamp(32.0, 1200.0)
         }
     };
-    let h0 = match density {
-        MeshDensity::Custom { max_element_size } if max_element_size > 0.0 => {
-            (max_element_size * (1usize << max_depth.min(2)) as f64).max(1e-5)
+    let h0 = if let Some(d_wire) = helical_wire_diam {
+        let leaf_factor = match density {
+            MeshDensity::Coarse => 0.72,
+            MeshDensity::Medium => 0.50,
+            MeshDensity::Fine => 0.36,
+            MeshDensity::Custom { max_element_size } if max_element_size > 0.0 => {
+                (max_element_size / d_wire).clamp(0.25, 0.70)
+            }
+            MeshDensity::Custom { .. } => 0.50,
+        };
+        let scale_lvl = (1usize << max_depth.min(1)) as f64;
+        (d_wire * leaf_factor * scale_lvl).max(1e-5)
+    } else {
+        match density {
+            MeshDensity::Custom { max_element_size } if max_element_size > 0.0 => {
+                (max_element_size * (1usize << max_depth.min(2)) as f64).max(1e-5)
+            }
+            _ => (vol_aabb / target_root_cells).cbrt().max(1e-5),
         }
-        _ => (vol_aabb / target_root_cells).cbrt().max(1e-5),
     };
 
+    let max_root_axis = if helical_wire_diam.is_some() { 42 } else { 30 };
     let min_count = dims
         .iter()
         .filter(|&&d| (d - min_dim).abs() <= 0.15 * min_dim)
@@ -1443,7 +1638,7 @@ pub(crate) fn build_octree_conforming_tet4(
             // Thin plate thickness: 1 root cell -> 2 cells at level 1, 4 cells at level 2 right at hole!
             raw.clamp(1, 3)
         } else {
-            raw.clamp(4, 30)
+            raw.clamp(4, max_root_axis)
         }
     };
 
@@ -1497,16 +1692,56 @@ pub(crate) fn build_octree_conforming_tet4(
         ([cx, cy, cz], diag)
     };
 
-    // Helper: check if cell overlaps the CAD solid (center or any of its 8 corners inside, OR near surface)
+    let cell_active_inside = |cell: OctreeCellKey| -> bool {
+        let inv_scale = 1.0 / ((1usize << cell.level) as f64);
+        let dx = dx0 * inv_scale;
+        let dy = dy0 * inv_scale;
+        let dz = dz0 * inv_scale;
+        let cx = aabb.min[0] + (cell.ix as f64 + 0.5) * dx;
+        let cy = aabb.min[1] + (cell.iy as f64 + 0.5) * dy;
+        let cz = aabb.min[2] + (cell.iz as f64 + 0.5) * dz;
+        if ray_caster.is_inside([cx, cy, cz]) {
+            return true;
+        }
+        if helical_wire_diam.is_some() {
+            let mut inside_faces = 0usize;
+            for p in [
+                [cx - 0.44 * dx, cy, cz],
+                [cx + 0.44 * dx, cy, cz],
+                [cx, cy - 0.44 * dy, cz],
+                [cx, cy + 0.44 * dy, cz],
+                [cx, cy, cz - 0.44 * dz],
+                [cx, cy, cz + 0.44 * dz],
+            ] {
+                if ray_caster.is_inside(p) {
+                    inside_faces += 1;
+                    if inside_faces >= 2 {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    };
+
+    // Helper: check if cell overlaps the CAD solid (center inside, OR near surface)
     let full_surface_index = SurfaceSpatialIndex::build(surface);
-    let cell_overlaps_solid = |cell: OctreeCellKey| -> bool {
+    let mut surf_scratch = SpatialQueryScratch::new(surface.indices.len());
+    let mut cell_overlaps_solid = |cell: OctreeCellKey| -> bool {
         let (c, diag) = cell_center_and_diag(cell);
         if ray_caster.is_inside(c) {
             return true;
         }
-        let d_surf = full_surface_index.distance_within(c, 0.55 * diag);
+        let d_surf = full_surface_index.distance_within_with_scratch(
+            c,
+            0.55 * diag,
+            &mut surf_scratch,
+        );
         d_surf <= 0.55 * diag
     };
+
+    let mut hp_scratch = SpatialQueryScratch::new(surface.indices.len());
+    let mut gc_scratch = SpatialQueryScratch::new(surface.indices.len());
 
     // Level-by-level adaptive subdivision around high-curvature & concentration zones
     for level in 0..max_depth {
@@ -1544,7 +1779,7 @@ pub(crate) fn build_octree_conforming_tet4(
                     (0.65 * refinement.refine_band_factor).max(0.75)
                 };
                 let band = band_factor * diag;
-                let d = idx.distance_within(center, band);
+                let d = idx.distance_within_with_scratch(center, band, &mut hp_scratch);
                 if d <= band {
                     best_priority = best_priority.min(d / band.max(1e-9));
                 }
@@ -1554,7 +1789,7 @@ pub(crate) fn build_octree_conforming_tet4(
             if level == 0 {
                 if let Some(ref idx) = gc_index {
                     let band = refinement.refine_band_factor * diag;
-                    let d = idx.distance_within(center, band);
+                    let d = idx.distance_within_with_scratch(center, band, &mut gc_scratch);
                     if d <= band {
                         best_priority = best_priority.min(0.5 + d / band.max(1e-9));
                     }
@@ -1595,13 +1830,10 @@ pub(crate) fn build_octree_conforming_tet4(
     // Enforce strong 2:1 balance across all 26 face/edge/vertex neighbors
     enforce_strong_2_to_1_balance(&mut leaves, nx0, ny0, nz0, max_depth);
 
-    // Filter leaves to active cells whose centers lie inside the closed CAD solid
+    // Filter leaves to active cells lying inside the closed CAD solid
     let mut active_leaves: Vec<OctreeCellKey> = leaves
         .into_iter()
-        .filter(|&cell| {
-            let (center, _) = cell_center_and_diag(cell);
-            ray_caster.is_inside(center)
-        })
+        .filter(|&cell| cell_active_inside(cell))
         .collect();
 
     if active_leaves.is_empty() {
@@ -2164,6 +2396,11 @@ pub fn snap_mesh_to_surface(
         None
     };
 
+    let n_cad_tris = cad_surface.indices.len();
+    let n_sharp_edges = sharp_index.as_ref().map_or(0, |s| s.edges.len());
+    let mut tri_scratch = SpatialQueryScratch::new(n_cad_tris);
+    let mut edge_scratch = SpatialQueryScratch::new(n_sharp_edges);
+
     // 3. Classify boundary nodes (sharp corner / sharp crease / smooth surface)
     let mut node_class = vec![BoundaryNodeClass::Interior; num_nodes];
     let mut corner_targets: HashMap<usize, [f64; 3]> = HashMap::new();
@@ -2192,7 +2429,9 @@ pub fn snap_mesh_to_surface(
             // Check sharp crease: incident mesh boundary normals must align with BOTH CAD face normals
             // meeting at the sharp CAD edge (prevents interior cylinder/hole staircase corners from
             // being misclassified as cap-rim creases).
-            if let Some(edge_proj) = sidx.project_to_sharp_edge_with_normals(p, 0.75 * h_local) {
+            if let Some(edge_proj) =
+                sidx.project_to_sharp_edge_with_normals_scratch(p, 0.75 * h_local, &mut edge_scratch)
+            {
                 let n_a = edge_proj.normal_a;
                 let n_b = edge_proj.normal_b;
                 let matches_both_cad_faces = node_surf_normals.get(&nid).is_some_and(|normals| {
@@ -2215,7 +2454,11 @@ pub fn snap_mesh_to_surface(
         node_class[nid] = BoundaryNodeClass::SmoothSurface;
     }
 
-    let target_for_node = |nid: usize, cur_pos: [f64; 3]| -> ([f64; 3], [f64; 3]) {
+    let target_for_node = |nid: usize,
+                           cur_pos: [f64; 3],
+                           ts: &mut SpatialQueryScratch,
+                           es: &mut SpatialQueryScratch|
+     -> ([f64; 3], [f64; 3]) {
         match node_class[nid] {
             BoundaryNodeClass::SharpCorner => {
                 let c = corner_targets.get(&nid).copied().unwrap_or(cur_pos);
@@ -2228,22 +2471,24 @@ pub fn snap_mesh_to_surface(
                     1e-3
                 };
                 if let Some(ref sidx) = sharp_index {
-                    if let Some((pt, _, tang)) = sidx.project_to_sharp_edge(cur_pos, 1.50 * h_local) {
+                    if let Some((pt, _, tang)) =
+                        sidx.project_to_sharp_edge_with_scratch(cur_pos, 1.50 * h_local, es)
+                    {
                         return (pt, tang);
                     }
                 }
-                let (pt, _, _, n) = spatial.project_point(cur_pos);
+                let (pt, _, _, n) = spatial.project_point_with_scratch(cur_pos, ts);
                 (pt, n)
             }
             _ => {
-                let (pt, _, _, n) = spatial.project_point(cur_pos);
+                let (pt, _, _, n) = spatial.project_point_with_scratch(cur_pos, ts);
                 (pt, n)
             }
         }
     };
 
     let min_sj_barrier = opts.min_allowed_scaled_jacobian.max(1e-3);
-    let total_passes = opts.outer_passes.max(5);
+    let total_passes = opts.outer_passes.max(1);
 
     // 4. Alternating boundary projection + tangential relaxation + interior Laplacian smoothing
     for pass in 0..total_passes {
@@ -2254,7 +2499,8 @@ pub fn snap_mesh_to_surface(
         // and never worsens any element that started below the barrier.
         for &nid in &boundary_indices {
             let cur_pos = mesh.nodes[nid].position;
-            let (target_pos, _) = target_for_node(nid, cur_pos);
+            let (target_pos, _) =
+                target_for_node(nid, cur_pos, &mut tri_scratch, &mut edge_scratch);
             let step_target = [
                 cur_pos[0] + frac * (target_pos[0] - cur_pos[0]),
                 cur_pos[1] + frac * (target_pos[1] - cur_pos[1]),
@@ -2320,15 +2566,22 @@ pub fn snap_mesh_to_surface(
                         avg += mesh.nodes[nb].pos_vec();
                     }
                     avg /= crease_nbs.len() as f64;
-                    let (_, tang) = target_for_node(nid, cur_pos);
+                    let (_, tang) =
+                        target_for_node(nid, cur_pos, &mut tri_scratch, &mut edge_scratch);
                     let t_vec = Vector3::from(tang);
                     let delta = avg - cur_v;
                     let tang_delta = t_vec * delta.dot(&t_vec);
                     let cand_raw = cur_v + tang_delta * 0.30;
-                    let (proj, _) = target_for_node(nid, [cand_raw.x, cand_raw.y, cand_raw.z]);
+                    let (proj, _) = target_for_node(
+                        nid,
+                        [cand_raw.x, cand_raw.y, cand_raw.z],
+                        &mut tri_scratch,
+                        &mut edge_scratch,
+                    );
                     proj
                 } else {
-                    let (_, _, _, best_n) = spatial.project_point(cur_pos);
+                    let (_, _, _, best_n) =
+                        spatial.project_point_with_scratch(cur_pos, &mut tri_scratch);
                     let n1 = Vector3::from(best_n);
                     let mut avg = Vector3::zeros();
                     for &nb in neighbors {
@@ -2338,8 +2591,10 @@ pub fn snap_mesh_to_surface(
                     let delta = avg - cur_v;
                     let tang_delta = delta - n1 * delta.dot(&n1);
                     let cand_raw = cur_v + tang_delta * 0.35;
-                    let (proj, _, _, _) =
-                        spatial.project_point([cand_raw.x, cand_raw.y, cand_raw.z]);
+                    let (proj, _, _, _) = spatial.project_point_with_scratch(
+                        [cand_raw.x, cand_raw.y, cand_raw.z],
+                        &mut tri_scratch,
+                    );
                     proj
                 };
 
@@ -2397,7 +2652,8 @@ pub fn snap_mesh_to_surface(
     for polish_cycle in 0..3 {
         for &nid in &boundary_indices {
             let cur_pos = mesh.nodes[nid].position;
-            let (target_pos, _) = target_for_node(nid, cur_pos);
+            let (target_pos, _) =
+                target_for_node(nid, cur_pos, &mut tri_scratch, &mut edge_scratch);
             let dist = (Vector3::from(target_pos) - Vector3::from(cur_pos)).norm();
             if dist > 1e-9 {
                 let cur_sj = min_incident_sj(&mesh.nodes, &mesh.elements, nid, cur_pos);
@@ -2554,14 +2810,21 @@ pub fn snap_mesh_to_surface(
                         avg += mesh.nodes[nb].pos_vec();
                     }
                     avg /= crease_nbs.len() as f64;
-                    let (_, tang) = target_for_node(nid, cur_pos);
+                    let (_, tang) =
+                        target_for_node(nid, cur_pos, &mut tri_scratch, &mut edge_scratch);
                     let t_vec = Vector3::from(tang);
                     let delta = avg - cur_v;
                     let cand_raw = cur_v + t_vec * (delta.dot(&t_vec) * omega);
-                    let (proj, _) = target_for_node(nid, [cand_raw.x, cand_raw.y, cand_raw.z]);
+                    let (proj, _) = target_for_node(
+                        nid,
+                        [cand_raw.x, cand_raw.y, cand_raw.z],
+                        &mut tri_scratch,
+                        &mut edge_scratch,
+                    );
                     proj
                 } else {
-                    let (_, _, _, best_n) = spatial.project_point(cur_pos);
+                    let (_, _, _, best_n) =
+                        spatial.project_point_with_scratch(cur_pos, &mut tri_scratch);
                     let n1 = Vector3::from(best_n);
                     let mut avg = Vector3::zeros();
                     for &nb in neighbors {
@@ -2571,8 +2834,10 @@ pub fn snap_mesh_to_surface(
                     let delta = avg - cur_v;
                     let tang_delta = delta - n1 * delta.dot(&n1);
                     let cand_raw = cur_v + tang_delta * omega;
-                    let (proj, _, _, _) =
-                        spatial.project_point([cand_raw.x, cand_raw.y, cand_raw.z]);
+                    let (proj, _, _, _) = spatial.project_point_with_scratch(
+                        [cand_raw.x, cand_raw.y, cand_raw.z],
+                        &mut tri_scratch,
+                    );
                     proj
                 };
                 let cand_sj = min_incident_sj(&mesh.nodes, &mesh.elements, nid, cand_proj);
@@ -2646,6 +2911,11 @@ pub fn to_tet10_boundary_snapped(
         None
     };
 
+    let mut tri_scratch = SpatialQueryScratch::new(cad_surface.indices.len());
+    let mut edge_scratch =
+        SpatialQueryScratch::new(sharp_index.as_ref().map_or(0, |s| s.edges.len()));
+    let mut cached_corner_normals: Vec<Option<[f64; 3]>> = vec![None; num_corners];
+
     let min_ratio = opts.min_tet10_gauss_jacobian_ratio.clamp(0.05, 0.85);
     let mut sorted_mids: Vec<usize> = exterior_mids.into_iter().collect();
     sorted_mids.sort_unstable();
@@ -2668,15 +2938,17 @@ pub fn to_tet10_boundary_snapped(
         if let Some(ref sidx) = sharp_index {
             let tol_end = 0.08 * edge_len;
             if let (Some((_, du, tu)), Some((_, dv, tv))) = (
-                sidx.project_to_sharp_edge(pu, tol_end),
-                sidx.project_to_sharp_edge(pv, tol_end),
+                sidx.project_to_sharp_edge_with_scratch(pu, tol_end, &mut edge_scratch),
+                sidx.project_to_sharp_edge_with_scratch(pv, tol_end, &mut edge_scratch),
             ) {
                 if du <= tol_end && dv <= tol_end {
                     let cos_t = Vector3::from(tu).dot(&Vector3::from(tv)).abs();
                     if cos_t > 0.70 {
-                        if let Some((proj, dist, _)) =
-                            sidx.project_to_sharp_edge(cur_pos, 0.20 * edge_len)
-                        {
+                        if let Some((proj, dist, _)) = sidx.project_to_sharp_edge_with_scratch(
+                            cur_pos,
+                            0.20 * edge_len,
+                            &mut edge_scratch,
+                        ) {
                             if dist > 1e-9 && dist <= 0.18 * edge_len {
                                 target_proj = Some(proj);
                             }
@@ -2688,11 +2960,20 @@ pub fn to_tet10_boundary_snapped(
 
         // Case 2: Both endpoints lie on a smooth curved CAD face
         if target_proj.is_none() {
-            let (_, _, _, nu) = spatial.project_point(pu);
-            let (_, _, _, nv) = spatial.project_point(pv);
+            let nu = *cached_corner_normals[u].get_or_insert_with(|| {
+                spatial
+                    .project_point_with_scratch(pu, &mut tri_scratch)
+                    .3
+            });
+            let nv = *cached_corner_normals[v].get_or_insert_with(|| {
+                spatial
+                    .project_point_with_scratch(pv, &mut tri_scratch)
+                    .3
+            });
             let cos_n = Vector3::from(nu).dot(&Vector3::from(nv));
             if cos_n > 0.72 {
-                let (proj, dist, _, _) = spatial.project_point(cur_pos);
+                let (proj, dist, _, _) =
+                    spatial.project_point_with_scratch(cur_pos, &mut tri_scratch);
                 if dist > 1e-9 && dist <= 0.18 * edge_len {
                     target_proj = Some(proj);
                 }
@@ -2757,8 +3038,27 @@ pub(crate) fn generate_conforming_mesh(
     };
 
     // 2. Boundary-conforming snapping (`fe_snap`) with Jacobian quality barrier
-    let tet4 = if options.snap_to_boundary {
-        snap_mesh_to_surface(&base_tet4, surface, options.snap)
+    // Thin helical wires automatically receive light boundary snapping even in Fast mode
+    // so curved coils keep smooth cross-sections and accurate axial compliance.
+    let auto_snap_helix =
+        !options.snap_to_boundary && detect_helical_wire_diameter(surface).is_some();
+    let (do_snap, snap_opts) = if auto_snap_helix {
+        (
+            true,
+            SnapOptions {
+                outer_passes: 3,
+                smoothing_sweeps: 2,
+                surface_tangential_sweeps: 1,
+                preserve_sharp_features: true,
+                ..options.snap
+            },
+        )
+    } else {
+        (options.snap_to_boundary, options.snap)
+    };
+
+    let tet4 = if do_snap {
+        snap_mesh_to_surface(&base_tet4, surface, snap_opts)
     } else {
         base_tet4
     };
@@ -2767,8 +3067,8 @@ pub(crate) fn generate_conforming_mesh(
     match options.element_order {
         ElementOrder::Linear => Ok(tet4),
         ElementOrder::Quadratic => {
-            if options.snap_to_boundary {
-                Ok(to_tet10_boundary_snapped(&tet4, surface, options.snap))
+            if do_snap {
+                Ok(to_tet10_boundary_snapped(&tet4, surface, snap_opts))
             } else {
                 Ok(tet4.to_tet10())
             }

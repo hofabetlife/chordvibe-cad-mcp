@@ -54,7 +54,7 @@ mcp-cad/
 │   ├── BENCH_BASELINE_RUST.md    # Базовая линия 15 задач бенчмарка против нативного Rust-сервера
 │   ├── adr/0001-geometry-kernel.md # ADR выбора геометрического ядра (manifold-rust + monstertruck)
 │   ├── adr/0002-fe-mesher.md        # ADR выбора генератора сетки МКЭ (fe_snap + TET10, P3-T5)
-│   └── agent_tasks/              # Детальные отчёты о выполнении задач P0-T1..T12, P1-T1..T4, P2-T1..T40, P3-T1..T24, P4-T0..T10, P5-T1..T20
+│   └── agent_tasks/              # Детальные отчёты о выполнении задач P0-T1..T12, P1-T1..T4, P2-T1..T40, P3-T1..T24, P4-T0..T10, P5-T1..T20, P5-T27..T35
 ├── spikes/
 │   ├── manifold_rust/            # Прототип ядра manifold-rust v0.19.2 (Pure Rust CSG + face_id)
 │   ├── monstertruck_brep/        # Прототип B-Rep ядра monstertruck v0.4.1 (fillet + ISO 10303-21 STEP)
@@ -299,7 +299,28 @@ graph TD
    - Любая ошибка параметров возвращается как `Result<T, CadError / ServerError>` и преобразуется в структурированный JSON `ErrorEnvelope`.
 2. **Чистота потока `stdout` в режиме `stdio`**:
    - В режиме `--mode stdio` поток `stdout` используется **исключительно** для сообщений JSON-RPC 2.0. Любой вывод логов (`tracing`, `eprintln!`) направляется строго в `std::io::stderr`.
-3. **Статус автоматического тестирования (актуализировано в `P5-T28` от 22.11.2026)**:
+3. **Статус автоматического тестирования (актуализировано в `P5-T35` от 24.11.2026)**:
+   - **Проверено в `P5-T35` (устранение эвристики `> 1.0 ? 1e-3 : 1.0` для призматических `joint.limits` в `src/cad/kinematics.ts:88-97` и `src/cad/press_simulation.ts:441-450` и unit-тест `P5-T35` на ход `> 1.0 м` в `src/cad/cad_engine.test.ts`):**
+     - `npx --yes tsx --test --test-name-pattern="P5-T35" src/cad/cad_engine.test.ts`: **1/1 PASS** (`0 failed`); полный прогон всех 11 TS-сьютов: **115/115 PASS** (`0 failed`: `85/85` в 5 базовых + `30/30` в 6 расширенных сьютах);
+     - `npm run lint` (`tsc --noEmit`) & `npm run build` (`vite build`): **PASS** (`0` ошибок).
+   - **Проверено в `P5-T34` (актуализация раздела `### 11. create_joint` в [`docs/MCP_API_REFERENCE.md`](docs/MCP_API_REFERENCE.md) и контрактный тест `P5-T34` в `src/cad/cad_engine.test.ts`):**
+     - `npx --yes tsx --test --test-name-pattern="P5-T34" src/cad/cad_engine.test.ts`: **1/1 PASS** (`0 failed`); полный прогон всех 11 TS-сьютов: **114/114 PASS** (`0 failed`); `npm run lint` & `npm run build`: **PASS**.
+   - **Проверено в `P5-T33` (учёт фактической плотности материала через `getMaterialById` и неразрушающая гидратация MCP `import_stl` в `src/cad/native_bridge.ts` и `src/App.tsx`, плюс unit-тест `P5-T33` в `src/cad/cad_engine.test.ts`):**
+     - `npx --yes tsx --test --test-name-pattern="P5-T33" src/cad/cad_engine.test.ts`: **1/1 PASS** (`0 failed`); полный прогон всех 11 TS-сьютов: **113/113 PASS** (`0 failed`); `npm run lint`, `npm run build` & живая браузерная верификация (`Playwright Chromium 1440×900`): **PASS** (`0` ошибок консоли).
+   - **Проверено в `P5-T32` (добавление якорных ссылок `42. bake_coupled_simulation` и `43. query_simulation_frame` в оглавление [`docs/MCP_API_REFERENCE.md`](docs/MCP_API_REFERENCE.md) и автоматический контрактный тест всех 43 инструментов оглавления с `crates/mcp-cad-server/src/tools/mod.rs` в `src/cad/cad_engine.test.ts`):**
+     - `npx --yes tsx --test --test-name-pattern="P5-T32" src/cad/cad_engine.test.ts`: **1/1 PASS** (`0 failed`); полный прогон всех 11 TS-сьютов: **112/112 PASS** (`0 failed`: `82/82` в 5 базовых + `30/30` в 6 расширенных сьютах);
+     - `npm run lint` (`tsc --noEmit`) & `npm run build` (`vite build`): **PASS** (`0` ошибок).
+   - **Проверено в `P5-T31` (строгая валидация неизвестного `failure_mode`, поддержка канонических Rust-ключей `young_modulus_gpa`/`young_modulus_pa`/`poisson_ratio` в `normalizeMaterialSpec` в `src/cad/materials.ts:384-466`, отказ от truthiness-проверки `0` в TS `define_material` в `src/cad/mcp_dispatcher.ts:1303-1330` и unit-тест `P5-T31` в `src/cad/cad_engine.test.ts`):**
+     - `npx --yes tsx --test --test-name-pattern="P5-T31" src/cad/cad_engine.test.ts`: **1/1 PASS** (`0 failed`); полный прогон всех 11 TS-сьютов: **111/111 PASS** (`0 failed`: `81/81` в 5 базовых + `30/30` в 6 расширенных сьютах);
+     - `npm run lint` (`tsc --noEmit`) & `npm run build` (`vite build`): **PASS** (`0` ошибок).
+   - **Проверено в `P5-T30` (согласование единиц `limits` призматического шарнира в тесте `P2-T15` с Rust-контрактом по умолчанию `'mm'`, валидация и возврат `length_unit` в `create_joint` в `src/cad/mcp_dispatcher.ts:1430-1501` и unit-тест `P5-T30` в `src/cad/cad_engine.test.ts`):**
+     - `npx --yes tsx --test src/cad/cad_engine.test.ts src/cad/__tests__/analyze_mechanism.test.ts src/cad/__tests__/destruction_engine.test.ts src/cad/__tests__/ortho_views.test.ts src/cad/__tests__/field_colormaps.test.ts`: **80/80 PASS** (`0 failed`, 100% зелёный прогон; плюс **30/30 PASS** в остальных 6 TS-сьютах, итого **110/110 PASS**);
+     - `npm run lint` (`tsc --noEmit`) & `npm run build` (`vite build`): **PASS** (`0` ошибок).
+   - **Проверено в `P5-T29` (учёт `params.material` при расчёте плотности `density = getDensity(matId)` в `import_stl` в `src/cad/mcp_dispatcher.ts:1990-1997`):**
+     - `npx --yes tsx --test --test-name-pattern="P5-T29" src/cad/cad_engine.test.ts`: **1/1 PASS** (`0 failed`); `npm run lint` & `npm run build`: **PASS**.
+   - **Проверено в `P5-T27` (документирование всех 7 параметров Фазы 5 инструмента `define_material` в [`docs/MCP_API_REFERENCE.md`](docs/MCP_API_REFERENCE.md) и контрактный тест синхронизации с `crates/mcp-cad-server/src/tools/{mod.rs, cad.rs}` в `src/cad/cad_engine.test.ts`):**
+     - `npx --yes tsx --test --test-name-pattern="P5-T27" src/cad/cad_engine.test.ts`: **1/1 PASS** (`0 failed`); полный прогон TS-тестов: **77/78 PASS** (`1` предсуществующее падение в `P2-T15`, исправлено в `P5-T30`);
+     - `npm run lint` (`tsc --noEmit`) & `npm run build` (`vite build`): **PASS** (`0` ошибок).
    - **Проверено в `P5-T28` (разрешение алиасов материалов и канонических Rust-ID через `getMaterialById` в `src/components/CadViewport3D.tsx:1106` и `src/cad/mcp_dispatcher.ts:1784, 1900`):**
      - `npx --yes tsx --test src/cad/cad_engine.test.ts src/cad/__tests__/analyze_mechanism.test.ts src/cad/__tests__/destruction_engine.test.ts src/cad/__tests__/ortho_views.test.ts src/cad/__tests__/field_colormaps.test.ts`: **76/76 PASS** (`0 failed`);
      - `npm run lint`, `npm run build` & живая браузерная верификация (`Playwright Chromium 1440×900`): **PASS** (`0` ошибок консоли).

@@ -81,19 +81,28 @@ import {
   getPresetDestructionConfig,
 } from './cad/destruction_engine';
 import {
+  liveProgressToSolveStatus,
+  type LiveCoupledProgressPayload,
+  type LiveFemSolveStatus,
+} from './cad/coupled_sim_stream';
+import {
   AI_UNOPTIMIZED_SCENARIOS,
   AiUnoptimizedScenario,
 } from './cad/query_optimizer';
 import {
   bakeNativeCoupledSimulation,
+  buildStandaloneNativeStlPart,
   cancelNativeCoupledSimulation,
   DEFAULT_BRIDGE_STATUS,
   executeRemoteWindowsMcpTool,
   getWindowsWgpuArtifactUrl,
   GOLDEN_WINDOWS_MAPPINGS,
+  hydrateImportedStlPartInScene,
   loadCachedRustStlMesh,
   NativeBridgeStatus,
+  type NativeStlLoadOptions,
   probeWindowsMcpServer,
+  resolveNativeStlMaterialSpec,
   RustBakeCancelledError,
 } from './cad/native_bridge';
 import type { RustAccuracyLevel } from './cad/rust_scene_sync';
@@ -254,6 +263,9 @@ export function App() {
   const [isProbingRust, setIsProbingRust] = useState<boolean>(false);
   const [nativeBakeError, setNativeBakeError] = useState<string | null>(null);
   const [canCancelBake, setCanCancelBake] = useState<boolean>(false);
+  const [liveFemStatus, setLiveFemStatus] =
+    useState<LiveFemSolveStatus | null>(null);
+  const [followLiveFrame, setFollowLiveFrame] = useState<boolean>(true);
   const activeRustJobIdRef = useRef<string | null>(null);
   const activeRustAbortRef = useRef<AbortController | null>(null);
 
@@ -357,9 +369,14 @@ export function App() {
       keepRenderMode?: RenderMode,
       preferRustStl: boolean = useCompiledRustStl
     ) => {
+      if (activeRustAbortRef.current && !activeRustAbortRef.current.signal.aborted) {
+        activeRustAbortRef.current.abort();
+      }
       setActivePreset(presetId);
       setIsSimulatingPhysics(false);
       setFeaResult(null);
+      setLiveFemStatus(null);
+      setFollowLiveFrame(true);
       setDestructionCache(null);
       setDestructionFrame(0);
       setIsPlayingDestruction(false);
@@ -1391,11 +1408,24 @@ export function App() {
       // Direct binary STL load from /output/*.stl when selected or when Rust STL kernel mode is active
       const nativeEntry = NATIVE_STL_PRESET_MAP[presetId];
       if (nativeEntry) {
-        handleLoadNativeStlUrl(nativeEntry.url, nativeEntry.title);
+        void handleLoadNativeStlUrl(nativeEntry.url, nativeEntry.title, {
+          materialId: nativeEntry.materialId,
+          materials,
+        });
       } else if (preferRustStl && GOLDEN_WINDOWS_MAPPINGS[presetId]?.stlUrl) {
         const mapping = GOLDEN_WINDOWS_MAPPINGS[presetId];
         if (mapping.stlUrl) {
-          handleLoadNativeStlUrl(mapping.stlUrl, mapping.titleRu || mapping.title);
+          const matchedEntry = Object.values(NATIVE_STL_PRESET_MAP).find(
+            (entry) => entry.url === mapping.stlUrl
+          );
+          void handleLoadNativeStlUrl(
+            mapping.stlUrl,
+            mapping.titleRu || mapping.title,
+            {
+              materialId: matchedEntry?.materialId,
+              materials,
+            }
+          );
         }
       }
     },
@@ -1408,6 +1438,9 @@ export function App() {
   const selectedPartIdRef = useRef<string>(selectedPartId);
   const materialsRef = useRef<MaterialSpec[]>(materials);
   const qualityRef = useRef<QualityPreset>(quality);
+  const followLiveFrameRef = useRef<boolean>(followLiveFrame);
+  const liveFemStatusRef = useRef<LiveFemSolveStatus | null>(liveFemStatus);
+  const destructionCacheRef = useRef<DestructionCache | null>(destructionCache);
 
   useEffect(() => {
     liveSyncEnabledRef.current = liveSyncEnabled;
@@ -1427,6 +1460,15 @@ export function App() {
   useEffect(() => {
     qualityRef.current = quality;
   }, [quality]);
+  useEffect(() => {
+    followLiveFrameRef.current = followLiveFrame;
+  }, [followLiveFrame]);
+  useEffect(() => {
+    liveFemStatusRef.current = liveFemStatus;
+  }, [liveFemStatus]);
+  useEffect(() => {
+    destructionCacheRef.current = destructionCache;
+  }, [destructionCache]);
 
   const applyLiveSnapshot = useCallback(
     async (
@@ -1594,7 +1636,10 @@ export function App() {
       };
 
       let autoSimCache: DestructionCache | null = null;
-      if (snapshot.coupled_simulation && snapshot.coupled_simulation.frame_count > 1) {
+      if (
+        (snapshot.coupled_simulation && snapshot.coupled_simulation.frame_count >= 1) ||
+        liveFemStatusRef.current?.active
+      ) {
         try {
           const coupledRes = await fetch(
             `/api/live-sync/coupled-sim?rev=${encodeURIComponent(String(snapshot.revision))}&t=${encodeURIComponent(String(snapshot.timestamp_ms))}`,
@@ -1605,7 +1650,7 @@ export function App() {
               summary?: RustCoupledSimBakeSummaryJson;
               frames?: RustCoupledSimFrameJson[];
             };
-            if (payload?.summary && Array.isArray(payload.frames) && payload.frames.length > 1) {
+            if (payload?.summary && Array.isArray(payload.frames) && payload.frames.length >= 1) {
               autoSimCache = convertRustCoupledSimToDestructionCache(
                 payload.summary,
                 payload.frames,
@@ -1627,6 +1672,7 @@ export function App() {
 
       if (
         !autoSimCache &&
+        !liveFemStatusRef.current?.active &&
         snapshot.physics_simulation &&
         snapshot.physics_simulation.trajectories.some((t) => t.samples.length > 1)
       ) {
@@ -1641,6 +1687,7 @@ export function App() {
 
       if (
         !autoSimCache &&
+        !liveFemStatusRef.current?.active &&
         hydratedParts.length > 0 &&
         shouldAutoSimulateLiveSnapshot(snapshot, mappedJoints)
       ) {
@@ -1660,15 +1707,25 @@ export function App() {
       setFeaResult(mappedFea);
 
       if (autoSimCache) {
+        const isStreamingNow = Boolean(liveFemStatusRef.current?.active);
         setDestructionConfig(autoSimCache.config);
         setDestructionCache(autoSimCache);
-        setDestructionFrame(0);
         setIsDestructionCacheStale(false);
         if (autoSimCache.maxStressOverallMPa > 10) {
-          setDestructionFieldMode('von_mises');
+          setDestructionFieldMode((prev) =>
+            prev === 'shaded' ? 'von_mises' : prev
+          );
         }
-        setIsPlayingDestruction(true);
-      } else {
+        if (isStreamingNow) {
+          if (followLiveFrameRef.current) {
+            setDestructionFrame(Math.max(0, autoSimCache.frames.length - 1));
+          }
+          setIsPlayingDestruction(false);
+        } else {
+          setDestructionFrame(0);
+          setIsPlayingDestruction(true);
+        }
+      } else if (!liveFemStatusRef.current?.active) {
         setDestructionCache(null);
         setDestructionFrame(0);
         setIsPlayingDestruction(false);
@@ -1798,9 +1855,36 @@ export function App() {
 
     (async () => {
       try {
-        const res = await fetch('/api/live-sync/scene', { cache: 'no-store' });
-        if (!cancelled && res.ok) {
-          const data = (await res.json()) as LiveSyncApiResponse;
+        const [sceneRes, progRes] = await Promise.all([
+          fetch('/api/live-sync/scene', { cache: 'no-store' }),
+          fetch('/api/live-sync/coupled-progress', { cache: 'no-store' }).catch(
+            () => null
+          ),
+        ]);
+
+        if (!cancelled && progRes && progRes.ok) {
+          try {
+            const progData = (await progRes.json()) as {
+              active?: boolean;
+              progress?: LiveCoupledProgressPayload | null;
+            };
+            if (progData?.active && progData.progress?.state === 'running') {
+              const status = liveProgressToSolveStatus(
+                progData.progress,
+                'live_sync'
+              );
+              setLiveFemStatus(status);
+              setBakeProgressPct(status.progressPct);
+              setBakeStageLabel(status.stageLabel);
+              setFollowLiveFrame(true);
+            }
+          } catch {
+            // Ignore malformed initial coupled progress payload
+          }
+        }
+
+        if (!cancelled && sceneRes.ok) {
+          const data = (await sceneRes.json()) as LiveSyncApiResponse;
           if (data.active && data.snapshot && data.snapshot.parts.length > 0) {
             setLiveSnapshot(data.snapshot);
             const applied = await applyLiveSnapshot(data.snapshot, {
@@ -1836,8 +1920,23 @@ export function App() {
 
     const handleIncomingEvent = (evt: MessageEvent, isInitialReady: boolean) => {
       try {
-        const payload = JSON.parse(evt.data) as LiveSyncApiResponse;
+        const payload = JSON.parse(evt.data) as LiveSyncApiResponse & {
+          coupledProgress?: LiveCoupledProgressPayload | null;
+        };
         setLiveSyncConnected(true);
+        if (
+          payload.coupledProgress &&
+          payload.coupledProgress.state === 'running' &&
+          liveSyncEnabledRef.current
+        ) {
+          const status = liveProgressToSolveStatus(
+            payload.coupledProgress,
+            'live_sync'
+          );
+          setLiveFemStatus(status);
+          setBakeProgressPct(status.progressPct);
+          setBakeStageLabel(status.stageLabel);
+        }
         if (payload.active && payload.snapshot) {
           setLiveSnapshot(payload.snapshot);
           if (liveSyncEnabledRef.current && payload.snapshot.parts.length > 0) {
@@ -1865,15 +1964,121 @@ export function App() {
     es.addEventListener('scene_updated', (evt) =>
       handleIncomingEvent(evt as MessageEvent, false)
     );
+    es.addEventListener('coupled_sim_progress', (evt) => {
+      try {
+        const raw = JSON.parse((evt as MessageEvent).data) as
+          | LiveCoupledProgressPayload
+          | {
+              active?: boolean;
+              progress?: LiveCoupledProgressPayload | null;
+            };
+        setLiveSyncConnected(true);
+        if (!liveSyncEnabledRef.current) return;
+        const prog: LiveCoupledProgressPayload | null | undefined =
+          'progress' in raw
+            ? raw.active === false
+              ? null
+              : raw.progress
+            : typeof (raw as LiveCoupledProgressPayload)?.state === 'string'
+              ? (raw as LiveCoupledProgressPayload)
+              : null;
+        if (!prog) {
+          setLiveFemStatus(null);
+          return;
+        }
+        const status = liveProgressToSolveStatus(prog, 'live_sync');
+        if (status.active) {
+          setLiveFemStatus(status);
+          setBakeProgressPct(status.progressPct);
+          setBakeStageLabel(status.stageLabel);
+          setActivePreset(MCP_LIVE_PRESET_ID);
+        } else {
+          setLiveFemStatus(null);
+          setBakeProgressPct(status.state === 'completed' ? 100 : 0);
+          setBakeStageLabel(status.stageLabel);
+          if (status.state === 'failed') {
+            showToast(
+              prog.error || 'Расчёт Rust FEM завершился с ошибкой',
+              'error'
+            );
+          } else if (status.state === 'cancelled') {
+            showToast('Расчёт Rust FEM отменён');
+          }
+        }
+      } catch {
+        // Ignore malformed coupled progress SSE payload
+      }
+    });
+    es.addEventListener('coupled_sim_frames', (evt) => {
+      try {
+        const data = JSON.parse((evt as MessageEvent).data) as {
+          active?: boolean;
+          simulation_id?: string;
+          frame_count?: number;
+          payload?: {
+            summary?: RustCoupledSimBakeSummaryJson;
+            frames?: RustCoupledSimFrameJson[];
+          } | null;
+        };
+        setLiveSyncConnected(true);
+        if (!liveSyncEnabledRef.current || data?.active === false) return;
+        const simPayload = data?.payload;
+        const currentParts = partsRef.current;
+        if (
+          !simPayload?.summary ||
+          !Array.isArray(simPayload.frames) ||
+          simPayload.frames.length === 0 ||
+          currentParts.length === 0
+        ) {
+          return;
+        }
+        const nextCache = convertRustCoupledSimToDestructionCache(
+          simPayload.summary,
+          simPayload.frames,
+          currentParts,
+          materialsRef.current,
+          { ...DEFAULT_DESTRUCTION_CONFIG, scenarioMode: 'impact_crush' }
+        );
+        setActivePreset(MCP_LIVE_PRESET_ID);
+        setDestructionConfig(nextCache.config);
+        setDestructionCache(nextCache);
+        setIsDestructionCacheStale(false);
+        setIsPlayingDestruction(false);
+        if (nextCache.maxStressOverallMPa > 10) {
+          setDestructionFieldMode((prev) =>
+            prev === 'shaded' ? 'von_mises' : prev
+          );
+        }
+        if (followLiveFrameRef.current) {
+          setDestructionFrame(Math.max(0, nextCache.frames.length - 1));
+        }
+        setLiveFemStatus((prev) =>
+          prev
+            ? {
+                ...prev,
+                framesCached: nextCache.frames.length,
+                latestFrameIndex: nextCache.frames.length - 1,
+                maxVonMisesMPa: Math.max(
+                  prev.maxVonMisesMPa,
+                  nextCache.maxStressOverallMPa
+                ),
+              }
+            : prev
+        );
+      } catch {
+        // Ignore malformed coupled frames SSE payload
+      }
+    });
     es.addEventListener('scene_cleared', () => {
       setLiveSnapshot(null);
+      setLiveFemStatus(null);
       liveLastAppliedKeyRef.current = '';
     });
 
     return () => {
       es.close();
     };
-  }, [applyLiveSnapshot]);
+  }, [applyLiveSnapshot, showToast]);
 
   const cycleQualityPreset = useCallback(() => {
     setQuality((prev) => {
@@ -2046,15 +2251,40 @@ export function App() {
     [isProbingRust, showToast]
   );
 
+  const handleToggleFollowLive = useCallback(() => {
+    setFollowLiveFrame((prev) => {
+      const next = !prev;
+      followLiveFrameRef.current = next;
+      if (next && destructionCacheRef.current) {
+        setIsPlayingDestruction(false);
+        setDestructionFrame(
+          Math.max(0, destructionCacheRef.current.frames.length - 1)
+        );
+      }
+      return next;
+    });
+  }, []);
+
   const handleCancelDestructionBake = useCallback(() => {
     const controller = activeRustAbortRef.current;
-    const jobId = activeRustJobIdRef.current;
+    const jobId =
+      activeRustJobIdRef.current || liveFemStatusRef.current?.jobId || null;
     if (controller && !controller.signal.aborted) {
       controller.abort();
     }
     if (jobId) {
       void cancelNativeCoupledSimulation(bridgeStatus.endpointUrl, jobId);
     }
+    setLiveFemStatus((prev) =>
+      prev
+        ? {
+            ...prev,
+            state: 'cancelling',
+            stageLabel: 'Остановка расчёта...',
+            cancellable: false,
+          }
+        : prev
+    );
   }, [bridgeStatus.endpointUrl]);
 
   const handleBakeDestructionCache = useCallback(async () => {
@@ -2063,22 +2293,51 @@ export function App() {
     setIsPlayingDestruction(false);
     setIsBakingDestruction(true);
     setNativeBakeError(null);
+    setFollowLiveFrame(true);
+    followLiveFrameRef.current = true;
     setBakeProgressPct(4);
-    setBakeStageLabel(
-      bridgeStatus.connectedToWindowsExe
-        ? `Rust FEM f64 (${rustAccuracyLevel}): синхронизация сцены и запуск HHT-α...`
-        : 'Web Local Preview: подготовка сетки и полей деформаций...'
-    );
+    const initialStage = bridgeStatus.connectedToWindowsExe
+      ? `Rust FEM f64 (${rustAccuracyLevel}): синхронизация сцены и запуск HHT-α...`
+      : 'Web Local Preview: подготовка сетки и расчёт кадров...';
+    setBakeStageLabel(initialStage);
+    setLiveFemStatus({
+      active: true,
+      state: 'running',
+      source: bridgeStatus.connectedToWindowsExe ? 'rust_fem' : 'web_local',
+      jobId: null,
+      simulationId: null,
+      progressPct: 4,
+      stepCount: 0,
+      frameCount: Math.max(
+        1,
+        Math.round(destructionConfig.durationSec * destructionConfig.fps) + 1
+      ),
+      framesCached: 0,
+      latestFrameIndex: 0,
+      currentTimeSec: 0,
+      totalTimeSec: destructionConfig.durationSec,
+      currentDtSec: 0,
+      bisections: 0,
+      erodedElements: 0,
+      detachedFragments: 0,
+      elapsedMs: 0,
+      estimatedRemainingMs: null,
+      maxVonMisesMPa: 0,
+      stageLabel: initialStage,
+      cancellable: true,
+    });
 
     const abortController = new AbortController();
     activeRustAbortRef.current = abortController;
     activeRustJobIdRef.current = null;
+    setCanCancelBake(true);
+
+    let autoSwitchedField = false;
 
     try {
       let cache: DestructionCache | null = null;
 
       if (bridgeStatus.connectedToWindowsExe) {
-        setCanCancelBake(true);
         try {
           cache = await bakeNativeCoupledSimulation(
             bridgeStatus.endpointUrl,
@@ -2095,23 +2354,42 @@ export function App() {
               onJobId: (jobId) => {
                 activeRustJobIdRef.current = jobId;
               },
+              onStatusUpdate: (status) => {
+                setLiveFemStatus(status);
+                setBakeProgressPct(status.progressPct);
+                setBakeStageLabel(status.stageLabel);
+              },
+              onPartialCache: (partialCache, latestIdx) => {
+                setDestructionCache(partialCache);
+                setIsDestructionCacheStale(false);
+                if (!autoSwitchedField && partialCache.maxStressOverallMPa > 10) {
+                  autoSwitchedField = true;
+                  setDestructionFieldMode((prev) =>
+                    prev === 'shaded' ? 'von_mises' : prev
+                  );
+                }
+                if (followLiveFrameRef.current) {
+                  setDestructionFrame(latestIdx);
+                }
+              },
               signal: abortController.signal,
             }
           );
-        } catch (nativeErr: any) {
-          if (
+        } catch (nativeErr: unknown) {
+          const isAbort =
             nativeErr instanceof RustBakeCancelledError ||
-            nativeErr?.name === 'AbortError' ||
-            abortController.signal.aborted
-          ) {
+            (nativeErr instanceof Error && nativeErr.name === 'AbortError') ||
+            abortController.signal.aborted;
+          if (isAbort) {
+            setLiveFemStatus(null);
             showToast('Расчёт Rust FEM отменён');
             return;
           }
           const msg =
-            nativeErr?.message ||
-            'Неизвестная ошибка при расчёте на Rust FEM сервере';
+            nativeErr instanceof Error
+              ? nativeErr.message
+              : 'Неизвестная ошибка при расчёте на Rust FEM сервере';
           setNativeBakeError(msg);
-          setCanCancelBake(false);
           setBakeStageLabel(
             'Сбой Rust FEM — переключение на Web Local Preview...'
           );
@@ -2119,7 +2397,7 @@ export function App() {
       }
 
       if (!cache) {
-        setCanCancelBake(false);
+        const localStart = performance.now();
         cache = await bakeDestructionCacheAsync(
           parts,
           joints,
@@ -2128,10 +2406,65 @@ export function App() {
           (pct, label) => {
             setBakeProgressPct(pct);
             setBakeStageLabel(label);
+          },
+          {
+            signal: abortController.signal,
+            yieldEveryFrames: 4,
+            onPartialCache: (partialCache, latestIdx, meta) => {
+              setDestructionCache(partialCache);
+              setIsDestructionCacheStale(false);
+              if (!autoSwitchedField && partialCache.maxStressOverallMPa > 10) {
+                autoSwitchedField = true;
+                setDestructionFieldMode((prev) =>
+                  prev === 'shaded' ? 'von_mises' : prev
+                );
+              }
+              if (followLiveFrameRef.current) {
+                setDestructionFrame(latestIdx);
+              }
+              const elapsedMs = meta.elapsedMs ?? performance.now() - localStart;
+              const estTotalFrames = Math.max(
+                partialCache.frames.length,
+                Math.round(destructionConfig.durationSec * destructionConfig.fps) + 1
+              );
+              setLiveFemStatus({
+                active: true,
+                state: 'running',
+                source: 'web_local',
+                jobId: null,
+                simulationId: partialCache.id,
+                progressPct: meta.progressPct,
+                stepCount: meta.stepCount,
+                frameCount: estTotalFrames,
+                framesCached: meta.framesCached,
+                latestFrameIndex: latestIdx,
+                currentTimeSec:
+                  partialCache.frames[latestIdx]?.timeSec ?? 0,
+                totalTimeSec: destructionConfig.durationSec,
+                currentDtSec:
+                  partialCache.frames.length > 1
+                    ? Math.max(
+                        1e-6,
+                        (partialCache.frames[latestIdx]?.timeSec ?? 0) -
+                          (partialCache.frames[Math.max(0, latestIdx - 1)]?.timeSec ?? 0)
+                      )
+                    : 0,
+                bisections: 0,
+                erodedElements:
+                  partialCache.frames[latestIdx]?.metrics.fracturedPartsCount ?? 0,
+                detachedFragments: meta.activeShards,
+                elapsedMs,
+                estimatedRemainingMs: meta.estimatedRemainingMs,
+                maxVonMisesMPa: partialCache.maxStressOverallMPa,
+                stageLabel: meta.stageLabel,
+                cancellable: true,
+              });
+            },
           }
         );
       }
 
+      setLiveFemStatus(null);
       setDestructionCache(cache);
       setDestructionFrame(0);
       setIsDestructionCacheStale(false);
@@ -2140,11 +2473,22 @@ export function App() {
       showToast(
         `Кэш запечён (${cache.solverLabel}): ${cache.totalFrames + 1} кадров, σ_max=${cache.maxStressOverallMPa.toFixed(0)} МПа (${formatCacheBytes(cache.cacheBytes)}, ${cache.bakeTimeMs.toFixed(0)} мс)`
       );
-    } catch (err: any) {
-      showToast(
-        err?.message || 'Ошибка при расчёте кэша разрушения',
-        'error'
-      );
+    } catch (err: unknown) {
+      const isAbort =
+        err instanceof RustBakeCancelledError ||
+        (err instanceof Error && err.name === 'AbortError') ||
+        abortController.signal.aborted;
+      setLiveFemStatus(null);
+      if (isAbort) {
+        showToast('Расчёт симуляции остановлен');
+      } else {
+        showToast(
+          err instanceof Error
+            ? err.message
+            : 'Ошибка при расчёте кэша разрушения',
+          'error'
+        );
+      }
     } finally {
       activeRustAbortRef.current = null;
       activeRustJobIdRef.current = null;
@@ -2164,6 +2508,10 @@ export function App() {
   ]);
 
   const handleClearDestructionCache = useCallback(() => {
+    if (activeRustAbortRef.current && !activeRustAbortRef.current.signal.aborted) {
+      activeRustAbortRef.current.abort();
+    }
+    setLiveFemStatus(null);
     setIsPlayingDestruction(false);
     setDestructionCache(null);
     setDestructionFrame(0);
@@ -2190,19 +2538,33 @@ export function App() {
       );
       setIsPlayingDestruction(false);
       setDestructionFrame(clamped);
+      if (isBakingDestruction || liveFemStatusRef.current?.active) {
+        const atTip = clamped >= Math.max(0, destructionCache.frames.length - 1);
+        setFollowLiveFrame(atTip);
+        followLiveFrameRef.current = atTip;
+      }
     },
-    [destructionCache]
+    [destructionCache, isBakingDestruction]
   );
 
   const handleStepDestructionFrame = useCallback(
     (delta: number) => {
       if (!destructionCache) return;
       setIsPlayingDestruction(false);
-      setDestructionFrame((prev) =>
-        Math.max(0, Math.min(destructionCache.totalFrames, prev + delta))
-      );
+      setDestructionFrame((prev) => {
+        const next = Math.max(
+          0,
+          Math.min(destructionCache.totalFrames, prev + delta)
+        );
+        if (isBakingDestruction || liveFemStatusRef.current?.active) {
+          const atTip = next >= Math.max(0, destructionCache.frames.length - 1);
+          setFollowLiveFrame(atTip);
+          followLiveFrameRef.current = atTip;
+        }
+        return next;
+      });
     },
-    [destructionCache]
+    [destructionCache, isBakingDestruction]
   );
 
   const handleSelectDestructionScenario = useCallback(
@@ -2303,34 +2665,56 @@ export function App() {
   };
 
   // Load Native Windows Rust STL from /output/*.stl centered at [0, 0, 0]
-  const handleLoadNativeStlUrl = async (stlUrl: string, label: string) => {
+  // or asynchronously hydrate a specific MCP `import_stl` part without wiping the scene.
+  const handleLoadNativeStlUrl = async (
+    stlUrl: string,
+    label: string,
+    options?: NativeStlLoadOptions
+  ) => {
     try {
-      const parsedMesh = await loadCachedRustStlMesh(stlUrl, 7850);
-      const partId =
-        stlUrl
-          .split('/')
-          .pop()
-          ?.replace(/\.stl$/i, '') || 'native_stl';
-      const newPart: CadPart = {
-        id: partId,
-        name: `Rust STL: ${label.split(' ')[0]}`,
-        materialId: partId.includes('rim') ? 'alu_6061' : 'steel_1045',
-        dag: [
-          {
-            id: 'node_stl',
-            name: `Compiled Windows STL (${parsedMesh.triangleCount.toLocaleString()} tris)`,
-            type: 'stl_import',
-            params: { file_path: stlUrl, triangles: parsedMesh.triangleCount },
-            enabled: true,
-          },
-        ],
-        mesh: parsedMesh,
-        visible: true,
-        position: [0, 0, 0],
-        rotation: [0, 0, 0],
-        scale: [1, 1, 1],
-        nativeStlUrl: stlUrl,
-      };
+      const activeMaterials =
+        options?.materials && options.materials.length > 0
+          ? options.materials
+          : materialsRef.current.length > 0
+            ? materialsRef.current
+            : materials;
+      const resolved = resolveNativeStlMaterialSpec(
+        stlUrl,
+        activeMaterials,
+        options?.materialId
+      );
+      const parsedMesh = await loadCachedRustStlMesh(stlUrl, resolved.density);
+
+      if (options?.hydratePartId) {
+        const targetPartId = options.hydratePartId;
+        const latestMaterials =
+          materialsRef.current.length >= activeMaterials.length
+            ? materialsRef.current
+            : activeMaterials;
+        setParts(
+          (prev) =>
+            hydrateImportedStlPartInScene(
+              prev,
+              targetPartId,
+              stlUrl,
+              parsedMesh,
+              latestMaterials
+            ).parts
+        );
+        setFitTrigger((c) => c + 1);
+        showToast(
+          `Hydrated STL for ${targetPartId}: ${stlUrl} (${parsedMesh.triangleCount.toLocaleString()} triangles)`
+        );
+        return;
+      }
+
+      const newPart = buildStandaloneNativeStlPart(
+        stlUrl,
+        label,
+        parsedMesh,
+        resolved.materialId,
+        resolved.partId
+      );
       setParts([newPart]);
       setSelectedPartId(newPart.id);
       setJoints([
@@ -2576,10 +2960,21 @@ export function App() {
       }
 
       // If import_stl specified a nativeStlUrl, fetch and hydrate the real STL buffer asynchronously
+      // onto the specific imported part without overwriting other scene parts or part metadata.
       if (toolName === 'import_stl' && response.native_stl_url) {
-        handleLoadNativeStlUrl(
+        const importedPart = nextState.parts.find(
+          (p) => p.id === response.part_id
+        );
+        void handleLoadNativeStlUrl(
           response.native_stl_url,
-          response.file_path || 'Imported STL'
+          importedPart?.name || response.file_path || 'Imported STL',
+          {
+            hydratePartId: String(response.part_id),
+            materialId:
+              importedPart?.materialId ||
+              String(params.material || 'steel_1045'),
+            materials: nextState.materials,
+          }
         );
       }
 
@@ -3338,12 +3733,16 @@ export function App() {
             showDestructionSparks={showDestructionSparks}
             hideAssemblyBar={
               destructionCache !== null ||
+              isBakingDestruction ||
+              Boolean(liveFemStatus?.active) ||
               activePreset === 'gears_clash_destruction' ||
               activePreset === 'gear_overload_burst'
             }
           />
 
           {(destructionCache ||
+            isBakingDestruction ||
+            Boolean(liveFemStatus?.active) ||
             activePreset === 'gears_clash_destruction' ||
             activePreset === 'gear_overload_burst') && (
             <CadDestructionTimeline
@@ -3351,6 +3750,8 @@ export function App() {
               isBaking={isBakingDestruction}
               bakeProgressPct={bakeProgressPct}
               bakeStageLabel={bakeStageLabel}
+              liveSolveStatus={liveFemStatus}
+              followLiveFrame={followLiveFrame}
               isCacheStale={isDestructionCacheStale}
               currentFrame={destructionFrame}
               isPlaying={isPlayingDestruction}
@@ -3371,13 +3772,17 @@ export function App() {
                 setShowDestructionStressGlow((v) => !v)
               }
               onToggleSparks={() => setShowDestructionSparks((v) => !v)}
+              onToggleFollowLive={handleToggleFollowLive}
               onBakeCache={handleBakeDestructionCache}
+              onCancelBake={handleCancelDestructionBake}
               onClearCache={handleClearDestructionCache}
             />
           )}
 
           {/* Subtle Bottom WGPU Status & Controls Overlay (hidden when destruction timeline dock is shown) */}
           {!destructionCache &&
+            !isBakingDestruction &&
+            !liveFemStatus?.active &&
             activePreset !== 'gears_clash_destruction' &&
             activePreset !== 'gear_overload_burst' && (
           <div className="absolute bottom-2.5 inset-x-3 pointer-events-none flex items-center justify-between gap-2 text-[11px] font-mono text-[#94a3b8] whitespace-nowrap">
@@ -3727,12 +4132,16 @@ export function App() {
             showDestructionSparks={showDestructionSparks}
             hideAssemblyBar={
               destructionCache !== null ||
+              isBakingDestruction ||
+              Boolean(liveFemStatus?.active) ||
               (activeWorkbench === 'simulation' &&
                 simulationSubMode === 'destruction')
             }
           />
 
           {(destructionCache !== null ||
+            isBakingDestruction ||
+            Boolean(liveFemStatus?.active) ||
             (activeWorkbench === 'simulation' &&
               simulationSubMode === 'destruction')) && (
             <CadDestructionTimeline
@@ -3740,6 +4149,8 @@ export function App() {
               isBaking={isBakingDestruction}
               bakeProgressPct={bakeProgressPct}
               bakeStageLabel={bakeStageLabel}
+              liveSolveStatus={liveFemStatus}
+              followLiveFrame={followLiveFrame}
               isCacheStale={isDestructionCacheStale}
               currentFrame={destructionFrame}
               isPlaying={isPlayingDestruction}
@@ -3760,7 +4171,9 @@ export function App() {
                 setShowDestructionStressGlow((v) => !v)
               }
               onToggleSparks={() => setShowDestructionSparks((v) => !v)}
+              onToggleFollowLive={handleToggleFollowLive}
               onBakeCache={handleBakeDestructionCache}
+              onCancelBake={handleCancelDestructionBake}
               onClearCache={handleClearDestructionCache}
             />
           )}
@@ -3810,6 +4223,7 @@ export function App() {
             rustAccuracyLevel={rustAccuracyLevel}
             nativeBakeError={nativeBakeError}
             canCancelBake={canCancelBake}
+            liveSolveStatus={liveFemStatus}
             onChangeDestructionFieldMode={setDestructionFieldMode}
             onChangeDestructionDeformScale={setDestructionDeformScale}
             onChangeDestructionConfig={handleChangeDestructionConfig}
@@ -3874,6 +4288,7 @@ export function App() {
         liveSyncConnected={liveSyncConnected}
         livePartsCount={liveSnapshot?.parts.length ?? 0}
         liveLastTool={liveSnapshot?.last_tool?.tool_name}
+        liveSolveStatus={liveFemStatus}
       />
 
       {/* Modal 1: Cut Cylindrical Hole + DIN 6885 Keyway */}

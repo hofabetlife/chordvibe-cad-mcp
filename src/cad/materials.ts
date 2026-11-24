@@ -383,63 +383,82 @@ export function normalizeMaterialSpec(
 ): MaterialSpec {
   const density = Number(raw.density ?? raw.density_kg_m3 ?? 7850);
   const youngsModulus =
-    raw.youngsModulus !== undefined
+    raw.youngsModulus != null
       ? Number(raw.youngsModulus)
-      : raw.youngs_modulus_pa !== undefined
+      : raw.youngs_modulus_pa != null
         ? Number(raw.youngs_modulus_pa)
-        : raw.youngs_modulus_gpa !== undefined
-          ? Number(raw.youngs_modulus_gpa) * 1e9
-          : 205e9;
-  const poissonsRatio = Number(raw.poissonsRatio ?? raw.poissons_ratio ?? 0.29);
+        : raw.young_modulus_pa != null
+          ? Number(raw.young_modulus_pa)
+          : raw.youngs_modulus_gpa != null
+            ? Number(raw.youngs_modulus_gpa) * 1e9
+            : raw.young_modulus_gpa != null
+              ? Number(raw.young_modulus_gpa) * 1e9
+              : 205e9;
+  const poissonsRatio = Number(
+    raw.poissonsRatio ?? raw.poissons_ratio ?? raw.poisson_ratio ?? 0.29
+  );
   const yieldStrength =
-    raw.yieldStrength !== undefined
+    raw.yieldStrength != null
       ? Number(raw.yieldStrength)
-      : raw.yield_strength_pa !== undefined
+      : raw.yield_strength_pa != null
         ? Number(raw.yield_strength_pa)
-        : raw.yield_strength_mpa !== undefined
+        : raw.yield_strength_mpa != null
           ? Number(raw.yield_strength_mpa) * 1e6
           : 250e6;
 
-  const rawMode = String(raw.failureMode ?? raw.failure_mode ?? 'ductile')
-    .trim()
-    .toLowerCase();
-  const failureMode: MaterialFailureMode = rawMode === 'brittle' ? 'brittle' : 'ductile';
-  const defaults = deriveNonlinearMaterialDefaults(youngsModulus, yieldStrength, failureMode);
+  const rawModeInput = raw.failureMode ?? raw.failure_mode;
+  let failureMode: MaterialFailureMode;
+  let defaultsMode: MaterialFailureMode = 'ductile';
+  if (rawModeInput === undefined || rawModeInput === null) {
+    failureMode = 'ductile';
+  } else if (typeof rawModeInput === 'string') {
+    const normalizedMode = rawModeInput.trim().toLowerCase();
+    if (normalizedMode === 'ductile' || normalizedMode === 'brittle') {
+      failureMode = normalizedMode;
+      defaultsMode = normalizedMode;
+    } else {
+      // Preserve invalid failure_mode so validateMaterialSpec / assertValidMaterialSpec rejects it
+      failureMode = normalizedMode as MaterialFailureMode;
+    }
+  } else {
+    failureMode = String(rawModeInput) as MaterialFailureMode;
+  }
+  const defaults = deriveNonlinearMaterialDefaults(youngsModulus, yieldStrength, defaultsMode);
 
   const ultimateStrengthPa =
-    raw.ultimateStrengthPa !== undefined
+    raw.ultimateStrengthPa != null
       ? Number(raw.ultimateStrengthPa)
-      : raw.ultimate_strength_pa !== undefined
+      : raw.ultimate_strength_pa != null
         ? Number(raw.ultimate_strength_pa)
-        : raw.ultimate_strength_mpa !== undefined
+        : raw.ultimate_strength_mpa != null
           ? Number(raw.ultimate_strength_mpa) * 1e6
           : defaults.ultimateStrengthPa;
 
   const hardeningModulusPa =
-    raw.hardeningModulusPa !== undefined
+    raw.hardeningModulusPa != null
       ? Number(raw.hardeningModulusPa)
-      : raw.hardening_modulus_pa !== undefined
+      : raw.hardening_modulus_pa != null
         ? Number(raw.hardening_modulus_pa)
         : defaults.hardeningModulusPa;
 
   const fractureStrain =
-    raw.fractureStrain !== undefined
+    raw.fractureStrain != null
       ? Number(raw.fractureStrain)
-      : raw.fracture_strain !== undefined
+      : raw.fracture_strain != null
         ? Number(raw.fracture_strain)
         : defaults.fractureStrain;
 
   const fractureEnergyJM2 =
-    raw.fractureEnergyJM2 !== undefined
+    raw.fractureEnergyJM2 != null
       ? Number(raw.fractureEnergyJM2)
-      : raw.fracture_energy_j_m2 !== undefined
+      : raw.fracture_energy_j_m2 != null
         ? Number(raw.fracture_energy_j_m2)
         : defaults.fractureEnergyJM2;
 
   const frictionCoeff =
-    raw.frictionCoeff !== undefined
+    raw.frictionCoeff != null
       ? Number(raw.frictionCoeff)
-      : raw.friction_coeff !== undefined
+      : raw.friction_coeff != null
         ? Number(raw.friction_coeff)
         : defaults.frictionCoeff;
 

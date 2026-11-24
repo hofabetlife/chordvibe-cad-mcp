@@ -14,6 +14,8 @@ import {
   Database,
   Zap,
   RotateCcw,
+  Radio,
+  Square,
 } from 'lucide-react';
 import type {
   DeformationScalePreset,
@@ -23,6 +25,10 @@ import type {
 } from '../types/cad';
 import { formatCacheBytes } from '../cad/destruction_engine';
 import { buildEnergyBalanceSeries } from '../cad/field_colormaps';
+import {
+  formatDurationMsRu,
+  type LiveFemSolveStatus,
+} from '../cad/coupled_sim_stream';
 
 export type PlaybackSpeed = 0.1 | 0.25 | 0.5 | 1 | 2;
 
@@ -33,6 +39,8 @@ interface CadDestructionTimelineProps {
   isBaking: boolean;
   bakeProgressPct: number;
   bakeStageLabel: string;
+  liveSolveStatus?: LiveFemSolveStatus | null;
+  followLiveFrame?: boolean;
   isCacheStale: boolean;
   currentFrame: number;
   isPlaying: boolean;
@@ -51,7 +59,9 @@ interface CadDestructionTimelineProps {
   onToggleLoop: () => void;
   onToggleStressGlow: () => void;
   onToggleSparks: () => void;
+  onToggleFollowLive?: () => void;
   onBakeCache: () => void;
+  onCancelBake?: () => void;
   onClearCache?: () => void;
 }
 
@@ -60,6 +70,8 @@ export const CadDestructionTimeline: React.FC<CadDestructionTimelineProps> = ({
   isBaking,
   bakeProgressPct,
   bakeStageLabel,
+  liveSolveStatus = null,
+  followLiveFrame = true,
   isCacheStale,
   currentFrame,
   isPlaying,
@@ -76,13 +88,26 @@ export const CadDestructionTimeline: React.FC<CadDestructionTimelineProps> = ({
   onToggleLoop,
   onToggleStressGlow,
   onToggleSparks,
+  onToggleFollowLive,
   onBakeCache,
+  onCancelBake,
   onClearCache,
 }) => {
   const [collapsed, setCollapsed] = useState(false);
   const [trackOverlayMode, setTrackOverlayMode] = useState<'energy' | 'stress'>(
     'energy'
   );
+
+  const isSolveActive = isBaking || Boolean(liveSolveStatus?.active);
+  const effectivePct = Math.max(
+    0,
+    Math.min(
+      100,
+      liveSolveStatus?.active ? liveSolveStatus.progressPct : bakeProgressPct
+    )
+  );
+  const effectiveStage = liveSolveStatus?.stageLabel || bakeStageLabel;
+  const maxPlayableFrame = cache ? Math.max(0, cache.frames.length - 1) : 0;
 
   // Build normalized SVG polyline for stress curve across cached frames
   const stressSparklinePoints = useMemo(() => {
@@ -131,19 +156,39 @@ export const CadDestructionTimeline: React.FC<CadDestructionTimelineProps> = ({
     }
   };
 
+  const etaStr = liveSolveStatus
+    ? formatDurationMsRu(liveSolveStatus.estimatedRemainingMs)
+    : '—';
+  const elapsedStr = liveSolveStatus
+    ? formatDurationMsRu(liveSolveStatus.elapsedMs)
+    : '—';
+
   if (collapsed) {
     return (
       <div
         data-testid="destruction-timeline-collapsed"
-        className="absolute bottom-3 left-1/2 -translate-x-1/2 z-30 flex items-center gap-2 px-3 py-1.5 rounded-md bg-[#12151cf2] border border-[#2a3142] shadow-lg text-xs font-mono text-[#e2e8f0]"
+        className="absolute bottom-3 left-1/2 -translate-x-1/2 z-30 flex items-center gap-2 px-3 py-1.5 rounded-md bg-[#12151cf5] border border-[#2a3142] shadow-lg text-xs font-mono text-[#e2e8f0]"
       >
         <Database className="w-3.5 h-3.5 text-[#f97316]" />
         <span className="tabular-nums">
-          {cache
-            ? `${cache.solverLabel} · Кадр ${currentFrame}/${cache.totalFrames}`
-            : 'Симуляция разрушения (не запечено)'}
+          {isSolveActive
+            ? `FEM ${effectivePct}% · Кадр ${(liveSolveStatus?.framesCached ?? (cache ? cache.frames.length : 0))}${
+                liveSolveStatus?.frameCount ? `/${liveSolveStatus.frameCount}` : ''
+              }${liveSolveStatus?.estimatedRemainingMs != null ? ` · ~${etaStr}` : ''}`
+            : cache
+              ? `${cache.solverLabel} · Кадр ${currentFrame}/${maxPlayableFrame}`
+              : 'Симуляция разрушения (не запечено)'}
         </span>
-        {cache && (
+        {isSolveActive && liveSolveStatus?.cancellable && onCancelBake && (
+          <button
+            type="button"
+            onClick={onCancelBake}
+            className="px-2 py-0.5 rounded bg-[#2a1418] hover:bg-[#3f1a20] border border-[#ef4444]/60 text-[#fca5a5] font-semibold cursor-pointer"
+          >
+            Отмена
+          </button>
+        )}
+        {cache && !isSolveActive && (
           <button
             type="button"
             onClick={onTogglePlay}
@@ -169,7 +214,7 @@ export const CadDestructionTimeline: React.FC<CadDestructionTimelineProps> = ({
   return (
     <div
       data-testid="destruction-timeline"
-      className="absolute bottom-3 left-1/2 -translate-x-1/2 z-30 w-[min(920px,calc(100%-24px))] rounded-lg bg-[#11141cf2] border border-[#2b3345] shadow-[0_14px_40px_rgba(0,0,0,0.65)] text-[#f1f5f9] select-none"
+      className="absolute bottom-3 left-1/2 -translate-x-1/2 z-30 w-[min(940px,calc(100%-24px))] rounded-lg bg-[#11141cf5] border border-[#2b3345] shadow-[0_14px_40px_rgba(0,0,0,0.65)] text-[#f1f5f9] select-none"
     >
       {/* Top thin header tab */}
       <div className="flex items-center justify-between px-3 py-1.5 border-b border-[#222836] bg-[#151923] rounded-t-lg gap-2">
@@ -179,29 +224,36 @@ export const CadDestructionTimeline: React.FC<CadDestructionTimelineProps> = ({
             <span>Кэш симуляции</span>
           </div>
 
-          {cache && (
+          {(cache || liveSolveStatus) && (
             <span
               data-testid="timeline-solver-badge"
               className={`px-1.5 py-0.5 rounded text-[9px] font-mono font-semibold border shrink-0 ${
-                cache.solverBackend === 'rust_fem_f64'
+                cache?.solverBackend === 'rust_fem_f64' ||
+                liveSolveStatus?.source === 'rust_fem' ||
+                liveSolveStatus?.source === 'live_sync'
                   ? 'bg-[#052e1e] border-[#10b981]/60 text-[#34d399]'
                   : 'bg-[#2a1d12] border-[#f59e0b]/60 text-[#fbbf24]'
               }`}
             >
-              {cache.solverLabel}
+              {cache?.solverLabel ??
+                (liveSolveStatus?.source === 'web_local'
+                  ? 'Web Local Preview'
+                  : 'Rust FEM f64')}
             </span>
           )}
 
-          {isBaking ? (
-            <span className="text-[#38bdf8] truncate">
-              {bakeStageLabel} ({bakeProgressPct}%)
+          {isSolveActive ? (
+            <span className="text-[#38bdf8] truncate tabular-nums">
+              {cache
+                ? `В кэше: ${cache.frames.length} кадр.`
+                : `Идёт расчёт FEM (${effectivePct}%)`}
             </span>
           ) : cache ? (
             <span
               className="text-[#94a3b8] tabular-nums truncate pr-1"
               title={`Запечено за ${cache.bakeTimeMs.toFixed(0)} мс (${cache.totalFrames + 1} кадров @ ${cache.fps} FPS)`}
             >
-              {cache.totalFrames + 1} кадр. · {cache.fps} FPS ·{' '}
+              {cache.frames.length} кадр. · {cache.fps} FPS ·{' '}
               {formatCacheBytes(cache.cacheBytes)}
               {isCacheStale ? ' · Устарел' : ''}
             </span>
@@ -237,35 +289,118 @@ export const CadDestructionTimeline: React.FC<CadDestructionTimelineProps> = ({
 
       {/* Body */}
       <div className="px-3 py-2 space-y-2">
-        {isBaking ? (
-          <div className="space-y-1.5 py-1">
-            <div className="flex items-center justify-between text-xs font-mono">
-              <span className="text-[#e2e8f0]">{bakeStageLabel}</span>
-              <span className="text-[#f97316] font-semibold tabular-nums">
-                {bakeProgressPct}%
-              </span>
+        {isSolveActive && (
+          <div
+            data-testid="live-fem-progress-hud"
+            className="space-y-1.5 px-2.5 py-2 rounded bg-[#0e131d] border border-[#253147]"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono tabular-nums">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="px-1.5 py-0.5 rounded bg-[#0c273b] border border-[#38bdf8]/45 text-[#38bdf8] text-[9px] font-semibold uppercase tracking-wider shrink-0">
+                  LIVE FEM
+                </span>
+                <span className="text-[#e2e8f0] truncate max-w-[360px]">
+                  {effectiveStage}
+                </span>
+              </div>
+
+              <div className="flex items-center gap-2.5 shrink-0 flex-wrap">
+                {liveSolveStatus && (
+                  <>
+                    <span className="text-[#cbd5e1]">
+                      Кадр{' '}
+                      <strong className="text-[#f97316]">
+                        {liveSolveStatus.framesCached}
+                      </strong>
+                      {liveSolveStatus.frameCount > 0
+                        ? `/${liveSolveStatus.frameCount}`
+                        : ''}
+                    </span>
+                    <span className="text-[#94a3b8]">
+                      Шаг {liveSolveStatus.stepCount}
+                    </span>
+                    <span className="text-[#38bdf8]">
+                      t={liveSolveStatus.currentTimeSec.toFixed(3)}
+                      {liveSolveStatus.totalTimeSec > 0
+                        ? `/${liveSolveStatus.totalTimeSec.toFixed(2)}с`
+                        : 'с'}
+                    </span>
+                    <span className="text-[#fb923c]">
+                      σ_max={liveSolveStatus.maxVonMisesMPa.toFixed(0)} МПа
+                    </span>
+                    <span className="text-[#94a3b8]">
+                      {elapsedStr}
+                      {liveSolveStatus.estimatedRemainingMs != null
+                        ? ` · ~${etaStr}`
+                        : ''}
+                    </span>
+                  </>
+                )}
+
+                <span
+                  data-testid="live-fem-progress-pct"
+                  className="text-[#38bdf8] font-bold"
+                >
+                  {effectivePct}%
+                </span>
+
+                {onToggleFollowLive && (
+                  <button
+                    type="button"
+                    data-testid="follow-live-btn"
+                    onClick={onToggleFollowLive}
+                    aria-pressed={followLiveFrame}
+                    title="Автоматически переключать 3D вид на каждый новый рассчитанный кадр"
+                    className={`flex items-center gap-1 px-2 py-0.5 rounded border text-[10px] cursor-pointer whitespace-nowrap ${
+                      followLiveFrame
+                        ? 'bg-[#052e1e] border-[#10b981]/60 text-[#34d399]'
+                        : 'bg-[#1a1f2b] border-[#2d3545] text-[#94a3b8] hover:text-[#e2e8f0]'
+                    }`}
+                  >
+                    <Radio className="w-3 h-3" />
+                    <span>Авто-кадр</span>
+                  </button>
+                )}
+
+                {(liveSolveStatus?.cancellable || isBaking) && onCancelBake && (
+                  <button
+                    type="button"
+                    data-testid="timeline-cancel-bake-btn"
+                    onClick={onCancelBake}
+                    className="flex items-center gap-1 px-2 py-0.5 rounded bg-[#2a1418] hover:bg-[#3f1a20] border border-[#ef4444]/60 text-[#fca5a5] text-[10px] cursor-pointer whitespace-nowrap"
+                  >
+                    <Square className="w-2.5 h-2.5 fill-current" />
+                    <span>Отмена</span>
+                  </button>
+                )}
+              </div>
             </div>
-            <div className="w-full h-2 rounded bg-[#0c0f15] border border-[#232938] overflow-hidden">
+
+            <div className="w-full h-1.5 rounded bg-[#080b10] border border-[#222b3d] overflow-hidden">
               <div
-                className="h-full bg-[#f97316] transition-all duration-150"
-                style={{ width: `${bakeProgressPct}%` }}
+                className="h-full bg-[#38bdf8] transition-all duration-150"
+                style={{ width: `${effectivePct}%` }}
               />
             </div>
           </div>
-        ) : !cache ? (
-          <div className="flex flex-wrap items-center justify-between gap-2 py-0.5">
-            <p className="text-xs text-[#94a3b8]">
-              Предварительный расчёт деформаций, напряжений σ_vM, пластичности ε_p, повреждаемости D и локальных сколов сохраняет кадры в кэш.
-            </p>
-            <button
-              type="button"
-              onClick={onBakeCache}
-              className="flex items-center gap-1.5 px-3.5 py-1.5 rounded bg-[#f97316] hover:bg-[#ea580c] text-[#0c0e12] text-xs font-semibold cursor-pointer whitespace-nowrap shrink-0 transition-colors"
-            >
-              <Zap className="w-3.5 h-3.5" />
-              <span>Запечь кэш симуляции</span>
-            </button>
-          </div>
+        )}
+
+        {!cache ? (
+          !isSolveActive && (
+            <div className="flex flex-wrap items-center justify-between gap-2 py-0.5">
+              <p className="text-xs text-[#94a3b8]">
+                Предварительный расчёт деформаций, напряжений σ_vM, пластичности ε_p, повреждаемости D и локальных сколов сохраняет кадры в кэш.
+              </p>
+              <button
+                type="button"
+                onClick={onBakeCache}
+                className="flex items-center gap-1.5 px-3.5 py-1.5 rounded bg-[#f97316] hover:bg-[#ea580c] text-[#0c0e12] text-xs font-semibold cursor-pointer whitespace-nowrap shrink-0 transition-colors"
+              >
+                <Zap className="w-3.5 h-3.5" />
+                <span>Запечь кэш симуляции</span>
+              </button>
+            </div>
+          )
         ) : (
           <>
             {/* Compact Energy Balance & Overlay Switcher Legend */}

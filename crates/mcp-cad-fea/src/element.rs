@@ -233,14 +233,11 @@ impl Tet4Element {
         let mut ke = Matrix12::<f64>::zeros();
         let r_t = r_mat.transpose();
         let mut b_rot = [SMatrix::<f64, 6, 3>::zeros(); 4];
-        let mut cb_rot = [SMatrix::<f64, 6, 3>::zeros(); 4];
         for (k, &g) in grads.iter().enumerate() {
-            let br = node_b_matrix(g) * r_t;
-            cb_rot[k] = rm.tangent * br;
-            b_rot[k] = br;
+            b_rot[k] = node_b_matrix(g) * r_t;
         }
 
-        let use_geo = corotated && include_geometric_stiffness && rm.stress.norm() > 1e-12;
+        let use_geo = corotated && include_geometric_stiffness;
         let su_inv = if use_geo {
             let su = Matrix3::identity() * u_stretch.trace() - u_stretch;
             su.try_inverse()
@@ -248,27 +245,63 @@ impl Tet4Element {
             None
         };
 
+        let mut cb_eff = [SMatrix::<f64, 6, 3>::zeros(); 4];
         let mut geo_a = [Matrix3::<f64>::zeros(); 4];
         let mut geo_m = [Matrix3::<f64>::zeros(); 4];
-        if let Some(su_inv_mat) = su_inv {
+        let has_geo = if let Some(su_inv_mat) = su_inv {
+            // Exact Biot strain variation: dE = sym(R^T dF) - 0.5*([d_omega]_x U - U [d_omega]_x)
+            // Compute 6x3 spin-stretch correction matrix Q_U so B_eff = B_rot + Q_U * G_omega annihilates rigid rotations.
+            let q_u = {
+                let mut q = SMatrix::<f64, 6, 3>::zeros();
+                let basis = [
+                    Vector3::new(1.0, 0.0, 0.0),
+                    Vector3::new(0.0, 1.0, 0.0),
+                    Vector3::new(0.0, 0.0, 1.0),
+                ];
+                for (m, em) in basis.iter().enumerate() {
+                    let sk = skew_matrix(em);
+                    let de = (u_stretch * sk - sk * u_stretch) * 0.5;
+                    q[(0, m)] = de[(0, 0)];
+                    q[(1, m)] = de[(1, 1)];
+                    q[(2, m)] = de[(2, 2)];
+                    q[(3, m)] = de[(0, 1)] + de[(1, 0)];
+                    q[(4, m)] = de[(1, 2)] + de[(2, 1)];
+                    q[(5, m)] = de[(2, 0)] + de[(0, 2)];
+                }
+                q
+            };
+            let c_qu = rm.tangent * q_u;
             for (k, &g) in grads.iter().enumerate() {
                 let gv = Vector3::new(g[0], g[1], g[2]);
                 let tk = sigma_mat * gv;
+                let gm = su_inv_mat * skew_matrix(&gv) * r_t;
                 geo_a[k] = r_mat * skew_matrix(&tk);
-                geo_m[k] = su_inv_mat * skew_matrix(&gv) * r_t;
+                geo_m[k] = gm;
+                cb_eff[k] = rm.tangent * b_rot[k] + c_qu * gm;
             }
-        }
+            true
+        } else {
+            for k in 0..4 {
+                cb_eff[k] = rm.tangent * b_rot[k];
+            }
+            false
+        };
 
         for a in 0..4 {
             let row = 3 * a;
             for b in a..4 {
                 let col = 3 * b;
-                let mut block = (b_rot[a].transpose() * cb_rot[b]) * self.volume;
-                if su_inv.is_some() {
-                    let g_ab = -(geo_a[a] * geo_m[b]) * self.volume;
-                    let g_ba = -(geo_a[b] * geo_m[a]) * self.volume;
-                    block += (g_ab + g_ba.transpose()) * 0.5;
-                }
+                let block = if has_geo {
+                    let blk_ab = (b_rot[a].transpose() * cb_eff[b] - geo_a[a] * geo_m[b]) * self.volume;
+                    if a == b {
+                        (blk_ab + blk_ab.transpose()) * 0.5
+                    } else {
+                        let blk_ba = (b_rot[b].transpose() * cb_eff[a] - geo_a[b] * geo_m[a]) * self.volume;
+                        (blk_ab + blk_ba.transpose()) * 0.5
+                    }
+                } else {
+                    (b_rot[a].transpose() * cb_eff[b]) * self.volume
+                };
 
                 for r in 0..3 {
                     for c in 0..3 {
@@ -689,14 +722,11 @@ impl Tet10Element {
 
             let r_t = r_mat.transpose();
             let mut b_rot = [SMatrix::<f64, 6, 3>::zeros(); 10];
-            let mut cb_rot = [SMatrix::<f64, 6, 3>::zeros(); 10];
             for (k, &g) in grads.iter().enumerate() {
-                let br = node_b_matrix(g) * r_t;
-                cb_rot[k] = rm.tangent * br;
-                b_rot[k] = br;
+                b_rot[k] = node_b_matrix(g) * r_t;
             }
 
-            let use_geo = corotated && include_geometric_stiffness && rm.stress.norm() > 1e-12;
+            let use_geo = corotated && include_geometric_stiffness;
             let su_inv = if use_geo {
                 let su = Matrix3::identity() * u_stretch.trace() - u_stretch;
                 su.try_inverse()
@@ -704,27 +734,61 @@ impl Tet10Element {
                 None
             };
 
+            let mut cb_eff = [SMatrix::<f64, 6, 3>::zeros(); 10];
             let mut geo_a = [Matrix3::<f64>::zeros(); 10];
             let mut geo_m = [Matrix3::<f64>::zeros(); 10];
-            if let Some(su_inv_mat) = su_inv {
+            let has_geo = if let Some(su_inv_mat) = su_inv {
+                let q_u = {
+                    let mut q = SMatrix::<f64, 6, 3>::zeros();
+                    let basis = [
+                        Vector3::new(1.0, 0.0, 0.0),
+                        Vector3::new(0.0, 1.0, 0.0),
+                        Vector3::new(0.0, 0.0, 1.0),
+                    ];
+                    for (m, em) in basis.iter().enumerate() {
+                        let sk = skew_matrix(em);
+                        let de = (u_stretch * sk - sk * u_stretch) * 0.5;
+                        q[(0, m)] = de[(0, 0)];
+                        q[(1, m)] = de[(1, 1)];
+                        q[(2, m)] = de[(2, 2)];
+                        q[(3, m)] = de[(0, 1)] + de[(1, 0)];
+                        q[(4, m)] = de[(1, 2)] + de[(2, 1)];
+                        q[(5, m)] = de[(2, 0)] + de[(0, 2)];
+                    }
+                    q
+                };
+                let c_qu = rm.tangent * q_u;
                 for (k, &g) in grads.iter().enumerate() {
                     let gv = Vector3::new(g[0], g[1], g[2]);
                     let tk = sigma_mat * gv;
+                    let gm = su_inv_mat * skew_matrix(&gv) * r_t;
                     geo_a[k] = r_mat * skew_matrix(&tk);
-                    geo_m[k] = su_inv_mat * skew_matrix(&gv) * r_t;
+                    geo_m[k] = gm;
+                    cb_eff[k] = rm.tangent * b_rot[k] + c_qu * gm;
                 }
-            }
+                true
+            } else {
+                for k in 0..10 {
+                    cb_eff[k] = rm.tangent * b_rot[k];
+                }
+                false
+            };
 
             for a in 0..10 {
                 let row = 3 * a;
                 for b in a..10 {
                     let col = 3 * b;
-                    let mut block = (b_rot[a].transpose() * cb_rot[b]) * w;
-                    if su_inv.is_some() {
-                        let g_ab = -(geo_a[a] * geo_m[b]) * w;
-                        let g_ba = -(geo_a[b] * geo_m[a]) * w;
-                        block += (g_ab + g_ba.transpose()) * 0.5;
-                    }
+                    let block = if has_geo {
+                        let blk_ab = (b_rot[a].transpose() * cb_eff[b] - geo_a[a] * geo_m[b]) * w;
+                        if a == b {
+                            (blk_ab + blk_ab.transpose()) * 0.5
+                        } else {
+                            let blk_ba = (b_rot[b].transpose() * cb_eff[a] - geo_a[b] * geo_m[a]) * w;
+                            (blk_ab + blk_ba.transpose()) * 0.5
+                        }
+                    } else {
+                        (b_rot[a].transpose() * cb_eff[b]) * w
+                    };
 
                     for r in 0..3 {
                         for c in 0..3 {
@@ -931,6 +995,48 @@ pub fn rotate_voigt_strain(r: &Matrix3<f64>, e_loc: &Vector6<f64>) -> Vector6<f6
 /// tensor $\mathbf{U} = \mathbf{R}^T \mathbf{F}$ via SVD with reflection safeguard and
 /// Newton-Schulz orthogonal polishing.
 pub fn polar_decomposition_so3(f: &Matrix3<f64>) -> (Matrix3<f64>, Matrix3<f64>) {
+    let det_f = f.determinant();
+    if det_f.is_finite() && det_f > 1e-9 {
+        let mut r = *f;
+        for _ in 0..8 {
+            let err_sq = (r.transpose() * r - Matrix3::identity()).norm_squared();
+            if err_sq <= 1e-29 && r.determinant() > 0.0 {
+                let rt_f = r.transpose() * f;
+                let u_stretch = (rt_f + rt_f.transpose()) * 0.5;
+                return (r, u_stretch);
+            }
+            let Some(r_inv) = r.try_inverse() else {
+                break;
+            };
+            let r_inv_t = r_inv.transpose();
+            let nr = r.norm_squared();
+            let ni = r_inv_t.norm_squared();
+            let gamma = if nr > 0.0 && ni > 0.0 {
+                (ni / nr).sqrt().sqrt()
+            } else {
+                1.0
+            };
+            let r_next = (r * gamma + r_inv_t / gamma) * 0.5;
+            let step_sq = (r_next - r).norm_squared();
+            r = r_next;
+            if step_sq <= 1e-30 * nr.max(1.0) {
+                // One Newton-Schulz polish if needed
+                let e_sq = (r.transpose() * r - Matrix3::identity()).norm_squared();
+                if e_sq > 1e-29 && e_sq < 0.25 {
+                    r = r * 1.5 - (r * r.transpose() * r) * 0.5;
+                }
+                if (r.transpose() * r - Matrix3::identity()).norm_squared() <= 1e-27
+                    && r.determinant() > 0.0
+                {
+                    let rt_f = r.transpose() * f;
+                    let u_stretch = (rt_f + rt_f.transpose()) * 0.5;
+                    return (r, u_stretch);
+                }
+                break;
+            }
+        }
+    }
+
     let svd = f.svd(true, true);
     let (mut u_mat, v_t) = match (svd.u, svd.v_t) {
         (Some(u), Some(vt)) => (u, vt),

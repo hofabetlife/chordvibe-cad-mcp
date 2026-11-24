@@ -58,7 +58,8 @@ pub use damage::{
 };
 pub use dynamics::{
     assemble_mass_matrix_tet10, assemble_mass_matrix_tet4, estimate_cfl_critical_dt,
-    frame_bodies_by_id, solve_dynamic_hht_coupled, solve_dynamic_hht_single_body,
+    frame_bodies_by_id, solve_dynamic_hht_coupled, solve_dynamic_hht_coupled_with_frames,
+    solve_dynamic_hht_single_body,
     DynamicBodyFrame, DynamicBodySpec, DynamicContactForce, DynamicEnergyBalance,
     DynamicFrameSnapshot, DynamicHhtReport, DynamicHubCoupling, DynamicHubReaction,
     DynamicPrismaticDrive, DynamicProgressUpdate, DynamicRevoluteDrive, DynamicTimelineEvent,
